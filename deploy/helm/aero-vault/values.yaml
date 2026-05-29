@@ -1,0 +1,150 @@
+# Default values for aero-vault.
+# Out of the box this deploys a single replica using SQLite + local storage on a
+# PersistentVolume — a working, dependency-free install. For production/HA,
+# switch DB_DRIVER to postgres and STORAGE_BACKEND to s3 (see config/secrets
+# below) and raise replicaCount / enable autoscaling.
+
+replicaCount: 1
+
+image:
+  repository: aero-vault
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# Matches the distroless:nonroot image (uid/gid 65532).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 80
+  # Container port the app listens on (matches APP_ADDR).
+  targetPort: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-body-size: "0"   # allow large uploads
+  hosts:
+    - host: aero-vault.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: aero-vault-tls
+    #   hosts: [aero-vault.local]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# PersistentVolume for local storage + the SQLite DB. Required by the default
+# (local/sqlite) config. Disable when using external Postgres + S3.
+persistence:
+  enabled: true
+  mountPath: /data
+  existingClaim: ""
+  storageClass: ""
+  accessModes: ["ReadWriteOnce"]
+  size: 10Gi
+
+# Non-secret environment → rendered into a ConfigMap and injected via envFrom.
+# Anything here is overridable; add keys freely (e.g. AI_*, OTEL_*).
+config:
+  APP_ADDR: ":8080"
+  APP_LOG_LEVEL: "info"
+  DB_DRIVER: "sqlite"
+  DB_DSN: "file:/data/aero.db?_pragma=foreign_keys(1)"
+  STORAGE_BACKEND: "local"
+  STORAGE_LOCAL_ROOT: "/data/objects"
+  S3_COMPAT_PREFIX: "/s3"
+  JOBS_WORKERS: "4"
+  WEBUI_ENABLED: "true"
+  AI_INDEX_ENABLED: "false"
+  AI_HYBRID_SEARCH: "false"
+  # For S3 + Postgres + AI, set e.g.:
+  # STORAGE_BACKEND: "s3"
+  # STORAGE_S3_ENDPOINT: "http://minio:9000"
+  # STORAGE_S3_BUCKET: "aero-vault"
+  # STORAGE_S3_REGION: "us-east-1"
+  # STORAGE_S3_FORCE_PATH_STYLE: "true"
+  # DB_DRIVER: "postgres"
+  # AI_INDEX_ENABLED: "true"
+  # AI_EMBED_PROVIDER: "http"
+  # AI_EMBED_ENDPOINT: "http://ollama:11434"
+  # OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+
+# Secret environment → rendered into a Secret (stringData) and injected via
+# envFrom. Keys here override the ConfigMap (envFrom secret is listed last).
+# Leave empty to omit. NEVER commit real secrets — set via --set or a values
+# file kept out of source control, or use existingSecret below.
+secrets: {}
+  # DB_DSN: "postgres://aero:pass@postgres:5432/aero_vault?sslmode=disable"
+  # STORAGE_S3_ACCESS_KEY: ""
+  # STORAGE_S3_SECRET_KEY: ""
+  # STORAGE_LOCAL_SIGN_KEY: "change-me"
+  # AUTH_KEYS: "prod-rw:acme:read+write,ops:*:admin"
+  # AUTH_JWT_SECRET: ""
+  # EVENTS_WEBHOOK_SECRET: ""
+  # AI_EMBED_API_KEY: ""
+  # AI_CHAT_API_KEY: ""
+
+# Use a pre-existing Secret for sensitive env instead of generating one.
+# When set, the chart skips creating its own Secret and envFrom-references this.
+existingSecret: ""
+
+# Extra raw env entries (full container env syntax: name+value or name+valueFrom).
+extraEnv: []
+  # - name: POD_IP
+  #   valueFrom:
+  #     fieldRef:
+  #       fieldPath: status.podIP
+
+# Extra volumes / mounts (e.g. to provide a writable /tmp under readOnlyRootFilesystem).
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

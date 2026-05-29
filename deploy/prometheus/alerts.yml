@@ -1,0 +1,88 @@
+# Prometheus alerting rules for aero-vault.
+#
+# Series referenced here are exported by the OpenTelemetry Prometheus exporter
+# (PROMETHEUS_ENABLED=true). OTel maps instrument names dots→underscores and
+# appends _total to monotonic counters, so internal/telemetry's "ai.cost_micros"
+# becomes "ai_cost_micros_total", etc.
+#
+# Load via prometheus.yml `rule_files: [alerts.yml]`. Validate with:
+#   promtool check rules deploy/prometheus/alerts.yml
+
+groups:
+  - name: aero-vault-http
+    rules:
+      - alert: HighServer5xxRate
+        expr: |
+          sum(rate(http_server_requests_total{status="500"}[5m]))
+            / clamp_min(sum(rate(http_server_requests_total[5m])), 1e-9)
+            > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elevated 5xx rate on aero-vault"
+          description: "More than 5% of requests returned 5xx over the last 5m (for 10m)."
+
+      - alert: HighRequestLatencyP95
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_server_duration_ms_bucket[5m])) by (le)) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 request latency above 1s"
+          description: "95th-percentile HTTP handler latency exceeded 1000ms for 10m."
+
+  - name: aero-vault-ai-cost
+    rules:
+      # Per-tenant AI spend rate (USD/hour) derived from cost_micros (USD millionths).
+      - alert: TenantAISpendRateHigh
+        expr: |
+          sum by (tenant) (rate(ai_cost_micros_total[1h])) * 3600 / 1e6 > 5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant {{ $labels.tenant }} AI spend > $5/hour"
+          description: "Estimated AI spend rate for tenant {{ $labels.tenant }} exceeded $5/hour for 30m. Check AI_TENANT_DAILY_BUDGET_USD."
+
+      - alert: AITokenThroughputSpike
+        expr: sum(rate(ai_tokens_total[5m])) > 10000
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "High AI token throughput"
+          description: "Aggregate token consumption exceeded 10k tokens/s for 15m."
+
+  - name: aero-vault-integrity
+    rules:
+      # Orphan blobs being detected faster than they are cleaned up = storage leak.
+      - alert: OrphanBlobsAccumulating
+        expr: |
+          increase(reconcile_orphan_blobs_total[1h])
+            - increase(reconcile_orphan_blobs_deleted_total[1h]) > 100
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orphan blobs accumulating without cleanup"
+          description: "Reconcile detected >100 more orphan blobs than it deleted over 1h. Enable RECONCILE_DELETE_ORPHAN_BLOBS or investigate failed writes."
+
+      - alert: IdempotencyReplayStorm
+        expr: sum(rate(idempotency_replays_total[5m])) > 50
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "High idempotent-replay rate"
+          description: "Clients are retrying writes heavily (>50 replays/s for 10m); check upstream timeouts/proxies."
+
+      - alert: EventBusDropping
+        expr: sum(rate(events_dropped_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "In-process event bus is dropping events"
+          description: "Subscribers are falling behind the 64-deep buffer (SSE/indexer/webhook lag). The durable event table is unaffected, but live consumers miss events — scale consumers or enable a cross-instance transport."

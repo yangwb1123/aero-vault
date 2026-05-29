@@ -1,0 +1,35 @@
+aero-vault {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}".
+
+1. Wait for the pod to become ready:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "aero-vault.fullname" . }}
+
+2. Reach the API:
+{{- if .Values.ingress.enabled }}
+   {{- range .Values.ingress.hosts }}
+   http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+   {{- end }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+   kubectl -n {{ .Release.Namespace }} get svc {{ include "aero-vault.fullname" . }} -w   # wait for EXTERNAL-IP
+{{- else }}
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "aero-vault.fullname" . }} 8080:{{ .Values.service.port }}
+   # then:
+   curl http://localhost:8080/healthz
+   open http://localhost:8080/docs
+{{- end }}
+
+{{- if and (eq (.Values.config.STORAGE_BACKEND | default "local") "local") (not .Values.persistence.enabled) }}
+
+WARNING: STORAGE_BACKEND=local but persistence is disabled — objects live on the
+pod's ephemeral filesystem and are lost on restart. Enable persistence or switch
+to STORAGE_BACKEND=s3.
+{{- end }}
+{{- if and .Values.autoscaling.enabled .Values.persistence.enabled (has "ReadWriteOnce" .Values.persistence.accessModes) }}
+
+WARNING: autoscaling is enabled with a ReadWriteOnce PVC. Multiple replicas
+cannot share an RWO volume — use STORAGE_BACKEND=s3 + DB_DRIVER=postgres (and
+disable persistence) for horizontal scaling, or use a ReadWriteMany volume.
+{{- end }}
+
+Config is in ConfigMap/{{ include "aero-vault.fullname" . }};
+secrets in Secret/{{ include "aero-vault.secretName" . }}.

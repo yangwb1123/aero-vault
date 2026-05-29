@@ -1,0 +1,2 @@
+ALTER TABLE objects DROP COLUMN acl;
+ALTER TABLE buckets DROP COLUMN acl;

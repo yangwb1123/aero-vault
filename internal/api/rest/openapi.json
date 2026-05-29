@@ -1,0 +1,180 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "aero-vault",
+    "version": "0.4.0",
+    "description": "AI-native file platform — REST + S3 + WebDAV + MCP protocols sharing a unified backend.",
+    "license": { "name": "MIT" }
+  },
+  "servers": [{ "url": "/", "description": "Self" }],
+  "tags": [
+    { "name": "files", "description": "Object CRUD" },
+    { "name": "search", "description": "Semantic + lexical retrieval" },
+    { "name": "chat", "description": "RAG inference" },
+    { "name": "agent", "description": "Tool-calling autonomous loop" },
+    { "name": "events", "description": "Lifecycle event stream" },
+    { "name": "buckets", "description": "Per-bucket policies" },
+    { "name": "admin", "description": "Operator surfaces (admin scope)" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearer": { "type": "http", "scheme": "bearer" },
+      "apiKey": { "type": "apiKey", "in": "header", "name": "X-Api-Key" }
+    },
+    "parameters": {
+      "tenant": {
+        "name": "X-Aero-Tenant",
+        "in": "header",
+        "schema": { "type": "string", "default": "default" }
+      }
+    },
+    "schemas": {
+      "Object": {
+        "type": "object",
+        "properties": {
+          "bucket": { "type": "string" },
+          "key": { "type": "string" },
+          "size": { "type": "integer" },
+          "etag": { "type": "string" },
+          "content_type": { "type": "string" },
+          "backend": { "type": "string" },
+          "metadata": { "type": "object", "additionalProperties": { "type": "string" } },
+          "tags": { "type": "object", "additionalProperties": { "type": "string" } },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" },
+              "request_id": { "type": "string" }
+            }
+          }
+        }
+      },
+      "SearchHit": {
+        "type": "object",
+        "properties": {
+          "score": { "type": "number" },
+          "chunk": { "type": "string" },
+          "chunk_id": { "type": "integer" },
+          "object_id": { "type": "integer" },
+          "bucket": { "type": "string" },
+          "object_key": { "type": "string" },
+          "seq": { "type": "integer" },
+          "embed_model": { "type": "string" }
+        }
+      }
+    }
+  },
+  "security": [{ "bearer": [] }, { "apiKey": [] }],
+  "paths": {
+    "/healthz": { "get": { "summary": "Liveness probe", "responses": { "200": { "description": "ok" } } } },
+    "/readyz":  { "get": { "summary": "Readiness probe", "responses": { "200": { "description": "ok" } } } },
+    "/metrics": { "get": { "summary": "Prometheus metrics", "responses": { "200": { "description": "text" } } } },
+
+    "/v1/files": {
+      "get": {
+        "tags": ["files"], "summary": "List objects",
+        "parameters": [
+          { "$ref": "#/components/parameters/tenant" },
+          { "name": "prefix", "in": "query", "schema": { "type": "string" } },
+          { "name": "marker", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 1000 } }
+        ],
+        "responses": { "200": { "description": "list" } }
+      },
+      "post": {
+        "tags": ["files"], "summary": "Multipart-form upload",
+        "responses": { "201": { "description": "created" } }
+      }
+    },
+    "/v1/files/{key}": {
+      "parameters": [
+        { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "$ref": "#/components/parameters/tenant" }
+      ],
+      "put":    { "tags": ["files"], "summary": "Raw upload", "responses": { "201": { "description": "created" } } },
+      "get":    { "tags": ["files"], "summary": "Download (?version=ID for history)", "responses": { "200": { "description": "body" } } },
+      "head":   { "tags": ["files"], "summary": "Stat", "responses": { "200": { "description": "headers only" } } },
+      "delete": { "tags": ["files"], "summary": "Delete (?hard=1 for physical)", "responses": { "204": { "description": "deleted" } } }
+    },
+    "/v1/files/{key}/tags": {
+      "parameters": [
+        { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get":    { "tags": ["files"], "summary": "Get tags",    "responses": { "200": { "description": "tag map" } } },
+      "put":    { "tags": ["files"], "summary": "Replace tags","responses": { "200": { "description": "ok" } } },
+      "delete": { "tags": ["files"], "summary": "Clear tags",  "responses": { "204": { "description": "ok" } } }
+    },
+    "/v1/files/{key}/versions": {
+      "get": { "tags": ["files"], "summary": "List versions",  "responses": { "200": { "description": "list" } } }
+    },
+    "/v1/files/{key}/lock": {
+      "post": { "tags": ["files"], "summary": "Apply object lock", "responses": { "200": { "description": "locked" } } }
+    },
+    "/v1/files/{key}/acl": {
+      "get": { "tags": ["files"], "summary": "Get object ACL", "responses": { "200": { "description": "{acl}" } } },
+      "put": { "tags": ["files"], "summary": "Set canned ACL (private|public-read|public-read-write|authenticated-read)", "responses": { "200": { "description": "ok" } } }
+    },
+    "/v1/files/{key}/thumbnail": {
+      "get": { "tags": ["files"], "summary": "On-demand JPEG thumbnail of an image (?w=&h=)",
+        "parameters": [
+          { "name": "w", "in": "query", "schema": { "type": "integer", "default": 256 } },
+          { "name": "h", "in": "query", "schema": { "type": "integer", "default": 256 } }
+        ],
+        "responses": { "200": { "description": "image/jpeg" }, "304": { "description": "not modified" }, "400": { "description": "not an image" } } }
+    },
+    "/v1/files/{key}/presign": {
+      "post": { "tags": ["files"], "summary": "Presigned URL", "responses": { "200": { "description": "url" } } }
+    },
+
+    "/v1/multipart": { "post": { "tags": ["files"], "summary": "Init multipart upload" } },
+    "/v1/multipart/{uploadID}/parts/{n}": { "put": { "tags": ["files"], "summary": "Upload part" } },
+    "/v1/multipart/{uploadID}/complete":  { "post":{ "tags": ["files"], "summary": "Complete" } },
+    "/v1/multipart/{uploadID}":            { "delete":{ "tags":["files"], "summary":"Abort" } },
+
+    "/v1/search": { "post": { "tags": ["search"], "summary": "Semantic + hybrid search",
+      "requestBody": { "required": true, "content": { "application/json": { "schema": {
+        "type":"object","properties":{
+          "query":{"type":"string"}, "k":{"type":"integer"},
+          "mode":{"type":"string","enum":["vector","bm25","hybrid"]},
+          "bucket":{"type":"string"} } } } } },
+      "responses": { "200": { "description": "ranked hits" } } } },
+
+    "/v1/chat":         { "post": { "tags": ["chat"],  "summary": "RAG chat with citations" } },
+    "/v1/chat/stream":  { "post": { "tags": ["chat"],  "summary": "Streaming RAG chat (SSE)" } },
+    "/v1/agent":        { "post": { "tags": ["agent"], "summary": "Tool-calling agent loop" } },
+    "/v1/lineage/objects/{id}": { "get": { "tags": ["agent"], "summary": "AI consumption history" } },
+    "/v1/events/stream": { "get": { "tags": ["events"], "summary": "SSE lifecycle stream" } },
+
+    "/v1/buckets/{bucket}/config":      { "get":{"tags":["buckets"],"summary":"Get config"} },
+    "/v1/buckets/{bucket}/versioning":  { "put":{"tags":["buckets"],"summary":"Toggle versioning"} },
+    "/v1/buckets/{bucket}/object-lock": { "put":{"tags":["buckets"],"summary":"Default retention"} },
+    "/v1/buckets/{bucket}/lifecycle":   { "put":{"tags":["buckets"],"summary":"Expire-after-days policy"} },
+    "/v1/buckets/{bucket}/acl":         { "get":{"tags":["buckets"],"summary":"Get bucket ACL"}, "put":{"tags":["buckets"],"summary":"Set bucket canned ACL"} },
+
+    "/v1/usage":                            { "get":   { "tags": ["admin"], "summary": "Tenant usage" } },
+    "/v1/admin/tenants/{tenant}/quota":     { "put":   { "tags": ["admin"], "summary": "Set quota" } },
+    "/v1/admin/keys":                        { "get":   { "tags": ["admin"], "summary": "List API keys" },
+                                              "post":  { "tags": ["admin"], "summary": "Add key" } },
+    "/v1/admin/keys/{token}":                { "delete":{ "tags": ["admin"], "summary": "Revoke key" } },
+    "/v1/admin/jwt":                         { "post":  { "tags": ["admin"], "summary": "Issue JWT" } },
+    "/v1/admin/webhook-failures":            { "get":   { "tags": ["admin"], "summary": "List undelivered webhooks" } },
+    "/v1/admin/jobs":                        { "get":   { "tags": ["admin"], "summary": "List background jobs + status histogram",
+                                              "parameters": [
+                                                { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["pending","running","succeeded","failed"] } },
+                                                { "name": "type",   "in": "query", "schema": { "type": "string" } },
+                                                { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } }
+                                              ],
+                                              "responses": { "200": { "description": "jobs + stats" } } } },
+    "/v1/admin/jobs/{id}/retry":             { "post":  { "tags": ["admin"], "summary": "Requeue a job" } },
+
+    "/mcp": { "post": { "tags": ["agent"], "summary": "JSON-RPC MCP server" } }
+  }
+}

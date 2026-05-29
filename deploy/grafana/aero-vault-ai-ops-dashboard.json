@@ -1,0 +1,89 @@
+{
+  "__comment": "aero-vault AI/ops domain-metrics dashboard. Import into Grafana with a Prometheus datasource scraping aero-vault /metrics. Companion to aero-vault-dashboard.json (HTTP metrics).",
+  "title": "aero-vault — AI & Ops",
+  "uid": "aero-vault-ai-ops",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["aero-vault", "ai", "ops"],
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(ai_cost_micros_total, tenant)",
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "AI spend rate (USD/hour) by tenant",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "targets": [
+        {
+          "expr": "sum by (tenant) (rate(ai_cost_micros_total{tenant=~\"$tenant\"}[5m])) * 3600 / 1e6",
+          "legendFormat": "{{tenant}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "AI tokens/sec by model",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(ai_tokens_total[5m]))",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "AI requests/sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(ai_requests_total[5m]))", "legendFormat": "requests/s" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Idempotent replays/sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(idempotency_replays_total[5m]))", "legendFormat": "replays/s" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Orphan blobs: detected vs deleted (1h increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "increase(reconcile_orphan_blobs_total[1h])", "legendFormat": "detected" },
+        { "expr": "increase(reconcile_orphan_blobs_deleted_total[1h])", "legendFormat": "deleted" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "HTTP 5xx ratio",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "targets": [
+        {
+          "expr": "sum(rate(http_server_requests_total{status=\"500\"}[5m])) / clamp_min(sum(rate(http_server_requests_total[5m])), 1e-9)",
+          "legendFormat": "5xx ratio"
+        }
+      ]
+    }
+  ]
+}

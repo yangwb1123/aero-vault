@@ -1,0 +1,48 @@
+{
+  "name": "@aero-vault/sdk",
+  "version": "0.4.0",
+  "description": "JavaScript/TypeScript client for the aero-vault AI-native file platform (REST + S3 + AI). Zero dependencies, built on the Node 18+ global fetch.",
+  "type": "module",
+  "main": "aero-vault.js",
+  "module": "aero-vault.js",
+  "types": "aero-vault.d.ts",
+  "exports": {
+    ".": {
+      "types": "./aero-vault.d.ts",
+      "import": "./aero-vault.js",
+      "default": "./aero-vault.js"
+    }
+  },
+  "files": [
+    "aero-vault.js",
+    "aero-vault.d.ts",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "node selftest.mjs",
+    "check": "node --check aero-vault.js"
+  },
+  "keywords": [
+    "storage",
+    "s3",
+    "object-storage",
+    "rag",
+    "vector-search",
+    "ai",
+    "aero-vault"
+  ],
+  "license": "MIT",
+  "author": "aero-vault",
+  "homepage": "https://github.com/aero-vault/aero-vault/tree/main/sdk/js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aero-vault/aero-vault.git",
+    "directory": "sdk/js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

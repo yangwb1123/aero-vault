@@ -1,0 +1,137 @@
+package reconcile
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"time"
+
+	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/storage"
+)
+
+// RetentionJob permanently purges rows that have been soft-deleted for longer
+// than a retention window, together with their backing blobs. Without it,
+// soft-deleted rows (and their blobs) accumulate forever. It mirrors
+// LifecycleJob: a ticker loop gated, when configured, behind a cluster lease so
+// the destructive sweep runs on only one replica at a time.
+const leaseRetentionGC = "retention-gc"
+
+type RetentionJob struct {
+	repo             repository.Repository
+	store            storage.Storage
+	interval         time.Duration
+	retention        time.Duration
+	idemTTL          time.Duration
+	clusterSingleton bool
+	holder           string
+	logger           *slog.Logger
+}
+
+func NewRetention(repo repository.Repository, store storage.Storage, interval time.Duration, retention time.Duration, logger *slog.Logger) *RetentionJob {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &RetentionJob{repo: repo, store: store, interval: interval, retention: retention, logger: logger}
+}
+
+// WithIdempotencyTTL enables GC of idempotency_keys older than ttl, so the
+// dedupe table doesn't grow without bound. Runs on the same sweep cadence.
+func (r *RetentionJob) WithIdempotencyTTL(ttl time.Duration) *RetentionJob {
+	r.idemTTL = ttl
+	return r
+}
+
+// WithClusterSingleton makes the (destructive) retention GC run on only one
+// replica at a time, gated by a repository lease held by `holder`.
+func (r *RetentionJob) WithClusterSingleton(holder string) *RetentionJob {
+	r.clusterSingleton = true
+	r.holder = holder
+	return r
+}
+
+func (r *RetentionJob) Run(ctx context.Context) {
+	if r.interval <= 0 || (r.retention <= 0 && r.idemTTL <= 0) {
+		return
+	}
+	t := time.NewTicker(r.interval)
+	defer t.Stop()
+	r.maybeSweep(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.maybeSweep(ctx)
+		}
+	}
+}
+
+// maybeSweep runs the sweep, first acquiring the cluster lease when configured
+// as a singleton (TTL 2× interval; the holder renews each round).
+func (r *RetentionJob) maybeSweep(ctx context.Context) {
+	if r.clusterSingleton {
+		held, err := r.repo.AcquireLease(ctx, leaseRetentionGC, r.holder, 2*r.interval)
+		if err != nil {
+			r.logger.Warn("retention: acquire lease", "err", err)
+			return
+		}
+		if !held {
+			return
+		}
+	}
+	r.sweep(ctx)
+}
+
+func (r *RetentionJob) sweep(ctx context.Context) {
+	if r.retention > 0 {
+		r.purgeSoftDeleted(ctx)
+	}
+	if r.idemTTL > 0 {
+		r.purgeIdempotency(ctx)
+	}
+}
+
+// purgeIdempotency deletes idempotency keys older than the configured TTL so
+// the dedupe table stays bounded.
+func (r *RetentionJob) purgeIdempotency(ctx context.Context) {
+	before := time.Now().Add(-r.idemTTL).UTC().Format(time.RFC3339Nano)
+	n, err := r.repo.DeleteIdempotencyKeysBefore(ctx, before)
+	if err != nil {
+		r.logger.Warn("retention idempotency gc", "err", err)
+		return
+	}
+	if n > 0 {
+		r.logger.Info("idempotency gc", "purged", n)
+	}
+}
+
+func (r *RetentionJob) purgeSoftDeleted(ctx context.Context) {
+	before := time.Now().Add(-r.retention).UTC().Format(time.RFC3339Nano)
+	objs, err := r.repo.ListSoftDeletedBefore(ctx, before, 200)
+	if err != nil {
+		r.logger.Warn("retention list soft-deleted", "err", err)
+		return
+	}
+	if len(objs) == 0 {
+		return
+	}
+	purged := 0
+	for _, obj := range objs {
+		if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
+			continue // can't purge while object lock is active
+		}
+		if err := r.store.Delete(ctx, obj.StorageKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			r.logger.Warn("retention storage delete", "key", obj.Key, "err", err)
+			continue
+		}
+		if err := r.repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err != nil {
+			r.logger.Warn("retention hard delete", "key", obj.Key, "err", err)
+			continue
+		}
+		purged++
+	}
+	if purged > 0 {
+		r.logger.Info("retention sweep", "purged", purged)
+	}
+}

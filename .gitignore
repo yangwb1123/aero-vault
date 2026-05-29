@@ -1,0 +1,9 @@
+/bin/
+/var/
+/.claude/
+.env
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.DS_Store

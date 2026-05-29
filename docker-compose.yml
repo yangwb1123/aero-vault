@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aero
+      POSTGRES_PASSWORD: aero
+      POSTGRES_DB: aero_vault
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aero -d aero_vault"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command: >
+      "mc alias set local http://minio:9000 minioadmin minioadmin &&
+       mc mb --ignore-existing local/aero-vault"
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      APP_ADDR: :8080
+      STORAGE_BACKEND: s3
+      STORAGE_S3_ENDPOINT: http://minio:9000
+      STORAGE_S3_REGION: us-east-1
+      STORAGE_S3_BUCKET: aero-vault
+      STORAGE_S3_ACCESS_KEY: minioadmin
+      STORAGE_S3_SECRET_KEY: minioadmin
+      STORAGE_S3_FORCE_PATH_STYLE: "true"
+      DB_DRIVER: postgres
+      DB_DSN: postgres://aero:aero@postgres:5432/aero_vault?sslmode=disable
+      S3_COMPAT_PREFIX: /s3
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
+  miniodata:

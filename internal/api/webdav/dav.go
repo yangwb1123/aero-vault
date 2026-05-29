@@ -1,0 +1,306 @@
+// Package webdav exposes aero-vault as a WebDAV file system, suitable for
+// mounting from macOS Finder ("Connect to Server"), Windows Explorer, or any
+// WebDAV client (rclone, cyberduck, davs2fuse).
+//
+// The implementation adapts the FileService to golang.org/x/net/webdav.
+// Tenant is read from the X-Aero-Tenant header (defaults to "default").
+package webdav
+
+import (
+	"context"
+	"errors"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"path"
+	"strings"
+	"time"
+
+	xwebdav "golang.org/x/net/webdav"
+
+	mw "github.com/aero-vault/aero-vault/internal/middleware"
+	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
+)
+
+// Handler returns an http.Handler implementing WebDAV at the given prefix.
+func Handler(prefix string, svc *service.FileService, logger *slog.Logger) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	dav := &xwebdav.Handler{
+		Prefix:     prefix,
+		FileSystem: &davFS{svc: svc, logger: logger},
+		LockSystem: xwebdav.NewMemLS(),
+		Logger: func(r *http.Request, err error) {
+			if err != nil {
+				logger.Debug("webdav", "method", r.Method, "path", r.URL.Path, "err", err)
+			}
+		},
+	}
+	return dav
+}
+
+// davFS is the FileSystem implementation backed by the FileService.
+type davFS struct {
+	svc    *service.FileService
+	logger *slog.Logger
+}
+
+func (f *davFS) tenant(ctx context.Context) string {
+	if t := mw.TenantFrom(ctx); t != "" {
+		return t
+	}
+	return "default"
+}
+
+func (f *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
+	// WebDAV directories are virtual — no-op. Files create their own implicit dirs.
+	return nil
+}
+
+func (f *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (xwebdav.File, error) {
+	name = strings.TrimPrefix(name, "/")
+	tenant := f.tenant(ctx)
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
+		return &davWriter{svc: f.svc, tenant: tenant, key: name, logger: f.logger}, nil
+	}
+	if name == "" || strings.HasSuffix(name, "/") {
+		return &davDir{svc: f.svc, tenant: tenant, prefix: name}, nil
+	}
+	obj, err := f.svc.Stat(ctx, tenant, service.DefaultBucket, name)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			// Treat as a directory listing if any objects exist under that prefix.
+			page, _ := f.svc.List(ctx, tenant, service.DefaultBucket, name+"/", "", 1)
+			if len(page.Objects) > 0 {
+				return &davDir{svc: f.svc, tenant: tenant, prefix: name + "/"}, nil
+			}
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	rc, _, err := f.svc.Get(ctx, tenant, service.DefaultBucket, name)
+	if err != nil {
+		return nil, err
+	}
+	// Stream the body into a bounded spill buffer so Seek is supported
+	// (golang.org/x/net/webdav requires it for serving Ranges and computing
+	// PROPFIND getcontentlength) without holding the whole object in memory:
+	// payloads larger than spillThreshold spill to a temp file.
+	buf := newSpillBuffer()
+	err = buf.fill(rc)
+	_ = rc.Close()
+	if err != nil {
+		_ = buf.Close()
+		return nil, err
+	}
+	return &davReader{buf: buf, info: davFileInfo(obj)}, nil
+}
+
+func (f *davFS) RemoveAll(ctx context.Context, name string) error {
+	name = strings.TrimPrefix(name, "/")
+	err := f.svc.Delete(ctx, f.tenant(ctx), service.DefaultBucket, name, true)
+	if errors.Is(err, service.ErrNotFound) {
+		return os.ErrNotExist
+	}
+	return err
+}
+
+func (f *davFS) Rename(ctx context.Context, oldName, newName string) error {
+	// WebDAV-required for drag-and-drop renames in Finder. Implement via
+	// copy-then-delete (atomic enough for MVP).
+	tenant := f.tenant(ctx)
+	rc, _, err := f.svc.Get(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"))
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	if _, err := f.svc.Put(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(newName, "/"),
+		ioReaderOf(body), int64(len(body)), service.PutOptions{}); err != nil {
+		return err
+	}
+	return f.svc.Delete(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"), true)
+}
+
+func (f *davFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+	name = strings.TrimPrefix(name, "/")
+	tenant := f.tenant(ctx)
+	if name == "" {
+		return davDirInfo("/"), nil
+	}
+	if strings.HasSuffix(name, "/") {
+		// A trailing slash denotes a directory (mirrors OpenFile). Probe with the
+		// name as-is; appending another "/" here would build a "dir//" prefix that
+		// matches nothing and wrongly 404s a PROPFIND on a subdirectory.
+		if page, _ := f.svc.List(ctx, tenant, service.DefaultBucket, name, "", 1); len(page.Objects) > 0 {
+			return davDirInfo(name), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	obj, err := f.svc.Stat(ctx, tenant, service.DefaultBucket, name)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			page, _ := f.svc.List(ctx, tenant, service.DefaultBucket, name+"/", "", 1)
+			if len(page.Objects) > 0 {
+				return davDirInfo(name), nil
+			}
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	return davFileInfo(obj), nil
+}
+
+// --- File adapters ---
+
+type davReader struct {
+	buf  *spillBuffer
+	info os.FileInfo
+}
+
+func (r *davReader) Read(p []byte) (int, error)  { return r.buf.Read(p) }
+func (r *davReader) Write(p []byte) (int, error) { return 0, fs.ErrPermission }
+func (r *davReader) Close() error                { return r.buf.Close() }
+func (r *davReader) Seek(offset int64, whence int) (int64, error) {
+	return r.buf.Seek(offset, whence)
+}
+func (r *davReader) Readdir(count int) ([]os.FileInfo, error) { return nil, fs.ErrInvalid }
+func (r *davReader) Stat() (os.FileInfo, error)               { return r.info, nil }
+
+type davWriter struct {
+	svc    *service.FileService
+	tenant string
+	key    string
+	logger *slog.Logger
+	buf    *spillBuffer
+}
+
+func (w *davWriter) Write(p []byte) (int, error) {
+	if w.buf == nil {
+		w.buf = newSpillBuffer()
+	}
+	return w.buf.Write(p)
+}
+func (w *davWriter) Read(p []byte) (int, error)                   { return 0, io.EOF }
+func (w *davWriter) Seek(offset int64, whence int) (int64, error) { return 0, fs.ErrInvalid }
+func (w *davWriter) Readdir(count int) ([]os.FileInfo, error)     { return nil, fs.ErrInvalid }
+func (w *davWriter) Stat() (os.FileInfo, error) {
+	var size int64
+	if w.buf != nil {
+		size = w.buf.Len()
+	}
+	return &davInfo{name: path.Base(w.key), size: size, mod: time.Now()}, nil
+}
+func (w *davWriter) Close() error {
+	if w.svc == nil || w.key == "" {
+		if w.buf != nil {
+			return w.buf.Close()
+		}
+		return nil
+	}
+	buf := w.buf
+	if buf == nil {
+		// Zero-length upload (e.g. PUT with empty body).
+		buf = newSpillBuffer()
+	}
+	defer buf.Close()
+	size := buf.Len()
+	// Rewind so Put streams the bytes we just wrote rather than starting at EOF.
+	if _, err := buf.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := w.svc.Put(context.Background(), w.tenant, service.DefaultBucket, w.key,
+		buf, size, service.PutOptions{})
+	return err
+}
+
+type davDir struct {
+	svc    *service.FileService
+	tenant string
+	prefix string
+	cur    int
+}
+
+func (d *davDir) Read(p []byte) (int, error)     { return 0, io.EOF }
+func (d *davDir) Write(p []byte) (int, error)    { return 0, fs.ErrPermission }
+func (d *davDir) Seek(int64, int) (int64, error) { return 0, fs.ErrInvalid }
+func (d *davDir) Close() error                   { return nil }
+func (d *davDir) Stat() (os.FileInfo, error)     { return davDirInfo(d.prefix), nil }
+func (d *davDir) Readdir(count int) ([]os.FileInfo, error) {
+	prefix := strings.TrimPrefix(d.prefix, "/")
+	page, err := d.svc.List(context.Background(), d.tenant, service.DefaultBucket, prefix, "", 1000)
+	if err != nil {
+		return nil, err
+	}
+	// Collapse common nested-dir prefixes to single virtual dir entries.
+	seen := map[string]bool{}
+	var out []os.FileInfo
+	for _, obj := range page.Objects {
+		rel := strings.TrimPrefix(obj.Key, prefix)
+		if idx := strings.Index(rel, "/"); idx >= 0 {
+			name := rel[:idx]
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, davDirInfo(prefix+name))
+			}
+			continue
+		}
+		out = append(out, davFileInfo(obj))
+	}
+	return out, nil
+}
+
+// --- FileInfo helpers ---
+
+type davInfo struct {
+	name string
+	size int64
+	mod  time.Time
+	dir  bool
+}
+
+func (d *davInfo) Name() string { return path.Base(d.name) }
+func (d *davInfo) Size() int64  { return d.size }
+func (d *davInfo) Mode() os.FileMode {
+	if d.dir {
+		return os.ModeDir | 0o755
+	}
+	return 0o644
+}
+func (d *davInfo) ModTime() time.Time { return d.mod }
+func (d *davInfo) IsDir() bool        { return d.dir }
+func (d *davInfo) Sys() any           { return nil }
+
+func davFileInfo(o repository.Object) os.FileInfo {
+	return &davInfo{name: o.Key, size: o.Size, mod: o.UpdatedAt}
+}
+
+func davDirInfo(name string) os.FileInfo {
+	return &davInfo{name: strings.TrimSuffix(name, "/"), dir: true, mod: time.Now()}
+}
+
+// ioReaderOf is a small helper that avoids importing bytes everywhere.
+func ioReaderOf(b []byte) io.Reader {
+	return &sliceReader{b: b}
+}
+
+type sliceReader struct {
+	b   []byte
+	off int
+}
+
+func (r *sliceReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.off:])
+	r.off += n
+	return n, nil
+}

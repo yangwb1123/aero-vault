@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>aero-vault console</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; margin: 0; background: #0e1116; color: #d8e1eb; }
+  header { display: flex; gap: 12px; align-items: center; padding: 14px 20px; background: #181d25; border-bottom: 1px solid #232a35; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header input, header select { background: #0e1116; color: #d8e1eb; border: 1px solid #2d3744; padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+  main { display: grid; grid-template-columns: 320px 1fr; gap: 0; height: calc(100vh - 56px); }
+  aside { border-right: 1px solid #232a35; overflow: auto; }
+  section { padding: 16px 22px; overflow: auto; }
+  .group { padding: 14px 18px; border-bottom: 1px solid #232a35; }
+  .group h3 { margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: #8a96a8; }
+  button { background: #1f7adb; color: white; border: none; padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #2588f0; }
+  button.ghost { background: transparent; border: 1px solid #2d3744; color: #d8e1eb; }
+  .file-list { font-size: 13px; }
+  .file-row { padding: 8px 10px; cursor: pointer; border-bottom: 1px solid #1a2029; display: flex; justify-content: space-between; }
+  .file-row:hover { background: #1a2029; }
+  .file-row .size { color: #8a96a8; font-size: 11px; }
+  textarea, input[type=text] { width: 100%; background: #0e1116; color: #d8e1eb; border: 1px solid #2d3744; padding: 8px; border-radius: 6px; font-family: inherit; font-size: 13px; }
+  pre { background: #0a0d12; padding: 14px; border-radius: 6px; overflow: auto; font-size: 12px; line-height: 1.5; border: 1px solid #1a2029; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 9999px; background: #1f7adb33; color: #6db8ff; font-size: 11px; }
+  .hit { padding: 12px 14px; border-bottom: 1px solid #1a2029; }
+  .hit .score { font-size: 11px; color: #8a96a8; }
+  .hit .src { font-size: 12px; color: #6db8ff; margin-top: 4px; }
+  .hit .text { margin-top: 6px; white-space: pre-wrap; font-size: 13px; line-height: 1.5; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tab { padding: 6px 12px; background: #181d25; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .tab.active { background: #1f7adb; color: white; }
+  label { font-size: 12px; color: #8a96a8; }
+</style>
+</head>
+<body>
+<header>
+  <h1>aero-vault</h1>
+  <label>tenant <input id="tenant" type="text" value="default" style="width: 110px"></label>
+  <label>api key <input id="apikey" type="text" placeholder="(optional)" style="width: 200px"></label>
+  <span style="flex:1"></span>
+  <button onclick="refresh()">refresh</button>
+</header>
+<main>
+  <aside>
+    <div class="group">
+      <h3>upload</h3>
+      <input id="up-key" type="text" placeholder="key (e.g. docs/note.md)" style="margin-bottom: 8px">
+      <input id="up-file" type="file" style="font-size: 12px; margin-bottom: 8px">
+      <button onclick="upload()">upload</button>
+    </div>
+    <div class="group" id="file-list-wrap">
+      <h3>objects <span class="pill" id="count">0</span></h3>
+      <input id="prefix" type="text" placeholder="prefix filter" oninput="refresh()" style="margin-bottom: 8px">
+      <div class="file-list" id="files"></div>
+    </div>
+  </aside>
+  <section>
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('search')" id="t-search">semantic search</div>
+      <div class="tab" onclick="switchTab('detail')" id="t-detail">object detail</div>
+      <div class="tab" onclick="switchTab('lineage')" id="t-lineage">lineage</div>
+    </div>
+    <div id="pane-search">
+      <div style="display:flex; gap: 8px; margin-bottom: 12px">
+        <input id="q" type="text" placeholder="e.g. 'localhost loopback addresses'" onkeydown="if(event.key=='Enter')doSearch()">
+        <select id="mode">
+          <option value="vector">vector</option>
+          <option value="bm25">bm25</option>
+          <option value="hybrid">hybrid</option>
+        </select>
+        <button onclick="doSearch()">search</button>
+      </div>
+      <div id="hits"></div>
+    </div>
+    <div id="pane-detail" style="display:none">
+      <pre id="detail">select an object on the left</pre>
+    </div>
+    <div id="pane-lineage" style="display:none">
+      <input id="lin-id" type="text" placeholder="object id" style="margin-bottom: 8px; width: 200px">
+      <button onclick="loadLineage()">load</button>
+      <pre id="lineage" style="margin-top: 12px">enter object id and click load</pre>
+    </div>
+  </section>
+</main>
+<script>
+const tenantInp = document.getElementById('tenant');
+const apiInp = document.getElementById('apikey');
+tenantInp.value = localStorage.getItem('aero_tenant') || 'default';
+apiInp.value    = localStorage.getItem('aero_apikey') || '';
+tenantInp.oninput = () => { localStorage.setItem('aero_tenant', tenantInp.value); refresh(); };
+apiInp.oninput    = () => localStorage.setItem('aero_apikey', apiInp.value);
+
+function headers(extra) {
+  const h = { 'X-Aero-Tenant': tenantInp.value || 'default', ...(extra || {}) };
+  if (apiInp.value) h['Authorization'] = 'Bearer ' + apiInp.value;
+  return h;
+}
+
+function switchTab(name) {
+  ['search','detail','lineage'].forEach(n => {
+    document.getElementById('t-'+n).classList.toggle('active', n === name);
+    document.getElementById('pane-'+n).style.display = n === name ? '' : 'none';
+  });
+}
+
+function el(tag, props, ...children) {
+  const e = document.createElement(tag);
+  if (props) Object.assign(e, props);
+  for (const c of children) {
+    if (c == null) continue;
+    e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return e;
+}
+
+async function refresh() {
+  const prefix = document.getElementById('prefix').value;
+  const r = await fetch('/v1/files?prefix=' + encodeURIComponent(prefix) + '&limit=200', { headers: headers() });
+  const data = await r.json();
+  const wrap = document.getElementById('files');
+  wrap.replaceChildren();
+  const objs = (data && data.objects) || [];
+  document.getElementById('count').textContent = String(objs.length);
+  for (const o of objs) {
+    const row = el('div', { className: 'file-row' },
+      el('span', null, o.key),
+      el('span', { className: 'size' }, String(o.size) + 'b'));
+    row.onclick = () => showDetail(o);
+    wrap.appendChild(row);
+  }
+}
+
+async function showDetail(obj) {
+  switchTab('detail');
+  const r = await fetch('/v1/files/' + encodePath(obj.key), { headers: headers() });
+  const body = await r.text();
+  const tags = await fetch('/v1/files/' + encodePath(obj.key) + '/tags', { headers: headers() }).then(r => r.json()).catch(() => ({}));
+  const versions = await fetch('/v1/files/' + encodePath(obj.key) + '/versions', { headers: headers() }).then(r => r.json()).catch(() => ({}));
+  document.getElementById('detail').textContent =
+    '== metadata ==\n' + JSON.stringify(obj, null, 2) +
+    '\n\n== tags ==\n' + JSON.stringify(tags, null, 2) +
+    '\n\n== versions ==\n' + JSON.stringify(versions, null, 2) +
+    '\n\n== content (first 4KB) ==\n' + body.slice(0, 4096);
+}
+
+async function upload() {
+  const key = document.getElementById('up-key').value || document.getElementById('up-file').files[0]?.name;
+  const file = document.getElementById('up-file').files[0];
+  if (!key || !file) { alert('key + file required'); return; }
+  const r = await fetch('/v1/files/' + encodePath(key), { method: 'PUT', headers: headers({ 'Content-Type': file.type || 'application/octet-stream' }), body: file });
+  if (!r.ok) { alert('upload failed: HTTP ' + r.status); return; }
+  document.getElementById('up-key').value = '';
+  document.getElementById('up-file').value = '';
+  refresh();
+}
+
+async function doSearch() {
+  const q = document.getElementById('q').value;
+  if (!q) return;
+  const mode = document.getElementById('mode').value;
+  const r = await fetch('/v1/search', { method: 'POST', headers: headers({ 'Content-Type': 'application/json' }), body: JSON.stringify({ query: q, k: 5, mode }) });
+  const data = await r.json();
+  const wrap = document.getElementById('hits');
+  wrap.replaceChildren();
+  const hits = (data && data.hits) || [];
+  if (hits.length === 0) {
+    wrap.appendChild(el('p', { style: 'color:#8a96a8' }, 'no hits'));
+    return;
+  }
+  for (const h of hits) {
+    const div = el('div', { className: 'hit' },
+      el('div', { className: 'score' }, 'score ' + (h.score || 0).toFixed(4) + '  ·  ' + (h.embed_model || '')),
+      el('div', { className: 'src' }, (h.bucket || '') + '/' + (h.object_key || '') + '#chunk-' + (h.seq || 0)),
+      el('div', { className: 'text' }, h.chunk || ''));
+    wrap.appendChild(div);
+  }
+}
+
+async function loadLineage() {
+  const id = document.getElementById('lin-id').value;
+  if (!id) return;
+  const r = await fetch('/v1/lineage/objects/' + encodeURIComponent(id), { headers: headers() });
+  const data = await r.json();
+  document.getElementById('lineage').textContent = JSON.stringify(data, null, 2);
+}
+
+function encodePath(k) { return k.split('/').map(encodeURIComponent).join('/'); }
+
+refresh();
+</script>
+</body>
+</html>

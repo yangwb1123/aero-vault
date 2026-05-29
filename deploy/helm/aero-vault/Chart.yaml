@@ -1,0 +1,17 @@
+apiVersion: v2
+name: aero-vault
+description: AI-native file platform — REST + S3 + WebDAV + MCP over a unified backend, with built-in RAG.
+type: application
+version: 0.1.0
+appVersion: "0.4.0"
+keywords:
+  - storage
+  - object-storage
+  - s3
+  - rag
+  - vector-search
+home: https://github.com/aero-vault/aero-vault
+sources:
+  - https://github.com/aero-vault/aero-vault
+maintainers:
+  - name: aero-vault

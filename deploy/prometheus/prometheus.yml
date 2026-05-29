@@ -1,0 +1,55 @@
+# Prometheus scrape config for aero-vault.
+#
+# Two scrape targets:
+#   1. aero-vault's own /metrics endpoint (enabled via PROMETHEUS_ENABLED=true).
+#      Exposes http_server_* request metrics plus go_* / process_* runtime
+#      metrics through the OpenTelemetry Prometheus exporter.
+#   2. The OpenTelemetry Collector's Prometheus exporter (:8889 in the demo
+#      stack, docker-compose.demo.yml), which re-exports the same OTLP metrics
+#      shipped over OTEL_EXPORTER_OTLP_ENDPOINT.
+#
+# Hostnames below assume the docker-compose.demo.yml network (service names
+# "app" and "otel-collector"). Adjust targets for your environment, e.g.
+# "localhost:8080" when running everything on the host.
+#
+# Run alongside the demo:
+#   docker run --rm -p 9090:9090 --network aero-vault-demo_default \
+#     -v "$PWD/deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+#     prom/prometheus
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: aero-vault
+
+# Alerting rules for domain + HTTP metrics (see alerts.yml).
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  # aero-vault application metrics (/metrics).
+  - job_name: aero-vault
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8080"]
+        labels:
+          service: aero-vault
+    # Drop the noisy OTel scope labels the exporter attaches to each series.
+    metric_relabel_configs:
+      - regex: "otel_scope_(name|version|schema_url)"
+        action: labeldrop
+
+  # OpenTelemetry Collector Prometheus exporter (collector-exported metrics).
+  - job_name: otel-collector
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["otel-collector:8889"]
+        labels:
+          service: aero-vault
+          source: otel-collector
+
+  # Prometheus self-monitoring.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aero-vault"
+version = "0.4.0"
+description = "Python client for the aero-vault AI-native file platform (REST + S3 + AI)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "aero-vault" }]
+keywords = ["storage", "s3", "object-storage", "rag", "vector-search", "ai"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: System :: Archiving",
+]
+dependencies = []  # stdlib-only by design
+
+[project.urls]
+Homepage = "https://github.com/aero-vault/aero-vault"
+Source = "https://github.com/aero-vault/aero-vault/tree/main/sdk/python"
+
+[project.scripts]
+aero-vault = "aero_vault:_main"
+
+[tool.setuptools]
+py-modules = ["aero_vault"]
