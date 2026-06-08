@@ -107,6 +107,16 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(w, rc)
 		return
 	}
+	// RFC 7232 conditional GET (If-Match / If-None-Match / If-[Un]Modified-Since).
+	if hasS3GetConditional(r) {
+		if obj, err := h.svc.Stat(r.Context(), tenant, bucket, key); err == nil {
+			if code := evalS3GetPreconditions(r, obj); code != 0 {
+				writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
+				w.WriteHeader(code)
+				return
+			}
+		}
+	}
 	// Range request → 206 Partial Content.
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
 		if obj, err := h.svc.Stat(r.Context(), tenant, bucket, key); err == nil {

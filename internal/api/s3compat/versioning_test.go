@@ -2,6 +2,7 @@ package s3compat
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,42 @@ import (
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
+
+// S3 GetObject honors RFC 7232 conditionals: If-None-Match on a matching ETag ->
+// 304; If-Match mismatch -> 412.
+func TestS3GetObject_Conditional(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	// Create an object and capture its ETag.
+	resp, _ := do(t, "PUT", base+"/b/c.txt", []byte("conditional body"), nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("put status %d", resp.StatusCode)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		// fall back to a HEAD if PUT didn't echo it
+		resp, _ = do(t, "HEAD", base+"/b/c.txt", nil, nil)
+		etag = resp.Header.Get("ETag")
+	}
+
+	// If-None-Match with the current ETag => 304 Not Modified.
+	resp, _ = do(t, "GET", base+"/b/c.txt", nil, map[string]string{"If-None-Match": etag})
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("If-None-Match match should be 304, got %d", resp.StatusCode)
+	}
+
+	// If-Match with a wrong ETag => 412 Precondition Failed.
+	resp, _ = do(t, "GET", base+"/b/c.txt", nil, map[string]string{"If-Match": `"deadbeef"`})
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("If-Match mismatch should be 412, got %d", resp.StatusCode)
+	}
+
+	// If-None-Match with a non-matching tag => normal 200 with body.
+	resp, body := do(t, "GET", base+"/b/c.txt", nil, map[string]string{"If-None-Match": `"deadbeef"`})
+	if resp.StatusCode != 200 || string(body) != "conditional body" {
+		t.Fatalf("non-matching If-None-Match should serve 200, got %d %q", resp.StatusCode, body)
+	}
+}
 
 // S3 GetObject/HeadObject honor ?versionId=<id>, returning that specific stored
 // version (and its x-amz-version-id), not just the current one.
