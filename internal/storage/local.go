@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -21,10 +22,20 @@ import (
 
 // LocalConfig configures the on-disk backend.
 type LocalConfig struct {
-	Root      string // root directory holding objects
-	PublicURL string // optional, used to build presigned URLs (e.g. http://host:8080/files)
-	SignKey   string // HMAC key for presigning; empty disables presigning
-	SSEKey    string // master key for server-side encryption; empty disables SSE
+	Root        string         // root directory holding objects
+	PublicURL   string         // optional, used to build presigned URLs (e.g. http://host:8080/files)
+	SignKey     string         // HMAC key for presigning; empty disables presigning
+	SSEKey      string         // single-key envelope SSE passphrase; empty disables SSE
+	SSEKeyfile  string         // versioned key ring path for rotation; takes precedence over SSEKey
+	SSEKeyURL   string         // HTTP secret store (Vault KV) serving the key ring; precedence over SSEKeyfile
+	SSEKeyToken string         // optional bearer token for SSEKeyURL
+	Secrets     SecretProvider // explicit key source; overrides the SSEKey* fields
+	// KMS-style remote wrapping (the wrapping key never leaves the KMS); takes
+	// precedence over every SecretProvider source above.
+	SSEKMSURL   string // HTTP KMS wrap/unwrap endpoint
+	SSEKMSKeyID string // KMS key id to wrap new data keys with
+	SSEKMSToken string // optional bearer token for SSEKMSURL
+	KMS         DataKeyWrapper
 }
 
 // LocalStorage stores objects on the local filesystem. Metadata is sidecar JSON.
@@ -64,12 +75,17 @@ func NewLocal(cfg LocalConfig) (*LocalStorage, error) {
 		return nil, fmt.Errorf("create root: %w", err)
 	}
 	ls := &LocalStorage{cfg: cfg, uploads: make(map[string]*localUpload)}
-	if cfg.SSEKey != "" {
-		enc, err := newEnvelopeEncrypter(cfg.SSEKey)
-		if err != nil {
-			return nil, fmt.Errorf("init sse: %w", err)
-		}
-		ls.enc = enc
+	// Remote KMS wrapping takes precedence over local-key providers.
+	if w := newDataKeyWrapper(cfg); w != nil {
+		ls.enc = newWrappingEncrypter(w)
+		return ls, nil
+	}
+	provider, err := newSecretProvider(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("init sse: %w", err)
+	}
+	if provider != nil {
+		ls.enc = newEnvelopeEncrypter(provider)
 	}
 	return ls, nil
 }
@@ -91,6 +107,15 @@ func (s *LocalStorage) objectPath(key string) (string, error) {
 }
 
 func (s *LocalStorage) metaPath(p string) string { return p + localMetaSuffix }
+
+// isInternalTemp reports whether name is one of the backend's transient staging
+// files (created by atomic temp+rename writes). They must never surface as objects
+// in List. Matched by prefix so legitimate dot-prefixed object keys are unaffected.
+func isInternalTemp(name string) bool {
+	return strings.HasPrefix(name, ".upload-") ||
+		strings.HasPrefix(name, ".assemble-") ||
+		strings.HasPrefix(name, ".meta-")
+}
 
 func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error) {
 	path, err := s.objectPath(key)
@@ -258,7 +283,15 @@ func (s *LocalStorage) List(ctx context.Context, prefix, marker string, limit in
 		if walkErr != nil {
 			return walkErr
 		}
-		if d.IsDir() || strings.HasSuffix(path, localMetaSuffix) {
+		if d.IsDir() {
+			if d.Name() == ".multipart" {
+				return filepath.SkipDir // in-progress upload parts are not objects
+			}
+			return nil
+		}
+		// Skip sidecars and transient atomic-write temp files so neither surfaces
+		// as a bogus object (e.g. a temp left behind by a crash mid-rename).
+		if strings.HasSuffix(path, localMetaSuffix) || isInternalTemp(d.Name()) {
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)
@@ -370,6 +403,22 @@ func (s *LocalStorage) UploadPart(ctx context.Context, key, uploadID string, par
 	return MultipartPart{PartNumber: partNumber, ETag: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
+// multipartETag computes the AWS-style multipart ETag: the hex MD5 of the
+// concatenated binary part MD5s, suffixed with "-<partCount>" — what real S3
+// returns for a completed multipart object (vs a whole-object MD5). Parts must be
+// in ascending part-number order.
+func multipartETag(parts []MultipartPart) (string, error) {
+	sum := md5.New()
+	for _, p := range parts {
+		raw, err := hex.DecodeString(p.ETag)
+		if err != nil {
+			return "", fmt.Errorf("multipart: part %d has a non-hex etag %q: %w", p.PartNumber, p.ETag, err)
+		}
+		sum.Write(raw)
+	}
+	return fmt.Sprintf("%s-%d", hex.EncodeToString(sum.Sum(nil)), len(parts)), nil
+}
+
 func (s *LocalStorage) CompleteMultipart(ctx context.Context, key, uploadID string, parts []MultipartPart) (ObjectInfo, error) {
 	s.mu.Lock()
 	up, ok := s.uploads[uploadID]
@@ -401,20 +450,50 @@ func (s *LocalStorage) CompleteMultipart(ctx context.Context, key, uploadID stri
 		_ = os.Remove(tmpName)
 	}()
 
-	h := md5.New()
-	var total int64
-	for _, p := range parts {
-		partPath := filepath.Join(up.dir, fmt.Sprintf("part-%05d", p.PartNumber))
-		f, err := os.Open(partPath)
+	var (
+		total    int64
+		envelope string
+	)
+	if s.enc != nil {
+		// SSE: assemble the plaintext, then write a single encrypted blob — mirrors
+		// Put's whole-object envelope. (Part files on disk are transient and removed
+		// by the deferred RemoveAll above.)
+		var buf bytes.Buffer
+		for _, p := range parts {
+			partPath := filepath.Join(up.dir, fmt.Sprintf("part-%05d", p.PartNumber))
+			f, err := os.Open(partPath)
+			if err != nil {
+				return ObjectInfo{}, err
+			}
+			n, err := io.Copy(&buf, f)
+			_ = f.Close()
+			if err != nil {
+				return ObjectInfo{}, err
+			}
+			total += n
+		}
+		ct, env, err := s.enc.encrypt(buf.Bytes())
 		if err != nil {
 			return ObjectInfo{}, err
 		}
-		n, err := io.Copy(io.MultiWriter(tmp, h), f)
-		_ = f.Close()
-		if err != nil {
+		envelope = env
+		if _, err := tmp.Write(ct); err != nil {
 			return ObjectInfo{}, err
 		}
-		total += n
+	} else {
+		for _, p := range parts {
+			partPath := filepath.Join(up.dir, fmt.Sprintf("part-%05d", p.PartNumber))
+			f, err := os.Open(partPath)
+			if err != nil {
+				return ObjectInfo{}, err
+			}
+			n, err := io.Copy(tmp, f)
+			_ = f.Close()
+			if err != nil {
+				return ObjectInfo{}, err
+			}
+			total += n
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return ObjectInfo{}, err
@@ -422,13 +501,18 @@ func (s *LocalStorage) CompleteMultipart(ctx context.Context, key, uploadID stri
 	if err := os.Rename(tmpName, dst); err != nil {
 		return ObjectInfo{}, err
 	}
+	etag, err := multipartETag(parts)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
 	meta := localMeta{
 		Key:          key,
 		Size:         total,
-		ETag:         hex.EncodeToString(h.Sum(nil)),
+		ETag:         etag,
 		ContentType:  up.opts.ContentType,
 		LastModified: time.Now().UTC(),
 		Metadata:     up.opts.Metadata,
+		Envelope:     envelope,
 	}
 	if err := writeMeta(s.metaPath(dst), meta); err != nil {
 		return ObjectInfo{}, err
@@ -465,7 +549,23 @@ func writeMeta(path string, m localMeta) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	// Write atomically (temp + rename) so a crash can't leave a torn sidecar —
+	// critical for re-wrap, which rewrites the envelope holding the wrapped key.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".meta-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func readMeta(path string) (localMeta, error) {

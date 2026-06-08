@@ -12,7 +12,13 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
+
+// recordEmbedUsage reports embedding token usage. It's a package var so tests can
+// observe the parsed token count without standing up a metrics reader.
+var recordEmbedUsage = telemetry.RecordEmbedUsage
 
 // Embedder produces a fixed-size float32 vector for each input text.
 // Implementations must return len(texts) vectors, each of length Dimensions().
@@ -113,12 +119,17 @@ type embedResp struct {
 	Data []struct {
 		Embedding []float32 `json:"embedding"`
 	} `json:"data"`
+	Usage struct {
+		PromptTokens int `json:"prompt_tokens"`
+		TotalTokens  int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
 func (e *HTTPEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
+	start := time.Now()
 	body, _ := json.Marshal(embedReq{Model: e.Model, Input: texts})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.Endpoint+"/v1/embeddings", bytes.NewReader(body))
 	if err != nil {
@@ -151,5 +162,10 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 	if len(out) > 0 && e.Dim == 0 {
 		e.Dim = len(out[0])
 	}
+	// Surface provider-reported token usage so embedding spend is observable
+	// (ai_embed_tokens_total{model}); the request is counted even when the
+	// provider omits usage.
+	recordEmbedUsage(ctx, e.Model, er.Usage.TotalTokens)
+	telemetry.RecordEmbedLatency(ctx, e.Model, float64(time.Since(start).Milliseconds()))
 	return out, nil
 }

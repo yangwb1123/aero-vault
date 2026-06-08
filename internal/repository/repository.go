@@ -60,6 +60,7 @@ type Upload struct {
 	Key        string
 	Backend    string
 	BackendUID string
+	StorageKey string // physical backend key the parts assemble to (versioned when the bucket has versioning on)
 	Metadata   map[string]string
 	CreatedAt  time.Time
 }
@@ -246,6 +247,7 @@ type Repository interface {
 	GetTenantQuota(ctx context.Context, tenant string) (TenantQuota, error)
 	ListTenantQuotas(ctx context.Context) ([]TenantQuota, error)
 	SetTenantQuota(ctx context.Context, tenant string, maxBytes, maxObjects int64) error
+	SetTenantBudgetMicros(ctx context.Context, tenant string, micros int64) error
 	AddTenantUsage(ctx context.Context, tenant string, deltaBytes, deltaObjects int64) (TenantQuota, error)
 
 	// Webhook retries

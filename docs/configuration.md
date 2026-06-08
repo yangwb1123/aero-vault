@@ -42,7 +42,22 @@ Validation (fails fast on startup): the storage backend must be one of
 | `STORAGE_LOCAL_ROOT` | `./var/objects` | Root directory for stored objects. **Required** for the local backend. |
 | `STORAGE_LOCAL_PUBLIC_URL` | _(empty)_ | Public base URL used to build presigned URLs (e.g. `http://localhost:8080/files`). |
 | `STORAGE_LOCAL_SIGN_KEY` | _(empty)_ | HMAC key for presigning local URLs; empty disables local presigning. |
-| `STORAGE_LOCAL_SSE_KEY` | _(empty)_ | Master key for envelope (AES-GCM) server-side encryption; empty disables SSE. *(config.go only)* |
+| `STORAGE_LOCAL_SSE_KEY` | _(empty)_ | Single master passphrase for envelope (AES-256-GCM) server-side encryption; empty disables SSE. When a keyfile is also set, this becomes the legacy key for pre-rotation (no-id) objects. |
+| `STORAGE_LOCAL_SSE_KEYFILE` | _(empty)_ | Path to a JSON key ring (`{"primary":"id","keys":{"id":"passphrase",…}}`) enabling versioned keys + zero-downtime rotation; takes precedence over `STORAGE_LOCAL_SSE_KEY`. Each object records its key id, so rotating = add a key + move `primary` (no re-encryption); old objects keep decrypting under their original key. Key ids must match `[A-Za-z0-9._-]+`. |
+| `STORAGE_LOCAL_SSE_KEY_URL` | _(empty)_ | HTTP secret store (e.g. Vault KV) serving the same key-ring JSON; fetched once at startup. Takes precedence over `STORAGE_LOCAL_SSE_KEYFILE`. Keeps key material out of local files. |
+| `STORAGE_LOCAL_SSE_KEY_TOKEN` | _(empty)_ | Bearer token sent as `Authorization: Bearer …` when fetching `STORAGE_LOCAL_SSE_KEY_URL`. |
+| `STORAGE_LOCAL_SSE_KMS_URL` | _(empty)_ | HTTP KMS endpoint that wraps/unwraps data keys remotely (`POST /wrap`, `POST /unwrap`) — the wrapping key never reaches aero-vault. Takes precedence over all key-ring sources. Compatible with a thin proxy in front of AWS/GCP KMS or Vault Transit. |
+| `STORAGE_LOCAL_SSE_KMS_KEY_ID` | _(empty)_ | KMS key id used to wrap new data keys (recorded per-object so unwrap targets the right key). |
+| `STORAGE_LOCAL_SSE_KMS_TOKEN` | _(empty)_ | Bearer token for `STORAGE_LOCAL_SSE_KMS_URL`. |
+| `STORAGE_SSE_REWRAP_ON_START` | `false` | On boot, re-wrap every object still encrypted under an older key id onto the current `primary` key — rewrites only the sidecar envelope (object bodies are untouched), idempotent — so retired keys can be removed from the ring. Opt-in; run it on one instance after a rotation. |
+
+> **SSE key-ring operations.** Treat a key id as **immutable**: to rotate, add a
+> *new* id and point `primary` at it — never change an existing id's passphrase in
+> place (objects written under it would no longer decrypt). Keep retired ids in the
+> ring as long as any object still references them. When migrating from
+> `STORAGE_LOCAL_SSE_KEY` to a keyfile, **keep the old `STORAGE_LOCAL_SSE_KEY` set**
+> — it decrypts pre-rotation (no-id) objects; dropping it makes those objects
+> unreadable until it is restored.
 
 ### AWS S3 / S3-compatible (`STORAGE_BACKEND=s3`)
 
@@ -106,6 +121,8 @@ Validation (fails fast on startup): the storage backend must be one of
 | `AI_CHAT_ENDPOINT` | _(empty)_ | Chat service base URL, e.g. `http://localhost:11434`. |
 | `AI_CHAT_MODEL` | `gpt-4o-mini` | Chat model name. |
 | `AI_CHAT_API_KEY` | _(empty)_ | API key for the chat endpoint. |
+| `AI_TENANT_DAILY_BUDGET_USD` | `0` | Default per-tenant daily AI spend cap (USD); 0 = unlimited. Chat returns `402` once a tenant's recorded same-day spend reaches the cap. Requires `AI_COST_*` pricing to estimate spend. |
+| `AI_PER_TENANT_BUDGETS` | `false` | Let each tenant override the default cap via `PUT /v1/admin/tenants/{tenant}/budget` (`{"daily_budget_usd": N}`). A tenant's override (when > 0) wins over the default — and enforces even when no default is set; `0` clears it. |
 | `AI_RERANK_PROVIDER` | _(empty = off)_ | Reranker: `http` (Cohere/Voyage/bge-reranker wire shape) or `heuristic` (dependency-free fallback). Lower-cased. |
 | `AI_RERANK_ENDPOINT` | _(empty)_ | Reranker service URL. |
 | `AI_RERANK_MODEL` | `bge-reranker-v2` | Reranker model name. |
@@ -163,7 +180,8 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 | `REPLICATION_BACKEND` | `local` | Replica backend: `local` \| `s3` \| `oss` \| `cos`. Lower-cased. |
 | `REPLICATION_LOCAL_ROOT` | _(empty)_ | Replica root dir (local replica backend). |
 | `REPLICATION_LOCAL_SIGN_KEY` | _(empty)_ | HMAC sign key for the local replica. *(config.go only)* |
-| `REPLICATION_LOCAL_SSE_KEY` | _(empty)_ | SSE key for the local replica. *(config.go only)* |
+| `REPLICATION_LOCAL_SSE_KEY` | _(empty)_ | SSE master passphrase for the local replica. |
+| `REPLICATION_LOCAL_SSE_KEYFILE` | _(empty)_ | Versioned SSE key ring for the local replica (mirror of `STORAGE_LOCAL_SSE_KEYFILE`). |
 | `REPLICATION_S3_ENDPOINT` | _(empty)_ | Replica S3 endpoint. |
 | `REPLICATION_S3_REGION` | `us-east-1` | Replica S3 region. |
 | `REPLICATION_S3_BUCKET` | _(empty)_ | Replica S3 bucket. |

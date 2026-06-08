@@ -19,6 +19,10 @@ var (
 	mAIRequests           metric.Int64Counter
 	mAITokens             metric.Int64Counter
 	mAICostMicros         metric.Int64Counter
+	mAIEmbedRequests      metric.Int64Counter
+	mAIEmbedTokens        metric.Int64Counter
+	mAISearchLatency      metric.Float64Histogram
+	mAIEmbedLatency       metric.Float64Histogram
 	mReconcileOrphanBlobs metric.Int64Counter
 	mReconcileDeleted     metric.Int64Counter
 	mIdempotencyReplays   metric.Int64Counter
@@ -31,6 +35,10 @@ func initDomain() {
 		mAIRequests, _ = m.Int64Counter("ai.requests")
 		mAITokens, _ = m.Int64Counter("ai.tokens")
 		mAICostMicros, _ = m.Int64Counter("ai.cost_micros")
+		mAIEmbedRequests, _ = m.Int64Counter("ai.embed_requests")
+		mAIEmbedTokens, _ = m.Int64Counter("ai.embed_tokens")
+		mAISearchLatency, _ = m.Float64Histogram("ai.search.duration_ms")
+		mAIEmbedLatency, _ = m.Float64Histogram("ai.embed.duration_ms")
 		mReconcileOrphanBlobs, _ = m.Int64Counter("reconcile.orphan_blobs")
 		mReconcileDeleted, _ = m.Int64Counter("reconcile.orphan_blobs_deleted")
 		mIdempotencyReplays, _ = m.Int64Counter("idempotency.replays")
@@ -49,6 +57,33 @@ func RecordAIUsage(ctx context.Context, tenant, model string, promptTokens, comp
 	mAIRequests.Add(ctx, 1, attrs)
 	mAITokens.Add(ctx, int64(promptTokens+completionTokens), attrs)
 	mAICostMicros.Add(ctx, costMicros, attrs)
+}
+
+// RecordEmbedUsage records one embedding API call and its token usage (surfaced
+// as ai_embed_requests_total / ai_embed_tokens_total, attributed by model), so
+// embedding spend is observable alongside chat usage. tokens may be 0 when the
+// provider doesn't report usage.
+func RecordEmbedUsage(ctx context.Context, model string, tokens int) {
+	initDomain()
+	attrs := metric.WithAttributes(attribute.String("model", model))
+	mAIEmbedRequests.Add(ctx, 1, attrs)
+	if tokens > 0 {
+		mAIEmbedTokens.Add(ctx, int64(tokens), attrs)
+	}
+}
+
+// RecordSearchLatency records the wall-clock latency (ms) of one semantic-search
+// retrieval, attributed by mode (vector|bm25|hybrid), as ai_search_duration_ms.
+func RecordSearchLatency(ctx context.Context, mode string, ms float64) {
+	initDomain()
+	mAISearchLatency.Record(ctx, ms, metric.WithAttributes(attribute.String("mode", mode)))
+}
+
+// RecordEmbedLatency records the latency (ms) of one embedding API call, as
+// ai_embed_duration_ms{model}.
+func RecordEmbedLatency(ctx context.Context, model string, ms float64) {
+	initDomain()
+	mAIEmbedLatency.Record(ctx, ms, metric.WithAttributes(attribute.String("model", model)))
 }
 
 // RecordReconcileBlobs records the outcome of one reconcile orphan-blob sweep.

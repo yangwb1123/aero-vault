@@ -18,6 +18,9 @@ func TestDomainMetrics_SurfaceInScrape(t *testing.T) {
 	ctx := context.Background()
 
 	RecordAIUsage(ctx, "acme", "gpt-test", 100, 50, 500_000)
+	RecordEmbedUsage(ctx, "embed-test", 320)
+	RecordSearchLatency(ctx, "hybrid", 12.5)
+	RecordEmbedLatency(ctx, "embed-test", 8.0)
 	RecordReconcileBlobs(ctx, 3, 2)
 	IncIdempotencyReplay(ctx)
 	IncEventDropped(ctx)
@@ -35,6 +38,10 @@ func TestDomainMetrics_SurfaceInScrape(t *testing.T) {
 		"ai_requests",
 		"ai_tokens",
 		"ai_cost_micros",
+		"ai_embed_requests",
+		"ai_embed_tokens",
+		"ai_search_duration_ms",
+		"ai_embed_duration_ms",
 		"reconcile_orphan_blobs",
 		"idempotency_replays",
 		"events_dropped",

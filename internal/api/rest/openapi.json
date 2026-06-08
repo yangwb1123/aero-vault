@@ -161,6 +161,7 @@
 
     "/v1/usage":                            { "get":   { "tags": ["admin"], "summary": "Tenant usage" } },
     "/v1/admin/tenants/{tenant}/quota":     { "put":   { "tags": ["admin"], "summary": "Set quota" } },
+    "/v1/admin/tenants/{tenant}/budget":    { "put":   { "tags": ["admin"], "summary": "Set per-tenant daily AI budget (USD)" } },
     "/v1/admin/keys":                        { "get":   { "tags": ["admin"], "summary": "List API keys" },
                                               "post":  { "tags": ["admin"], "summary": "Add key" } },
     "/v1/admin/keys/{token}":                { "delete":{ "tags": ["admin"], "summary": "Revoke key" } },

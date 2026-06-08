@@ -691,19 +691,19 @@ func (s *sqlStore) CreateUpload(ctx context.Context, u Upload) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, s.rebind(`INSERT INTO multipart_uploads (upload_id, tenant_id, bucket, key, backend, backend_uid, metadata) VALUES ($1,$2,$3,$4,$5,$6,$7)`),
-		u.ID, u.TenantID, u.Bucket, u.Key, u.Backend, u.BackendUID, string(metaBytes))
+	_, err = s.db.ExecContext(ctx, s.rebind(`INSERT INTO multipart_uploads (upload_id, tenant_id, bucket, key, backend, backend_uid, storage_key, metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
+		u.ID, u.TenantID, u.Bucket, u.Key, u.Backend, u.BackendUID, u.StorageKey, string(metaBytes))
 	return err
 }
 
 func (s *sqlStore) GetUpload(ctx context.Context, uploadID string) (Upload, error) {
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT upload_id, tenant_id, bucket, key, backend, backend_uid, metadata, created_at FROM multipart_uploads WHERE upload_id=$1`), uploadID)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT upload_id, tenant_id, bucket, key, backend, backend_uid, storage_key, metadata, created_at FROM multipart_uploads WHERE upload_id=$1`), uploadID)
 	var (
 		u        Upload
 		metaRaw  []byte
 		createdT flexTime
 	)
-	if err := row.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &metaRaw, &createdT); err != nil {
+	if err := row.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &u.StorageKey, &metaRaw, &createdT); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Upload{}, ErrUploadNotFound
 		}
@@ -726,7 +726,7 @@ func (s *sqlStore) ListUploads(ctx context.Context, tenant, bucket string, limit
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	q := `SELECT upload_id, tenant_id, bucket, key, backend, backend_uid, metadata, created_at FROM multipart_uploads WHERE tenant_id=$1`
+	q := `SELECT upload_id, tenant_id, bucket, key, backend, backend_uid, storage_key, metadata, created_at FROM multipart_uploads WHERE tenant_id=$1`
 	args := []any{tenant}
 	if bucket != "" {
 		q += ` AND bucket=$2 ORDER BY created_at ASC LIMIT $3`
@@ -747,7 +747,7 @@ func (s *sqlStore) ListUploads(ctx context.Context, tenant, bucket string, limit
 			metaRaw  []byte
 			createdT flexTime
 		)
-		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &metaRaw, &createdT); err != nil {
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &u.StorageKey, &metaRaw, &createdT); err != nil {
 			return nil, err
 		}
 		u.CreatedAt = createdT.Time

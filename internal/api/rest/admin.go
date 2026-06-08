@@ -73,6 +73,33 @@ func (h *AdminHandler) SetQuota(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"tenant": tenant, "max_bytes": body.MaxBytes, "max_objects": body.MaxObjects})
 }
 
+// PUT /v1/admin/tenants/{t}/budget — body {"daily_budget_usd": <float>}; 0 clears
+// the override so the global AI_TENANT_DAILY_BUDGET_USD default applies again.
+func (h *AdminHandler) SetBudget(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(w, r) {
+		return
+	}
+	tenant := chiURLParam(r, "tenant")
+	var body struct {
+		DailyBudgetUSD float64 `json:"daily_budget_usd"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: fmt.Sprintf("bad JSON: %v", err)}})
+		return
+	}
+	if body.DailyBudgetUSD < 0 {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: "daily_budget_usd must be >= 0"}})
+		return
+	}
+	micros := int64(body.DailyBudgetUSD * 1_000_000)
+	if err := h.repo.SetTenantBudgetMicros(r.Context(), tenant, micros); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		return
+	}
+	h.audit(r, "budget.set", tenant, fmt.Sprintf("daily_budget_usd=%g", body.DailyBudgetUSD))
+	writeJSON(w, http.StatusOK, map[string]any{"tenant": tenant, "daily_budget_usd": body.DailyBudgetUSD})
+}
+
 // GET /v1/admin/keys
 func (h *AdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(w, r) {

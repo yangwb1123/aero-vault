@@ -27,6 +27,7 @@ type Chat struct {
 	promptMicrosPer1K     int64
 	completionMicrosPer1K int64
 	dailyBudgetMicros     int64
+	perTenantBudget       bool
 }
 
 func NewChat(search *Search, llm LLM, repo repository.Repository, logger *slog.Logger) *Chat {
@@ -45,16 +46,45 @@ func (c *Chat) WithPricing(promptUSDPer1K, completionUSDPer1K float64) *Chat {
 	return c
 }
 
-// WithBudget sets a per-tenant daily AI spend cap (USD). Zero (the default)
-// disables enforcement. Requires pricing to be set to have any effect.
+// WithBudget sets the default per-tenant daily AI spend cap (USD). Zero (the
+// default) disables enforcement. Requires pricing to be set to have any effect.
 func (c *Chat) WithBudget(dailyUSD float64) *Chat {
 	c.dailyBudgetMicros = int64(dailyUSD * 1_000_000) // USD → micros
 	return c
 }
 
+// WithPerTenantBudgets lets each tenant override the global daily cap via its
+// stored quota row (daily_budget_micros). When enabled, a tenant's override (when
+// > 0) takes precedence over the global default — so a tenant cap can apply even
+// when no global cap is set.
+func (c *Chat) WithPerTenantBudgets() *Chat {
+	c.perTenantBudget = true
+	return c
+}
+
+// budgetMicros returns the effective daily cap for a tenant: its stored override
+// when per-tenant budgets are enabled and the tenant set one (> 0), else the
+// global default.
+func (c *Chat) budgetMicros(ctx context.Context, tenant string) (int64, error) {
+	if c.perTenantBudget && c.repo != nil {
+		q, err := c.repo.GetTenantQuota(ctx, tenant)
+		if err != nil {
+			return 0, err
+		}
+		if q.DailyBudgetMicros > 0 {
+			return q.DailyBudgetMicros, nil
+		}
+	}
+	return c.dailyBudgetMicros, nil
+}
+
 // overBudget reports whether the tenant has reached its daily AI spend cap.
 func (c *Chat) overBudget(ctx context.Context, tenant string) (bool, error) {
-	if c.dailyBudgetMicros <= 0 {
+	budget, err := c.budgetMicros(ctx, tenant)
+	if err != nil {
+		return false, err
+	}
+	if budget <= 0 {
 		return false, nil
 	}
 	since := time.Now().UTC().Truncate(24 * time.Hour).Format(time.RFC3339Nano)
@@ -62,7 +92,7 @@ func (c *Chat) overBudget(ctx context.Context, tenant string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return spent >= c.dailyBudgetMicros, nil
+	return spent >= budget, nil
 }
 
 // ChatReq is the user-facing input.

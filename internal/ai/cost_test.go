@@ -146,3 +146,61 @@ func TestChatBudgetAllowsUnderCap(t *testing.T) {
 		t.Fatalf("under-budget call should proceed, got %v", err)
 	}
 }
+
+// TestChatPerTenantBudgetOverride: a tenant's stored override beats the global cap.
+func TestChatPerTenantBudgetOverride(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t)
+	emb := NewHashEmbedder(64)
+	obj := env.putObject(t, "kb.txt", "text/plain", "the answer is 42")
+	env.seedChunks(t, obj, emb, "the answer is 42")
+
+	// $0.20 spent today; the global cap is $0.10 → would be over.
+	if err := env.repo.RecordUsage(ctx, repository.Usage{
+		TenantID: testTenant, Caller: "rest:chat", CostMicros: 200_000, ObjectIDs: []int64{obj.ID},
+	}); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	chat := NewChat(NewSearch(env.repo, emb, nil), usageLLM{}, env.repo, nil).
+		WithPricing(2.0, 6.0).WithBudget(0.10).WithPerTenantBudgets()
+
+	// With no override, the global $0.10 cap rejects.
+	if _, err := chat.Answer(ctx, ChatReq{Tenant: testTenant, Bucket: testBucket, Query: "x", K: 3}); !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("no override → global cap should reject, got %v", err)
+	}
+
+	// Grant a $5/day override → spend is now well under, call proceeds.
+	if err := env.repo.SetTenantBudgetMicros(ctx, testTenant, 5_000_000); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, err := chat.Answer(ctx, ChatReq{Tenant: testTenant, Bucket: testBucket, Query: "x", K: 3}); err != nil {
+		t.Fatalf("with a $5 override and $0.20 spent, call should proceed, got %v", err)
+	}
+}
+
+// TestChatPerTenantBudgetEnforcesWithoutGlobal: a per-tenant override enforces even
+// when no global cap is configured.
+func TestChatPerTenantBudgetEnforcesWithoutGlobal(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t)
+	emb := NewHashEmbedder(64)
+	obj := env.putObject(t, "kb.txt", "text/plain", "the answer is 42")
+	env.seedChunks(t, obj, emb, "the answer is 42")
+
+	if err := env.repo.RecordUsage(ctx, repository.Usage{
+		TenantID: testTenant, Caller: "rest:chat", CostMicros: 200_000, ObjectIDs: []int64{obj.ID},
+	}); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	// No global cap (0), but a $0.10 per-tenant override < $0.20 spent → reject.
+	chat := NewChat(NewSearch(env.repo, emb, nil), usageLLM{}, env.repo, nil).
+		WithPricing(2.0, 6.0).WithBudget(0).WithPerTenantBudgets()
+	if err := env.repo.SetTenantBudgetMicros(ctx, testTenant, 100_000); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, err := chat.Answer(ctx, ChatReq{Tenant: testTenant, Bucket: testBucket, Query: "x", K: 3}); !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("per-tenant override should enforce without a global cap, got %v", err)
+	}
+}

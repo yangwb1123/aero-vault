@@ -65,10 +65,10 @@ func (f *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fil
 	name = strings.TrimPrefix(name, "/")
 	tenant := f.tenant(ctx)
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
-		return &davWriter{svc: f.svc, tenant: tenant, key: name, logger: f.logger}, nil
+		return &davWriter{ctx: ctx, svc: f.svc, tenant: tenant, key: name, logger: f.logger}, nil
 	}
 	if name == "" || strings.HasSuffix(name, "/") {
-		return &davDir{svc: f.svc, tenant: tenant, prefix: name}, nil
+		return &davDir{ctx: ctx, svc: f.svc, tenant: tenant, prefix: name}, nil
 	}
 	obj, err := f.svc.Stat(ctx, tenant, service.DefaultBucket, name)
 	if err != nil {
@@ -76,7 +76,7 @@ func (f *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fil
 			// Treat as a directory listing if any objects exist under that prefix.
 			page, _ := f.svc.List(ctx, tenant, service.DefaultBucket, name+"/", "", 1)
 			if len(page.Objects) > 0 {
-				return &davDir{svc: f.svc, tenant: tenant, prefix: name + "/"}, nil
+				return &davDir{ctx: ctx, svc: f.svc, tenant: tenant, prefix: name + "/"}, nil
 			}
 			return nil, os.ErrNotExist
 		}
@@ -175,6 +175,7 @@ func (r *davReader) Readdir(count int) ([]os.FileInfo, error) { return nil, fs.E
 func (r *davReader) Stat() (os.FileInfo, error)               { return r.info, nil }
 
 type davWriter struct {
+	ctx    context.Context // request context, captured at OpenFile (Close has none)
 	svc    *service.FileService
 	tenant string
 	key    string
@@ -216,12 +217,17 @@ func (w *davWriter) Close() error {
 	if _, err := buf.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	_, err := w.svc.Put(context.Background(), w.tenant, service.DefaultBucket, w.key,
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := w.svc.Put(ctx, w.tenant, service.DefaultBucket, w.key,
 		buf, size, service.PutOptions{})
 	return err
 }
 
 type davDir struct {
+	ctx    context.Context // request context, captured at OpenFile (Readdir has none)
 	svc    *service.FileService
 	tenant string
 	prefix string
@@ -235,7 +241,11 @@ func (d *davDir) Close() error                   { return nil }
 func (d *davDir) Stat() (os.FileInfo, error)     { return davDirInfo(d.prefix), nil }
 func (d *davDir) Readdir(count int) ([]os.FileInfo, error) {
 	prefix := strings.TrimPrefix(d.prefix, "/")
-	page, err := d.svc.List(context.Background(), d.tenant, service.DefaultBucket, prefix, "", 1000)
+	ctx := d.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	page, err := d.svc.List(ctx, d.tenant, service.DefaultBucket, prefix, "", 1000)
 	if err != nil {
 		return nil, err
 	}

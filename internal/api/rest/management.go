@@ -98,6 +98,7 @@ func (h *Handler) GetSpecificVersion(w http.ResponseWriter, r *http.Request, key
 		w.Header().Set("Content-Type", obj.ContentType)
 	}
 	w.Header().Set("X-Version-Id", obj.VersionID)
+	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	_, _ = io.Copy(w, rc)
 }
 

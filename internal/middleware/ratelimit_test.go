@@ -8,6 +8,23 @@ import (
 	"time"
 )
 
+// evictIdle reclaims buckets untouched past the idle TTL (so a flood of unique,
+// client-controlled tenant values can't grow the map without bound) while keeping
+// active ones.
+func TestRateLimiter_EvictsIdleBuckets(t *testing.T) {
+	rl := NewRateLimiter(10, 10)
+	now := time.Now()
+	rl.buckets["fresh"] = &bucket{tokens: 5, last: now}
+	rl.buckets["stale"] = &bucket{tokens: 5, last: now.Add(-rlIdleTTL - time.Minute)}
+	rl.evictIdle(now)
+	if _, ok := rl.buckets["stale"]; ok {
+		t.Fatal("idle bucket should be evicted")
+	}
+	if _, ok := rl.buckets["fresh"]; !ok {
+		t.Fatal("fresh bucket must remain")
+	}
+}
+
 func TestNewRateLimiter_DisabledReturnsNil(t *testing.T) {
 	cases := []struct {
 		name       string

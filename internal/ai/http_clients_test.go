@@ -63,6 +63,31 @@ func TestHTTPEmbedderSuccess(t *testing.T) {
 	}
 }
 
+// TestHTTPEmbedderReportsUsage verifies the embedder parses the provider's token
+// usage and reports it (model + total_tokens) for the embed-usage metric.
+func TestHTTPEmbedderReportsUsage(t *testing.T) {
+	orig := recordEmbedUsage
+	defer func() { recordEmbedUsage = orig }()
+	var gotModel string
+	var gotTokens int
+	recordEmbedUsage = func(_ context.Context, model string, tokens int) {
+		gotModel, gotTokens = model, tokens
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[{"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":40,"total_tokens":42}}`)
+	}))
+	defer srv.Close()
+
+	e := NewHTTPEmbedder(srv.URL, "embed-x", "", 2)
+	if _, err := e.Embed(context.Background(), []string{"hi"}); err != nil {
+		t.Fatalf("embed: %v", err)
+	}
+	if gotModel != "embed-x" || gotTokens != 42 {
+		t.Fatalf("usage not reported: model=%q tokens=%d", gotModel, gotTokens)
+	}
+}
+
 func TestHTTPEmbedderEmptyInputShortCircuits(t *testing.T) {
 	// No request should be made for empty input.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/cluster"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/storage"
 	"github.com/aero-vault/aero-vault/internal/telemetry"
@@ -38,8 +39,7 @@ type Job struct {
 	deleteOrphanBlobs bool
 	gracePeriod       time.Duration
 	tenants           []string // tenants to scan; empty means scan default only
-	clusterSingleton  bool     // when true, gate each sweep behind a DB lease
-	holder            string   // this instance's lease holder id
+	singleton         *cluster.Singleton
 	logger            *slog.Logger
 }
 
@@ -47,8 +47,7 @@ type Job struct {
 // by a repository lease held by `holder` (a per-instance id). Without it, every
 // replica sweeps independently (fine for a single instance).
 func (j *Job) WithClusterSingleton(holder string) *Job {
-	j.clusterSingleton = true
-	j.holder = holder
+	j.singleton.Enable(holder)
 	return j
 }
 
@@ -59,7 +58,7 @@ func New(repo repository.Repository, store storage.Storage, interval time.Durati
 	if len(tenants) == 0 {
 		tenants = []string{"default"}
 	}
-	return &Job{repo: repo, store: store, interval: interval, deleteOrphanBlobs: deleteOrphanBlobs, gracePeriod: gracePeriod, tenants: tenants, logger: logger}
+	return &Job{repo: repo, store: store, interval: interval, deleteOrphanBlobs: deleteOrphanBlobs, gracePeriod: gracePeriod, tenants: tenants, singleton: cluster.NewSingleton(repo, leaseReconcileSweep, logger), logger: logger}
 }
 
 // Run blocks until ctx is canceled. It runs an initial sweep immediately, then
@@ -81,22 +80,11 @@ func (j *Job) Run(ctx context.Context) {
 	}
 }
 
-// maybeSweep runs the sweep, first acquiring the cluster lease when configured
-// as a singleton. The lease TTL is 2× the interval so the holder keeps renewing
-// each round; if it dies, the lease frees after ~2 intervals and another replica
-// takes over.
+// maybeSweep runs the sweep, gated by the cluster singleton when enabled. The
+// lease TTL is 2× the interval so the holder keeps renewing each round; if it
+// dies, the lease frees after ~2 intervals and another replica takes over.
 func (j *Job) maybeSweep(ctx context.Context) {
-	if j.clusterSingleton {
-		held, err := j.repo.AcquireLease(ctx, leaseReconcileSweep, j.holder, 2*j.interval)
-		if err != nil {
-			j.logger.Warn("reconcile: acquire lease", "err", err)
-			return
-		}
-		if !held {
-			return // another replica owns the sweep this round
-		}
-	}
-	j.sweep(ctx)
+	j.singleton.Guard(ctx, 2*j.interval, j.sweep)
 }
 
 // sweep reconciles every configured tenant in both directions: orphan rows

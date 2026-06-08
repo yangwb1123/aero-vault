@@ -129,6 +129,19 @@ func (s *FileService) Put(ctx context.Context, tenant, bucket, key string, r io.
 				return repository.Object{}, fmt.Errorf("%w: objects %d/%d", ErrQuotaExceeded, q.UsedObjects+1, q.MaxObjects)
 			}
 		}
+	} else {
+		// Size unknown (e.g. a chunked/streaming PUT with no Content-Length): the
+		// delta can't be pre-checked, but still refuse when the tenant is already at
+		// its byte or object cap so an unsized upload can't bypass quota entirely.
+		q, qErr := s.repo.GetTenantQuota(ctx, tenant)
+		if qErr == nil {
+			if q.MaxBytes > 0 && q.UsedBytes >= q.MaxBytes {
+				return repository.Object{}, fmt.Errorf("%w: bytes %d/%d", ErrQuotaExceeded, q.UsedBytes, q.MaxBytes)
+			}
+			if q.MaxObjects > 0 && q.UsedObjects >= q.MaxObjects {
+				return repository.Object{}, fmt.Errorf("%w: objects %d/%d", ErrQuotaExceeded, q.UsedObjects, q.MaxObjects)
+			}
+		}
 	}
 	// Check existing object lock before overwriting.
 	if !bcfg.Versioning {
@@ -370,6 +383,16 @@ func (s *FileService) PresignPut(ctx context.Context, tenant, bucket, key string
 	return s.store.PresignPut(ctx, storageKey(tenant, bucket, key), expiry)
 }
 
+// uploadStorageKey returns the upload's persisted assembly key, falling back to
+// the recomputed unversioned key for uploads created before storage_key was
+// tracked (in-flight across the migration).
+func uploadStorageKey(u repository.Upload) string {
+	if u.StorageKey != "" {
+		return u.StorageKey
+	}
+	return storageKey(u.TenantID, u.Bucket, u.Key)
+}
+
 // InitMultipart opens a multipart upload and persists the session.
 func (s *FileService) InitMultipart(ctx context.Context, tenant, bucket, key string, opts PutOptions) (repository.Upload, error) {
 	tenant, bucket = defaults(tenant, bucket)
@@ -379,7 +402,17 @@ func (s *FileService) InitMultipart(ctx context.Context, tenant, bucket, key str
 	if err := s.repo.CreateBucket(ctx, tenant, bucket); err != nil {
 		return repository.Upload{}, err
 	}
+	bcfg, err := s.repo.GetBucketConfig(ctx, tenant, bucket)
+	if err != nil {
+		return repository.Upload{}, fmt.Errorf("get bucket config: %w", err)
+	}
+	// On a versioned bucket, assemble into a unique per-version storage key so the
+	// completed object becomes a new version instead of overwriting the current one
+	// (mirrors Put's one-blob-per-version scheme).
 	sk := storageKey(tenant, bucket, key)
+	if bcfg.Versioning {
+		sk = sk + "@v" + repoVersionID()
+	}
 	init, err := s.store.InitMultipart(ctx, sk, storage.PutOptions{
 		ContentType: opts.ContentType,
 		Metadata:    opts.Metadata,
@@ -394,6 +427,7 @@ func (s *FileService) InitMultipart(ctx context.Context, tenant, bucket, key str
 		Key:        key,
 		Backend:    s.store.Backend(),
 		BackendUID: init.UploadID,
+		StorageKey: sk,
 		Metadata:   opts.Metadata,
 	}
 	if err := s.repo.CreateUpload(ctx, u); err != nil {
@@ -411,7 +445,7 @@ func (s *FileService) UploadPart(ctx context.Context, uploadID string, partNumbe
 		}
 		return repository.PartRecord{}, err
 	}
-	sk := storageKey(u.TenantID, u.Bucket, u.Key)
+	sk := uploadStorageKey(u)
 	part, err := s.store.UploadPart(ctx, sk, u.BackendUID, partNumber, r, size)
 	if err != nil {
 		return repository.PartRecord{}, fmt.Errorf("storage upload part: %w", err)
@@ -450,7 +484,30 @@ func (s *FileService) CompleteMultipart(ctx context.Context, uploadID string) (r
 		total += p.Size
 	}
 
-	sk := storageKey(u.TenantID, u.Bucket, u.Key)
+	bcfg, err := s.repo.GetBucketConfig(ctx, u.TenantID, u.Bucket)
+	if err != nil {
+		return repository.Object{}, fmt.Errorf("get bucket config: %w", err)
+	}
+	// Quota enforcement before assembling — multipart must respect caps like a
+	// single PUT does (the total part size is known here).
+	if q, qErr := s.repo.GetTenantQuota(ctx, u.TenantID); qErr == nil {
+		if q.MaxBytes > 0 && q.UsedBytes+total > q.MaxBytes {
+			return repository.Object{}, fmt.Errorf("%w: bytes %d/%d", ErrQuotaExceeded, q.UsedBytes+total, q.MaxBytes)
+		}
+		if q.MaxObjects > 0 && q.UsedObjects+1 > q.MaxObjects {
+			return repository.Object{}, fmt.Errorf("%w: objects %d/%d", ErrQuotaExceeded, q.UsedObjects+1, q.MaxObjects)
+		}
+	}
+	// Respect object-lock on overwrite (non-versioned buckets), like Put.
+	if !bcfg.Versioning {
+		if cur, gErr := s.repo.GetObject(ctx, u.TenantID, u.Bucket, u.Key); gErr == nil {
+			if cur.LockedUntil != nil && cur.LockedUntil.After(time.Now()) {
+				return repository.Object{}, fmt.Errorf("%w: overwrite blocked until %s", ErrLocked, cur.LockedUntil.Format(time.RFC3339))
+			}
+		}
+	}
+
+	sk := uploadStorageKey(u)
 	info, err := s.store.CompleteMultipart(ctx, sk, u.BackendUID, storageParts)
 	if err != nil {
 		return repository.Object{}, fmt.Errorf("storage complete: %w", err)
@@ -470,10 +527,30 @@ func (s *FileService) CompleteMultipart(ctx context.Context, uploadID string) (r
 		ContentType: info.ContentType,
 		Metadata:    u.Metadata,
 	}
-	saved, err := s.repo.UpsertObject(ctx, obj)
+	if bcfg.ObjectLockSeconds > 0 {
+		until := time.Now().Add(time.Duration(bcfg.ObjectLockSeconds) * time.Second)
+		obj.LockedUntil = &until
+	}
+	var saved repository.Object
+	if bcfg.Versioning {
+		// New version (sk is the unique @v key from InitMultipart).
+		saved, err = s.repo.InsertObjectVersion(ctx, obj)
+	} else {
+		saved, err = s.repo.UpsertObject(ctx, obj)
+	}
 	if err != nil {
-		s.logger.Error("repo upsert after multipart failed; orphan", "key", u.Key, "err", err)
-		return repository.Object{}, fmt.Errorf("repo upsert: %w", err)
+		s.logger.Error("repo write after multipart failed; orphan", "key", u.Key, "err", err)
+		return repository.Object{}, fmt.Errorf("repo write: %w", err)
+	}
+	if bcfg.ObjectLockSeconds > 0 && saved.LockedUntil == nil {
+		until := time.Now().Add(time.Duration(bcfg.ObjectLockSeconds) * time.Second)
+		_ = s.repo.SetLockedUntil(ctx, u.TenantID, u.Bucket, u.Key, until)
+		saved.LockedUntil = &until
+	}
+	// Account the upload against the tenant quota (best effort) — previously
+	// multipart uploads consumed storage without ever incrementing usage.
+	if _, qErr := s.repo.AddTenantUsage(ctx, u.TenantID, saved.Size, 1); qErr != nil {
+		s.logger.Warn("quota usage increment failed", "tenant", u.TenantID, "err", qErr)
 	}
 	_ = s.repo.DeleteUpload(ctx, uploadID)
 	s.emit(ctx, saved, repository.EventCreated)
@@ -488,7 +565,7 @@ func (s *FileService) AbortMultipart(ctx context.Context, uploadID string) error
 		}
 		return err
 	}
-	sk := storageKey(u.TenantID, u.Bucket, u.Key)
+	sk := uploadStorageKey(u)
 	_ = s.store.AbortMultipart(ctx, sk, u.BackendUID)
 	return s.repo.DeleteUpload(ctx, uploadID)
 }

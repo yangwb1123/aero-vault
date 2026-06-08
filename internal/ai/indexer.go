@@ -205,6 +205,9 @@ func (ix *Indexer) DeleteObjectChunks(ctx context.Context, objectID int64) error
 // than the current one (e.g. after the embedder was changed), so the corpus
 // stays consistent with the active model. Returns the count re-indexed.
 func (ix *Indexer) ReindexStale(ctx context.Context, tenant string, limit int) (int, error) {
+	if ix.embedder == nil {
+		return 0, fmt.Errorf("reindex: no embedder configured")
+	}
 	ids, err := ix.repo.ListObjectIDsToReindex(ctx, tenant, ix.embedder.Name(), limit)
 	if err != nil {
 		return 0, err
@@ -229,6 +232,9 @@ func (ix *Indexer) ReindexStale(ctx context.Context, tenant string, limit int) (
 // success — only genuine failures (storage, embed, persistence) return errors,
 // which the job queue will retry.
 func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
+	if ix.embedder == nil {
+		return fmt.Errorf("index: no embedder configured")
+	}
 	obj, err := ix.repo.GetObjectByID(ctx, objectID)
 	if err != nil {
 		return fmt.Errorf("get object %d: %w", objectID, err)

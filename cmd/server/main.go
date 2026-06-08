@@ -76,7 +76,27 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init storage: %w", err)
 	}
-	logger.Info("storage ready", "backend", store.Backend(), "sse", cfg.Storage.Local.SSEKey != "")
+	logger.Info("storage ready", "backend", store.Backend(), "sse", cfg.Storage.Local.SSEKey != "" || cfg.Storage.Local.SSEKeyfile != "")
+
+	// After an SSE key rotation, opt in to migrate objects still wrapped under an
+	// older key version onto the current key, so retired keys can be removed.
+	if cfg.Storage.SSERewrapOnStart {
+		go func() {
+			rep, err := storage.RewrapStale(ctx, store)
+			if err != nil {
+				logger.Warn("sse rewrap-on-start failed", "err", err)
+				return
+			}
+			if rep.Failed > 0 {
+				// Objects whose recorded key id is no longer in the ring (a key was
+				// retired before they were re-wrapped) — they are already unreadable.
+				logger.Warn("sse rewrap-on-start: some objects could not be re-wrapped",
+					"scanned", rep.Scanned, "rewrapped", rep.Rewrapped, "failed", rep.Failed)
+			} else {
+				logger.Info("sse rewrap-on-start complete", "scanned", rep.Scanned, "rewrapped", rep.Rewrapped)
+			}
+		}()
+	}
 
 	repo, err := repository.Open(ctx, cfg.DB.Driver, cfg.DB.DSN)
 	if err != nil {
@@ -179,6 +199,9 @@ func run() error {
 			chat = ai.NewChat(search, llm, repo, logger).
 				WithPricing(cfg.AI.ChatCostPromptPer1K, cfg.AI.ChatCostCompletionPer1K).
 				WithBudget(cfg.AI.TenantDailyBudgetUSD)
+			if cfg.AI.PerTenantBudgets {
+				chat.WithPerTenantBudgets()
+			}
 			agent = ai.NewAgent(svc, search, llm, repo, logger)
 			logger.Info("rag chat + agent enabled", "llm", llm.Name())
 		}
@@ -335,6 +358,23 @@ func run() error {
 		if cfg.Auth.KeyCacheTTLSeconds > 0 {
 			authReg.WithKeyCache(time.Duration(cfg.Auth.KeyCacheTTLSeconds)*time.Second, 4096)
 			logger.Info("persisted API-key lookup cache enabled", "ttl_seconds", cfg.Auth.KeyCacheTTLSeconds)
+			// Cross-replica cache invalidation: when a Postgres transport DSN is
+			// available, propagate add/revoke to every replica immediately (instead
+			// of waiting out the TTL) over a DEDICATED LISTEN/NOTIFY channel — kept
+			// separate from the lifecycle event bus so key hashes never reach
+			// webhooks or the durable event log.
+			if cfg.Events.TransportDSN != "" {
+				keyTr := events.NewPostgresTransport(cfg.Events.TransportDSN, "aero_key_invalidate")
+				authReg.WithKeyChangePublisher(func(ctx context.Context, hash string) {
+					if err := keyTr.Publish(ctx, repository.Event{Type: "auth.key.invalidate", Key: hash}); err != nil {
+						logger.Warn("key-change publish failed", "err", err)
+					}
+				})
+				go func() {
+					_ = keyTr.Run(ctx, func(e repository.Event) { authReg.InvalidateCachedKey(e.Key) })
+				}()
+				logger.Info("cross-replica key-cache invalidation enabled", "channel", keyTr.Channel())
+			}
 		}
 	}
 	if authReg.Enabled() {
@@ -516,10 +556,16 @@ func buildStorageFrom(ctx context.Context, sc config.StorageConfig) (storage.Sto
 	switch fc.Kind {
 	case storage.BackendLocal:
 		fc.Local = storage.LocalConfig{
-			Root:      sc.Local.Root,
-			PublicURL: sc.Local.PublicURL,
-			SignKey:   sc.Local.SignKey,
-			SSEKey:    sc.Local.SSEKey,
+			Root:        sc.Local.Root,
+			PublicURL:   sc.Local.PublicURL,
+			SignKey:     sc.Local.SignKey,
+			SSEKey:      sc.Local.SSEKey,
+			SSEKeyfile:  sc.Local.SSEKeyfile,
+			SSEKeyURL:   sc.Local.SSEKeyURL,
+			SSEKeyToken: sc.Local.SSEKeyToken,
+			SSEKMSURL:   sc.Local.SSEKMSURL,
+			SSEKMSKeyID: sc.Local.SSEKMSKeyID,
+			SSEKMSToken: sc.Local.SSEKMSToken,
 		}
 	case storage.BackendS3:
 		fc.S3 = storage.S3Config{

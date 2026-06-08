@@ -130,15 +130,27 @@ func (v *SigV4Verifier) verifyPresigned(r *http.Request) (Key, error) {
 		return Key{}, errors.New("sigv4: unknown access key")
 	}
 	amzDate := q.Get("X-Amz-Date")
+	if amzDate == "" {
+		return Key{}, errors.New("sigv4: missing X-Amz-Date")
+	}
+	signedAt, err := time.Parse("20060102T150405Z", amzDate)
+	if err != nil {
+		return Key{}, errors.New("sigv4: invalid X-Amz-Date")
+	}
 	signedHeaders := strings.Split(q.Get("X-Amz-SignedHeaders"), ";")
 	providedSig := q.Get("X-Amz-Signature")
 
-	// Expiry check.
+	// Expiry check. When X-Amz-Expires is present it MUST be valid and unexpired,
+	// measured from the (now validated) signing date. Previously a missing or
+	// unparseable X-Amz-Date silently skipped expiry entirely, so a URL could
+	// dodge its own expiry by corrupting the date.
 	if exp := q.Get("X-Amz-Expires"); exp != "" {
-		if t, err := time.Parse("20060102T150405Z", amzDate); err == nil {
-			if secs, err := strconv.Atoi(exp); err == nil && secs > 0 && time.Now().UTC().After(t.Add(time.Duration(secs)*time.Second)) {
-				return Key{}, errors.New("sigv4: presigned URL expired")
-			}
+		secs, err := strconv.Atoi(exp)
+		if err != nil || secs <= 0 {
+			return Key{}, errors.New("sigv4: invalid X-Amz-Expires")
+		}
+		if time.Now().UTC().After(signedAt.Add(time.Duration(secs) * time.Second)) {
+			return Key{}, errors.New("sigv4: presigned URL expired")
 		}
 	}
 

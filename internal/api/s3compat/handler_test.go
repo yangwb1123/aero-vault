@@ -193,6 +193,21 @@ func TestMultipartRoundTrip(t *testing.T) {
 	}
 }
 
+// An out-of-range partNumber (e.g. 0) is rejected, not silently accepted.
+func TestMultipart_InvalidPartNumberRejected(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	_, body := do(t, "POST", base+"/b/x.bin?uploads", nil, map[string]string{"Content-Type": "application/octet-stream"})
+	var init initiateMultipartUploadResult
+	if err := xml.Unmarshal(body, &init); err != nil || init.UploadID == "" {
+		t.Fatalf("parse init: %v body=%s", err, body)
+	}
+	resp, _ := do(t, "PUT", base+"/b/x.bin?partNumber=0&uploadId="+init.UploadID, []byte("AAAA"), nil)
+	if resp.StatusCode < 400 {
+		t.Fatalf("partNumber=0 should be rejected, got status %d", resp.StatusCode)
+	}
+}
+
 func TestMultipartAbort(t *testing.T) {
 	s := newTestServer(t)
 	base := s.URL

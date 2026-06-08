@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/cluster"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
@@ -18,21 +19,20 @@ import (
 const leaseRetentionGC = "retention-gc"
 
 type RetentionJob struct {
-	repo             repository.Repository
-	store            storage.Storage
-	interval         time.Duration
-	retention        time.Duration
-	idemTTL          time.Duration
-	clusterSingleton bool
-	holder           string
-	logger           *slog.Logger
+	repo      repository.Repository
+	store     storage.Storage
+	interval  time.Duration
+	retention time.Duration
+	idemTTL   time.Duration
+	singleton *cluster.Singleton
+	logger    *slog.Logger
 }
 
 func NewRetention(repo repository.Repository, store storage.Storage, interval time.Duration, retention time.Duration, logger *slog.Logger) *RetentionJob {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &RetentionJob{repo: repo, store: store, interval: interval, retention: retention, logger: logger}
+	return &RetentionJob{repo: repo, store: store, interval: interval, retention: retention, singleton: cluster.NewSingleton(repo, leaseRetentionGC, logger), logger: logger}
 }
 
 // WithIdempotencyTTL enables GC of idempotency_keys older than ttl, so the
@@ -45,8 +45,7 @@ func (r *RetentionJob) WithIdempotencyTTL(ttl time.Duration) *RetentionJob {
 // WithClusterSingleton makes the (destructive) retention GC run on only one
 // replica at a time, gated by a repository lease held by `holder`.
 func (r *RetentionJob) WithClusterSingleton(holder string) *RetentionJob {
-	r.clusterSingleton = true
-	r.holder = holder
+	r.singleton.Enable(holder)
 	return r
 }
 
@@ -67,20 +66,10 @@ func (r *RetentionJob) Run(ctx context.Context) {
 	}
 }
 
-// maybeSweep runs the sweep, first acquiring the cluster lease when configured
-// as a singleton (TTL 2× interval; the holder renews each round).
+// maybeSweep runs the sweep, gated by the cluster singleton when enabled (lease
+// TTL 2× interval; the holder renews each round).
 func (r *RetentionJob) maybeSweep(ctx context.Context) {
-	if r.clusterSingleton {
-		held, err := r.repo.AcquireLease(ctx, leaseRetentionGC, r.holder, 2*r.interval)
-		if err != nil {
-			r.logger.Warn("retention: acquire lease", "err", err)
-			return
-		}
-		if !held {
-			return
-		}
-	}
-	r.sweep(ctx)
+	r.singleton.Guard(ctx, 2*r.interval, r.sweep)
 }
 
 func (r *RetentionJob) sweep(ctx context.Context) {

@@ -3,6 +3,7 @@ package s3compat
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -166,6 +167,11 @@ func (h *Handler) createMultipartUpload(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) uploadPart(w http.ResponseWriter, r *http.Request, uploadID string, partNumber int) {
+	// S3 part numbers are 1..10000; reject out-of-range (e.g. a missing/0 value).
+	if partNumber < 1 || partNumber > 10000 {
+		writeS3Error(w, r, fmt.Errorf("%w: partNumber must be between 1 and 10000", service.ErrInvalidArgs))
+		return
+	}
 	part, err := h.svc.UploadPart(r.Context(), uploadID, int32(partNumber), r.Body, r.ContentLength)
 	if err != nil {
 		writeS3Error(w, r, err)

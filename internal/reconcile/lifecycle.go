@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/cluster"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
@@ -15,26 +16,24 @@ import (
 const leaseLifecycleSweep = "lifecycle-sweep"
 
 type LifecycleJob struct {
-	repo             repository.Repository
-	store            storage.Storage
-	interval         time.Duration
-	clusterSingleton bool
-	holder           string
-	logger           *slog.Logger
+	repo      repository.Repository
+	store     storage.Storage
+	interval  time.Duration
+	singleton *cluster.Singleton
+	logger    *slog.Logger
 }
 
 func NewLifecycle(repo repository.Repository, store storage.Storage, interval time.Duration, logger *slog.Logger) *LifecycleJob {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &LifecycleJob{repo: repo, store: store, interval: interval, logger: logger}
+	return &LifecycleJob{repo: repo, store: store, interval: interval, singleton: cluster.NewSingleton(repo, leaseLifecycleSweep, logger), logger: logger}
 }
 
 // WithClusterSingleton makes the (destructive) lifecycle sweep run on only one
 // replica at a time, gated by a repository lease held by `holder`.
 func (l *LifecycleJob) WithClusterSingleton(holder string) *LifecycleJob {
-	l.clusterSingleton = true
-	l.holder = holder
+	l.singleton.Enable(holder)
 	return l
 }
 
@@ -55,20 +54,10 @@ func (l *LifecycleJob) Run(ctx context.Context) {
 	}
 }
 
-// maybeSweep runs the sweep, first acquiring the cluster lease when configured
-// as a singleton (TTL 2× interval; the holder renews each round).
+// maybeSweep runs the sweep, gated by the cluster singleton when enabled (lease
+// TTL 2× interval; the holder renews each round).
 func (l *LifecycleJob) maybeSweep(ctx context.Context) {
-	if l.clusterSingleton {
-		held, err := l.repo.AcquireLease(ctx, leaseLifecycleSweep, l.holder, 2*l.interval)
-		if err != nil {
-			l.logger.Warn("lifecycle: acquire lease", "err", err)
-			return
-		}
-		if !held {
-			return
-		}
-	}
-	l.sweep(ctx)
+	l.singleton.Guard(ctx, 2*l.interval, l.sweep)
 }
 
 func (l *LifecycleJob) sweep(ctx context.Context) {

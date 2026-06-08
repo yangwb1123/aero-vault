@@ -22,6 +22,56 @@ func openTenantTestRepo(t *testing.T) repository.Repository {
 	return repo
 }
 
+// TestTenantBudgetOverride verifies the per-tenant daily AI budget round-trips and
+// that the budget and storage-cap setters never clobber each other (they share the
+// tenant_quotas row).
+func TestTenantBudgetOverride(t *testing.T) {
+	ctx := context.Background()
+	repo := openTenantTestRepo(t)
+
+	// Default: no override.
+	q, err := repo.GetTenantQuota(ctx, "acme")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if q.DailyBudgetMicros != 0 {
+		t.Fatalf("default budget should be 0, got %d", q.DailyBudgetMicros)
+	}
+
+	// Set storage caps, then a budget override — the override must not clobber caps.
+	if err := repo.SetTenantQuota(ctx, "acme", 999, 7); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+	if err := repo.SetTenantBudgetMicros(ctx, "acme", 50_000_000); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	q, _ = repo.GetTenantQuota(ctx, "acme")
+	if q.DailyBudgetMicros != 50_000_000 {
+		t.Fatalf("want budget 50e6, got %d", q.DailyBudgetMicros)
+	}
+	if q.MaxBytes != 999 || q.MaxObjects != 7 {
+		t.Fatalf("setting budget clobbered caps: %+v", q)
+	}
+
+	// Updating caps must not clobber the budget.
+	if err := repo.SetTenantQuota(ctx, "acme", 1, 1); err != nil {
+		t.Fatalf("set quota again: %v", err)
+	}
+	q, _ = repo.GetTenantQuota(ctx, "acme")
+	if q.DailyBudgetMicros != 50_000_000 {
+		t.Fatalf("setting quota clobbered budget: %d", q.DailyBudgetMicros)
+	}
+
+	// Clearing with 0 removes the override.
+	if err := repo.SetTenantBudgetMicros(ctx, "acme", 0); err != nil {
+		t.Fatalf("clear budget: %v", err)
+	}
+	q, _ = repo.GetTenantQuota(ctx, "acme")
+	if q.DailyBudgetMicros != 0 {
+		t.Fatalf("override should be cleared, got %d", q.DailyBudgetMicros)
+	}
+}
+
 // TestTenantUpsertGetListDelete walks the full lifecycle: upsert → get → list →
 // delete, checking found/affected reporting along the way.
 func TestTenantUpsertGetListDelete(t *testing.T) {

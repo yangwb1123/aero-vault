@@ -22,11 +22,30 @@ type bucket struct {
 	last   time.Time
 }
 
+const (
+	// rlMaxBuckets caps the per-tenant bucket map. The tenant key comes from the
+	// client-controlled X-Aero-Tenant header, so without a bound a flood of unique
+	// values would grow the map without limit (memory DoS).
+	rlMaxBuckets = 50_000
+	// rlIdleTTL is how long an untouched bucket lives before eviction. A bucket idle
+	// this long has refilled to full, so dropping it loses no rate-limit state.
+	rlIdleTTL = 10 * time.Minute
+)
+
 func NewRateLimiter(rps, burst float64) *RateLimiter {
 	if rps <= 0 || burst <= 0 {
 		return nil
 	}
 	return &RateLimiter{rps: rps, burst: burst, buckets: make(map[string]*bucket)}
+}
+
+// evictIdle drops buckets untouched for longer than rlIdleTTL. Caller holds rl.mu.
+func (rl *RateLimiter) evictIdle(now time.Time) {
+	for k, b := range rl.buckets {
+		if now.Sub(b.last) > rlIdleTTL {
+			delete(rl.buckets, k)
+		}
+	}
 }
 
 func (rl *RateLimiter) Allow(tenant string) (bool, time.Duration) {
@@ -38,6 +57,10 @@ func (rl *RateLimiter) Allow(tenant string) (bool, time.Duration) {
 	b, ok := rl.buckets[tenant]
 	now := time.Now()
 	if !ok {
+		// Bound the map: when it's full, reclaim idle buckets before adding a new one.
+		if len(rl.buckets) >= rlMaxBuckets {
+			rl.evictIdle(now)
+		}
 		b = &bucket{tokens: rl.burst, last: now}
 		rl.buckets[tenant] = b
 	}

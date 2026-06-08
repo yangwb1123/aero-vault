@@ -43,6 +43,42 @@ func newAdminTenantTest(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// TestAdminSetBudget exercises the per-tenant AI budget endpoint end-to-end:
+// a USD value is accepted, persisted as micros, and negatives are rejected.
+func TestAdminSetBudget(t *testing.T) {
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "b.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	reg, _ := auth.Parse("")
+	adm := NewAdminHandler(nil, repo, reg)
+	r := chi.NewRouter()
+	r.Put("/v1/admin/tenants/{tenant}/budget", adm.SetBudget)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	resp, body := req(t, "PUT", srv.URL+"/v1/admin/tenants/acme/budget", []byte(`{"daily_budget_usd":25}`), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set budget: status=%d body=%s", resp.StatusCode, body)
+	}
+	q, err := repo.GetTenantQuota(ctx, "acme")
+	if err != nil {
+		t.Fatalf("get quota: %v", err)
+	}
+	if q.DailyBudgetMicros != 25_000_000 {
+		t.Fatalf("want 25e6 persisted, got %d", q.DailyBudgetMicros)
+	}
+
+	resp2, _ := req(t, "PUT", srv.URL+"/v1/admin/tenants/acme/budget", []byte(`{"daily_budget_usd":-1}`), nil)
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative budget should be 400, got %d", resp2.StatusCode)
+	}
+}
+
 func TestAdminTenantCRUD(t *testing.T) {
 	s := newAdminTenantTest(t)
 	base := s.URL + "/v1/admin/tenants"

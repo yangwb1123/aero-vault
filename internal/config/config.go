@@ -36,11 +36,12 @@ type AppConfig struct {
 }
 
 type StorageConfig struct {
-	Backend string
-	Local   LocalStorageConfig
-	S3      S3StorageConfig
-	OSS     OSSStorageConfig
-	COS     COSStorageConfig
+	Backend          string
+	SSERewrapOnStart bool
+	Local            LocalStorageConfig
+	S3               S3StorageConfig
+	OSS              OSSStorageConfig
+	COS              COSStorageConfig
 }
 
 type OSSStorageConfig struct {
@@ -57,10 +58,16 @@ type COSStorageConfig struct {
 }
 
 type LocalStorageConfig struct {
-	Root      string
-	PublicURL string
-	SignKey   string
-	SSEKey    string
+	Root        string
+	PublicURL   string
+	SignKey     string
+	SSEKey      string
+	SSEKeyfile  string
+	SSEKeyURL   string
+	SSEKeyToken string
+	SSEKMSURL   string
+	SSEKMSKeyID string
+	SSEKMSToken string
 }
 
 type S3StorageConfig struct {
@@ -125,6 +132,9 @@ type AIConfig struct {
 	ChatCostCompletionPer1K float64
 	// Per-tenant daily AI spend cap (USD; 0 = unlimited). Enforced at the chat seam.
 	TenantDailyBudgetUSD float64
+	// PerTenantBudgets lets each tenant override TenantDailyBudgetUSD via its
+	// stored quota row (set through the admin budget endpoint).
+	PerTenantBudgets bool
 
 	RerankProvider string // "http" | "heuristic" | ""
 	RerankEndpoint string
@@ -216,12 +226,19 @@ func Load() (*Config, error) {
 			LogLevel: logLevel,
 		},
 		Storage: StorageConfig{
-			Backend: strings.ToLower(getEnv("STORAGE_BACKEND", "local")),
+			Backend:          strings.ToLower(getEnv("STORAGE_BACKEND", "local")),
+			SSERewrapOnStart: getEnvBool("STORAGE_SSE_REWRAP_ON_START", false),
 			Local: LocalStorageConfig{
-				Root:      getEnv("STORAGE_LOCAL_ROOT", "./var/objects"),
-				PublicURL: getEnv("STORAGE_LOCAL_PUBLIC_URL", ""),
-				SignKey:   getEnv("STORAGE_LOCAL_SIGN_KEY", ""),
-				SSEKey:    getEnv("STORAGE_LOCAL_SSE_KEY", ""),
+				Root:        getEnv("STORAGE_LOCAL_ROOT", "./var/objects"),
+				PublicURL:   getEnv("STORAGE_LOCAL_PUBLIC_URL", ""),
+				SignKey:     getEnv("STORAGE_LOCAL_SIGN_KEY", ""),
+				SSEKey:      getEnv("STORAGE_LOCAL_SSE_KEY", ""),
+				SSEKeyfile:  getEnv("STORAGE_LOCAL_SSE_KEYFILE", ""),
+				SSEKeyURL:   getEnv("STORAGE_LOCAL_SSE_KEY_URL", ""),
+				SSEKeyToken: getEnv("STORAGE_LOCAL_SSE_KEY_TOKEN", ""),
+				SSEKMSURL:   getEnv("STORAGE_LOCAL_SSE_KMS_URL", ""),
+				SSEKMSKeyID: getEnv("STORAGE_LOCAL_SSE_KMS_KEY_ID", ""),
+				SSEKMSToken: getEnv("STORAGE_LOCAL_SSE_KMS_TOKEN", ""),
 			},
 			S3: S3StorageConfig{
 				Endpoint:       getEnv("STORAGE_S3_ENDPOINT", ""),
@@ -285,6 +302,7 @@ func Load() (*Config, error) {
 			ChatCostPromptPer1K:     getEnvFloat("AI_COST_PROMPT_PER_1K", 0),
 			ChatCostCompletionPer1K: getEnvFloat("AI_COST_COMPLETION_PER_1K", 0),
 			TenantDailyBudgetUSD:    getEnvFloat("AI_TENANT_DAILY_BUDGET_USD", 0),
+			PerTenantBudgets:        getEnvBool("AI_PER_TENANT_BUDGETS", false),
 
 			RerankProvider: strings.ToLower(getEnv("AI_RERANK_PROVIDER", "")),
 			RerankEndpoint: getEnv("AI_RERANK_ENDPOINT", ""),
@@ -339,9 +357,10 @@ func Load() (*Config, error) {
 			Storage: StorageConfig{
 				Backend: strings.ToLower(getEnv("REPLICATION_BACKEND", "local")),
 				Local: LocalStorageConfig{
-					Root:    getEnv("REPLICATION_LOCAL_ROOT", ""),
-					SignKey: getEnv("REPLICATION_LOCAL_SIGN_KEY", ""),
-					SSEKey:  getEnv("REPLICATION_LOCAL_SSE_KEY", ""),
+					Root:       getEnv("REPLICATION_LOCAL_ROOT", ""),
+					SignKey:    getEnv("REPLICATION_LOCAL_SIGN_KEY", ""),
+					SSEKey:     getEnv("REPLICATION_LOCAL_SSE_KEY", ""),
+					SSEKeyfile: getEnv("REPLICATION_LOCAL_SSE_KEYFILE", ""),
 				},
 				S3: S3StorageConfig{
 					Endpoint:       getEnv("REPLICATION_S3_ENDPOINT", ""),

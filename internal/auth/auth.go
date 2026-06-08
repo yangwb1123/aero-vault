@@ -58,6 +58,10 @@ type Registry struct {
 	store    PersistentStore // optional repo-backed store for runtime keys (hashed)
 	anonRead bool            // allow unauthenticated GET/HEAD on object paths (ACL-gated)
 	keyCache *keyCache       // optional bounded TTL cache for persisted-key lookups (nil = off)
+	// keyChangePublisher, when set, is invoked after a local persisted-key
+	// add/revoke with the affected token hash, so other replicas can drop it from
+	// their caches immediately. nil = single-instance (local invalidation only).
+	keyChangePublisher func(ctx context.Context, tokenHash string)
 }
 
 // Parse turns the AUTH_KEYS env string into a Registry. An empty string
@@ -121,6 +125,30 @@ func (r *Registry) WithKeyCache(ttl time.Duration, capacity int) *Registry {
 	defer r.mu.Unlock()
 	r.keyCache = newKeyCache(ttl, capacity)
 	return r
+}
+
+// WithKeyChangePublisher wires a cross-instance notifier invoked on a successful
+// persisted-key AddKey/RevokeKey with the affected token hash. Paired with
+// InvalidateCachedKey on the receiving side (via a transport such as Postgres
+// LISTEN/NOTIFY), it propagates a revoke to every replica immediately instead of
+// waiting out the key-cache TTL. No-op contribution when key caching is off.
+func (r *Registry) WithKeyChangePublisher(fn func(ctx context.Context, tokenHash string)) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.keyChangePublisher = fn
+	return r
+}
+
+// InvalidateCachedKey drops a token hash from the local key cache. Safe to call on
+// any replica (no-op when caching is disabled); the key-change listener calls it to
+// apply a remote add/revoke.
+func (r *Registry) InvalidateCachedKey(tokenHash string) {
+	r.mu.RLock()
+	cache := r.keyCache
+	r.mu.RUnlock()
+	if cache != nil {
+		cache.delete(tokenHash)
+	}
 }
 
 // WithSigV4 enables AWS SigV4 verification for S3 requests.
@@ -231,6 +259,7 @@ func (r *Registry) AddKey(ctx context.Context, k Key, expiresAt, label string) e
 	r.mu.Lock()
 	store := r.store
 	cache := r.keyCache
+	pub := r.keyChangePublisher
 	if store == nil {
 		r.keys[k.Token] = k
 		r.enabled = true
@@ -245,13 +274,20 @@ func (r *Registry) AddKey(ctx context.Context, k Key, expiresAt, label string) e
 	if cache != nil {
 		cache.delete(HashToken(k.Token))
 	}
-	return store.PutAPIKey(ctx, PersistedKey{
+	if err := store.PutAPIKey(ctx, PersistedKey{
 		TokenHash: HashToken(k.Token),
 		TenantID:  k.Tenant,
 		Scopes:    scopesToString(k.Scopes),
 		Label:     label,
 		ExpiresAt: expiresAt,
-	})
+	}); err != nil {
+		return err
+	}
+	// Tell other replicas to drop any cached copy of this hash.
+	if pub != nil {
+		pub(ctx, HashToken(k.Token))
+	}
+	return nil
 }
 
 // RevokeKey removes an API key from the in-memory set and, when present, the
@@ -264,6 +300,7 @@ func (r *Registry) RevokeKey(ctx context.Context, token string) (bool, error) {
 	}
 	store := r.store
 	cache := r.keyCache
+	pub := r.keyChangePublisher
 	r.mu.Unlock()
 	// Invalidate the local cache so a revoke takes effect immediately.
 	if cache != nil {
@@ -273,6 +310,10 @@ func (r *Registry) RevokeKey(ctx context.Context, token string) (bool, error) {
 		deleted, err := store.DeleteAPIKeyByHash(ctx, HashToken(token))
 		if err != nil {
 			return false, err
+		}
+		// Tell other replicas to drop any cached copy of this hash.
+		if pub != nil {
+			pub(ctx, HashToken(token))
 		}
 		return ok || deleted, nil
 	}
@@ -415,7 +456,9 @@ func (r *Registry) Middleware() func(http.Handler) http.Handler {
 func (r *Registry) Require(s Scope) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			if !r.enabled {
+			// Use Enabled() (env keys OR jwt OR sigv4 OR store), not the env-keys-only
+			// `enabled` field, so a JWT/SigV4/store-only config still enforces scopes.
+			if !r.Enabled() {
 				next.ServeHTTP(w, req)
 				return
 			}

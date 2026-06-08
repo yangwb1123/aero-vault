@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
 // Search is the user-facing semantic-search service. It embeds the query,
@@ -108,8 +109,14 @@ func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
 	if mode == "" {
 		mode = "vector"
 	}
+	if mode != "vector" && mode != "bm25" && mode != "hybrid" {
+		return nil, fmt.Errorf("invalid search mode %q: want vector, bm25, or hybrid", mode)
+	}
 	if (mode == "bm25" || mode == "hybrid") && s.bm25 == nil && s.lexical == nil {
 		return nil, fmt.Errorf("bm25 not enabled; set search mode to vector or build the BM25 index")
+	}
+	if (mode == "vector" || mode == "hybrid") && s.embedder == nil {
+		return nil, fmt.Errorf("vector search unavailable: no embedder configured")
 	}
 	// Keep the request's normalized fields (K/Mode defaults applied) on req so
 	// the cache key reflects exactly what the retrieval path will use.
@@ -125,7 +132,9 @@ func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
 		}
 	}
 
-	// Collect ranked lists per modality.
+	// Collect ranked lists per modality. Time from here (a confirmed cache miss)
+	// so the histogram reflects real retrieval+rerank cost, not cache hits.
+	start := time.Now()
 	type ranked struct {
 		chunkID int64
 		score   float32
@@ -271,6 +280,7 @@ func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
 	}); err != nil {
 		s.logger.Warn("audit usage failed", "err", err)
 	}
+	telemetry.RecordSearchLatency(ctx, mode, float64(time.Since(start).Milliseconds()))
 	if s.results != nil {
 		s.results.put(cacheKey, out)
 	}

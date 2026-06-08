@@ -101,9 +101,10 @@ burst.
   scrape (verified). Ships with a Grafana dashboard
   (`deploy/grafana/aero-vault-ai-ops-dashboard.json`) and Prometheus alert rules
   (`deploy/prometheus/alerts.yml`: 5xx rate, p95 latency, per-tenant spend,
-  orphan-blob accumulation, replay storms, dropped events). *Remaining:*
-  embedding/search latency histograms, and validating live dashboards against a
-  running Grafana/collector.
+  orphan-blob accumulation, replay storms, dropped events). **Embedding/search
+  latency histograms** ✅ *added* (`ai_embed_duration_ms{model}`,
+  `ai_search_duration_ms{mode}`). *Remaining (external):* validating live
+  dashboards against a running Grafana/collector.
 - **Cost accounting:** extend `Usage` with token counts + estimated cost +
   latency, and enforce **per-tenant AI budgets/quotas** at the `Chat`/`Embed`
   seam (reuse the existing quota machinery). ✅ *Accounting implemented.*
@@ -114,9 +115,13 @@ burst.
   API surfaces them. **Per-tenant daily budget enforcement** ✅ *also implemented*
   (`AI_TENANT_DAILY_BUDGET_USD`): the chat seam sums the tenant's recorded spend
   for the current UTC day via `repo.SumAICostMicros` and rejects over-budget
-  calls before invoking the LLM (REST returns `402 BudgetExceeded`).
-  *Remaining:* record embedder usage (the HTTP embedder doesn't yet surface
-  token counts); per-tenant budget *overrides* (currently one global cap).
+  calls before invoking the LLM (REST returns `402 BudgetExceeded`). **Per-tenant
+  budget overrides** ✅ *added* (`AI_PER_TENANT_BUDGETS` + `PUT /v1/admin/tenants/
+  {tenant}/budget`): each tenant can override the global default via its stored
+  quota row (`daily_budget_micros`); the override wins when set and enforces even
+  without a global cap. **Embedder usage** ✅ *added*: the HTTP embedder parses the
+  provider's `usage` and surfaces it as `ai_embed_requests_total` /
+  `ai_embed_tokens_total{model}`, so embedding spend is observable alongside chat.
 - **Backpressure:** queue-depth caps with `429 + Retry-After`, and a
   dead-letter path for jobs that exhaust retries (the admin `ListJobs`/`RetryJob`
   surface already exists to operate it). ✅ *Implemented.* The durable queue
@@ -124,7 +129,7 @@ burst.
   via admin retry); added a **depth cap** — `Queue.WithMaxDepth`
   (`JOBS_MAX_DEPTH`) backed by `repo.CountJobsByStatus("pending")` returns
   `ErrQueueFull` once the backlog is reached, so enqueue sites can shed load /
-  return 429. *Remaining:* embedding & hot-search result caching.
+  return 429.
 - **Caching:** memoize embeddings and hot search results to cut both latency and
   cost. ✅ *Embedding cache implemented.* `ai.NewCachingEmbedder`
   (`AI_EMBED_CACHE_SIZE`) wraps any embedder in a bounded in-memory cache so
@@ -178,7 +183,10 @@ most basic production topology.
   lifecycle sweeps so only the lease holder runs them; a dead holder's lease
   frees after ~2 intervals. (BM25 rebuild stays per-replica by design — each
   instance needs its own in-memory index; the real fix is a shared index, #1.)
-  *Remaining:* a generic leader-election helper for any future singleton.
+  The lease gating is now a reusable **`cluster.Singleton`** helper ✅ *added*
+  (`Enable`/`Guard`, fail-safe on lease error) that the reconcile, lifecycle and
+  retention sweeps share — a generic leader-election primitive for any future
+  singleton task.
 - **Shared index + config** so replicas don't each rebuild/hold their own
   (couples naturally with #1's persisted index and #4's persisted keys).
 
@@ -208,13 +216,35 @@ plaintext — the latter is a hard blocker for SOC2/ISO and most security review
   `RevokeKey`/`ListKeys` survive restart and are shared across replicas, and
   expired keys are rejected. **Read-through cache** ✅ *added*
   (`Registry.WithKeyCache` / `AUTH_KEY_CACHE_TTL_SECONDS`): bounded TTL'd cache
-  in front of the store lookup, invalidated locally on add/revoke (cross-replica
-  revokes bounded by the short TTL). Persisted **tenant** records ✅ *done* (see
-  the tenant-CRUD item below). *Remaining:* event-driven cross-replica cache
-  invalidation (a refinement over the TTL).
-- **Pluggable secret backend** (KMS / Vault / `age`) for the envelope-encryption
-  keys, with **key versioning + rotation** (the storage layer already does
-  envelope SSE — it needs a real key source and re-wrap-on-rotate).
+  in front of the store lookup, invalidated locally on add/revoke. **Event-driven
+  cross-replica invalidation** ✅ *added* (`Registry.WithKeyChangePublisher` /
+  `InvalidateCachedKey`): a successful persisted add/revoke broadcasts the token
+  hash over a **dedicated** Postgres LISTEN/NOTIFY channel (`aero_key_invalidate`,
+  reusing `EVENTS_TRANSPORT_DSN`), so other replicas drop the entry immediately
+  rather than waiting out the TTL. The channel is separate from the lifecycle bus,
+  so key hashes never reach webhooks or the durable event log. Persisted **tenant**
+  records ✅ *done* (see the tenant-CRUD item below).
+- **Pluggable secret backend** for the envelope-encryption keys, with **key
+  versioning + rotation** ✅ *done*. A `storage.SecretProvider` interface supplies
+  versioned master keys; the object envelope records the key id (`kid`) so the
+  master key rotates **without rewriting objects** — old objects decrypt under
+  their original version, new writes use the current one. Two built-in providers:
+  `env` (single passphrase = pre-existing behaviour; stamps no id → byte-compatible
+  with old envelopes) and `keyfile` (`STORAGE_LOCAL_SSE_KEYFILE` — a JSON key ring
+  with a `primary` pointer), with the former env key serving as the legacy slot for
+  no-id objects. Background **re-wrap** ✅ *added* (`STORAGE_SSE_REWRAP_ON_START`
+  → `storage.RewrapStale`): on boot, objects still on an older key id are
+  re-wrapped onto the current key — rewriting only the sidecar envelope (the body
+  is untouched), idempotent — so retired key versions can be dropped from the ring.
+  An **HTTP secret-store provider** ✅ *added* (`STORAGE_LOCAL_SSE_KEY_URL` +
+  `_TOKEN`) fetches the key ring from a Vault-KV-style endpoint (bearer auth)
+  instead of a local file, keeping key material off-disk. A **remote-wrap KMS
+  client** ✅ *added* (`DataKeyWrapper` + `STORAGE_LOCAL_SSE_KMS_URL`): the
+  per-object data key is wrapped/unwrapped over HTTP (`/wrap`, `/unwrap`) so the
+  master key **never reaches aero-vault**; the envelope records `wrap:"kms"` + the
+  KMS key id (backward-compatible — local envelopes are unchanged). Speaks a small
+  generic shape compatible with a thin proxy in front of AWS/GCP KMS or Vault
+  Transit. *Remaining (external):* validating against a real KMS deployment.
 - Admin CRUD for tenants, quotas, and bucket policies, with an **audit trail**
   (the persisted event log is a natural foundation). ✅ *Tenant CRUD + quotas +
   bucket policies done.* Persisted `tenants` table (migration `0015`, verified on
@@ -268,7 +298,8 @@ under retry, burst, or failure recovery:
   (`internal/reconcile/retention.go`, `RECONCILE_RETENTION_DAYS`) permanently
   purges rows soft-deleted longer ago than the window — and their blobs — via
   the new `repo.ListSoftDeletedBefore`; it honors object-lock and runs as a
-  cluster singleton. *Remaining:* a dropped-event metric for #3's 64-buffer.
+  cluster singleton. The **dropped-event metric** for #3's 64-buffer is ✅ done
+  (`events_dropped_total` via `telemetry.IncEventDropped` / `Bus.Dropped()`).
 
 These are individually small but collectively define whether the platform is
 **trustworthy with data** when it's busy — which is when trust matters most.

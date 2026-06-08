@@ -201,6 +201,55 @@ func TestKeyCache_DisabledPassesThrough(t *testing.T) {
 	}
 }
 
+// TestKeyChangePublisher_FiredOnAddAndRevoke verifies the cross-instance notifier
+// fires with the affected token hash on a successful persisted add/revoke.
+func TestKeyChangePublisher_FiredOnAddAndRevoke(t *testing.T) {
+	ctx := context.Background()
+	reg, _ := Parse("")
+	var got []string
+	reg.WithStore(newFakeStore()).WithKeyChangePublisher(func(_ context.Context, hash string) {
+		got = append(got, hash)
+	})
+
+	const tok = "propagate-me"
+	if err := reg.AddKey(ctx, Key{Token: tok, Tenant: "acme", Scopes: map[Scope]bool{ScopeRead: true}}, "", ""); err != nil {
+		t.Fatalf("AddKey: %v", err)
+	}
+	if _, err := reg.RevokeKey(ctx, tok); err != nil {
+		t.Fatalf("RevokeKey: %v", err)
+	}
+	want := HashToken(tok)
+	if len(got) != 2 || got[0] != want || got[1] != want {
+		t.Fatalf("publisher should fire with the token hash on add+revoke, got %v (want %q twice)", got, want)
+	}
+}
+
+// TestInvalidateCachedKey_DropsEntry simulates a remote revoke applied locally:
+// invalidating the cached hash forces the next lookup back to the store.
+func TestInvalidateCachedKey_DropsEntry(t *testing.T) {
+	ctx := context.Background()
+	reg, _ := Parse("")
+	cs := newCountingStore()
+	reg.WithStore(cs).WithKeyCache(time.Minute, 16)
+
+	const tok = "remote-revoke"
+	if err := reg.AddKey(ctx, Key{Token: tok, Tenant: "acme", Scopes: map[Scope]bool{ScopeRead: true}}, "", ""); err != nil {
+		t.Fatalf("AddKey: %v", err)
+	}
+	reg.Lookup(ctx, tok) // populates cache (store gets == 1)
+	reg.Lookup(ctx, tok) // served from cache (store gets still 1)
+	if cs.gets != 1 {
+		t.Fatalf("expected 1 store get before invalidation, got %d", cs.gets)
+	}
+
+	// A remote replica revoked it → apply the invalidation locally.
+	reg.InvalidateCachedKey(HashToken(tok))
+	reg.Lookup(ctx, tok) // cache dropped → store queried again
+	if cs.gets != 2 {
+		t.Fatalf("expected store re-queried after invalidation, got %d gets", cs.gets)
+	}
+}
+
 // TestNoStore_DefaultDisabled guards the MVP posture: without env keys / JWT /
 // SigV4 / store, auth stays disabled (pass-through).
 func TestNoStore_DefaultDisabled(t *testing.T) {
