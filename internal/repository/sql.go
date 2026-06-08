@@ -430,7 +430,7 @@ FROM objects WHERE tenant_id=$1 AND bucket=$2 AND key=$3 ORDER BY updated_at DES
 		}
 		out = append(out, obj)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *sqlStore) UpdateTags(ctx context.Context, tenant, bucket, key string, tags map[string]string) error {
@@ -629,7 +629,7 @@ LIMIT $1`), limit)
 		}
 		_ = q
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // ListSoftDeletedBefore finds objects that were soft-deleted (deleted_at set)
@@ -784,7 +784,7 @@ func (s *sqlStore) ListParts(ctx context.Context, uploadID string) ([]PartRecord
 		}
 		out = append(out, p)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // --- Events ---
@@ -848,7 +848,7 @@ FROM object_events WHERE consumed_at IS NULL ORDER BY id ASC LIMIT $1`
 		e.Payload, _ = unmarshalKV(payload)
 		out = append(out, e)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *sqlStore) MarkEventConsumed(ctx context.Context, id int64) error {
@@ -1037,7 +1037,7 @@ FROM ai_usage WHERE tenant_id=$1 ORDER BY id DESC LIMIT $2`
 			break
 		}
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // --- Scanners ---
@@ -1119,7 +1119,7 @@ func scanChunks(rows *sql.Rows) ([]Chunk, error) {
 		c.Embedding = decodeEmbedding(embedRaw)
 		out = append(out, c)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func scanUsages(rows *sql.Rows) ([]Usage, error) {
@@ -1139,7 +1139,7 @@ func scanUsages(rows *sql.Rows) ([]Usage, error) {
 		u.CreatedAt = createdT.Time
 		out = append(out, u)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // --- Helpers ---

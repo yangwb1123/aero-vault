@@ -38,8 +38,15 @@ func Create(outPath, dbPath, objectsRoot string) error {
 	tw := tar.NewWriter(gz)
 	defer tw.Close()
 
-	// DB files
-	for _, suffix := range []string{"", "-wal", "-shm"} {
+	// DB files: the main database is mandatory — a snapshot without it is a silent
+	// empty backup. The WAL/SHM sidecars are optional (may be checkpointed away).
+	if _, err := os.Stat(dbFile); err != nil {
+		return fmt.Errorf("snapshot: database file %q not found: %w", dbFile, err)
+	}
+	if err := addFile(tw, dbFile, "db/"+filepath.Base(dbFile)); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
 		path := dbFile + suffix
 		if _, err := os.Stat(path); err != nil {
 			continue

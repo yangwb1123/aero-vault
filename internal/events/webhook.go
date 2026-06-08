@@ -171,7 +171,12 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 		mac.Write(body)
 		sig = "sha256=" + hex.EncodeToString(mac.Sum(nil))
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, f.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL, bytes.NewReader(body))
+	if err != nil {
+		// A malformed URL must not panic the retry loop; record the failed attempt.
+		w.persistFailure(ctx, f.EventID, f.URL, body, "bad url: "+err.Error(), 0, f.Attempts+1)
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if sig != "" {
 		req.Header.Set("X-Aero-Signature", sig)

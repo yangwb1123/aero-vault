@@ -69,6 +69,16 @@ func TestRestore_BadDSNErrors(t *testing.T) {
 	}
 }
 
+// A snapshot whose main database file is missing must FAIL, not silently produce
+// an archive with no database (which would be an undetected empty backup).
+func TestCreate_MissingMainDBFails(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "snap.tar.gz")
+	if err := Create(out, "file:"+filepath.Join(dir, "missing.db"), dir); err == nil {
+		t.Fatal("Create must fail when the main database file is missing")
+	}
+}
+
 func TestCreate_MissingObjectsRootIsOK(t *testing.T) {
 	// objectsRoot that does not exist must not fail Create (filepath.Walk's
 	// ErrNotExist is swallowed); the DB file should still be archived.

@@ -274,7 +274,10 @@ func (s *Server) readResource(ctx context.Context, raw json.RawMessage) (any, *r
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	defer rc.Close()
-	body, _ := io.ReadAll(io.LimitReader(rc, 4<<20))
+	body, err := io.ReadAll(io.LimitReader(rc, 4<<20))
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: "read object: " + err.Error()}
+	}
 	return readResourceResult{Contents: []resourceContent{{
 		URI: p.URI, MimeType: obj.ContentType, Text: string(body),
 	}}}, nil
