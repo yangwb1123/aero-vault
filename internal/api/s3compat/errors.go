@@ -32,6 +32,16 @@ func classify(err error) (string, string, int) {
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrRangeNotSatisfiable):
 		return "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable
+	case errors.Is(err, service.ErrPreconditionFailed):
+		return "PreconditionFailed", "At least one of the preconditions you specified did not hold.", http.StatusPreconditionFailed
+	case errors.Is(err, service.ErrUploadNotFound), errors.Is(err, repository.ErrUploadNotFound):
+		return "NoSuchUpload", "The specified multipart upload does not exist.", http.StatusNotFound
+	case errors.Is(err, service.ErrLocked):
+		return "AccessDenied", "Object is under retention lock (WORM).", http.StatusForbidden
+	case errors.Is(err, service.ErrQuotaExceeded):
+		return "QuotaExceeded", "The tenant storage quota has been exceeded.", http.StatusForbidden
+	case errors.Is(err, service.ErrForbidden):
+		return "AccessDenied", "Access denied.", http.StatusForbidden
 	default:
 		return "InternalError", err.Error(), http.StatusInternalServerError
 	}
