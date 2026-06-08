@@ -90,7 +90,7 @@ func (e *RemoteExtractor) Extract(ctx context.Context, contentType string, r io.
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return "", fmt.Errorf("remote extractor http %d: %s", resp.StatusCode, string(raw))
 	}
 	var out remoteExtractResp

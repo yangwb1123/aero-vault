@@ -145,7 +145,7 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("embedder http %d: %s", resp.StatusCode, string(b))
 	}
 	var er embedResp

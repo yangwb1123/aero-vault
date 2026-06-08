@@ -147,6 +147,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	}
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+	writeMetadataHeaders(w, obj.Metadata)
 	_, _ = io.Copy(w, rc)
 }
 
@@ -166,6 +167,7 @@ func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, tenant, key
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+length-1, obj.Size))
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+	writeMetadataHeaders(w, obj.Metadata)
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = io.Copy(w, rc)
 }
@@ -194,6 +196,7 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+	writeMetadataHeaders(w, obj.Metadata)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -349,6 +352,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeMetadataHeaders emits stored user metadata as X-Meta-<key> response headers
+// (the inverse of extractMetadataHeaders), so GET/HEAD return the metadata a PUT
+// stored — previously it was write-only.
+func writeMetadataHeaders(w http.ResponseWriter, meta map[string]string) {
+	for k, v := range meta {
+		w.Header().Set("X-Meta-"+k, v)
+	}
 }
 
 // extractMetadataHeaders pulls user-metadata from X-Amz-Meta-* and X-Meta-*.

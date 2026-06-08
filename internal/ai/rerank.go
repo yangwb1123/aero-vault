@@ -87,7 +87,7 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, hits []Hit, top
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("reranker http %d: %s", resp.StatusCode, string(raw))
 	}
 	var out rerankResp

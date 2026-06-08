@@ -117,7 +117,7 @@ func (l *HTTPLLM) Chat(ctx context.Context, req ChatRequest) (ChatResponse, erro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return ChatResponse{}, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(raw))
 	}
 	var r chatAPIResp
@@ -175,7 +175,7 @@ func (l *HTTPLLM) ChatStream(ctx context.Context, req ChatRequest, onChunk func(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return ChatResponse{}, fmt.Errorf("llm stream http %d: %s", resp.StatusCode, string(raw))
 	}
 	var content strings.Builder
