@@ -90,6 +90,23 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant := mw.TenantFrom(r.Context())
+	// Version-specific read: GET ...?versionId=<id> serves that stored version.
+	if vid := r.URL.Query().Get("versionId"); vid != "" {
+		rc, obj, err := h.svc.GetVersion(r.Context(), tenant, bucket, key, vid)
+		if err != nil {
+			writeS3Error(w, r, err)
+			return
+		}
+		defer rc.Close()
+		writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
+		w.Header().Set("x-amz-version-id", obj.VersionID)
+		for k, v := range obj.Metadata {
+			w.Header().Set("x-amz-meta-"+k, v)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, rc)
+		return
+	}
 	// Range request → 206 Partial Content.
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
 		if obj, err := h.svc.Stat(r.Context(), tenant, bucket, key); err == nil {
@@ -134,7 +151,23 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HeadObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
-	obj, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), bucket, key)
+	tenant := mw.TenantFrom(r.Context())
+	if vid := r.URL.Query().Get("versionId"); vid != "" {
+		rc, obj, err := h.svc.GetVersion(r.Context(), tenant, bucket, key, vid)
+		if err != nil {
+			writeS3Error(w, r, err)
+			return
+		}
+		_ = rc.Close() // HEAD: metadata only
+		writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
+		w.Header().Set("x-amz-version-id", obj.VersionID)
+		for k, v := range obj.Metadata {
+			w.Header().Set("x-amz-meta-"+k, v)
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	obj, err := h.svc.Stat(r.Context(), tenant, bucket, key)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
