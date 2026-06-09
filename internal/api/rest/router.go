@@ -18,8 +18,9 @@ import (
 
 var errInvalidPostKey = errors.New("invalid request: use /files/<key>/presign or POST /files multipart form")
 
-// NewRouter returns a sub-router mounted at /v1.
-func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger) chi.Router {
+// NewRouter returns a sub-router mounted at /v1. idemHashBody folds a hash of
+// the request body into Idempotency-Key fingerprints (IDEMPOTENCY_HASH_BODY).
+func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger, idemHashBody bool) chi.Router {
 	h := NewHandler(svc, logger)
 	aih := NewAIHandler(repo, search, chat, agent, logger)
 	sse := NewSSEHandler(bus, repo, logger)
@@ -34,7 +35,7 @@ func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.
 	// Object mutations are Idempotency-Key aware (opt-in via the header): a
 	// retried write replays the original response instead of duplicating it.
 	r.Group(func(r chi.Router) {
-		r.Use(idempotency(repo, logger))
+		r.Use(idempotency(repo, logger, idemHashBody))
 		r.Post("/files", h.PostForm)
 		r.Post("/files/*", h.postKey)
 		r.Put("/files/*", h.putKey)

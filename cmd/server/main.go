@@ -428,7 +428,7 @@ func run() error {
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
 
-	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger))
+	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody))
 	if cfg.S3Compat.Prefix != "" {
 		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger))
 	}

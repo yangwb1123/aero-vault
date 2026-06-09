@@ -1,10 +1,13 @@
 package rest
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -28,7 +31,14 @@ import (
 //     in progress: 409 Conflict.
 //   - Idempotency store error: fail closed with 500 (never risk a silent
 //     duplicate write).
-func idempotency(repo repository.Repository, logger *slog.Logger) func(http.Handler) http.Handler {
+//
+// hashBody (IDEMPOTENCY_HASH_BODY) extends the fingerprint with a SHA-256 of
+// the request body (v2): the same key replayed with different bytes is
+// rejected instead of replayed. The body is spooled — at most
+// idemSpoolThreshold bytes in memory, beyond that in a temp file — and handed
+// to the downstream handler unchanged; a body that cannot be read fails closed
+// with 500 before any claim is taken.
+func idempotency(repo repository.Repository, logger *slog.Logger, hashBody bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := r.Header.Get("Idempotency-Key")
@@ -40,6 +50,18 @@ func idempotency(repo repository.Repository, logger *slog.Logger) func(http.Hand
 			tenant := mw.TenantFrom(ctx)
 			reqID := mw.RequestIDFrom(ctx)
 			fp := fingerprint(r)
+			if hashBody {
+				sp, bodyHash, err := spoolBody(r)
+				if err != nil {
+					logger.Warn("idempotency body spool failed", "err", err, "key", key, "tenant", tenant)
+					writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{
+						Code: "InternalError", Message: "could not buffer request body", RequestID: reqID,
+					}})
+					return
+				}
+				defer sp.Close()
+				fp = bodyFingerprint(r, bodyHash)
+			}
 
 			rec, claimed, err := repo.ClaimIdempotencyKey(ctx, tenant, key, fp, reqID)
 			if err != nil {
@@ -136,11 +158,107 @@ func idemConflict(w http.ResponseWriter, reqID, msg string) {
 }
 
 // fingerprint identifies the request so the same key reused for a different
-// method/path is rejected. Bodies are not hashed (uploads are not re-readable),
-// so this guards against same-key/different-target, not same-key/different-bytes.
+// method/path is rejected. Bodies are not part of this v1 fingerprint, so it
+// guards against same-key/different-target, not same-key/different-bytes —
+// bodyFingerprint covers that when IDEMPOTENCY_HASH_BODY is on.
 func fingerprint(r *http.Request) string {
 	sum := sha256.Sum256([]byte(r.Method + " " + r.URL.Path))
 	return hex.EncodeToString(sum[:])
+}
+
+// bodyFingerprint is the v2 fingerprint: it folds the hex SHA-256 of the
+// request body (computed by spoolBody) into the hash so the same key replayed
+// with different bytes no longer matches and is rejected with 409.
+func bodyFingerprint(r *http.Request, bodyHash string) string {
+	sum := sha256.Sum256([]byte(r.Method + " " + r.URL.Path + " " + bodyHash))
+	return hex.EncodeToString(sum[:])
+}
+
+// idemSpoolThreshold is the number of request-body bytes kept in memory before
+// spoolBody switches to an on-disk temp file, so hashing a large upload never
+// pins the whole payload in RAM (same bound as the WebDAV spillBuffer).
+const idemSpoolThreshold = 8 << 20 // 8 MiB
+
+// idemSpool buffers a request body that was consumed for fingerprint hashing
+// so it can be replayed to the downstream handler: at most idemSpoolThreshold
+// bytes in memory, anything larger in a temp file. Close releases the memory
+// and removes the temp file; it is safe to call multiple times.
+type idemSpool struct {
+	mem  []byte
+	file *os.File
+}
+
+func (s *idemSpool) Write(p []byte) (int, error) {
+	if s.file == nil && len(s.mem)+len(p) > idemSpoolThreshold {
+		f, err := os.CreateTemp("", "aero-idem-*")
+		if err != nil {
+			return 0, err
+		}
+		if _, err := f.Write(s.mem); err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return 0, err
+		}
+		s.file = f
+		s.mem = nil
+	}
+	if s.file != nil {
+		return s.file.Write(p)
+	}
+	s.mem = append(s.mem, p...)
+	return len(p), nil
+}
+
+// reader rewinds the spool and returns a ReadCloser over exactly the buffered
+// bytes. Its Close is a no-op (handlers and the server may close the request
+// body); idemSpool.Close owns the temp file's lifetime.
+func (s *idemSpool) reader() (io.ReadCloser, error) {
+	if s.file != nil {
+		if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		return io.NopCloser(s.file), nil
+	}
+	return io.NopCloser(bytes.NewReader(s.mem)), nil
+}
+
+func (s *idemSpool) Close() error {
+	s.mem = nil
+	if s.file == nil {
+		return nil
+	}
+	f := s.file
+	s.file = nil
+	name := f.Name()
+	err := f.Close()
+	if rmErr := os.Remove(name); rmErr != nil && err == nil {
+		err = rmErr
+	}
+	return err
+}
+
+// spoolBody consumes r.Body while hashing it with SHA-256, then swaps in a
+// reader that replays the same bytes so the downstream handler sees an
+// identical stream (ContentLength is left untouched). The caller must Close
+// the returned spool by the end of the request — a deferred Close runs even
+// on a handler panic. No or empty body hashes the empty byte string.
+func spoolBody(r *http.Request) (*idemSpool, string, error) {
+	h := sha256.New()
+	sp := &idemSpool{}
+	if r.Body != nil {
+		if _, err := io.Copy(io.MultiWriter(h, sp), r.Body); err != nil {
+			_ = sp.Close()
+			return nil, "", err
+		}
+		_ = r.Body.Close()
+		body, err := sp.reader()
+		if err != nil {
+			_ = sp.Close()
+			return nil, "", err
+		}
+		r.Body = body
+	}
+	return sp, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func isWriteMethod(m string) bool {
