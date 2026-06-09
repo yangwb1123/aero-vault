@@ -68,6 +68,7 @@ type Indexer struct {
 	redact    bool
 	logger    *slog.Logger
 	queue     Enqueuer
+	sinks     []ChunkSink
 
 	pollEvery time.Duration
 	batch     int
@@ -79,6 +80,14 @@ type Indexer struct {
 // processes events inline (the original behavior).
 func (ix *Indexer) WithQueue(q Enqueuer) *Indexer {
 	ix.queue = q
+	return ix
+}
+
+// WithChunkSink registers a write-through sink that is notified after the
+// repository's chunk rows change. May be called multiple times; every
+// registered sink receives every upsert/delete.
+func (ix *Indexer) WithChunkSink(s ChunkSink) *Indexer {
+	ix.sinks = append(ix.sinks, s)
 	return ix
 }
 
@@ -198,7 +207,15 @@ func (ix *Indexer) dispatch(ctx context.Context, jobType, tenant string, objectI
 // DeleteObjectChunks removes all chunks for an object. Used as the
 // delete_chunks job handler.
 func (ix *Indexer) DeleteObjectChunks(ctx context.Context, objectID int64) error {
-	return ix.repo.DeleteChunksForObject(ctx, objectID)
+	if err := ix.repo.DeleteChunksForObject(ctx, objectID); err != nil {
+		return err
+	}
+	for _, s := range ix.sinks {
+		if err := s.DeleteObjectChunks(ctx, objectID); err != nil {
+			return fmt.Errorf("sink delete chunks %d: %w", objectID, err)
+		}
+	}
+	return nil
 }
 
 // ReindexStale re-indexes objects whose chunks were embedded by a model other
@@ -299,6 +316,19 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 	}
 	if err := ix.repo.InsertChunks(ctx, chunks); err != nil {
 		return fmt.Errorf("insert chunks %d: %w", obj.ID, err)
+	}
+	if len(ix.sinks) > 0 {
+		// InsertChunks does not backfill IDs; re-read the canonical rows so
+		// sinks see real chunk IDs (hybrid rank fusion dedupes by chunk ID).
+		rows, err := ix.repo.ListChunksForObject(ctx, obj.ID)
+		if err != nil {
+			return fmt.Errorf("list chunks for sinks %d: %w", obj.ID, err)
+		}
+		for _, s := range ix.sinks {
+			if err := s.UpsertObjectChunks(ctx, obj.ID, rows); err != nil {
+				return fmt.Errorf("sink upsert chunks %d: %w", obj.ID, err)
+			}
+		}
 	}
 	ix.logger.Info("indexed", "tenant", obj.TenantID, "key", obj.Key, "chunks", len(chunks), "model", ix.embedder.Name())
 	return nil
