@@ -177,6 +177,7 @@ type ReconcileCfg struct {
 	ClusterSingleton    bool // when true, only one replica runs the sweep (DB lease)
 	RetentionDays       int  // >0 enables permanent GC of rows soft-deleted longer ago than this
 	IdempotencyTTLHours int  // >0 enables GC of idempotency keys older than this
+	IdempotencyHashBody bool // fold a request-body hash into /v1 idempotency fingerprints (catches same-key/different-bytes)
 }
 
 // JobsCfg controls the background job worker pool. Workers<=0 disables the
@@ -340,6 +341,7 @@ func Load() (*Config, error) {
 			ClusterSingleton:    getEnvBool("RECONCILE_CLUSTER_SINGLETON", false),
 			RetentionDays:       getEnvInt("RECONCILE_RETENTION_DAYS", 0),
 			IdempotencyTTLHours: getEnvInt("IDEMPOTENCY_TTL_HOURS", 0),
+			IdempotencyHashBody: getEnvBool("IDEMPOTENCY_HASH_BODY", false),
 		},
 		Jobs: JobsCfg{
 			Workers:  getEnvInt("JOBS_WORKERS", 4),

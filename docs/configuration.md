@@ -209,6 +209,13 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 | `RECONCILE_ORPHAN_GRACE_MINUTES` | `60` | Minimum age (minutes) an orphan blob must reach before it is eligible for deletion. |
 | `RECONCILE_TENANTS` | `default` | Comma-separated list of tenants to scan. Empty/unset defaults to `default`. |
 
+## Write idempotency (`/v1`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IDEMPOTENCY_TTL_HOURS` | `0` | `>0` lets the retention sweep delete stored `Idempotency-Key` records older than this many hours, bounding the dedupe table. `0` keeps them forever. |
+| `IDEMPOTENCY_HASH_BODY` | `false` | Fold a SHA-256 of the request body into the `Idempotency-Key` fingerprint (Stripe-style v2): the same key replayed with **different bytes** is rejected with `409 IdempotencyConflict` instead of replaying the stored response. Bodies are buffered while hashing — up to 8 MiB in memory, larger payloads spill to a temp file — and handed to the handler unchanged. **Caveat:** enabling (or disabling) it changes fingerprints, so keys claimed before the flip will `409` on retry until they expire (`IDEMPOTENCY_TTL_HOURS`) or new keys are used. |
+
 ## Telemetry
 
 | Variable | Default | Description |
