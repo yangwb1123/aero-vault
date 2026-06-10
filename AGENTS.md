@@ -39,7 +39,7 @@ Subcommands: `aero-vault mcp` (stdio), `aero-vault cli …` (client).
 | `internal/storage` | `Storage` iface + `local`/`s3`/`oss`/`cos` backends, `factory.go`, envelope SSE (versioned keys + KMS), HMAC presign. `contract_test.go` = shared suite. |
 | `internal/repository` | `Repository` metadata: `sqlite.go` (default, pure-Go) + `postgres.go` share `sql.go`; `migrations/{sqlite,postgres}`. |
 | `internal/api/rest` | JSON API `/v1`: files, search, chat, agent, events/SSE, buckets, admin, ACL, thumbnails, OpenAPI. |
-| `internal/api/s3compat` | S3 gateway `/s3`: objects, listing (v1/v2), multipart, tagging, ACL, copy, batch-delete; SigV4. |
+| `internal/api/s3compat` | S3 gateway `/s3`: objects, listing (v1/v2) + versions, multipart, tagging, ACL, copy, batch-delete, bucket sub-resources (versioning/lock/lifecycle); SigV4. |
 | `internal/api/webdav` | WebDAV — dispatched **outside** chi so `PROPFIND`/`MKCOL` work. |
 | `internal/mcp` | MCP server (HTTP + stdio): `list_files`, `read_file`, `search` (search only when AI on). |
 | `internal/auth` | Scoped API keys (opt-in persisted + hashed), HS256 JWT, SigV4 verify, anonymous public-read. |
