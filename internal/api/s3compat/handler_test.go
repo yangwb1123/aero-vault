@@ -352,3 +352,85 @@ func TestListObjectsV2(t *testing.T) {
 		t.Fatalf("expected 2 keys, got %d: %s", lbr.KeyCount, body)
 	}
 }
+
+func TestListObjectsV1(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b/a/1.txt", []byte("11"), map[string]string{"Content-Type": "text/plain"})
+	do(t, "PUT", base+"/b/a/2.txt", []byte("222"), map[string]string{"Content-Type": "text/plain"})
+
+	resp, body := do(t, "GET", base+"/b?prefix=a/", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("list status %d body=%s", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/xml" {
+		t.Fatalf("content-type=%q want application/xml", ct)
+	}
+	if strings.Contains(string(body), "KeyCount") ||
+		strings.Contains(string(body), "ContinuationToken") {
+		t.Fatalf("v1 response must not carry v2-only fields: %s", body)
+	}
+	var lbr listBucketResultV1
+	if err := xml.Unmarshal(body, &lbr); err != nil {
+		t.Fatalf("parse list: %v body=%s", err, body)
+	}
+	if len(lbr.Contents) != 2 {
+		t.Fatalf("expected 2 contents, got %d: %s", len(lbr.Contents), body)
+	}
+	bySize := map[string]int64{}
+	for _, c := range lbr.Contents {
+		if c.Key == "" || c.ETag == "" {
+			t.Fatalf("content missing key/etag: %+v", c)
+		}
+		bySize[c.Key] = c.Size
+	}
+	if bySize["a/1.txt"] != 2 || bySize["a/2.txt"] != 3 {
+		t.Fatalf("unexpected sizes: %+v", bySize)
+	}
+}
+
+func TestListObjectsV1Pagination(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	for _, k := range []string{"p/1.txt", "p/2.txt", "p/3.txt"} {
+		do(t, "PUT", base+"/b/"+k, []byte("x"), nil)
+	}
+
+	// First page: max-keys smaller than count → truncated with a NextMarker.
+	resp, body := do(t, "GET", base+"/b?prefix=p/&max-keys=2", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("page1 status %d body=%s", resp.StatusCode, body)
+	}
+	var p1 listBucketResultV1
+	if err := xml.Unmarshal(body, &p1); err != nil {
+		t.Fatalf("parse page1: %v body=%s", err, body)
+	}
+	if !p1.IsTruncated {
+		t.Fatalf("page1 should be truncated: %s", body)
+	}
+	if p1.NextMarker == "" {
+		t.Fatalf("page1 should have NextMarker: %s", body)
+	}
+	if len(p1.Contents) != 2 {
+		t.Fatalf("page1 expected 2 contents, got %d: %s", len(p1.Contents), body)
+	}
+
+	// Second page: passing the marker returns the rest.
+	resp, body = do(t, "GET", base+"/b?prefix=p/&max-keys=2&marker="+p1.NextMarker, nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("page2 status %d body=%s", resp.StatusCode, body)
+	}
+	var p2 listBucketResultV1
+	if err := xml.Unmarshal(body, &p2); err != nil {
+		t.Fatalf("parse page2: %v body=%s", err, body)
+	}
+	if p2.Marker != p1.NextMarker {
+		t.Fatalf("page2 Marker=%q want %q", p2.Marker, p1.NextMarker)
+	}
+	if p2.IsTruncated {
+		t.Fatalf("page2 should not be truncated: %s", body)
+	}
+	if len(p2.Contents) != 1 {
+		t.Fatalf("page2 expected 1 content, got %d: %s", len(p2.Contents), body)
+	}
+}

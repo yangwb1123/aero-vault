@@ -22,7 +22,7 @@ import (
 //	GET    /{bucket}/{key+}      GetObject
 //	HEAD   /{bucket}/{key+}      HeadObject
 //	DELETE /{bucket}/{key+}      DeleteObject
-//	GET    /{bucket}/?list-type=2 ListObjectsV2
+//	GET    /{bucket}/?list-type=2 ListObjectsV2 (else ListObjects v1)
 //	HEAD   /{bucket}/            HeadBucket
 //	PUT    /{bucket}/            CreateBucket (no-op-ish; registers bucket)
 type Handler struct {
@@ -208,7 +208,7 @@ func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
-	// Bucket-scoped operations: ListObjectsV2 (GET), HeadBucket (HEAD), CreateBucket (PUT).
+	// Bucket-scoped operations: ListObjects v1/v2 (GET), HeadBucket (HEAD), CreateBucket (PUT).
 	bucket := chi.URLParam(r, "bucket")
 	switch r.Method {
 	case http.MethodGet:
@@ -233,11 +233,15 @@ func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket string) {
-	q := r.URL.Query()
-	if q.Get("list-type") != "2" {
-		writeS3Error(w, r, errors.New("only list-type=2 is supported"))
+	if r.URL.Query().Get("list-type") == "2" {
+		h.listObjectsV2(w, r, bucket)
 		return
 	}
+	h.listObjectsV1(w, r, bucket)
+}
+
+func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
+	q := r.URL.Query()
 	prefix := q.Get("prefix")
 	token := q.Get("continuation-token")
 	maxKeys, _ := strconv.Atoi(q.Get("max-keys"))
@@ -271,6 +275,46 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 			StorageClass: "STANDARD",
 		})
 	}
+	writeListResult(w, out)
+}
+
+func (h *Handler) listObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
+	q := r.URL.Query()
+	prefix := q.Get("prefix")
+	marker := q.Get("marker")
+	maxKeys, _ := strconv.Atoi(q.Get("max-keys"))
+	if maxKeys <= 0 {
+		maxKeys = 1000
+	}
+	page, err := h.svc.List(r.Context(), mw.TenantFrom(r.Context()), bucket, prefix, marker, maxKeys)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	out := listBucketResultV1{
+		Xmlns:       s3Namespace,
+		Name:        bucket,
+		Prefix:      prefix,
+		Marker:      marker,
+		MaxKeys:     maxKeys,
+		IsTruncated: page.HasMore,
+	}
+	if page.HasMore {
+		out.NextMarker = page.NextMarker
+	}
+	for _, o := range page.Objects {
+		out.Contents = append(out.Contents, listContent{
+			Key:          o.Key,
+			LastModified: o.UpdatedAt.UTC(),
+			ETag:         `"` + o.ETag + `"`,
+			Size:         o.Size,
+			StorageClass: "STANDARD",
+		})
+	}
+	writeListResult(w, out)
+}
+
+func writeListResult(w http.ResponseWriter, out any) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(xml.Header))
