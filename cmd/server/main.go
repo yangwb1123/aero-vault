@@ -151,6 +151,9 @@ func run() error {
 	)
 	if embedder != nil {
 		search = ai.NewSearch(repo, embedder, logger)
+		// qdrant is registered on BOTH the search index and the indexer sink, so
+		// it is built here and wired into the indexer below.
+		var qdrantIndex *ai.QdrantIndex
 		// Optional pgvector ANN backend (opt-in; requires Postgres + vector
 		// extension). NOT exercised by CI — default keeps brute-force retrieval.
 		if cfg.AI.VectorBackend == "pgvector" && cfg.AI.VectorDSN != "" {
@@ -160,6 +163,18 @@ func run() error {
 				search.WithVectorIndex(vi)
 				logger.Info("pgvector vector index enabled (requires Postgres + vector ext; unverified in CI)")
 			}
+		}
+		// Optional Qdrant external vector store (opt-in). It implements both the
+		// read seam (search vector index) and the write seam (indexer chunk sink).
+		// NOT exercised by CI — default keeps brute-force retrieval.
+		if cfg.AI.VectorBackend == "qdrant" && cfg.AI.VectorURL != "" {
+			qdrantIndex = ai.NewQdrantIndex(ai.QdrantOptions{
+				BaseURL:    cfg.AI.VectorURL,
+				APIKey:     cfg.AI.VectorAPIKey,
+				Collection: cfg.AI.VectorCollection,
+			})
+			search.WithVectorIndex(qdrantIndex)
+			logger.Info("qdrant vector index enabled (external store; unverified in CI)", "collection", cfg.AI.VectorCollection)
 		}
 		// Optional Postgres FTS lexical backend (opt-in; reuses AI_VECTOR_DSN).
 		if cfg.AI.LexicalBackend == "pgfts" && cfg.AI.VectorDSN != "" {
@@ -206,6 +221,11 @@ func run() error {
 		indexer := ai.NewIndexer(repo, store, extractor, ai.NewChunker(), embedder, logger)
 		if bm != nil {
 			indexer.WithChunkSink(bm)
+		}
+		// Mirror chunk writes into the external Qdrant store when enabled, so the
+		// vector index it serves stays in sync with the repository.
+		if qdrantIndex != nil {
+			indexer.WithChunkSink(qdrantIndex)
 		}
 		if cfg.AI.PIIScan {
 			indexer.WithPII(ai.NewPIIDetector(), cfg.AI.PIIRedact)

@@ -112,9 +112,15 @@ type AIConfig struct {
 	ReindexStaleOnStart   bool // re-index objects whose chunks use a different embed model (after embedder change)
 
 	// Vector retrieval backend. "" = brute-force (default); "pgvector" = ANN via
-	// Postgres pgvector. Requires Postgres + the vector extension; opt-in.
+	// Postgres pgvector; "qdrant" = an external Qdrant vector store. Each is
+	// opt-in; "" keeps the brute-force repository scan.
 	VectorBackend string
 	VectorDSN     string
+	// Qdrant external vector store (used when VectorBackend == "qdrant"). The
+	// adapter implements both the read (VectorIndex) and write (ChunkSink) seams.
+	VectorURL        string
+	VectorAPIKey     string
+	VectorCollection string
 	// Lexical retrieval backend. "" = in-process BM25 (default); "pgfts" =
 	// Postgres full-text search. Reuses VectorDSN for its connection; opt-in.
 	LexicalBackend string
@@ -288,9 +294,12 @@ func Load() (*Config, error) {
 			SearchCacheTTLSeconds: getEnvInt("AI_SEARCH_CACHE_TTL_SECONDS", 30),
 			ReindexStaleOnStart:   getEnvBool("AI_REINDEX_STALE_ON_START", false),
 
-			VectorBackend:  strings.ToLower(getEnv("AI_VECTOR_BACKEND", "")),
-			VectorDSN:      getEnv("AI_VECTOR_DSN", ""),
-			LexicalBackend: strings.ToLower(getEnv("AI_LEXICAL_BACKEND", "")),
+			VectorBackend:    strings.ToLower(getEnv("AI_VECTOR_BACKEND", "")),
+			VectorDSN:        getEnv("AI_VECTOR_DSN", ""),
+			VectorURL:        getEnv("AI_VECTOR_URL", ""),
+			VectorAPIKey:     getEnv("AI_VECTOR_API_KEY", ""),
+			VectorCollection: getEnv("AI_VECTOR_COLLECTION", "aero_chunks"),
+			LexicalBackend:   strings.ToLower(getEnv("AI_LEXICAL_BACKEND", "")),
 
 			ExtractorEndpoint: getEnv("AI_EXTRACTOR_ENDPOINT", ""),
 			ExtractorAPIKey:   getEnv("AI_EXTRACTOR_API_KEY", ""),
