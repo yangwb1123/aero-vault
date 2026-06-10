@@ -262,6 +262,33 @@ func TestQdrantHTTPErrorsSurface(t *testing.T) {
 	}
 }
 
+// TestQdrantUpsertPutErrorSurfaces pins the upsert's own PUT /points error path:
+// the delete-by-filter that Upsert issues first succeeds (2xx), so the error the
+// caller sees must originate from the PUT, not the preceding delete.
+func TestQdrantUpsertPutErrorSurfaces(t *testing.T) {
+	var putCalled bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/collections/chunks/points" {
+			putCalled = true
+			http.Error(w, "qdrant boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL, Collection: "chunks"})
+
+	chunks := []repository.Chunk{{ID: 1, ObjectID: 9, Embedding: []float32{1}}}
+	err := qi.UpsertObjectChunks(context.Background(), 9, chunks)
+	if err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
+		t.Fatalf("upsert PUT error not surfaced: %v", err)
+	}
+	if !putCalled {
+		t.Fatal("PUT /points was never reached (delete masked the upsert path)")
+	}
+}
+
 // --- helpers ---
 
 type recordedCall struct {
