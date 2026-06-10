@@ -47,11 +47,24 @@ well below what customers will bring. This is the single clearest line between
 fronts retrieval; `Search` calls `s.vindex.SearchVectors(...)` instead of the
 repository directly, defaulting to the brute-force `repoVectorIndex` and
 overridable via `WithVectorIndex`. A pgvector/Qdrant adapter now has a clean
-home with **no change to `Search`**. *Remaining (needs Postgres to verify):* the
-pgvector HNSW/IVFFlat adapter itself, and moving BM25 to Postgres FTS.
+home with **no change to `Search`**. **External vector store** ✅ *also shipped*:
+`ai.QdrantIndex` (`internal/ai/qdrant.go`) implements **both** seams — the read
+seam (`VectorIndex.SearchVectors`) and the write seam (`ChunkSink`) — over
+Qdrant's REST API (stdlib `net/http`, no new deps), wired opt-in via
+`AI_VECTOR_BACKEND=qdrant` (+ `AI_VECTOR_URL`/`_API_KEY`/`_COLLECTION`) and
+registered on both `Search` and the indexer so writes propagate. Pinned by
+`httptest` contract tests; live round-trip against a real Qdrant is UNVERIFIED in
+CI by design. *Remaining (external):* the pgvector/Qdrant live round-trips need a
+running backend to verify (pgvector is already exercised by `make
+test-integration`).
 - **Postgres path:** pgvector with an HNSW/IVFFlat index → approximate top-k in
   the database, not the app. Move lexical search to Postgres FTS (`tsvector`) or
   a persisted/incremental BM25 so it isn't rebuilt from scratch per instance.
+  **Incremental BM25** ✅ *shipped*: the in-memory index now implements
+  `ChunkSink` and is maintained incrementally on every index/delete (O(1)
+  bookkeeping for `df`/`avgLen` via a running length total + an objectID→chunkIDs
+  map), so the 30-second full-corpus rebuild is gone (one build at startup, then
+  live upserts/deletes); concurrency-safe (race-tested).
   ✅ *Adapters shipped and **runtime-verified**.* `ai.PgVectorIndex`
   (`internal/ai/pgvector.go`, cosine `<=>` ANN) implements `VectorIndex`;
   `ai.PgFTSIndex` (`internal/ai/lexicalindex.go`, `to_tsvector`/`ts_rank`)
@@ -181,8 +194,10 @@ most basic production topology.
   generic `leases` table (migration `0013`) + atomic `repo.AcquireLease`
   (renew-own / take-over-on-expiry) now gate the **destructive** reconcile and
   lifecycle sweeps so only the lease holder runs them; a dead holder's lease
-  frees after ~2 intervals. (BM25 rebuild stays per-replica by design — each
-  instance needs its own in-memory index; the real fix is a shared index, #1.)
+  frees after ~2 intervals. (The 30s full BM25 rebuild is **gone** — the
+  in-memory index is now maintained incrementally via `ChunkSink`, #1; each
+  replica still holds its own in-memory index, and the shared-index fix is the
+  opt-in Qdrant/pgvector external store, #1.)
   The lease gating is now a reusable **`cluster.Singleton`** helper ✅ *added*
   (`Enable`/`Guard`, fail-safe on lease error) that the reconcile, lifecycle and
   retention sweeps share — a generic leader-election primitive for any future
@@ -270,8 +285,9 @@ under retry, burst, or failure recovery:
   `repo.StorageKeyReferenced` and, when `RECONCILE_DELETE_ORPHAN_BLOBS=true`,
   deletes the unreferenced ones older than `RECONCILE_ORPHAN_GRACE_MINUTES`
   (default 60). Detect-and-log is the safe default; versioned (`@v…`) and
-  soft-deleted blobs are protected. *Next:* surface the counts as metrics and
-  make the destructive sweep a cluster singleton (see #2, #3).
+  soft-deleted blobs are protected. ✅ *Done:* the counts surface as metrics
+  (`reconcile_orphan_blobs`/`_deleted`, see #2) and the destructive sweep runs as
+  a cluster singleton (`RECONCILE_CLUSTER_SINGLETON`, see #3).
 - **Write idempotency.** ✅ *Implemented.* `/v1` object mutations now honor an
   `Idempotency-Key` header (opt-in, Stripe-style): a retried `PUT`/`POST`/`DELETE`
   replays the original response (`Idempotency-Replayed: true`) instead of
@@ -280,13 +296,19 @@ under retry, burst, or failure recovery:
   409 on key-reuse/in-flight, 5xx-releases-claim, and fail-closed on store
   errors. **TTL/GC** ✅ *added* (`IDEMPOTENCY_TTL_HOURS` →
   `repo.DeleteIdempotencyKeysBefore`, swept by the `RetentionJob`) so the dedupe
-  table stays bounded. *Next (v2):* optionally hash the request body to also
-  catch same-key/different-bytes.
+  table stays bounded. **Body-hash fingerprint (v2)** ✅ *added* (opt-in,
+  `IDEMPOTENCY_HASH_BODY`): the fingerprint folds in a SHA-256 of the request
+  body so the same key replayed with *different bytes* is rejected (409) instead
+  of replaying — the body is spooled (≤8 MiB in RAM, larger to a temp file
+  removed on request end) and replayed to the handler unchanged, failing closed
+  on a spool error. Default off keeps v1 semantics byte-for-byte.
 - **Large objects buffered fully in memory.** ✅ *Fixed.* The WebDAV read and
   write paths now use a bounded `spillBuffer` (`internal/api/webdav/spill.go`):
   ≤8 MiB stays in RAM, larger payloads spill to a temp file (removed on Close),
   so big uploads/downloads no longer OOM. Range/Seek preserved; covered by a
-  9 MiB round-trip + Range test. (`Rename`'s copy path is the remaining buffer.)
+  9 MiB round-trip + Range test. **`Rename`'s copy path** ✅ *also fixed*: MOVE now
+  streams the object through the same bounded `spillBuffer` (no more `io.ReadAll`)
+  and carries the source's `ContentType`/user metadata/tags across the rename.
 - **Embedding-model drift.** ✅ *Fixed.* `Search` now drops vector hits whose
   `embed_model` differs from the query embedder's `Name()`, so vectors from
   different models are never compared even at matching dimension (guard test in
