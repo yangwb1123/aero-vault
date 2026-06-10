@@ -27,6 +27,15 @@ import (
 // and a cleanup function (also registered via t.Cleanup).
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	srv, _ := newTestServerSvc(t)
+	return srv
+}
+
+// newTestServerSvc is newTestServer plus a handle to the underlying
+// FileService, for tests that need to seed or inspect object metadata
+// (ContentType/Metadata/Tags) that the WebDAV layer does not expose over HTTP.
+func newTestServerSvc(t *testing.T) (*httptest.Server, *service.FileService) {
+	t.Helper()
 	dir := t.TempDir()
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "test.db"))
 	if err != nil {
@@ -47,7 +56,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	h := mw.Tenant(webdav.Handler("/webdav", svc, nil))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, svc
 }
 
 // do sends a request to the server and returns the response plus body bytes.
@@ -330,6 +339,68 @@ func TestMoveLargeFile(t *testing.T) {
 	}
 	if !bytes.Equal(body, want) {
 		t.Fatalf("MOVE large: bytes at dst differ from source (%d vs %d bytes)", len(body), len(want))
+	}
+}
+
+// TestMovePreservesMetadata seeds an object (via the service, since the WebDAV
+// PUT path does not let clients set ContentType/Metadata/Tags) with a
+// non-default Content-Type, a user metadata entry, and a tag, then MOVEs it and
+// asserts those survived on the destination. The bytes must also be intact.
+func TestMovePreservesMetadata(t *testing.T) {
+	srv, svc := newTestServerSvc(t)
+
+	const content = "carry me across"
+	const ctype = "application/x-aero-test"
+	wantMeta := map[string]string{"author": "amelia", "purpose": "rename-test"}
+	wantTags := map[string]string{"env": "staging"}
+
+	if _, err := svc.Put(context.Background(), service.DefaultTenant, service.DefaultBucket,
+		"meta-src.txt", bytes.NewReader([]byte(content)), int64(len(content)),
+		service.PutOptions{ContentType: ctype, Metadata: wantMeta, Tags: wantTags}); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	resp, _ := do(t, srv, "MOVE", "/webdav/meta-src.txt", nil, map[string]string{
+		"Destination": srv.URL + "/webdav/meta-dst.txt",
+		"Overwrite":   "T",
+	})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("MOVE: got %d, want 201 or 204", resp.StatusCode)
+	}
+
+	// Old path must be gone.
+	resp, _ = do(t, srv, http.MethodGet, "/webdav/meta-src.txt", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET after MOVE (old path): got %d, want 404", resp.StatusCode)
+	}
+
+	// New path retains the bytes.
+	resp, body := do(t, srv, http.MethodGet, "/webdav/meta-dst.txt", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET after MOVE (new path): got %d, want 200", resp.StatusCode)
+	}
+	if string(body) != content {
+		t.Fatalf("MOVE: content at dst: got %q, want %q", string(body), content)
+	}
+
+	// And the metadata that the WebDAV layer cannot surface over HTTP: inspect
+	// the destination object through the service directly.
+	obj, err := svc.Stat(context.Background(), service.DefaultTenant, service.DefaultBucket, "meta-dst.txt")
+	if err != nil {
+		t.Fatalf("Stat dst: %v", err)
+	}
+	if obj.ContentType != ctype {
+		t.Errorf("ContentType after MOVE: got %q, want %q", obj.ContentType, ctype)
+	}
+	for k, v := range wantMeta {
+		if obj.Metadata[k] != v {
+			t.Errorf("Metadata[%q] after MOVE: got %q, want %q", k, obj.Metadata[k], v)
+		}
+	}
+	for k, v := range wantTags {
+		if obj.Tags[k] != v {
+			t.Errorf("Tags[%q] after MOVE: got %q, want %q", k, obj.Tags[k], v)
+		}
 	}
 }
 
