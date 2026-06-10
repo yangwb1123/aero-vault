@@ -210,9 +210,38 @@ func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
 	// Bucket-scoped operations: ListObjectsV2 (GET), HeadBucket (HEAD), CreateBucket (PUT).
 	bucket := chi.URLParam(r, "bucket")
+	q := r.URL.Query()
+	// Bucket sub-resources are dispatched before the default list/create paths so
+	// that e.g. GET ?versioning no longer falls through to ListObjects.
+	switch {
+	case q.Has("versioning"):
+		if r.Method == http.MethodPut {
+			h.putBucketVersioning(w, r, bucket)
+		} else {
+			h.getBucketVersioning(w, r, bucket)
+		}
+		return
+	case q.Has("lifecycle"):
+		if r.Method == http.MethodPut {
+			h.putBucketLifecycle(w, r, bucket)
+		} else {
+			h.getBucketLifecycle(w, r, bucket)
+		}
+		return
+	case q.Has("object-lock"):
+		if r.Method == http.MethodPut {
+			h.putBucketObjectLock(w, r, bucket)
+		} else {
+			h.getBucketObjectLock(w, r, bucket)
+		}
+		return
+	case q.Has("versions"):
+		h.listObjectVersions(w, r, bucket)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
-		if r.URL.Query().Has("uploads") {
+		if q.Has("uploads") {
 			h.listMultipartUploads(w, r, bucket)
 			return
 		}
