@@ -238,14 +238,15 @@ type objectLockRetention struct {
 
 // listVersionsResult is the body of GET /{bucket}?versions.
 type listVersionsResult struct {
-	XMLName     xml.Name       `xml:"ListVersionsResult"`
-	Xmlns       string         `xml:"xmlns,attr"`
-	Name        string         `xml:"Name"`
-	Prefix      string         `xml:"Prefix"`
-	KeyMarker   string         `xml:"KeyMarker"`
-	MaxKeys     int            `xml:"MaxKeys"`
-	IsTruncated bool           `xml:"IsTruncated"`
-	Versions    []versionEntry `xml:"Version"`
+	XMLName       xml.Name       `xml:"ListVersionsResult"`
+	Xmlns         string         `xml:"xmlns,attr"`
+	Name          string         `xml:"Name"`
+	Prefix        string         `xml:"Prefix"`
+	KeyMarker     string         `xml:"KeyMarker"`
+	NextKeyMarker string         `xml:"NextKeyMarker,omitempty"`
+	MaxKeys       int            `xml:"MaxKeys"`
+	IsTruncated   bool           `xml:"IsTruncated"`
+	Versions      []versionEntry `xml:"Version"`
 }
 
 type versionEntry struct {
@@ -276,6 +277,52 @@ func cannedToPolicy(acl string) accessControlPolicy {
 		p.Grants = append(p.Grants,
 			aclGrant{Grantee: aclGrantee{Type: "Group", URI: allUsersURI}, Permission: "READ"},
 			aclGrant{Grantee: aclGrantee{Type: "Group", URI: allUsersURI}, Permission: "WRITE"})
+	case "authenticated-read":
+		p.Grants = append(p.Grants, aclGrant{Grantee: aclGrantee{Type: "Group", URI: authUsersURI}, Permission: "READ"})
 	}
 	return p
+}
+
+const authUsersURI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+
+// policyToCanned maps an AccessControlPolicy body back to the nearest canned
+// ACL aero-vault stores: AllUsers READ+WRITE → public-read-write, AllUsers READ
+// → public-read, AuthenticatedUsers READ → authenticated-read, else private.
+func policyToCanned(p accessControlPolicy) string {
+	allUsersRead, allUsersWrite, authRead := false, false, false
+	for _, g := range p.Grants {
+		switch g.Grantee.URI {
+		case allUsersURI:
+			switch g.Permission {
+			case "READ":
+				allUsersRead = true
+			case "WRITE":
+				allUsersWrite = true
+			case "FULL_CONTROL":
+				allUsersRead, allUsersWrite = true, true
+			}
+		case authUsersURI:
+			if g.Permission == "READ" || g.Permission == "FULL_CONTROL" {
+				authRead = true
+			}
+		}
+	}
+	switch {
+	case allUsersRead && allUsersWrite:
+		return "public-read-write"
+	case allUsersRead:
+		return "public-read"
+	case authRead:
+		return "authenticated-read"
+	default:
+		return "private"
+	}
+}
+
+// locationConstraint is the body of GET /{bucket}?location. aero-vault is
+// single-region; an empty constraint is what S3 clients read as us-east-1.
+type locationConstraint struct {
+	XMLName  xml.Name `xml:"LocationConstraint"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Location string   `xml:",chardata"`
 }

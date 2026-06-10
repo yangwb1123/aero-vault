@@ -31,10 +31,16 @@ var errNoSuchLifecycle = errors.New("the lifecycle configuration does not exist"
 // errMalformedXML signals an unparsable request body (400 MalformedXML).
 var errMalformedXML = errors.New("the XML you provided was not well-formed or did not validate")
 
+// errNoSuchBucket signals a request against a bucket that does not exist
+// (404 NoSuchBucket).
+var errNoSuchBucket = errors.New("the specified bucket does not exist")
+
 func classify(err error) (string, string, int) {
 	switch {
 	case errors.Is(err, errMalformedXML):
 		return "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.", http.StatusBadRequest
+	case errors.Is(err, errNoSuchBucket):
+		return "NoSuchBucket", "The specified bucket does not exist.", http.StatusNotFound
 	case errors.Is(err, errNoSuchLifecycle):
 		return "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist.", http.StatusNotFound
 	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):

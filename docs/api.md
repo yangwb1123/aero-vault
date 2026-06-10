@@ -420,7 +420,10 @@ same objects.
 | ListMultipartUploads | `GET /{bucket}?uploads` | ✅ | |
 | ListObjects (v1) | `GET /{bucket}` (no `list-type=2`) | ✅ | `prefix`, `marker`, `max-keys`; `NextMarker` when truncated. |
 | Versioning / lock / lifecycle sub-resources | `GET`/`PUT /{bucket}?versioning`, `?object-lock`, `?lifecycle` | ✅ | XML config round-trips; `GET ?lifecycle` is `404 NoSuchLifecycleConfiguration` when unset. |
-| ListObjectVersions | `GET /{bucket}?versions` | ✅ | Honors `?prefix`; every stored version is a `<Version>` (newest `IsLatest=true`); unpaginated (`IsTruncated=false`). |
+| DeleteBucketLifecycle | `DELETE /{bucket}?lifecycle` | ✅ | Clears the expiry policy; `204 No Content`. |
+| GetBucketAcl / PutBucketAcl | `GET`/`PUT /{bucket}?acl` | ✅ | Canned ACL ↔ `AccessControlPolicy`; PUT via `x-amz-acl` header or policy body. |
+| GetBucketLocation | `GET /{bucket}?location` | ✅ | Empty `LocationConstraint` (us-east-1); `404 NoSuchBucket` if absent. |
+| ListObjectVersions | `GET /{bucket}?versions` | ✅ | Honors `?prefix`; every stored version is a `<Version>` (newest `IsLatest=true`); paginated by key via `?max-keys`/`?key-marker` (`NextKeyMarker` when truncated). |
 | Presigned URLs | — | ✅ (REST) | Use `POST /v1/files/{key}/presign`. |
 
 ## SigV4 usage

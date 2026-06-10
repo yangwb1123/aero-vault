@@ -222,9 +222,12 @@ func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	case q.Has("lifecycle"):
-		if r.Method == http.MethodPut {
+		switch r.Method {
+		case http.MethodPut:
 			h.putBucketLifecycle(w, r, bucket)
-		} else {
+		case http.MethodDelete:
+			h.deleteBucketLifecycle(w, r, bucket)
+		default:
 			h.getBucketLifecycle(w, r, bucket)
 		}
 		return
@@ -234,6 +237,16 @@ func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
 		} else {
 			h.getBucketObjectLock(w, r, bucket)
 		}
+		return
+	case q.Has("acl"):
+		if r.Method == http.MethodPut {
+			h.putBucketACL(w, r, bucket)
+		} else {
+			h.getBucketACL(w, r, bucket)
+		}
+		return
+	case q.Has("location"):
+		h.getBucketLocation(w, r, bucket)
 		return
 	case q.Has("versions"):
 		h.listObjectVersions(w, r, bucket)

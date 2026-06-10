@@ -479,6 +479,175 @@ func TestBucketConfigMalformedXML(t *testing.T) {
 	}
 }
 
+func TestBucketACLRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	// Default (private): owner FULL_CONTROL grant, no AllUsers grant.
+	resp, body := do(t, "GET", base+"/b?acl", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("get acl status=%d body=%s", resp.StatusCode, body)
+	}
+	var pol accessControlPolicy
+	if err := xml.Unmarshal(body, &pol); err != nil {
+		t.Fatalf("parse acl: %v body=%s", err, body)
+	}
+	if pol.Owner.ID == "" || len(pol.Grants) != 1 || pol.Grants[0].Permission != "FULL_CONTROL" {
+		t.Fatalf("default acl not private/owner-only: %s", body)
+	}
+	for _, g := range pol.Grants {
+		if g.Grantee.URI == allUsersURI {
+			t.Fatalf("private bucket should have no AllUsers grant: %s", body)
+		}
+	}
+
+	// PUT canned public-read via x-amz-acl header, then confirm the AllUsers READ grant.
+	resp, _ = do(t, "PUT", base+"/b?acl", nil, map[string]string{"x-amz-acl": "public-read"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("put acl status=%d", resp.StatusCode)
+	}
+	resp, body = do(t, "GET", base+"/b?acl", nil, nil)
+	pol = accessControlPolicy{}
+	_ = xml.Unmarshal(body, &pol)
+	gotAllUsersRead := false
+	for _, g := range pol.Grants {
+		if g.Grantee.URI == allUsersURI && g.Permission == "READ" {
+			gotAllUsersRead = true
+		}
+	}
+	if resp.StatusCode != 200 || !gotAllUsersRead {
+		t.Fatalf("expected AllUsers READ grant after public-read, got status=%d body=%s", resp.StatusCode, body)
+	}
+
+	// PUT via an AccessControlPolicy body: AllUsers FULL_CONTROL must map to
+	// public-read-write (FULL_CONTROL implies write), so a later GET shows a
+	// WRITE grant to AllUsers.
+	aclBody, _ := xml.Marshal(accessControlPolicy{
+		Owner:  aclOwner{ID: "aero-vault"},
+		Grants: []aclGrant{{Grantee: aclGrantee{Type: "Group", URI: allUsersURI}, Permission: "FULL_CONTROL"}},
+	})
+	if resp, _ := do(t, "PUT", base+"/b?acl", aclBody, nil); resp.StatusCode != 200 {
+		t.Fatalf("put acl body status=%d", resp.StatusCode)
+	}
+	resp, body = do(t, "GET", base+"/b?acl", nil, nil)
+	pol = accessControlPolicy{}
+	_ = xml.Unmarshal(body, &pol)
+	gotAllUsersWrite := false
+	for _, g := range pol.Grants {
+		if g.Grantee.URI == allUsersURI && g.Permission == "WRITE" {
+			gotAllUsersWrite = true
+		}
+	}
+	if resp.StatusCode != 200 || !gotAllUsersWrite {
+		t.Fatalf("expected AllUsers WRITE grant after FULL_CONTROL body (public-read-write), got status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestBucketLocation(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	resp, body := do(t, "GET", base+"/b?location", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("get location status=%d body=%s", resp.StatusCode, body)
+	}
+	var lc locationConstraint
+	if err := xml.Unmarshal(body, &lc); err != nil {
+		t.Fatalf("parse location: %v body=%s", err, body)
+	}
+
+	// Missing bucket → 404 NoSuchBucket.
+	resp, body = do(t, "GET", base+"/missing?location", nil, nil)
+	if resp.StatusCode != 404 {
+		t.Fatalf("location on missing bucket status=%d want 404 body=%s", resp.StatusCode, body)
+	}
+	var e s3Error
+	_ = xml.Unmarshal(body, &e)
+	if e.Code != "NoSuchBucket" {
+		t.Fatalf("expected NoSuchBucket, got %q body=%s", e.Code, body)
+	}
+}
+
+func TestBucketLifecycleDelete(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	// Configure, confirm present.
+	putBody, _ := xml.Marshal(lifecycleConfiguration{Rules: []lifecycleRule{{Status: "Enabled", Expiration: &lifecycleExpiration{Days: 30}}}})
+	if resp, _ := do(t, "PUT", base+"/b?lifecycle", putBody, nil); resp.StatusCode != 200 {
+		t.Fatalf("put lifecycle status=%d", resp.StatusCode)
+	}
+	if resp, _ := do(t, "GET", base+"/b?lifecycle", nil, nil); resp.StatusCode != 200 {
+		t.Fatalf("get lifecycle after put status=%d want 200", resp.StatusCode)
+	}
+
+	// Delete → 204, then GET → 404 NoSuchLifecycleConfiguration.
+	resp, _ := do(t, "DELETE", base+"/b?lifecycle", nil, nil)
+	if resp.StatusCode != 204 {
+		t.Fatalf("delete lifecycle status=%d want 204", resp.StatusCode)
+	}
+	resp, body := do(t, "GET", base+"/b?lifecycle", nil, nil)
+	if resp.StatusCode != 404 {
+		t.Fatalf("get lifecycle after delete status=%d want 404 body=%s", resp.StatusCode, body)
+	}
+	var e s3Error
+	_ = xml.Unmarshal(body, &e)
+	if e.Code != "NoSuchLifecycleConfiguration" {
+		t.Fatalf("expected NoSuchLifecycleConfiguration, got %q body=%s", e.Code, body)
+	}
+}
+
+func TestListObjectVersionsPagination(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+	// Versioning on, and one key gets two versions, so the page also exercises
+	// multiple <Version> rows per key (not just one row per key).
+	putBody, _ := xml.Marshal(versioningConfiguration{Status: "Enabled"})
+	do(t, "PUT", base+"/b?versioning", putBody, nil)
+	for _, k := range []string{"a.txt", "b.txt", "c.txt"} {
+		do(t, "PUT", base+"/b/"+k, []byte("x"), nil)
+	}
+	do(t, "PUT", base+"/b/a.txt", []byte("x2"), nil) // a.txt now has 2 versions
+
+	// First page of 2 keys → truncated with a NextKeyMarker.
+	resp, body := do(t, "GET", base+"/b?versions&max-keys=2", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("versions page1 status=%d body=%s", resp.StatusCode, body)
+	}
+	var p1 listVersionsResult
+	if err := xml.Unmarshal(body, &p1); err != nil {
+		t.Fatalf("parse page1: %v body=%s", err, body)
+	}
+	if !p1.IsTruncated || p1.NextKeyMarker == "" {
+		t.Fatalf("expected truncated page1 with NextKeyMarker, got truncated=%v marker=%q body=%s", p1.IsTruncated, p1.NextKeyMarker, body)
+	}
+	// Page 1 = keys a.txt (2 versions) + b.txt (1 version) = 3 version rows.
+	if len(p1.Versions) != 3 {
+		t.Fatalf("expected 3 version rows on page1 (a.txt x2 + b.txt), got %d: %s", len(p1.Versions), body)
+	}
+	aLatest := 0
+	for _, v := range p1.Versions {
+		if v.Key == "a.txt" && v.IsLatest {
+			aLatest++
+		}
+	}
+	if aLatest != 1 {
+		t.Fatalf("expected exactly one IsLatest among a.txt's versions, got %d: %s", aLatest, body)
+	}
+
+	// Second page via key-marker → remaining key, not truncated.
+	resp, body = do(t, "GET", base+"/b?versions&max-keys=2&key-marker="+p1.NextKeyMarker, nil, nil)
+	var p2 listVersionsResult
+	_ = xml.Unmarshal(body, &p2)
+	if resp.StatusCode != 200 || p2.IsTruncated || len(p2.Versions) != 1 {
+		t.Fatalf("expected final page with 1 version, got status=%d truncated=%v n=%d body=%s", resp.StatusCode, p2.IsTruncated, len(p2.Versions), body)
+	}
+}
+
 func TestListObjectsV2(t *testing.T) {
 	s := newTestServer(t)
 	base := s.URL
