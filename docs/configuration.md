@@ -133,7 +133,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `AI_PII_REDACT` | `false` | Redact detected PII before embedding (requires `AI_PII_SCAN`). |
 | `AI_VECTOR_BACKEND` | _(empty = brute-force)_ | Vector retrieval backend: `pgvector` (ANN via Postgres + the `vector` extension; uses `AI_VECTOR_DSN`) or `qdrant` (external Qdrant store; uses `AI_VECTOR_URL`). Empty keeps the default brute-force repository scan. Opt-in; unverified in CI. Lower-cased. |
 | `AI_VECTOR_DSN` | _(empty)_ | Postgres DSN for the `pgvector` (and `pgfts`) backends. Required when `AI_VECTOR_BACKEND=pgvector`. |
-| `AI_VECTOR_URL` | _(empty)_ | Qdrant REST base URL, e.g. `http://localhost:6333`. Required when `AI_VECTOR_BACKEND=qdrant`. The adapter mirrors chunk writes into Qdrant and serves search from it; the collection (with the right vector size + distance) must be created out of band. |
+| `AI_VECTOR_URL` | _(empty)_ | Qdrant REST base URL, e.g. `http://localhost:6333`. Required when `AI_VECTOR_BACKEND=qdrant`. The adapter mirrors chunk writes into Qdrant and serves search from it; the collection is auto-provisioned at startup from the embedder's dimension (Cosine), best-effort and idempotent. |
 | `AI_VECTOR_API_KEY` | _(empty)_ | Qdrant API key, sent as the `api-key` header when non-empty. |
 | `AI_VECTOR_COLLECTION` | `aero_chunks` | Qdrant collection holding chunk points. |
 | `AI_LEXICAL_BACKEND` | _(empty = in-process BM25)_ | Lexical backend: `pgfts` (Postgres full-text search; reuses `AI_VECTOR_DSN`). Empty keeps the in-process BM25 index. Opt-in; unverified in CI. Lower-cased. |
