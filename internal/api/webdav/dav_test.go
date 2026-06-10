@@ -27,6 +27,15 @@ import (
 // and a cleanup function (also registered via t.Cleanup).
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	srv, _ := newTestServerWithSvc(t)
+	return srv
+}
+
+// newTestServerWithSvc is like newTestServer but also returns the backing
+// FileService so a test can seed objects directly (e.g. with a stored
+// Content-Type that the plain WebDAV PUT path does not carry).
+func newTestServerWithSvc(t *testing.T) (*httptest.Server, *service.FileService) {
+	t.Helper()
 	dir := t.TempDir()
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "test.db"))
 	if err != nil {
@@ -47,7 +56,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	h := mw.Tenant(webdav.Handler("/webdav", svc, nil))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, svc
 }
 
 // do sends a request to the server and returns the response plus body bytes.
@@ -540,5 +549,55 @@ func TestDeleteMissingResource(t *testing.T) {
 	resp, _ := do(t, srv, http.MethodDelete, "/webdav/doesnotexist.txt", nil, nil)
 	if resp.StatusCode >= 500 {
 		t.Fatalf("DELETE missing: got %d, want < 500", resp.StatusCode)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Stored Content-Type (webdav.ContentTyper): a GET must serve the content-type
+// the client stored via REST/S3 PUT, not one sniffed from the bytes.
+// ----------------------------------------------------------------------------
+
+func TestGetServesStoredContentType(t *testing.T) {
+	srv, svc := newTestServerWithSvc(t)
+
+	const want = "application/x-custom"
+	if _, err := svc.Put(context.Background(), "default", service.DefaultBucket, "custom.bin",
+		bytes.NewReader([]byte("payload")), int64(len("payload")),
+		service.PutOptions{ContentType: want}); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	resp, _ := do(t, srv, http.MethodGet, "/webdav/custom.bin", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET: got %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != want {
+		t.Fatalf("Content-Type: got %q, want stored %q", got, want)
+	}
+}
+
+// TestGetStoredContentTypeBeatsSniff seeds an object whose bytes would sniff to
+// a different type (HTML) than its stored Content-Type, proving the stored type
+// wins over x/net/webdav's http.DetectContentType fallback.
+func TestGetStoredContentTypeBeatsSniff(t *testing.T) {
+	srv, svc := newTestServerWithSvc(t)
+
+	const stored = "application/x-custom"
+	body := []byte("<!DOCTYPE html><html><body>hi</body></html>")
+	if _, err := svc.Put(context.Background(), "default", service.DefaultBucket, "looks-like-html",
+		bytes.NewReader(body), int64(len(body)),
+		service.PutOptions{ContentType: stored}); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	resp, got := do(t, srv, http.MethodGet, "/webdav/looks-like-html", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET: got %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != stored {
+		t.Fatalf("Content-Type: got %q, want stored %q (must not sniff to text/html)", ct, stored)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("GET body: got %q, want %q", got, body)
 	}
 }

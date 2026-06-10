@@ -30,9 +30,10 @@ func Handler(prefix string, svc *service.FileService, logger *slog.Logger) http.
 	if logger == nil {
 		logger = slog.Default()
 	}
+	fsys := &davFS{svc: svc, logger: logger}
 	dav := &xwebdav.Handler{
 		Prefix:     prefix,
-		FileSystem: &davFS{svc: svc, logger: logger},
+		FileSystem: fsys,
 		LockSystem: xwebdav.NewMemLS(),
 		Logger: func(r *http.Request, err error) {
 			if err != nil {
@@ -40,7 +41,20 @@ func Handler(prefix string, svc *service.FileService, logger *slog.Logger) http.
 			}
 		},
 	}
-	return dav
+	// x/net/webdav serves GET/HEAD via http.ServeContent, which sniffs the
+	// Content-Type itself and never consults the FileSystem's ContentTyper.
+	// Pre-set the stored Content-Type so ServeContent honours it instead of
+	// sniffing; PROPFIND already reads ContentTyper directly.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			if name, ok := strings.CutPrefix(r.URL.Path, prefix); ok {
+				if ct := fsys.storedContentType(r.Context(), name); ct != "" {
+					w.Header().Set("Content-Type", ct)
+				}
+			}
+		}
+		dav.ServeHTTP(w, r)
+	})
 }
 
 // davFS is the FileSystem implementation backed by the FileService.
@@ -54,6 +68,21 @@ func (f *davFS) tenant(ctx context.Context) string {
 		return t
 	}
 	return "default"
+}
+
+// storedContentType returns the content-type recorded for the object at name,
+// or "" when there is none (directory, missing object, or any error) so the
+// caller leaves x/net/webdav's own sniffing untouched.
+func (f *davFS) storedContentType(ctx context.Context, name string) string {
+	name = strings.TrimPrefix(name, "/")
+	if name == "" || strings.HasSuffix(name, "/") {
+		return ""
+	}
+	obj, err := f.svc.Stat(ctx, f.tenant(ctx), service.DefaultBucket, name)
+	if err != nil {
+		return ""
+	}
+	return obj.ContentType
 }
 
 func (f *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
@@ -270,10 +299,11 @@ func (d *davDir) Readdir(count int) ([]os.FileInfo, error) {
 // --- FileInfo helpers ---
 
 type davInfo struct {
-	name string
-	size int64
-	mod  time.Time
-	dir  bool
+	name        string
+	size        int64
+	mod         time.Time
+	dir         bool
+	contentType string
 }
 
 func (d *davInfo) Name() string { return path.Base(d.name) }
@@ -288,8 +318,19 @@ func (d *davInfo) ModTime() time.Time { return d.mod }
 func (d *davInfo) IsDir() bool        { return d.dir }
 func (d *davInfo) Sys() any           { return nil }
 
+// ContentType implements golang.org/x/net/webdav.ContentTyper so PROPFIND
+// reports the stored content-type rather than one sniffed from bytes. When no
+// type is stored (unknown object / directory) it returns ErrNotImplemented so
+// x/net/webdav falls back to its own DetectContentType behaviour.
+func (d *davInfo) ContentType(ctx context.Context) (string, error) {
+	if d.contentType != "" {
+		return d.contentType, nil
+	}
+	return "", xwebdav.ErrNotImplemented
+}
+
 func davFileInfo(o repository.Object) os.FileInfo {
-	return &davInfo{name: o.Key, size: o.Size, mod: o.UpdatedAt}
+	return &davInfo{name: o.Key, size: o.Size, mod: o.UpdatedAt, contentType: o.ContentType}
 }
 
 func davDirInfo(name string) os.FileInfo {
