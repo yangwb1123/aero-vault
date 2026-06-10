@@ -174,6 +174,12 @@ func run() error {
 				Collection: cfg.AI.VectorCollection,
 			})
 			search.WithVectorIndex(qdrantIndex)
+			// Auto-provision the collection from the embedder's dimension (Cosine),
+			// best-effort: Qdrant may be unreachable at startup, and the search/index
+			// paths already tolerate qdrant errors, so a failure must not crash boot.
+			if err := qdrantIndex.EnsureCollection(ctx, embedder.Dimensions()); err != nil {
+				logger.Warn("qdrant ensure collection failed (continuing)", "err", err)
+			}
 			logger.Info("qdrant vector index enabled (external store; unverified in CI)", "collection", cfg.AI.VectorCollection)
 		}
 		// Optional Postgres FTS lexical backend (opt-in; reuses AI_VECTOR_DSN).

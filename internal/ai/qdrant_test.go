@@ -289,6 +289,100 @@ func TestQdrantUpsertPutErrorSurfaces(t *testing.T) {
 	}
 }
 
+// TestQdrantEnsureCollectionCreates verifies EnsureCollection issues
+// PUT /collections/{name} with the embedder's vector size and Cosine distance.
+func TestQdrantEnsureCollectionCreates(t *testing.T) {
+	var gotPath, gotMethod, gotAPIKey string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotMethod, gotAPIKey = r.URL.Path, r.Method, r.Header.Get("api-key")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = w.Write([]byte(`{"result":true,"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL, Collection: "chunks", APIKey: "tok"})
+	if err := qi.EnsureCollection(context.Background(), 384); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("method: want PUT, got %q", gotMethod)
+	}
+	if gotPath != "/collections/chunks" {
+		t.Errorf("path: want /collections/chunks, got %q", gotPath)
+	}
+	if gotAPIKey != "tok" {
+		t.Errorf("api-key not forwarded: %q", gotAPIKey)
+	}
+	vectors, ok := gotBody["vectors"].(map[string]any)
+	if !ok {
+		t.Fatalf("vectors object missing in body: %v", gotBody)
+	}
+	if v, _ := vectors["size"].(float64); int(v) != 384 {
+		t.Errorf("vectors.size: want 384, got %v", vectors["size"])
+	}
+	if vectors["distance"] != "Cosine" {
+		t.Errorf("vectors.distance: want Cosine, got %v", vectors["distance"])
+	}
+}
+
+// TestQdrantEnsureCollectionIdempotent confirms an already-existing collection
+// (Qdrant may answer 409 / "already exists") is treated as success, not error.
+func TestQdrantEnsureCollectionIdempotent(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"conflict409", http.StatusConflict, `{"status":{"error":"Collection ` + "`chunks`" + ` already exists!"}}`},
+		{"badrequest400", http.StatusBadRequest, `{"status":{"error":"Wrong input: Collection already exists"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL, Collection: "chunks"})
+			if err := qi.EnsureCollection(context.Background(), 3); err != nil {
+				t.Fatalf("already-exists must be treated as success, got %v", err)
+			}
+		})
+	}
+}
+
+// TestQdrantEnsureCollectionBadDim asserts dim<=0 errors without any network call.
+func TestQdrantEnsureCollectionBadDim(t *testing.T) {
+	var hit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL})
+	for _, dim := range []int{0, -1, -100} {
+		if err := qi.EnsureCollection(context.Background(), dim); err == nil {
+			t.Errorf("dim=%d: want error, got nil", dim)
+		}
+	}
+	if hit {
+		t.Fatal("EnsureCollection must not hit the network for dim<=0")
+	}
+}
+
+// TestQdrantEnsureCollectionServerError confirms a genuine 500 surfaces as a
+// wrapped error (distinct from the already-exists case).
+func TestQdrantEnsureCollectionServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "qdrant boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL})
+	if err := qi.EnsureCollection(context.Background(), 3); err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
+		t.Fatalf("genuine 500 should surface as wrapped error, got %v", err)
+	}
+}
+
 // --- helpers ---
 
 type recordedCall struct {

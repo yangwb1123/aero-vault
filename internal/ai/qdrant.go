@@ -14,10 +14,11 @@
 //   - OPT-IN: nothing wires it in by default. An operator selects it via
 //     AI_VECTOR_BACKEND=qdrant; the brute-force repository scan stays the
 //     default and is byte-for-byte unchanged.
-//   - Collection lifecycle is the operator's responsibility: create the
-//     collection (with the right vector size + distance) out of band, e.g.
-//     PUT /collections/aero_chunks {"vectors":{"size":<dim>,"distance":"Cosine"}}.
-//     The adapter does not create it (the embedding dimension is not known here).
+//   - Collection auto-provisioning: EnsureCollection issues
+//     PUT /collections/aero_chunks {"vectors":{"size":<dim>,"distance":"Cosine"}}
+//     from the embedder's Dimensions() and is called at startup (best-effort) by
+//     cmd/server. It is idempotent — an already-existing collection is treated as
+//     success — so the operator no longer has to create it out of band.
 //   - UNVERIFIED in CI: there is no Qdrant in the test harness, so the live
 //     round-trip against a real server is NOT exercised. Correctness here is
 //     pinned by the httptest contract tests in qdrant_test.go (request paths,
@@ -176,6 +177,53 @@ func (q *QdrantIndex) SearchVectors(ctx context.Context, tenant, bucket string, 
 	return hits, nil
 }
 
+type qdrantVectorParams struct {
+	Size     int    `json:"size"`
+	Distance string `json:"distance"`
+}
+
+type qdrantCreateCollectionReq struct {
+	Vectors qdrantVectorParams `json:"vectors"`
+}
+
+// EnsureCollection idempotently provisions the collection that holds chunk
+// points. It issues PUT /collections/{Collection} with a single unnamed vector
+// of the given dimension and Cosine distance (1-cosine is exactly the score the
+// adapter maps back). Qdrant answers 200 on create; if the collection already
+// exists it may answer 200 or a 4xx "already exists" — both are treated as
+// success so repeated startups are safe. A genuine failure (e.g. 5xx) surfaces
+// as a wrapped error. dim<=0 returns an error without touching the network.
+func (q *QdrantIndex) EnsureCollection(ctx context.Context, dim int) error {
+	if dim <= 0 {
+		return fmt.Errorf("qdrant: ensure collection: invalid dimension %d", dim)
+	}
+	body := qdrantCreateCollectionReq{Vectors: qdrantVectorParams{Size: dim, Distance: "Cosine"}}
+	status, raw, err := q.doStatus(ctx, http.MethodPut, "", "", body)
+	if err != nil {
+		return err
+	}
+	if status >= 200 && status < 300 {
+		return nil
+	}
+	if collectionAlreadyExists(status, raw) {
+		return nil
+	}
+	return fmt.Errorf("qdrant http %d: %s", status, strings.TrimSpace(string(raw)))
+}
+
+// collectionAlreadyExists reports whether a non-2xx response is Qdrant's
+// idempotent "collection already exists" answer rather than a real failure: a
+// 409 Conflict, or any 4xx whose body mentions an existing collection.
+func collectionAlreadyExists(status int, raw []byte) bool {
+	if status == http.StatusConflict {
+		return true
+	}
+	if status >= 400 && status < 500 {
+		return strings.Contains(strings.ToLower(string(raw)), "already exist")
+	}
+	return false
+}
+
 type qdrantPoint struct {
 	ID      int64        `json:"id"`
 	Vector  []float32    `json:"vector"`
@@ -274,4 +322,34 @@ func (q *QdrantIndex) do(ctx context.Context, method, subPath, rawQuery string, 
 		return fmt.Errorf("qdrant: decode response: %w", err)
 	}
 	return nil
+}
+
+// doStatus performs one Qdrant REST call like do but, instead of folding a
+// non-2xx into a wrapped error, returns the raw status code and a bounded body
+// so the caller can distinguish cases (e.g. EnsureCollection treating an
+// "already exists" 4xx as success). A transport error is still returned as err.
+func (q *QdrantIndex) doStatus(ctx context.Context, method, subPath, rawQuery string, reqBody any) (int, []byte, error) {
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return 0, nil, fmt.Errorf("qdrant: encode request: %w", err)
+	}
+	url := q.baseURL + "/collections/" + q.collection + subPath
+	if rawQuery != "" {
+		url += "?" + rawQuery
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, fmt.Errorf("qdrant: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if q.apiKey != "" {
+		req.Header.Set("api-key", q.apiKey)
+	}
+	resp, err := q.client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("qdrant: %s %s: %w", method, subPath, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, raw, nil
 }
