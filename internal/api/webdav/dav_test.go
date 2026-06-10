@@ -294,6 +294,65 @@ func TestMoveRenamesFile(t *testing.T) {
 	}
 }
 
+// TestMoveLargeFile renames an object above the 8 MiB spill threshold, so the
+// copy inside Rename must go through the temp-file-backed spill path rather
+// than buffering the whole payload in memory.
+func TestMoveLargeFile(t *testing.T) {
+	srv := newTestServer(t)
+
+	const size = 9 << 20
+	want := make([]byte, size)
+	for i := range want {
+		want[i] = byte((i*2654435761 + 1013904223) >> 13)
+	}
+
+	resp, _ := do(t, srv, http.MethodPut, "/webdav/big-src.bin", want, nil)
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT big-src: got %d, want 201 or 204", resp.StatusCode)
+	}
+
+	resp, _ = do(t, srv, "MOVE", "/webdav/big-src.bin", nil, map[string]string{
+		"Destination": srv.URL + "/webdav/big-dst.bin",
+		"Overwrite":   "T",
+	})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("MOVE large: got %d, want 201 or 204", resp.StatusCode)
+	}
+
+	resp, _ = do(t, srv, http.MethodGet, "/webdav/big-src.bin", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET after MOVE (old path): got %d, want 404", resp.StatusCode)
+	}
+
+	resp, body := do(t, srv, http.MethodGet, "/webdav/big-dst.bin", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET after MOVE (new path): got %d, want 200", resp.StatusCode)
+	}
+	if !bytes.Equal(body, want) {
+		t.Fatalf("MOVE large: bytes at dst differ from source (%d vs %d bytes)", len(body), len(want))
+	}
+}
+
+// TestMoveMissingSource asserts Rename's not-found error keeps surfacing the
+// same way: moveFiles in golang.org/x/net/webdav maps any Rename error to 403.
+func TestMoveMissingSource(t *testing.T) {
+	srv := newTestServer(t)
+
+	resp, _ := do(t, srv, "MOVE", "/webdav/no-such-src.txt", nil, map[string]string{
+		"Destination": srv.URL + "/webdav/no-such-dst.txt",
+		"Overwrite":   "T",
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("MOVE missing source: got %d, want 403", resp.StatusCode)
+	}
+
+	// The destination must not have been created.
+	resp, _ = do(t, srv, http.MethodGet, "/webdav/no-such-dst.txt", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET dst after failed MOVE: got %d, want 404", resp.StatusCode)
+	}
+}
+
 // ----------------------------------------------------------------------------
 // OPTIONS — DAV capability advertisement
 // ----------------------------------------------------------------------------

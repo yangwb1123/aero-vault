@@ -117,13 +117,17 @@ func (f *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	// Stream the source through a bounded spill buffer (same as the read path)
+	// so a large object is not pinned in memory during the copy.
+	buf := newSpillBuffer()
+	defer buf.Close()
+	err = buf.fill(rc)
+	_ = rc.Close()
 	if err != nil {
 		return err
 	}
 	if _, err := f.svc.Put(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(newName, "/"),
-		ioReaderOf(body), int64(len(body)), service.PutOptions{}); err != nil {
+		buf, buf.Len(), service.PutOptions{}); err != nil {
 		return err
 	}
 	return f.svc.Delete(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"), true)
@@ -294,23 +298,4 @@ func davFileInfo(o repository.Object) os.FileInfo {
 
 func davDirInfo(name string) os.FileInfo {
 	return &davInfo{name: strings.TrimSuffix(name, "/"), dir: true, mod: time.Now()}
-}
-
-// ioReaderOf is a small helper that avoids importing bytes everywhere.
-func ioReaderOf(b []byte) io.Reader {
-	return &sliceReader{b: b}
-}
-
-type sliceReader struct {
-	b   []byte
-	off int
-}
-
-func (r *sliceReader) Read(p []byte) (int, error) {
-	if r.off >= len(r.b) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b[r.off:])
-	r.off += n
-	return n, nil
 }
