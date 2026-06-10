@@ -174,22 +174,14 @@ func run() error {
 		if cfg.AI.SearchCacheSize > 0 {
 			search.WithResultCache(cfg.AI.SearchCacheSize, time.Duration(cfg.AI.SearchCacheTTLSeconds)*time.Second)
 		}
+		// The in-process BM25 index is seeded once at startup and then kept
+		// current incrementally via the ChunkSink seam (registered on the
+		// indexer below), so there is no periodic full-corpus rebuild.
+		var bm *ai.BM25
 		if cfg.AI.HybridSearch {
-			bm := ai.NewBM25()
+			bm = ai.NewBM25()
 			search.WithBM25(bm)
-			go func() {
-				_ = bm.BuildFromRepo(ctx, repo, "default")
-				t := time.NewTicker(30 * time.Second)
-				defer t.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-t.C:
-						_ = bm.BuildFromRepo(ctx, repo, "default")
-					}
-				}
-			}()
+			go func() { _ = bm.BuildFromRepo(ctx, repo, "default") }()
 		}
 		if reranker != nil {
 			search.WithReranker(reranker)
@@ -212,6 +204,9 @@ func run() error {
 			logger.Info("remote extractor enabled", "endpoint", cfg.AI.ExtractorEndpoint)
 		}
 		indexer := ai.NewIndexer(repo, store, extractor, ai.NewChunker(), embedder, logger)
+		if bm != nil {
+			indexer.WithChunkSink(bm)
+		}
 		if cfg.AI.PIIScan {
 			indexer.WithPII(ai.NewPIIDetector(), cfg.AI.PIIRedact)
 			logger.Info("pii scan enabled", "redact", cfg.AI.PIIRedact)

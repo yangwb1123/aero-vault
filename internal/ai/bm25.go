@@ -10,9 +10,10 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
-// BM25 is an in-memory BM25 index over chunks. It is rebuilt on demand from
-// the repository. For an MVP-grade search, this is fine: the corpus is small
-// enough that a periodic rebuild is cheap.
+// BM25 is an in-memory BM25 index over chunks. It is seeded once from the
+// repository (BuildFromRepo) and then maintained incrementally as the indexer
+// fans out per-object chunk changes through the ChunkSink seam — no periodic
+// full-corpus rebuild.
 //
 // In production, swap this for an inverted index in Postgres (tsvector) or
 // Meilisearch/Tantivy via an HTTP adapter.
@@ -22,8 +23,10 @@ type BM25 struct {
 	mu       sync.RWMutex
 	docs     map[int64]bm25Doc // chunkID -> doc
 	df       map[string]int    // term -> doc frequency
+	objDocs  map[int64][]int64 // objectID -> chunk IDs it owns
 	avgLen   float64
 	totalDoc int
+	totalLen int // running sum of doc lengths, so avgLen stays O(1) to update
 }
 
 type bm25Doc struct {
@@ -38,7 +41,7 @@ type bm25Doc struct {
 }
 
 func NewBM25() *BM25 {
-	return &BM25{k1: 1.5, b: 0.75, docs: map[int64]bm25Doc{}, df: map[string]int{}}
+	return &BM25{k1: 1.5, b: 0.75, docs: map[int64]bm25Doc{}, df: map[string]int{}, objDocs: map[int64][]int64{}}
 }
 
 var tokenRe = regexp.MustCompile(`[\p{L}\p{N}]+`)
@@ -77,28 +80,94 @@ func (b *BM25) BuildFromRepo(ctx context.Context, repo repository.Repository, te
 	defer b.mu.Unlock()
 	b.docs = make(map[int64]bm25Doc, len(all))
 	b.df = make(map[string]int)
-	totalLen := 0
+	b.objDocs = make(map[int64][]int64)
+	b.totalDoc = 0
+	b.totalLen = 0
 	for _, c := range all {
-		toks := tokenize(c.Content)
-		tf := make(map[string]int, len(toks))
-		for _, t := range toks {
-			tf[t]++
-		}
-		for t := range tf {
-			b.df[t]++
-		}
-		b.docs[c.ID] = bm25Doc{
-			tenant: c.TenantID, bucket: c.Bucket, objectKey: c.ObjectKey,
-			objectID: c.ObjectID, seq: c.Seq, content: c.Content, length: len(toks), tokens: tf,
-		}
-		totalLen += len(toks)
+		b.insertDocLocked(c)
 	}
-	b.totalDoc = len(b.docs)
-	if b.totalDoc > 0 {
-		b.avgLen = float64(totalLen) / float64(b.totalDoc)
-	}
+	b.recomputeAvgLenLocked()
 	return nil
 }
+
+// insertDocLocked indexes one chunk as a doc, updating df, totalDoc, totalLen
+// and the objectID->chunkIDs aux map. Caller holds b.mu.Lock and is responsible
+// for calling recomputeAvgLenLocked afterwards.
+func (b *BM25) insertDocLocked(c repository.Chunk) {
+	toks := tokenize(c.Content)
+	tf := make(map[string]int, len(toks))
+	for _, t := range toks {
+		tf[t]++
+	}
+	for t := range tf {
+		b.df[t]++
+	}
+	b.docs[c.ID] = bm25Doc{
+		tenant: c.TenantID, bucket: c.Bucket, objectKey: c.ObjectKey,
+		objectID: c.ObjectID, seq: c.Seq, content: c.Content, length: len(toks), tokens: tf,
+	}
+	b.objDocs[c.ObjectID] = append(b.objDocs[c.ObjectID], c.ID)
+	b.totalDoc++
+	b.totalLen += len(toks)
+}
+
+// removeObjectLocked drops every doc the aux map records for objectID,
+// decrementing df per unique term (deleting the key at zero) and subtracting
+// each doc's length from the running total. Caller holds b.mu.Lock and is
+// responsible for calling recomputeAvgLenLocked afterwards.
+func (b *BM25) removeObjectLocked(objectID int64) {
+	for _, id := range b.objDocs[objectID] {
+		d, ok := b.docs[id]
+		if !ok {
+			continue
+		}
+		for t := range d.tokens {
+			if b.df[t] <= 1 {
+				delete(b.df, t)
+			} else {
+				b.df[t]--
+			}
+		}
+		b.totalLen -= d.length
+		b.totalDoc--
+		delete(b.docs, id)
+	}
+	delete(b.objDocs, objectID)
+}
+
+func (b *BM25) recomputeAvgLenLocked() {
+	if b.totalDoc > 0 {
+		b.avgLen = float64(b.totalLen) / float64(b.totalDoc)
+	} else {
+		b.avgLen = 0
+	}
+}
+
+// UpsertObjectChunks replaces everything the index holds for objectID with
+// exactly the given chunks (an empty slice clears the object). It implements
+// ai.ChunkSink and is safe for concurrent use.
+func (b *BM25) UpsertObjectChunks(_ context.Context, objectID int64, chunks []repository.Chunk) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.removeObjectLocked(objectID)
+	for _, c := range chunks {
+		b.insertDocLocked(c)
+	}
+	b.recomputeAvgLenLocked()
+	return nil
+}
+
+// DeleteObjectChunks removes everything the index holds for objectID. It
+// implements ai.ChunkSink and is safe for concurrent use.
+func (b *BM25) DeleteObjectChunks(_ context.Context, objectID int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.removeObjectLocked(objectID)
+	b.recomputeAvgLenLocked()
+	return nil
+}
+
+var _ ChunkSink = (*BM25)(nil)
 
 type bm25Hit struct {
 	ChunkID int64
