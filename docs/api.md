@@ -403,7 +403,7 @@ same objects.
 | HeadObject | `HEAD /{bucket}/{key}` | ✅ | |
 | DeleteObject | `DELETE /{bucket}/{key}` | ✅ | Physical delete. |
 | CopyObject | `PUT` + `x-amz-copy-source` | ✅ | `x-amz-metadata-directive: COPY` (default) or `REPLACE`. |
-| ListObjectsV2 | `GET /{bucket}?list-type=2` | ✅ | `prefix`, `continuation-token`, `max-keys`, `start-after`. **Only `list-type=2`.** |
+| ListObjectsV2 | `GET /{bucket}?list-type=2` | ✅ | `prefix`, `continuation-token`, `max-keys`, `start-after`. |
 | HeadBucket | `HEAD /{bucket}` | ✅ | |
 | CreateBucket | `PUT /{bucket}` | ✅ | Registers the bucket; canned ACL via `x-amz-acl`. |
 | DeleteObjects (batch) | `POST /{bucket}?delete` | ✅ | XML body; supports quiet mode. |
@@ -418,7 +418,7 @@ same objects.
 | AbortMultipartUpload | `DELETE /{bucket}/{key}?uploadId=` | ✅ | |
 | ListParts | `GET /{bucket}/{key}?uploadId=` | ✅ | |
 | ListMultipartUploads | `GET /{bucket}?uploads` | ✅ | |
-| ListObjects (v1) | `GET /{bucket}` (no `list-type=2`) | ❌ | Use `list-type=2`. |
+| ListObjects (v1) | `GET /{bucket}` (no `list-type=2`) | ✅ | `prefix`, `marker`, `max-keys`; `NextMarker` when truncated. |
 | Versioning / lock / lifecycle sub-resources | `?versioning`, `?object-lock`, `?lifecycle` | ❌ (via S3) | Use the REST `/v1/buckets/...` endpoints. |
 | Presigned URLs | — | ✅ (REST) | Use `POST /v1/files/{key}/presign`. |
 

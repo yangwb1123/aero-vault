@@ -21,6 +21,21 @@ type listBucketResult struct {
 	Contents              []listContent `xml:"Contents"`
 }
 
+// listBucketResultV1 is the ListObjects (v1) response: it echoes the request
+// Marker and emits NextMarker when truncated, and never carries the v2-only
+// KeyCount / ContinuationToken / NextContinuationToken fields.
+type listBucketResultV1 struct {
+	XMLName     xml.Name      `xml:"ListBucketResult"`
+	Xmlns       string        `xml:"xmlns,attr"`
+	Name        string        `xml:"Name"`
+	Prefix      string        `xml:"Prefix"`
+	Marker      string        `xml:"Marker"`
+	NextMarker  string        `xml:"NextMarker,omitempty"`
+	MaxKeys     int           `xml:"MaxKeys"`
+	IsTruncated bool          `xml:"IsTruncated"`
+	Contents    []listContent `xml:"Contents"`
+}
+
 type listContent struct {
 	Key          string    `xml:"Key"`
 	LastModified time.Time `xml:"LastModified"`
