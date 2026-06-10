@@ -113,7 +113,7 @@ func (f *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	// WebDAV-required for drag-and-drop renames in Finder. Implement via
 	// copy-then-delete (atomic enough for MVP).
 	tenant := f.tenant(ctx)
-	rc, _, err := f.svc.Get(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"))
+	rc, src, err := f.svc.Get(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"))
 	if err != nil {
 		return err
 	}
@@ -126,8 +126,23 @@ func (f *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	if err != nil {
 		return err
 	}
+	// Carry the source object's ContentType, user metadata, and tags across the
+	// move; copy the maps so the new object never aliases the source's.
+	opts := service.PutOptions{ContentType: src.ContentType}
+	if len(src.Metadata) > 0 {
+		opts.Metadata = make(map[string]string, len(src.Metadata))
+		for k, v := range src.Metadata {
+			opts.Metadata[k] = v
+		}
+	}
+	if len(src.Tags) > 0 {
+		opts.Tags = make(map[string]string, len(src.Tags))
+		for k, v := range src.Tags {
+			opts.Tags[k] = v
+		}
+	}
 	if _, err := f.svc.Put(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(newName, "/"),
-		buf, buf.Len(), service.PutOptions{}); err != nil {
+		buf, buf.Len(), opts); err != nil {
 		return err
 	}
 	return f.svc.Delete(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"), true)
