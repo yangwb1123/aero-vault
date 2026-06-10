@@ -335,6 +335,150 @@ func TestRangeRequests(t *testing.T) {
 	}
 }
 
+func TestBucketVersioningRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	// Unconfigured: empty VersioningConfiguration, no Status.
+	resp, body := do(t, "GET", base+"/b?versioning", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("get versioning status %d", resp.StatusCode)
+	}
+	var vc versioningConfiguration
+	if err := xml.Unmarshal(body, &vc); err != nil {
+		t.Fatalf("parse versioning: %v body=%s", err, body)
+	}
+	if vc.Status != "" {
+		t.Fatalf("expected empty Status when unconfigured, got %q", vc.Status)
+	}
+
+	// Enable.
+	putBody, _ := xml.Marshal(versioningConfiguration{Status: "Enabled"})
+	resp, _ = do(t, "PUT", base+"/b?versioning", putBody, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("put versioning status %d", resp.StatusCode)
+	}
+	resp, body = do(t, "GET", base+"/b?versioning", nil, nil)
+	_ = xml.Unmarshal(body, &vc)
+	if resp.StatusCode != 200 || vc.Status != "Enabled" {
+		t.Fatalf("expected Enabled, got status=%d Status=%q body=%s", resp.StatusCode, vc.Status, body)
+	}
+}
+
+func TestBucketLifecycleRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	// Unconfigured → 404 NoSuchLifecycleConfiguration.
+	resp, body := do(t, "GET", base+"/b?lifecycle", nil, nil)
+	if resp.StatusCode != 404 {
+		t.Fatalf("unconfigured lifecycle GET status=%d want 404 body=%s", resp.StatusCode, body)
+	}
+	var e s3Error
+	_ = xml.Unmarshal(body, &e)
+	if e.Code != "NoSuchLifecycleConfiguration" {
+		t.Fatalf("expected NoSuchLifecycleConfiguration, got %q body=%s", e.Code, body)
+	}
+
+	// Configure Days=30.
+	putBody, _ := xml.Marshal(lifecycleConfiguration{Rules: []lifecycleRule{{Status: "Enabled", Expiration: &lifecycleExpiration{Days: 30}}}})
+	resp, _ = do(t, "PUT", base+"/b?lifecycle", putBody, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("put lifecycle status %d", resp.StatusCode)
+	}
+	resp, body = do(t, "GET", base+"/b?lifecycle", nil, nil)
+	var lc lifecycleConfiguration
+	if err := xml.Unmarshal(body, &lc); err != nil {
+		t.Fatalf("parse lifecycle: %v body=%s", err, body)
+	}
+	if resp.StatusCode != 200 || len(lc.Rules) != 1 || lc.Rules[0].Expiration == nil || lc.Rules[0].Expiration.Days != 30 {
+		t.Fatalf("expected one rule with Days=30, got status=%d %+v body=%s", resp.StatusCode, lc.Rules, body)
+	}
+}
+
+func TestBucketObjectLockRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	putBody, _ := xml.Marshal(objectLockConfiguration{
+		ObjectLockEnabled: "Enabled",
+		Rule:              &objectLockRule{DefaultRetention: objectLockRetention{Mode: "GOVERNANCE", Days: 1}},
+	})
+	resp, _ := do(t, "PUT", base+"/b?object-lock", putBody, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("put object-lock status %d", resp.StatusCode)
+	}
+	resp, body := do(t, "GET", base+"/b?object-lock", nil, nil)
+	var olc objectLockConfiguration
+	if err := xml.Unmarshal(body, &olc); err != nil {
+		t.Fatalf("parse object-lock: %v body=%s", err, body)
+	}
+	if resp.StatusCode != 200 || olc.ObjectLockEnabled != "Enabled" || olc.Rule == nil {
+		t.Fatalf("expected enabled lock with a rule, got status=%d %+v body=%s", resp.StatusCode, olc, body)
+	}
+	if olc.Rule.DefaultRetention.Days != 1 || olc.Rule.DefaultRetention.Mode != "GOVERNANCE" {
+		t.Fatalf("expected GOVERNANCE Days=1, got %+v", olc.Rule.DefaultRetention)
+	}
+}
+
+func TestListObjectVersions(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	// Enable versioning, then write the same key twice.
+	putBody, _ := xml.Marshal(versioningConfiguration{Status: "Enabled"})
+	do(t, "PUT", base+"/b?versioning", putBody, nil)
+	do(t, "PUT", base+"/b/k.txt", []byte("v1"), nil)
+	do(t, "PUT", base+"/b/k.txt", []byte("v2"), nil)
+
+	resp, body := do(t, "GET", base+"/b?versions", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("list versions status=%d body=%s", resp.StatusCode, body)
+	}
+	var lvr listVersionsResult
+	if err := xml.Unmarshal(body, &lvr); err != nil {
+		t.Fatalf("parse versions: %v body=%s", err, body)
+	}
+	if lvr.Name != "b" {
+		t.Fatalf("expected Name=b, got %q", lvr.Name)
+	}
+	if len(lvr.Versions) != 2 {
+		t.Fatalf("expected 2 versions, got %d: %s", len(lvr.Versions), body)
+	}
+	latest := 0
+	for _, v := range lvr.Versions {
+		if v.Key != "k.txt" {
+			t.Fatalf("unexpected version key %q", v.Key)
+		}
+		if v.IsLatest {
+			latest++
+		}
+	}
+	if latest != 1 {
+		t.Fatalf("expected exactly one IsLatest=true, got %d: %s", latest, body)
+	}
+}
+
+func TestBucketConfigMalformedXML(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	do(t, "PUT", base+"/b", nil, nil)
+
+	resp, body := do(t, "PUT", base+"/b?versioning", []byte("<not-xml"), nil)
+	if resp.StatusCode != 400 {
+		t.Fatalf("malformed PUT status=%d want 400 body=%s", resp.StatusCode, body)
+	}
+	var e s3Error
+	_ = xml.Unmarshal(body, &e)
+	if e.Code != "MalformedXML" {
+		t.Fatalf("expected MalformedXML, got %q body=%s", e.Code, body)
+	}
+}
+
 func TestListObjectsV2(t *testing.T) {
 	s := newTestServer(t)
 	base := s.URL

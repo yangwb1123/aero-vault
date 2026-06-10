@@ -24,8 +24,19 @@ func writeS3Error(w http.ResponseWriter, r *http.Request, err error) {
 	_ = xml.NewEncoder(w).Encode(body)
 }
 
+// errNoSuchLifecycle signals that a bucket has no lifecycle configuration, which
+// AWS reports as a 404 NoSuchLifecycleConfiguration rather than an empty body.
+var errNoSuchLifecycle = errors.New("the lifecycle configuration does not exist")
+
+// errMalformedXML signals an unparsable request body (400 MalformedXML).
+var errMalformedXML = errors.New("the XML you provided was not well-formed or did not validate")
+
 func classify(err error) (string, string, int) {
 	switch {
+	case errors.Is(err, errMalformedXML):
+		return "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.", http.StatusBadRequest
+	case errors.Is(err, errNoSuchLifecycle):
+		return "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist.", http.StatusNotFound
 	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):
 		return "NoSuchKey", "The specified key does not exist.", http.StatusNotFound
 	case errors.Is(err, service.ErrInvalidArgs):

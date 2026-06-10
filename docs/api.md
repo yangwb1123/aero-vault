@@ -419,7 +419,8 @@ same objects.
 | ListParts | `GET /{bucket}/{key}?uploadId=` | ✅ | |
 | ListMultipartUploads | `GET /{bucket}?uploads` | ✅ | |
 | ListObjects (v1) | `GET /{bucket}` (no `list-type=2`) | ✅ | `prefix`, `marker`, `max-keys`; `NextMarker` when truncated. |
-| Versioning / lock / lifecycle sub-resources | `?versioning`, `?object-lock`, `?lifecycle` | ❌ (via S3) | Use the REST `/v1/buckets/...` endpoints. |
+| Versioning / lock / lifecycle sub-resources | `GET`/`PUT /{bucket}?versioning`, `?object-lock`, `?lifecycle` | ✅ | XML config round-trips; `GET ?lifecycle` is `404 NoSuchLifecycleConfiguration` when unset. |
+| ListObjectVersions | `GET /{bucket}?versions` | ✅ | Honors `?prefix`; every stored version is a `<Version>` (newest `IsLatest=true`); unpaginated (`IsTruncated=false`). |
 | Presigned URLs | — | ✅ (REST) | Use `POST /v1/files/{key}/presign`. |
 
 ## SigV4 usage

@@ -191,6 +191,73 @@ type aclGrantee struct {
 	URI  string `xml:"URI,omitempty"`
 }
 
+// --- Bucket sub-resources (versioning / lifecycle / object-lock / versions) ---
+
+// versioningConfiguration is the body of GET/PUT /{bucket}?versioning. AWS omits
+// <Status> when versioning was never configured, so Status uses omitempty.
+type versioningConfiguration struct {
+	XMLName xml.Name `xml:"VersioningConfiguration"`
+	Xmlns   string   `xml:"xmlns,attr,omitempty"`
+	Status  string   `xml:"Status,omitempty"`
+}
+
+// lifecycleConfiguration is the body of GET/PUT /{bucket}?lifecycle. We model the
+// single expire-after-days rule the service supports.
+type lifecycleConfiguration struct {
+	XMLName xml.Name        `xml:"LifecycleConfiguration"`
+	Xmlns   string          `xml:"xmlns,attr,omitempty"`
+	Rules   []lifecycleRule `xml:"Rule"`
+}
+
+type lifecycleRule struct {
+	ID         string               `xml:"ID,omitempty"`
+	Status     string               `xml:"Status"`
+	Expiration *lifecycleExpiration `xml:"Expiration,omitempty"`
+}
+
+type lifecycleExpiration struct {
+	Days int `xml:"Days"`
+}
+
+// objectLockConfiguration is the body of GET/PUT /{bucket}?object-lock.
+type objectLockConfiguration struct {
+	XMLName           xml.Name        `xml:"ObjectLockConfiguration"`
+	Xmlns             string          `xml:"xmlns,attr,omitempty"`
+	ObjectLockEnabled string          `xml:"ObjectLockEnabled"`
+	Rule              *objectLockRule `xml:"Rule,omitempty"`
+}
+
+type objectLockRule struct {
+	DefaultRetention objectLockRetention `xml:"DefaultRetention"`
+}
+
+type objectLockRetention struct {
+	Mode string `xml:"Mode"`
+	Days int    `xml:"Days,omitempty"`
+}
+
+// listVersionsResult is the body of GET /{bucket}?versions.
+type listVersionsResult struct {
+	XMLName     xml.Name       `xml:"ListVersionsResult"`
+	Xmlns       string         `xml:"xmlns,attr"`
+	Name        string         `xml:"Name"`
+	Prefix      string         `xml:"Prefix"`
+	KeyMarker   string         `xml:"KeyMarker"`
+	MaxKeys     int            `xml:"MaxKeys"`
+	IsTruncated bool           `xml:"IsTruncated"`
+	Versions    []versionEntry `xml:"Version"`
+}
+
+type versionEntry struct {
+	Key          string    `xml:"Key"`
+	VersionID    string    `xml:"VersionId"`
+	IsLatest     bool      `xml:"IsLatest"`
+	LastModified time.Time `xml:"LastModified"`
+	ETag         string    `xml:"ETag"`
+	Size         int64     `xml:"Size"`
+	StorageClass string    `xml:"StorageClass"`
+}
+
 const allUsersURI = "http://acs.amazonaws.com/groups/global/AllUsers"
 
 // cannedToPolicy synthesizes an AccessControlPolicy from a canned ACL.
