@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
 // Handler executes one job. Returning an error triggers a retry with backoff
@@ -181,6 +182,7 @@ func (p *Pool) runOne(ctx context.Context, worker string) (worked bool, err erro
 	if !ok {
 		p.logger.Error("no handler for job type", "type", job.Type, "id", job.ID)
 		_ = p.repo.FailJob(ctx, job.ID, "no handler registered for type "+job.Type)
+		telemetry.IncJobFailed(ctx, job.Type)
 		return true, nil
 	}
 	runErr := p.execute(ctx, h, job)
@@ -189,17 +191,20 @@ func (p *Pool) runOne(ctx context.Context, worker string) (worked bool, err erro
 			p.logger.Warn("complete job", "id", job.ID, "err", e)
 		}
 		p.logger.Info("job done", "id", job.ID, "type", job.Type, "attempts", job.Attempts)
+		telemetry.IncJobCompleted(ctx, job.Type)
 		return true, nil
 	}
 	// Failed: retry with backoff or give up.
 	if job.Attempts >= job.MaxAttempts {
 		p.logger.Error("job failed permanently", "id", job.ID, "type", job.Type, "attempts", job.Attempts, "err", runErr)
 		_ = p.repo.FailJob(ctx, job.ID, runErr.Error())
+		telemetry.IncJobFailed(ctx, job.Type)
 		return true, nil
 	}
 	delay := p.backoff(job.Attempts)
 	p.logger.Warn("job failed, retrying", "id", job.ID, "type", job.Type, "attempt", job.Attempts, "retry_in", delay.String(), "err", runErr)
 	_ = p.repo.RetryJob(ctx, job.ID, runErr.Error(), time.Now().Add(delay))
+	telemetry.IncJobRetried(ctx, job.Type)
 	return true, nil
 }
 

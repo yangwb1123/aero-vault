@@ -59,15 +59,27 @@ func (c *resultCache) get(key string) ([]Hit, bool) {
 	return cloneHits(e.hits), true
 }
 
-// put stores a COPY of hits with a fresh expiry, evicting one arbitrary entry
-// when at capacity.
+// put stores a COPY of hits with a fresh expiry. When at capacity it evicts an
+// expired entry first (preserving live results) and falls back to an arbitrary
+// live entry only when all entries are still valid.
 func (c *resultCache) put(key string, hits []Hit) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, exists := c.cache[key]; !exists && len(c.cache) >= c.capacity {
-		for ek := range c.cache {
-			delete(c.cache, ek)
-			break
+		now := time.Now()
+		evicted := false
+		for ek, ev := range c.cache {
+			if now.After(ev.expiry) {
+				delete(c.cache, ek)
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			for ek := range c.cache {
+				delete(c.cache, ek)
+				break
+			}
 		}
 	}
 	c.cache[key] = resultEntry{hits: cloneHits(hits), expiry: time.Now().Add(c.ttl)}

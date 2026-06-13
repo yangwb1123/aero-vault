@@ -226,6 +226,34 @@ func TestMiddleware_BypassPaths(t *testing.T) {
 	}
 }
 
+// TestStart_BackgroundEviction verifies the background goroutine periodically
+// evicts stale buckets without waiting for the map to hit rlMaxBuckets.
+func TestStart_BackgroundEviction(t *testing.T) {
+	rl := NewRateLimiter(10, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rl.mu.Lock()
+	rl.buckets["stale"] = &bucket{tokens: 5, last: time.Now().Add(-rlIdleTTL - time.Minute)}
+	rl.buckets["fresh"] = &bucket{tokens: 5, last: time.Now()}
+	rl.mu.Unlock()
+
+	rl.startWithInterval(ctx, time.Millisecond)
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		rl.mu.Lock()
+		_, stillStale := rl.buckets["stale"]
+		_, stillFresh := rl.buckets["fresh"]
+		rl.mu.Unlock()
+		if !stillStale && stillFresh {
+			return // evicted stale, kept fresh
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("background sweep did not evict stale bucket within 100ms")
+}
+
 func TestMiddleware_PerTenantBuckets(t *testing.T) {
 	rl := NewRateLimiter(1e-9, 1)
 	h := rl.Middleware()(okHandler())

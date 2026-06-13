@@ -352,6 +352,12 @@ All `/v1/admin/*` routes require the `admin` scope (when auth is enabled).
 |--------|------|---------|
 | `GET` | `/v1/usage` | Current tenant's quota & usage. |
 | `PUT` | `/v1/admin/tenants/{tenant}/quota` | Set quota. |
+| `PUT` | `/v1/admin/tenants/{tenant}/budget` | Set per-tenant daily AI spend cap (USD). |
+| `POST` | `/v1/admin/tenants` | Create or upsert a tenant record. |
+| `GET` | `/v1/admin/tenants` | List all tenants. |
+| `DELETE` | `/v1/admin/tenants/{tenant}` | Delete a tenant record. |
+| `PUT` | `/v1/admin/tenants/{tenant}/status` | Set tenant status (`active`\|`disabled`). |
+| `GET` | `/v1/admin/audit` | List audit-log entries (admin actions). |
 | `GET` | `/v1/admin/keys` | List API keys (tokens redacted). |
 | `POST` | `/v1/admin/keys` | Add key. |
 | `DELETE` | `/v1/admin/keys/{token}` | Revoke key. |
@@ -383,6 +389,41 @@ curl -s -X POST -d '{"sub":"svc-a","tenant":"acme","scopes":["read"],"ttl_second
 curl -s "$BASE/v1/admin/webhook-failures?limit=50"
 curl -s "$BASE/v1/admin/jobs?limit=20"
 curl -s -X POST "$BASE/v1/admin/jobs/123/retry"
+```
+
+### Tenant management
+
+Tenants created here are persisted in the DB and survive restarts. Omitting `display_name` is fine.
+
+```bash
+# Create or upsert a tenant
+curl -s -X POST -d '{"tenant_id":"acme","display_name":"Acme Corp"}' \
+  "$BASE/v1/admin/tenants"
+# -> { "tenant_id":"acme","display_name":"Acme Corp","status":"active","created_at":"…" }
+
+# List all tenants
+curl -s "$BASE/v1/admin/tenants"
+# -> { "tenants": [ { "tenant_id":"acme", … } ] }
+
+# Disable / re-enable a tenant (status: "active" | "disabled")
+curl -s -X PUT -d '{"status":"disabled"}' "$BASE/v1/admin/tenants/acme/status"
+curl -s -X PUT -d '{"status":"active"}'   "$BASE/v1/admin/tenants/acme/status"
+
+# Delete a tenant record (204; 404 if not found)
+curl -s -X DELETE "$BASE/v1/admin/tenants/acme"
+
+# Set per-tenant daily AI budget (0 clears the override)
+curl -s -X PUT -d '{"daily_budget_usd":5.00}' "$BASE/v1/admin/tenants/acme/budget"
+```
+
+### Audit log
+
+Admin and security actions are recorded automatically: key add/revoke, tenant create/delete/status, quota/budget set.
+
+```bash
+# Most recent 50 entries (default 100)
+curl -s "$BASE/v1/admin/audit?limit=50"
+# -> { "audit": [ { "actor":"ops","action":"key.add","target":"…","detail":"…","created_at":"…" } ] }
 ```
 
 ---

@@ -63,6 +63,30 @@ func TestSearchResultCache_ShortCircuitsRepeatQuery(t *testing.T) {
 	}
 }
 
+// TestResultCache_EvictsExpiredBeforeLive verifies that when the cache is at
+// capacity, a new entry evicts an already-expired entry instead of a live one.
+func TestResultCache_EvictsExpiredBeforeLive(t *testing.T) {
+	c := newResultCache(2, time.Hour)
+	hit := []Hit{{ChunkID: 1}}
+
+	// Fill to capacity: one entry that expires immediately, one that lives.
+	c.cache["expired"] = resultEntry{hits: cloneHits(hit), expiry: time.Now().Add(-time.Second)}
+	c.cache["live"] = resultEntry{hits: cloneHits(hit), expiry: time.Now().Add(time.Hour)}
+
+	// Adding a third entry should evict "expired", not "live".
+	c.put("fresh", hit)
+
+	if _, ok := c.cache["live"]; !ok {
+		t.Fatal("live entry must not be evicted when an expired entry is available")
+	}
+	if _, ok := c.cache["expired"]; ok {
+		t.Fatal("expired entry should have been evicted")
+	}
+	if _, ok := c.cache["fresh"]; !ok {
+		t.Fatal("newly added entry should be present")
+	}
+}
+
 func TestSearchResultCache_ZeroCapacityIsPassThrough(t *testing.T) {
 	env := newTestEnv(t)
 	emb := &countingHashEmbedder{inner: NewHashEmbedder(128)}

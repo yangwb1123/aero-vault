@@ -31,8 +31,11 @@ type Config struct {
 }
 
 type AppConfig struct {
-	Addr     string
-	LogLevel slog.Level
+	Addr              string
+	LogLevel          slog.Level
+	WriteTimeoutSec   int // APP_WRITE_TIMEOUT; 0 = disabled
+	IdleTimeoutSec    int // APP_IDLE_TIMEOUT; 0 = disabled
+	RequestTimeoutSec int // REQUEST_TIMEOUT_SECONDS; 0 = disabled
 }
 
 type StorageConfig struct {
@@ -93,8 +96,9 @@ type EventsConfig struct {
 	WebhookSecret string
 	// Cross-instance event transport (multi-replica). "" = in-process only;
 	// "postgres" = LISTEN/NOTIFY bridge. Requires Postgres; opt-in.
-	Transport    string
-	TransportDSN string
+	Transport     string
+	TransportDSN  string
+	SubBufferSize int // EVENTS_SUB_BUFFER; per-subscriber channel depth (0 = default 64)
 }
 
 type AIConfig struct {
@@ -149,6 +153,10 @@ type AIConfig struct {
 
 	PIIScan   bool
 	PIIRedact bool
+
+	AgentMaxSteps int
+	ChunkWindow   int
+	ChunkOverlap  int
 }
 
 type AuthConfig struct {
@@ -168,11 +176,14 @@ type CORSCfg struct {
 	AllowedOrigins []string
 	AllowedMethods []string
 	AllowedHeaders []string
+	ExposeHeaders  []string // CORS_EXPOSE_HEADERS; response headers browsers may read
 }
 
 type RateLimitCfg struct {
-	RPS   float64
-	Burst float64
+	RPS     float64
+	Burst   float64
+	AIRPS   float64
+	AIBurst float64
 }
 
 type ReconcileCfg struct {
@@ -229,8 +240,11 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		App: AppConfig{
-			Addr:     getEnv("APP_ADDR", ":8080"),
-			LogLevel: logLevel,
+			Addr:              getEnv("APP_ADDR", ":8080"),
+			LogLevel:          logLevel,
+			WriteTimeoutSec:   getEnvInt("APP_WRITE_TIMEOUT", 60),
+			IdleTimeoutSec:    getEnvInt("APP_IDLE_TIMEOUT", 120),
+			RequestTimeoutSec: getEnvInt("REQUEST_TIMEOUT_SECONDS", 120),
 		},
 		Storage: StorageConfig{
 			Backend:          strings.ToLower(getEnv("STORAGE_BACKEND", "local")),
@@ -279,6 +293,7 @@ func Load() (*Config, error) {
 			WebhookSecret: getEnv("EVENTS_WEBHOOK_SECRET", ""),
 			Transport:     strings.ToLower(getEnv("EVENTS_TRANSPORT", "")),
 			TransportDSN:  getEnv("EVENTS_TRANSPORT_DSN", ""),
+			SubBufferSize: getEnvInt("EVENTS_SUB_BUFFER", 0),
 		},
 		AI: AIConfig{
 			Enabled:        getEnvBool("AI_INDEX_ENABLED", false),
@@ -321,6 +336,10 @@ func Load() (*Config, error) {
 
 			PIIScan:   getEnvBool("AI_PII_SCAN", false),
 			PIIRedact: getEnvBool("AI_PII_REDACT", false),
+
+			AgentMaxSteps: getEnvInt("AI_AGENT_MAX_STEPS", 4),
+			ChunkWindow:   getEnvInt("AI_CHUNK_WINDOW", 600),
+			ChunkOverlap:  getEnvInt("AI_CHUNK_OVERLAP", 80),
 		},
 		Auth: AuthConfig{
 			Keys:                getEnv("AUTH_KEYS", ""),
@@ -337,10 +356,13 @@ func Load() (*Config, error) {
 			AllowedOrigins: splitCSV(getEnv("CORS_ALLOWED_ORIGINS", "")),
 			AllowedMethods: splitCSV(getEnv("CORS_ALLOWED_METHODS", "")),
 			AllowedHeaders: splitCSV(getEnv("CORS_ALLOWED_HEADERS", "")),
+			ExposeHeaders:  splitCSV(getEnv("CORS_EXPOSE_HEADERS", "")),
 		},
 		RateLimit: RateLimitCfg{
-			RPS:   getEnvFloat("RATE_LIMIT_RPS", 0),
-			Burst: getEnvFloat("RATE_LIMIT_BURST", 0),
+			RPS:     getEnvFloat("RATE_LIMIT_RPS", 0),
+			Burst:   getEnvFloat("RATE_LIMIT_BURST", 0),
+			AIRPS:   getEnvFloat("AI_RATE_LIMIT_RPS", 0),
+			AIBurst: getEnvFloat("AI_RATE_LIMIT_BURST", 0),
 		},
 		Reconcile: ReconcileCfg{
 			IntervalMinutes:     getEnvInt("RECONCILE_INTERVAL_MINUTES", 0),

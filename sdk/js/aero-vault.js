@@ -732,6 +732,94 @@ export class Client {
       return false;
     }
   }
+
+  // ---- admin ----
+
+  /** Add an API key. @returns {Promise<{token?: string}>} */
+  async addKey(label, opts = {}) {
+    return this._requestJSON("POST", "/v1/admin/keys", {
+      json: { label, ...opts },
+    });
+  }
+
+  /** List API keys. @returns {Promise<{keys?: Array}>} */
+  async listKeys() {
+    return this._requestJSON("GET", "/v1/admin/keys");
+  }
+
+  /** Revoke an API key. */
+  async revokeKey(token) {
+    return this._requestJSON("DELETE", `/v1/admin/keys/${encodeURIComponent(token)}`);
+  }
+
+  /** Issue a JWT. @returns {Promise<{token?: string}>} */
+  async issueJWT(tenant, opts = {}) {
+    return this._requestJSON("POST", "/v1/admin/jwt", {
+      json: { tenant, ...opts },
+    });
+  }
+
+  /** List webhook delivery failures. */
+  async listWebhookFailures() {
+    return this._requestJSON("GET", "/v1/admin/webhook-failures");
+  }
+
+  /** List background jobs. */
+  async listJobs() {
+    return this._requestJSON("GET", "/v1/admin/jobs");
+  }
+
+  /** Retry a failed job. */
+  async retryJob(jobId) {
+    return this._requestJSON("POST", `/v1/admin/jobs/${jobId}/retry`);
+  }
+
+  /** Create a tenant. */
+  async createTenant(tenantId, opts = {}) {
+    return this._requestJSON("POST", "/v1/admin/tenants", {
+      json: { tenant_id: tenantId, ...opts },
+    });
+  }
+
+  /** List tenants. @returns {Promise<{tenants?: Array}>} */
+  async listTenants() {
+    return this._requestJSON("GET", "/v1/admin/tenants");
+  }
+
+  /** Delete a tenant. */
+  async deleteTenant(tenantId) {
+    return this._requestJSON("DELETE", `/v1/admin/tenants/${encodeURIComponent(tenantId)}`);
+  }
+
+  /** Set tenant active/disabled status. */
+  async setTenantStatus(tenantId, status) {
+    return this._requestJSON("PUT", `/v1/admin/tenants/${encodeURIComponent(tenantId)}/status`, {
+      json: { status },
+    });
+  }
+
+  /** List audit log entries. */
+  async listAudit(opts = {}) {
+    const params = new URLSearchParams();
+    if (opts.limit) params.set("limit", String(opts.limit));
+    if (opts.before) params.set("before", opts.before);
+    const qs = params.toString();
+    return this._requestJSON("GET", "/v1/admin/audit" + (qs ? "?" + qs : ""));
+  }
+
+  /** Set tenant storage quota. */
+  async setQuota(tenantId, opts = {}) {
+    return this._requestJSON("PUT", `/v1/admin/tenants/${encodeURIComponent(tenantId)}/quota`, {
+      json: opts,
+    });
+  }
+
+  /** Set per-tenant AI daily budget (USD). */
+  async setBudget(tenantId, dailyUSD) {
+    return this._requestJSON("PUT", `/v1/admin/tenants/${encodeURIComponent(tenantId)}/budget`, {
+      json: { daily_budget_usd: dailyUSD },
+    });
+  }
 }
 
 // ---- helpers ------------------------------------------------------------

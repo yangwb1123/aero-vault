@@ -21,6 +21,7 @@ type Server struct {
 	svc    *service.FileService
 	repo   repository.Repository
 	search *ai.Search
+	chat   *ai.Chat
 	tenant string // active tenant for resources (default "default")
 	logger *slog.Logger
 }
@@ -33,6 +34,12 @@ func NewServer(svc *service.FileService, repo repository.Repository, search *ai.
 		tenant = "default"
 	}
 	return &Server{svc: svc, repo: repo, search: search, tenant: tenant, logger: logger}
+}
+
+// WithChat wires a Chat service into the server, enabling the chat tool.
+func (s *Server) WithChat(c *ai.Chat) *Server {
+	s.chat = c
+	return s
 }
 
 // tenantFor returns the request-scoped tenant from ctx if present (set by the
@@ -128,6 +135,30 @@ func (s *Server) listTools() listToolsResult {
 				"required": []string{"key"},
 			},
 		},
+		{
+			Name:        "write_file",
+			Description: "Write text content to an object key.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"key":          map[string]any{"type": "string", "description": "Object key to write"},
+					"content":      map[string]any{"type": "string", "description": "Text content to store"},
+					"content_type": map[string]any{"type": "string", "description": "MIME type (default: text/plain)"},
+				},
+				"required": []string{"key", "content"},
+			},
+		},
+		{
+			Name:        "delete_file",
+			Description: "Soft-delete an object by key.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"key": map[string]any{"type": "string", "description": "Object key to delete"},
+				},
+				"required": []string{"key"},
+			},
+		},
 	}
 	if s.search != nil {
 		tools = append(tools, tool{
@@ -139,6 +170,20 @@ func (s *Server) listTools() listToolsResult {
 					"query":  map[string]any{"type": "string"},
 					"bucket": map[string]any{"type": "string"},
 					"k":      map[string]any{"type": "integer"},
+				},
+				"required": []string{"query"},
+			},
+		})
+	}
+	if s.chat != nil {
+		tools = append(tools, tool{
+			Name:        "chat",
+			Description: "Answer a question using RAG over the knowledge vault.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string", "description": "Question to answer using the knowledge vault"},
+					"k":     map[string]any{"type": "integer", "description": "Number of chunks to retrieve (default 5)"},
 				},
 				"required": []string{"query"},
 			},
@@ -162,8 +207,14 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 		return s.toolListFiles(ctx, p.Arguments)
 	case "read_file":
 		return s.toolReadFile(ctx, p.Arguments)
+	case "write_file":
+		return s.toolWriteFile(ctx, p.Arguments)
+	case "delete_file":
+		return s.toolDeleteFile(ctx, p.Arguments)
 	case "search":
 		return s.toolSearch(ctx, p.Arguments)
+	case "chat":
+		return s.toolChat(ctx, p.Arguments)
 	default:
 		return nil, &rpcError{Code: -32601, Message: "unknown tool: " + p.Name}
 	}
@@ -233,6 +284,47 @@ func (s *Server) toolSearch(ctx context.Context, args map[string]any) (any, *rpc
 		b.WriteString("(no matches)")
 	}
 	return toolResult{Content: []contentBlock{{Type: "text", Text: b.String()}}}, nil
+}
+
+func (s *Server) toolWriteFile(ctx context.Context, args map[string]any) (any, *rpcError) {
+	key := stringArg(args, "key", "")
+	if key == "" {
+		return errResult(errors.New("key required")), nil
+	}
+	content := stringArg(args, "content", "")
+	ct := stringArg(args, "content_type", "text/plain")
+	_, err := s.svc.Put(ctx, s.tenantFor(ctx), service.DefaultBucket, key, strings.NewReader(content), int64(len(content)), service.PutOptions{ContentType: ct})
+	if err != nil {
+		return errResult(err), nil
+	}
+	return toolResult{Content: []contentBlock{{Type: "text", Text: fmt.Sprintf("written: %s (%d bytes)", key, len(content))}}}, nil
+}
+
+func (s *Server) toolDeleteFile(ctx context.Context, args map[string]any) (any, *rpcError) {
+	key := stringArg(args, "key", "")
+	if key == "" {
+		return errResult(errors.New("key required")), nil
+	}
+	if err := s.svc.Delete(ctx, s.tenantFor(ctx), service.DefaultBucket, key, false); err != nil {
+		return errResult(err), nil
+	}
+	return toolResult{Content: []contentBlock{{Type: "text", Text: "deleted: " + key}}}, nil
+}
+
+func (s *Server) toolChat(ctx context.Context, args map[string]any) (any, *rpcError) {
+	if s.chat == nil {
+		return errResult(errors.New("chat not enabled")), nil
+	}
+	query := stringArg(args, "query", "")
+	if query == "" {
+		return errResult(errors.New("query required")), nil
+	}
+	k := intArg(args, "k", 5)
+	resp, err := s.chat.Answer(ctx, ai.ChatReq{Tenant: s.tenantFor(ctx), Query: query, K: k, Caller: "mcp:chat"})
+	if err != nil {
+		return errResult(err), nil
+	}
+	return toolResult{Content: []contentBlock{{Type: "text", Text: resp.Answer}}}, nil
 }
 
 func (s *Server) listResources(ctx context.Context) (any, *rpcError) {

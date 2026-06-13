@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -94,6 +95,7 @@ func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 
 	resp, err := h.chat.AnswerStream(r.Context(), ai.ChatReq{
 		Tenant: mw.TenantFrom(r.Context()), Bucket: req.Bucket,
@@ -106,14 +108,31 @@ func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	})
 	if err != nil {
-		fmt.Fprintf(w, "event: error\ndata: %q\n\n", err.Error())
-		flusher.Flush()
+		if errors.Is(err, ai.ErrBudgetExceeded) {
+			writeSSEError(w, flusher, "BudgetExceeded", "tenant AI budget exceeded")
+		} else {
+			writeSSEError(w, flusher, "InternalError", err.Error())
+		}
 		return
 	}
 	// Final frame: full answer + citations as JSON
 	final, _ := json.Marshal(resp)
 	fmt.Fprintf(w, "event: done\ndata: %s\n\n", string(final))
 	flusher.Flush()
+}
+
+// writeSSEError emits a structured SSE error frame after headers have been
+// sent. The payload is a JSON object so clients can parse code and message
+// independently. json.Marshal is used for the message field to ensure correct
+// escaping of quotes and control characters.
+func writeSSEError(w http.ResponseWriter, f http.Flusher, code, message string) {
+	type sseErrPayload struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	body, _ := json.Marshal(sseErrPayload{Code: code, Message: message})
+	fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(body))
+	f.Flush()
 }
 
 // POST /v1/agent — runs a tool-calling loop and returns the final answer.

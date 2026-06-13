@@ -54,6 +54,7 @@ func (h *SSEHandler) Stream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 
 	// Replay missed events.
 	var lastID int64

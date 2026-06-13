@@ -2,7 +2,7 @@ SHELL := /bin/bash
 BIN   := bin/aero-vault
 PKG   := ./cmd/server
 
-.PHONY: build run test test-integration tidy clean docker compose-up compose-down
+.PHONY: build run test test-integration test-integration-qdrant tidy clean docker compose-up compose-down
 
 AERO_PG_DSN ?= postgres://aero:aero@localhost:55432/aero?sslmode=disable
 
@@ -27,6 +27,18 @@ test-integration:
 	for i in $$(seq 1 30); do docker exec aero-pg pg_isready -U aero -d aero >/dev/null 2>&1 && break; sleep 1; done
 	AERO_PG_DSN="$(AERO_PG_DSN)" go test -tags=integration ./internal/integration/ -v; \
 	  rc=$$?; docker rm -f aero-pg >/dev/null 2>&1 || true; exit $$rc
+
+# Runtime-verify the Qdrant adapter against a throwaway Qdrant container.
+# Excluded from the default `test` gate (needs Docker + Qdrant).
+AERO_QDRANT_URL ?= http://localhost:6333
+
+test-integration-qdrant:
+	@docker rm -f aero-qdrant >/dev/null 2>&1 || true
+	docker run -d --name aero-qdrant -p 6333:6333 qdrant/qdrant >/dev/null
+	@echo "waiting for qdrant..."; \
+	for i in $$(seq 1 30); do curl -sf http://localhost:6333/readyz >/dev/null 2>&1 && break; sleep 1; done
+	AERO_QDRANT_URL="$(AERO_QDRANT_URL)" go test -tags=integration ./internal/integration/ -v -run TestQdrant; \
+	  rc=$$?; docker rm -f aero-qdrant >/dev/null 2>&1 || true; exit $$rc
 
 tidy:
 	go mod tidy

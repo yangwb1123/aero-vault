@@ -162,6 +162,38 @@
     "/v1/usage":                            { "get":   { "tags": ["admin"], "summary": "Tenant usage" } },
     "/v1/admin/tenants/{tenant}/quota":     { "put":   { "tags": ["admin"], "summary": "Set quota" } },
     "/v1/admin/tenants/{tenant}/budget":    { "put":   { "tags": ["admin"], "summary": "Set per-tenant daily AI budget (USD)" } },
+    "/v1/admin/tenants": {
+      "get":  { "tags": ["admin"], "summary": "List tenants" },
+      "post": { "tags": ["admin"], "summary": "Create or upsert a tenant record",
+                "requestBody": { "required": true, "content": { "application/json": {
+                  "schema": { "type": "object", "required": ["tenant_id"],
+                    "properties": {
+                      "tenant_id":    { "type": "string" },
+                      "display_name": { "type": "string" } } } } } } }
+    },
+    "/v1/admin/tenants/{tenant}": {
+      "parameters": [
+        { "name": "tenant", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "delete": { "tags": ["admin"], "summary": "Delete a tenant record",
+                  "responses": { "204": { "description": "deleted" }, "404": { "description": "not found" } } }
+    },
+    "/v1/admin/tenants/{tenant}/status": {
+      "parameters": [
+        { "name": "tenant", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": { "tags": ["admin"], "summary": "Set tenant status (active|disabled)",
+               "requestBody": { "required": true, "content": { "application/json": {
+                 "schema": { "type": "object", "required": ["status"],
+                   "properties": { "status": { "type": "string", "enum": ["active","disabled"] } } } } } } }
+    },
+    "/v1/admin/audit": {
+      "get": { "tags": ["admin"], "summary": "List audit-log entries (admin/security actions)",
+               "parameters": [
+                 { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } }
+               ],
+               "responses": { "200": { "description": "audit entries" } } }
+    },
     "/v1/admin/keys":                        { "get":   { "tags": ["admin"], "summary": "List API keys" },
                                               "post":  { "tags": ["admin"], "summary": "Add key" } },
     "/v1/admin/keys/{token}":                { "delete":{ "tags": ["admin"], "summary": "Revoke key" } },

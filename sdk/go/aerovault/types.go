@@ -120,6 +120,92 @@ type Usage struct {
 	MaxObjects  int64  `json:"max_objects"`
 }
 
+// ---- admin types ----------------------------------------------------------
+
+// APIKey is one persisted API key as returned by AddKey / ListKeys.
+type APIKey struct {
+	TokenHash  string `json:"token_hash"`
+	TenantID   string `json:"tenant_id"`
+	Scopes     string `json:"scopes"`
+	Label      string `json:"label"`
+	CreatedAt  string `json:"created_at"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+	LastUsedAt string `json:"last_used_at,omitempty"`
+}
+
+// TenantRecord is a tenant row as returned by CreateTenant / ListTenants /
+// SetTenantStatus.
+type TenantRecord struct {
+	TenantID    string `json:"tenant_id"`
+	DisplayName string `json:"display_name"`
+	Status      string `json:"status"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// AuditEntry is one row from the audit log (GET /v1/admin/audit).
+type AuditEntry struct {
+	ID        int64  `json:"id"`
+	CreatedAt string `json:"created_at"`
+	Actor     string `json:"actor"`
+	Action    string `json:"action"`
+	Target    string `json:"target"`
+	TenantID  string `json:"tenant_id"`
+	Detail    string `json:"detail"`
+}
+
+// Job is a background job row as returned by ListJobs / RetryJob.
+type Job struct {
+	ID          int64  `json:"id"`
+	TenantID    string `json:"tenant_id"`
+	Type        string `json:"type"`
+	Payload     string `json:"payload"`
+	Status      string `json:"status"`
+	Priority    int    `json:"priority"`
+	Attempts    int    `json:"attempts"`
+	MaxAttempts int    `json:"max_attempts"`
+	RunAfter    string `json:"run_after"`
+	LastError   string `json:"last_error,omitempty"`
+}
+
+// WebhookFailure is an undelivered webhook delivery attempt.
+type WebhookFailure struct {
+	ID          int64  `json:"id"`
+	EventID     int64  `json:"event_id"`
+	URL         string `json:"url"`
+	Payload     string `json:"payload"`
+	Attempts    int    `json:"attempts"`
+	LastError   string `json:"last_error,omitempty"`
+	LastStatus  int    `json:"last_status,omitempty"`
+	NextRetryAt string `json:"next_retry_at"`
+	Succeeded   bool   `json:"succeeded"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// AddKeyRequest is the body for AddKey (POST /v1/admin/keys).
+type AddKeyRequest struct {
+	Token     string   `json:"token"`
+	Tenant    string   `json:"tenant"`
+	Scopes    []string `json:"scopes"`
+	ExpiresAt string   `json:"expires,omitempty"`
+	Label     string   `json:"label,omitempty"`
+}
+
+// IssueJWTRequest is the body for IssueJWT (POST /v1/admin/jwt).
+type IssueJWTRequest struct {
+	Sub        string   `json:"sub,omitempty"`
+	Tenant     string   `json:"tenant"`
+	Scopes     []string `json:"scopes"`
+	TTLSeconds int      `json:"ttl_seconds,omitempty"`
+}
+
+// IssueJWTResponse is the response from IssueJWT.
+type IssueJWTResponse struct {
+	Token      string   `json:"token"`
+	Tenant     string   `json:"tenant"`
+	Scopes     []string `json:"scopes"`
+	TTLSeconds int      `json:"ttl_seconds"`
+}
+
 // Error is returned for any non-2xx HTTP response. It carries the HTTP status
 // plus the platform's error envelope ({"error":{"code","message","request_id"}})
 // when present; for non-JSON bodies the raw text lands in Message.

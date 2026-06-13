@@ -217,10 +217,11 @@ func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
 		for id, s := range acc {
 			merged = append(merged, ranked{chunkID: id, score: float32(s), chunk: seen[id]})
 		}
-		// sort desc
+		// sort desc; break ties by chunkID ascending for deterministic output
 		for i := 1; i < len(merged); i++ {
 			j := i
-			for j > 0 && merged[j].score > merged[j-1].score {
+			for j > 0 && (merged[j].score > merged[j-1].score ||
+				(merged[j].score == merged[j-1].score && merged[j].chunkID < merged[j-1].chunkID)) {
 				merged[j], merged[j-1] = merged[j-1], merged[j]
 				j--
 			}

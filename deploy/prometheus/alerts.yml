@@ -86,3 +86,36 @@ groups:
         annotations:
           summary: "In-process event bus is dropping events"
           description: "Subscribers are falling behind the 64-deep buffer (SSE/indexer/webhook lag). The durable event table is unaffected, but live consumers miss events — scale consumers or enable a cross-instance transport."
+
+  - name: aero-vault-ai-latency
+    rules:
+      - alert: HighEmbedLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ai_embed_duration_ms_bucket[5m])) by (le, model)) > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Embedding p95 latency > 500ms for model {{ $labels.model }}"
+          description: "95th-percentile embedding latency exceeded 500ms for 10m. Check the embedding provider or increase AI_EMBED_CACHE_SIZE."
+
+      - alert: HighSearchLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ai_search_duration_ms_bucket[5m])) by (le, mode)) > 2000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Search p95 latency > 2s for mode {{ $labels.mode }}"
+          description: "95th-percentile retrieval latency exceeded 2s for 10m. Consider enabling AI_SEARCH_CACHE_SIZE or switching to an external vector store."
+
+      - alert: JobQueueDepthHigh
+        expr: jobs_pending > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job queue depth > 1000"
+          description: "Pending job backlog exceeded 1000 for 5m. Consider increasing JOBS_WORKERS or setting JOBS_MAX_DEPTH to shed load."

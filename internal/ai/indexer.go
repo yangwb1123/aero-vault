@@ -11,6 +11,7 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/storage"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
 // Job types emitted by the indexer's event bridge. Handlers for these are
@@ -279,14 +280,17 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 	if err != nil {
 		if errors.Is(err, ErrUnsupported) {
 			ix.logger.Info("indexer: skipping unsupported content", "key", obj.Key, "content_type", obj.ContentType)
+			telemetry.IncIndexerSkip(ctx, "unsupported")
 			return nil
 		}
 		// drain any unread bytes silently
 		_, _ = io.Copy(io.Discard, rc)
+		telemetry.IncIndexerSkip(ctx, "error")
 		return fmt.Errorf("extract %q: %w", obj.Key, err)
 	}
 	pieces := ix.chunker.Chunk(text)
 	if len(pieces) == 0 {
+		telemetry.IncIndexerSkip(ctx, "empty")
 		return nil
 	}
 	vectors, err := ix.embedder.Embed(ctx, pieces)

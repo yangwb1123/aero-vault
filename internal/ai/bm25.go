@@ -58,22 +58,38 @@ func tokenize(text string) []string {
 }
 
 // BuildFromRepo refreshes the index from every chunk in the repository for the
-// given tenant. Call this on startup and periodically (or after a write
-// burst).
+// given tenant. It iterates all buckets the tenant owns and paginates through
+// all objects — not just the first 1000 in the "default" bucket. Call this
+// on startup to warm the index from persisted data; subsequent writes are
+// kept current via the ChunkSink (UpsertObjectChunks / DeleteObjectChunks).
 func (b *BM25) BuildFromRepo(ctx context.Context, repo repository.Repository, tenant string) error {
-	// Load all chunks via SearchChunks with a zero-length query vector trick is
-	// not viable; we read object lists then chunks per object.
-	page, err := repo.ListObjects(ctx, tenant, "default", "", "", 1000)
+	buckets, err := repo.ListBuckets(ctx, tenant)
 	if err != nil {
 		return err
 	}
+	// Collect all chunks before taking the write lock so the index is
+	// unavailable for as short a window as possible.
+	const pageSize = 500
 	var all []repository.Chunk
-	for _, o := range page.Objects {
-		chunks, err := repo.ListChunksForObject(ctx, o.ID)
-		if err != nil {
-			continue
+	for _, bucket := range buckets {
+		marker := ""
+		for {
+			page, err := repo.ListObjects(ctx, tenant, bucket, "", marker, pageSize)
+			if err != nil {
+				break
+			}
+			for _, o := range page.Objects {
+				chunks, err := repo.ListChunksForObject(ctx, o.ID)
+				if err != nil {
+					continue
+				}
+				all = append(all, chunks...)
+			}
+			if !page.HasMore {
+				break
+			}
+			marker = page.NextMarker
 		}
-		all = append(all, chunks...)
 	}
 
 	b.mu.Lock()

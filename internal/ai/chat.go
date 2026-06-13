@@ -133,6 +133,11 @@ func (c *Chat) AnswerStream(ctx context.Context, req ChatReq, onChunk func(strin
 	if req.Caller == "" {
 		req.Caller = "rest:chat-stream"
 	}
+	if over, err := c.overBudget(ctx, req.Tenant); err != nil {
+		return ChatResp{}, fmt.Errorf("budget check: %w", err)
+	} else if over {
+		return ChatResp{}, ErrBudgetExceeded
+	}
 	hits, err := c.search.Query(ctx, Request{
 		Tenant: req.Tenant, Bucket: req.Bucket, Query: req.Query,
 		K: req.K, Mode: req.Mode, Caller: req.Caller, ReqID: req.ReqID,
@@ -151,12 +156,6 @@ func (c *Chat) AnswerStream(ctx context.Context, req ChatReq, onChunk func(strin
 	}
 	messages = append(messages, req.Prior...)
 	messages = append(messages, ChatMessage{Role: "user", Content: req.Query})
-
-	if over, err := c.overBudget(ctx, req.Tenant); err != nil {
-		return ChatResp{}, fmt.Errorf("budget check: %w", err)
-	} else if over {
-		return ChatResp{}, ErrBudgetExceeded
-	}
 	start := time.Now()
 	resp, err := c.llm.ChatStream(ctx, ChatRequest{Messages: messages, Temperature: req.Temperature}, onChunk)
 	if err != nil {
@@ -202,7 +201,12 @@ func (c *Chat) Answer(ctx context.Context, req ChatReq) (ChatResp, error) {
 	if req.Caller == "" {
 		req.Caller = "rest:chat"
 	}
-	// Retrieval first.
+	if over, err := c.overBudget(ctx, req.Tenant); err != nil {
+		return ChatResp{}, fmt.Errorf("budget check: %w", err)
+	} else if over {
+		return ChatResp{}, ErrBudgetExceeded
+	}
+	// Retrieval.
 	hits, err := c.search.Query(ctx, Request{
 		Tenant: req.Tenant, Bucket: req.Bucket, Query: req.Query,
 		K: req.K, Mode: req.Mode, Caller: req.Caller, ReqID: req.ReqID,
@@ -224,12 +228,6 @@ func (c *Chat) Answer(ctx context.Context, req ChatReq) (ChatResp, error) {
 	}
 	messages = append(messages, req.Prior...)
 	messages = append(messages, ChatMessage{Role: "user", Content: req.Query})
-
-	if over, err := c.overBudget(ctx, req.Tenant); err != nil {
-		return ChatResp{}, fmt.Errorf("budget check: %w", err)
-	} else if over {
-		return ChatResp{}, ErrBudgetExceeded
-	}
 	start := time.Now()
 	resp, err := c.llm.Chat(ctx, ChatRequest{
 		Messages: messages, Temperature: req.Temperature,

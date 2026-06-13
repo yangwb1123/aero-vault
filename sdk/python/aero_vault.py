@@ -485,6 +485,83 @@ class Client:
         except AeroVaultError:
             return False
 
+    # ---- admin -------
+
+    def add_key(self, label: str, scopes: t.Optional[t.List[str]] = None,
+                expires_at: t.Optional[str] = None) -> t.Dict[str, t.Any]:
+        """Add an API key (POST /v1/admin/keys)."""
+        body: t.Dict[str, t.Any] = {"label": label}
+        if scopes: body["scopes"] = scopes
+        if expires_at: body["expires_at"] = expires_at
+        return self._request_json("POST", "/v1/admin/keys", json_body=body) or {}
+
+    def list_keys(self) -> t.List[t.Any]:
+        """List API keys (GET /v1/admin/keys)."""
+        return (self._request_json("GET", "/v1/admin/keys") or {}).get("keys", [])
+
+    def revoke_key(self, token: str) -> None:
+        """Revoke an API key (DELETE /v1/admin/keys/{token})."""
+        self._request_json("DELETE", f"/v1/admin/keys/{token}")
+
+    def issue_jwt(self, tenant: str, scopes: t.Optional[t.List[str]] = None,
+                  expires_in: int = 3600) -> t.Dict[str, t.Any]:
+        """Issue a JWT (POST /v1/admin/jwt)."""
+        body: t.Dict[str, t.Any] = {"tenant": tenant, "expires_in": expires_in}
+        if scopes: body["scopes"] = scopes
+        return self._request_json("POST", "/v1/admin/jwt", json_body=body) or {}
+
+    def list_webhook_failures(self) -> t.List[t.Any]:
+        """List webhook delivery failures (GET /v1/admin/webhook-failures)."""
+        return (self._request_json("GET", "/v1/admin/webhook-failures") or {}).get("failures", [])
+
+    def list_jobs(self) -> t.Dict[str, t.Any]:
+        """List background jobs (GET /v1/admin/jobs)."""
+        return self._request_json("GET", "/v1/admin/jobs") or {}
+
+    def retry_job(self, job_id: int) -> t.Dict[str, t.Any]:
+        """Retry a failed job (POST /v1/admin/jobs/{id}/retry)."""
+        return self._request_json("POST", f"/v1/admin/jobs/{job_id}/retry") or {}
+
+    def create_tenant(self, tenant_id: str, display_name: str = "",
+                      max_bytes: int = 0, max_objects: int = 0) -> t.Dict[str, t.Any]:
+        """Create a tenant (POST /v1/admin/tenants)."""
+        body: t.Dict[str, t.Any] = {"tenant_id": tenant_id}
+        if display_name: body["display_name"] = display_name
+        if max_bytes: body["max_bytes"] = max_bytes
+        if max_objects: body["max_objects"] = max_objects
+        return self._request_json("POST", "/v1/admin/tenants", json_body=body) or {}
+
+    def list_tenants(self) -> t.List[t.Any]:
+        """List tenants (GET /v1/admin/tenants)."""
+        return (self._request_json("GET", "/v1/admin/tenants") or {}).get("tenants", [])
+
+    def delete_tenant(self, tenant_id: str) -> None:
+        """Delete a tenant (DELETE /v1/admin/tenants/{tenant})."""
+        self._request_json("DELETE", f"/v1/admin/tenants/{tenant_id}")
+
+    def set_tenant_status(self, tenant_id: str, status: str) -> t.Dict[str, t.Any]:
+        """Set tenant status to 'active' or 'disabled' (PUT /v1/admin/tenants/{tenant}/status)."""
+        return self._request_json("PUT", f"/v1/admin/tenants/{tenant_id}/status",
+                                  json_body={"status": status}) or {}
+
+    def list_audit(self, limit: int = 50, before: t.Optional[str] = None) -> t.List[t.Any]:
+        """List audit log entries (GET /v1/admin/audit)."""
+        params: t.Dict[str, t.Any] = {"limit": limit}
+        if before: params["before"] = before
+        return (self._request_json("GET", "/v1/admin/audit", params=params) or {}).get("entries", [])
+
+    def set_quota(self, tenant_id: str, max_bytes: int = 0, max_objects: int = 0) -> t.Dict[str, t.Any]:
+        """Set tenant quota (PUT /v1/admin/tenants/{tenant}/quota)."""
+        body: t.Dict[str, t.Any] = {}
+        if max_bytes: body["max_bytes"] = max_bytes
+        if max_objects: body["max_objects"] = max_objects
+        return self._request_json("PUT", f"/v1/admin/tenants/{tenant_id}/quota", json_body=body) or {}
+
+    def set_budget(self, tenant_id: str, daily_usd: float) -> t.Dict[str, t.Any]:
+        """Set per-tenant AI daily budget (PUT /v1/admin/tenants/{tenant}/budget)."""
+        return self._request_json("PUT", f"/v1/admin/tenants/{tenant_id}/budget",
+                                  json_body={"daily_budget_usd": daily_usd}) or {}
+
 
 # ---- helpers ------------------------------------------------------------
 

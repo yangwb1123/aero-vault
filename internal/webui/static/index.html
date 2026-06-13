@@ -32,6 +32,7 @@
   .tab { padding: 6px 12px; background: #181d25; border-radius: 6px; cursor: pointer; font-size: 13px; }
   .tab.active { background: #1f7adb; color: white; }
   label { font-size: 12px; color: #8a96a8; }
+  .drop-active { background: #1a2b40; }
 </style>
 </head>
 <body>
@@ -43,7 +44,7 @@
   <button onclick="refresh()">refresh</button>
 </header>
 <main>
-  <aside>
+  <aside ondragover="event.preventDefault()" ondrop="handleDrop(event)" ondragenter="this.classList.add('drop-active')" ondragleave="this.classList.remove('drop-active')">
     <div class="group">
       <h3>upload</h3>
       <input id="up-key" type="text" placeholder="key (e.g. docs/note.md)" style="margin-bottom: 8px">
@@ -61,6 +62,7 @@
       <div class="tab active" onclick="switchTab('search')" id="t-search">semantic search</div>
       <div class="tab" onclick="switchTab('detail')" id="t-detail">object detail</div>
       <div class="tab" onclick="switchTab('lineage')" id="t-lineage">lineage</div>
+      <div class="tab" onclick="switchTab('chat')" id="t-chat">chat</div>
     </div>
     <div id="pane-search">
       <div style="display:flex; gap: 8px; margin-bottom: 12px">
@@ -82,6 +84,19 @@
       <button onclick="loadLineage()">load</button>
       <pre id="lineage" style="margin-top: 12px">enter object id and click load</pre>
     </div>
+    <div id="pane-chat" style="display:none">
+      <div style="display:flex; gap: 8px; margin-bottom: 12px">
+        <input id="cq" type="text" placeholder="ask a question about your files…" onkeydown="if(event.key=='Enter')doChat()">
+        <select id="cmode">
+          <option value="vector">vector</option>
+          <option value="bm25">bm25</option>
+          <option value="hybrid">hybrid</option>
+        </select>
+        <button onclick="doChat()">ask</button>
+      </div>
+      <div id="chat-resp" style="white-space: pre-wrap; font-size: 13px; line-height: 1.6; padding: 12px 14px; background: #0a0d12; border: 1px solid #1a2029; border-radius: 6px; min-height: 80px; margin-bottom: 12px"></div>
+      <div id="chat-cites"></div>
+    </div>
   </section>
 </main>
 <script>
@@ -99,7 +114,7 @@ function headers(extra) {
 }
 
 function switchTab(name) {
-  ['search','detail','lineage'].forEach(n => {
+  ['search','detail','lineage','chat'].forEach(n => {
     document.getElementById('t-'+n).classList.toggle('active', n === name);
     document.getElementById('pane-'+n).style.display = n === name ? '' : 'none';
   });
@@ -187,6 +202,79 @@ async function loadLineage() {
 }
 
 function encodePath(k) { return k.split('/').map(encodeURIComponent).join('/'); }
+
+async function doChat() {
+  const q = document.getElementById('cq').value.trim();
+  if (!q) return;
+  const mode = document.getElementById('cmode').value;
+  const respEl = document.getElementById('chat-resp');
+  const citesEl = document.getElementById('chat-cites');
+  respEl.textContent = '';
+  citesEl.replaceChildren();
+
+  const resp = await fetch('/v1/chat/stream', {
+    method: 'POST',
+    headers: headers({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ query: q, k: 5, mode })
+  });
+  if (!resp.ok) {
+    respEl.textContent = 'Error: HTTP ' + resp.status;
+    return;
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    let evtType = 'message';
+    for (const line of lines) {
+      if (line.startsWith('event: ')) { evtType = line.slice(7).trim(); continue; }
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6);
+        if (evtType === 'token') {
+          respEl.textContent += data;
+        } else if (evtType === 'done' || evtType === 'citations') {
+          try {
+            const obj = JSON.parse(data);
+            const hits = obj.hits || obj.citations || (Array.isArray(obj) ? obj : []);
+            for (const h of hits) {
+              const div = el('div', { className: 'hit' },
+                el('div', { className: 'src' }, (h.bucket || '') + '/' + (h.object_key || '') + ' #' + (h.seq ?? '')),
+                el('div', { className: 'text' }, h.chunk || ''));
+              citesEl.appendChild(div);
+            }
+          } catch (_) {}
+        } else if (evtType === 'error') {
+          try {
+            const obj = JSON.parse(data);
+            respEl.textContent += '\n[Error: ' + (obj.message || data) + ']';
+          } catch (_) { respEl.textContent += '\n[Error: ' + data + ']'; }
+        }
+        evtType = 'message';
+      }
+    }
+  }
+}
+
+async function handleDrop(ev) {
+  ev.preventDefault();
+  ev.currentTarget.classList.remove('drop-active');
+  const files = [...(ev.dataTransfer.files || [])];
+  for (const file of files) {
+    const key = file.name;
+    await fetch('/v1/files/' + encodePath(key), {
+      method: 'PUT',
+      headers: headers({ 'Content-Type': file.type || 'application/octet-stream' }),
+      body: file
+    });
+  }
+  refresh();
+}
 
 refresh();
 </script>

@@ -96,6 +96,8 @@ func Run(args []string) int {
 		return c.cmdLineage(args[1:])
 	case "snapshot":
 		return cmdSnapshot(args[1:])
+	case "admin":
+		return c.cmdAdmin(args[1:])
 	case "-h", "--help", "help":
 		usage()
 		return 0
@@ -120,6 +122,13 @@ commands:
   lineage <objectID>        show AI consumption history
   snapshot create <out.tgz> [--db file:./var/aero.db] [--objects ./var/objects]
   snapshot restore <in.tgz> [--db file:./var/aero.db] [--objects ./var/objects]
+  admin keys list                list API keys
+  admin keys add <token> [--scopes read,write] [--label name] [--tenant t]
+  admin keys revoke <token>      revoke an API key
+  admin tenants list             list tenants
+  admin tenants create <id> [--display-name name]
+  admin tenants delete <id>
+  admin tenants status <id> <active|suspended>
 
 env: AERO_ENDPOINT, AERO_API_KEY, AERO_TENANT`)
 }
@@ -363,6 +372,210 @@ func (c *Client) cmdLineage(args []string) int {
 	}
 	fmt.Println(string(respBody))
 	return 0
+}
+
+func adminUsage() {
+	fmt.Fprintln(os.Stderr, `usage: aero-vault cli admin <resource> <action> [args]
+
+resources:
+  keys list
+  keys add <token> [--scopes read,write] [--label name] [--tenant t]
+  keys revoke <token>
+  tenants list
+  tenants create <id> [--display-name name]
+  tenants delete <id>
+  tenants status <id> <active|suspended>`)
+}
+
+func (c *Client) cmdAdmin(args []string) int {
+	if len(args) < 2 {
+		adminUsage()
+		return 2
+	}
+	resource, action := args[0], args[1]
+	rest := args[2:]
+	switch resource {
+	case "keys":
+		return c.cmdAdminKeys(action, rest)
+	case "tenants":
+		return c.cmdAdminTenants(action, rest)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown admin resource: %s\n", resource)
+		adminUsage()
+		return 2
+	}
+}
+
+func (c *Client) cmdAdminKeys(action string, args []string) int {
+	switch action {
+	case "list":
+		resp, err := c.do(http.MethodGet, "/v1/admin/keys", nil, nil)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer resp.Body.Close()
+		var env struct {
+			Keys []json.RawMessage `json:"keys"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+			fmt.Fprintln(os.Stderr, "decode:", err)
+			return 1
+		}
+		for _, k := range env.Keys {
+			var m map[string]any
+			_ = json.Unmarshal(k, &m)
+			fmt.Printf("%-40s tenant=%-20s scopes=%-15s label=%s\n",
+				strOrEmpty(m["token_hash"]), strOrEmpty(m["tenant_id"]),
+				strOrEmpty(m["scopes"]), strOrEmpty(m["label"]))
+		}
+		return 0
+
+	case "add":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: admin keys add <token> [--scopes read,write] [--label name] [--tenant t]")
+			return 2
+		}
+		token := args[0]
+		var scopes, label, tenant string
+		for i := 1; i < len(args)-1; i++ {
+			switch args[i] {
+			case "--scopes":
+				scopes = args[i+1]
+				i++
+			case "--label":
+				label = args[i+1]
+				i++
+			case "--tenant":
+				tenant = args[i+1]
+				i++
+			}
+		}
+		body := map[string]any{"token": token, "tenant": tenant, "label": label}
+		if scopes != "" {
+			body["scopes"] = strings.Split(scopes, ",")
+		}
+		b, _ := json.Marshal(body)
+		resp, err := c.do(http.MethodPost, "/v1/admin/keys", bytes.NewReader(b), map[string]string{"Content-Type": "application/json"})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+		fmt.Println()
+		return 0
+
+	case "revoke":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: admin keys revoke <token>")
+			return 2
+		}
+		resp, err := c.do(http.MethodDelete, "/v1/admin/keys/"+url.PathEscape(args[0]), nil, nil)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer resp.Body.Close()
+		fmt.Println("revoked")
+		return 0
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown keys action: %s\n", action)
+		return 2
+	}
+}
+
+func (c *Client) cmdAdminTenants(action string, args []string) int {
+	switch action {
+	case "list":
+		resp, err := c.do(http.MethodGet, "/v1/admin/tenants", nil, nil)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer resp.Body.Close()
+		var env struct {
+			Tenants []json.RawMessage `json:"tenants"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+			fmt.Fprintln(os.Stderr, "decode:", err)
+			return 1
+		}
+		for _, t := range env.Tenants {
+			var m map[string]any
+			_ = json.Unmarshal(t, &m)
+			fmt.Printf("%-30s display=%-30s status=%s\n",
+				strOrEmpty(m["tenant_id"]), strOrEmpty(m["display_name"]), strOrEmpty(m["status"]))
+		}
+		return 0
+
+	case "create":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: admin tenants create <id> [--display-name name]")
+			return 2
+		}
+		id := args[0]
+		var displayName string
+		for i := 1; i < len(args)-1; i++ {
+			if args[i] == "--display-name" {
+				displayName = args[i+1]
+				i++
+			}
+		}
+		body := map[string]any{"tenant_id": id, "display_name": displayName}
+		b, _ := json.Marshal(body)
+		resp, err := c.do(http.MethodPost, "/v1/admin/tenants", bytes.NewReader(b), map[string]string{"Content-Type": "application/json"})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+		fmt.Println()
+		return 0
+
+	case "delete":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: admin tenants delete <id>")
+			return 2
+		}
+		resp, err := c.do(http.MethodDelete, "/v1/admin/tenants/"+url.PathEscape(args[0]), nil, nil)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer resp.Body.Close()
+		fmt.Println("deleted")
+		return 0
+
+	case "status":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: admin tenants status <id> <active|suspended>")
+			return 2
+		}
+		body := map[string]any{"status": args[1]}
+		b, _ := json.Marshal(body)
+		resp, err := c.do(http.MethodPut, "/v1/admin/tenants/"+url.PathEscape(args[0])+"/status", bytes.NewReader(b), map[string]string{"Content-Type": "application/json"})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer resp.Body.Close()
+		fmt.Println("updated")
+		return 0
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown tenants action: %s\n", action)
+		return 2
+	}
+}
+
+func strOrEmpty(v any) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 func escapeKey(k string) string {

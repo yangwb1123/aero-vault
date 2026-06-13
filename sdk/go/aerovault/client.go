@@ -757,6 +757,199 @@ func (c *Client) Health(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// ---- admin ----------------------------------------------------------------
+
+// AddKey creates a persisted API key (POST /v1/admin/keys).
+func (c *Client) AddKey(ctx context.Context, req AddKeyRequest) (map[string]any, error) {
+	body, ctOpt, err := jsonBody(req)
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.newRequest(ctx, http.MethodPost, "/v1/admin/keys", body, ctOpt)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	return out, c.doJSON(r, &out)
+}
+
+// ListKeys returns all persisted API keys (GET /v1/admin/keys).
+func (c *Client) ListKeys(ctx context.Context) ([]APIKey, error) {
+	r, err := c.newRequest(ctx, http.MethodGet, "/v1/admin/keys", nil)
+	if err != nil {
+		return nil, err
+	}
+	var env struct {
+		Keys []APIKey `json:"keys"`
+	}
+	return env.Keys, c.doJSON(r, &env)
+}
+
+// RevokeKey deletes a persisted API key (DELETE /v1/admin/keys/{token}).
+func (c *Client) RevokeKey(ctx context.Context, token string) error {
+	r, err := c.newRequest(ctx, http.MethodDelete, "/v1/admin/keys/"+url.PathEscape(token), nil)
+	if err != nil {
+		return err
+	}
+	return c.doJSON(r, nil)
+}
+
+// IssueJWT signs and returns a short-lived JWT (POST /v1/admin/jwt).
+func (c *Client) IssueJWT(ctx context.Context, req IssueJWTRequest) (*IssueJWTResponse, error) {
+	body, ctOpt, err := jsonBody(req)
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.newRequest(ctx, http.MethodPost, "/v1/admin/jwt", body, ctOpt)
+	if err != nil {
+		return nil, err
+	}
+	var out IssueJWTResponse
+	return &out, c.doJSON(r, &out)
+}
+
+// ListWebhookFailures returns undelivered webhook attempts
+// (GET /v1/admin/webhook-failures).
+func (c *Client) ListWebhookFailures(ctx context.Context) ([]WebhookFailure, error) {
+	r, err := c.newRequest(ctx, http.MethodGet, "/v1/admin/webhook-failures", nil)
+	if err != nil {
+		return nil, err
+	}
+	var env struct {
+		Failures []WebhookFailure `json:"failures"`
+	}
+	return env.Failures, c.doJSON(r, &env)
+}
+
+// ListJobs returns background jobs and their status (GET /v1/admin/jobs).
+func (c *Client) ListJobs(ctx context.Context) (map[string]any, error) {
+	r, err := c.newRequest(ctx, http.MethodGet, "/v1/admin/jobs", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	return out, c.doJSON(r, &out)
+}
+
+// RetryJob re-queues a failed job (POST /v1/admin/jobs/{id}/retry).
+func (c *Client) RetryJob(ctx context.Context, jobID int64) (map[string]any, error) {
+	path := fmt.Sprintf("/v1/admin/jobs/%d/retry", jobID)
+	r, err := c.newRequest(ctx, http.MethodPost, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	return out, c.doJSON(r, &out)
+}
+
+// CreateTenant creates or upserts a tenant record (POST /v1/admin/tenants).
+func (c *Client) CreateTenant(ctx context.Context, tenantID, displayName string) (*TenantRecord, error) {
+	body, ctOpt, err := jsonBody(map[string]string{"tenant_id": tenantID, "display_name": displayName})
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.newRequest(ctx, http.MethodPost, "/v1/admin/tenants", body, ctOpt)
+	if err != nil {
+		return nil, err
+	}
+	var out TenantRecord
+	return &out, c.doJSON(r, &out)
+}
+
+// ListTenants returns all tenant records (GET /v1/admin/tenants).
+func (c *Client) ListTenants(ctx context.Context) ([]TenantRecord, error) {
+	r, err := c.newRequest(ctx, http.MethodGet, "/v1/admin/tenants", nil)
+	if err != nil {
+		return nil, err
+	}
+	var env struct {
+		Tenants []TenantRecord `json:"tenants"`
+	}
+	return env.Tenants, c.doJSON(r, &env)
+}
+
+// DeleteTenant removes a tenant (DELETE /v1/admin/tenants/{tenant}).
+func (c *Client) DeleteTenant(ctx context.Context, tenantID string) error {
+	r, err := c.newRequest(ctx, http.MethodDelete, "/v1/admin/tenants/"+url.PathEscape(tenantID), nil)
+	if err != nil {
+		return err
+	}
+	return c.doJSON(r, nil)
+}
+
+// SetTenantStatus sets a tenant's status to "active" or "disabled"
+// (PUT /v1/admin/tenants/{tenant}/status).
+func (c *Client) SetTenantStatus(ctx context.Context, tenantID, status string) (*TenantRecord, error) {
+	body, ctOpt, err := jsonBody(map[string]string{"status": status})
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.newRequest(ctx, http.MethodPut, "/v1/admin/tenants/"+url.PathEscape(tenantID)+"/status", body, ctOpt)
+	if err != nil {
+		return nil, err
+	}
+	var out TenantRecord
+	return &out, c.doJSON(r, &out)
+}
+
+// ListAudit returns audit log entries (GET /v1/admin/audit).
+// limit<=0 uses the server default (50). before is an optional RFC3339 cursor.
+func (c *Client) ListAudit(ctx context.Context, limit int, before string) ([]AuditEntry, error) {
+	params := map[string]string{}
+	if limit > 0 {
+		params["limit"] = strconv.Itoa(limit)
+	}
+	if before != "" {
+		params["before"] = before
+	}
+	r, err := c.newRequest(ctx, http.MethodGet, "/v1/admin/audit", nil, withQuery(params))
+	if err != nil {
+		return nil, err
+	}
+	var env struct {
+		Entries []AuditEntry `json:"entries"`
+	}
+	return env.Entries, c.doJSON(r, &env)
+}
+
+// SetQuota updates a tenant's storage quota
+// (PUT /v1/admin/tenants/{tenant}/quota).
+// Zero values are omitted (server keeps existing limits).
+func (c *Client) SetQuota(ctx context.Context, tenantID string, maxBytes, maxObjects int64) (map[string]any, error) {
+	m := map[string]int64{}
+	if maxBytes > 0 {
+		m["max_bytes"] = maxBytes
+	}
+	if maxObjects > 0 {
+		m["max_objects"] = maxObjects
+	}
+	body, ctOpt, err := jsonBody(m)
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.newRequest(ctx, http.MethodPut, "/v1/admin/tenants/"+url.PathEscape(tenantID)+"/quota", body, ctOpt)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	return out, c.doJSON(r, &out)
+}
+
+// SetBudget sets a tenant's daily AI spend limit in USD
+// (PUT /v1/admin/tenants/{tenant}/budget).
+func (c *Client) SetBudget(ctx context.Context, tenantID string, dailyUSD float64) (map[string]any, error) {
+	body, ctOpt, err := jsonBody(map[string]float64{"daily_budget_usd": dailyUSD})
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.newRequest(ctx, http.MethodPut, "/v1/admin/tenants/"+url.PathEscape(tenantID)+"/budget", body, ctOpt)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	return out, c.doJSON(r, &out)
+}
+
 // AsError unwraps err into an *Error if it (or anything it wraps) is one,
 // storing it in *target and reporting true. It is a thin wrapper over
 // errors.As kept here so callers need not import errors for the common case.

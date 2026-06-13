@@ -107,7 +107,7 @@ func run() error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	bus := events.New(repo, logger)
+	bus := events.NewWithBuffer(repo, logger, cfg.Events.SubBufferSize)
 	// Optional cross-instance event transport (multi-replica). Opt-in; requires
 	// Postgres. NOT exercised by CI — default ("") keeps the in-process bus.
 	if cfg.Events.Transport == "postgres" && cfg.Events.TransportDSN != "" {
@@ -202,7 +202,16 @@ func run() error {
 		if cfg.AI.HybridSearch {
 			bm = ai.NewBM25()
 			search.WithBM25(bm)
-			go func() { _ = bm.BuildFromRepo(ctx, repo, "default") }()
+			// Warm up from all configured tenants (falls back to "default").
+			warmTenants := cfg.Reconcile.Tenants
+			if len(warmTenants) == 0 {
+				warmTenants = []string{"default"}
+			}
+			go func() {
+				for _, t := range warmTenants {
+					_ = bm.BuildFromRepo(ctx, repo, t)
+				}
+			}()
 		}
 		if reranker != nil {
 			search.WithReranker(reranker)
@@ -216,6 +225,7 @@ func run() error {
 				chat.WithPerTenantBudgets()
 			}
 			agent = ai.NewAgent(svc, search, llm, repo, logger)
+			agent.MaxSteps = cfg.AI.AgentMaxSteps
 			logger.Info("rag chat + agent enabled", "llm", llm.Name())
 		}
 		// Indexer can be wrapped by the remote extractor if configured.
@@ -224,7 +234,7 @@ func run() error {
 			extractor = ai.NewRemoteExtractor(cfg.AI.ExtractorEndpoint, cfg.AI.ExtractorAPIKey, extractor)
 			logger.Info("remote extractor enabled", "endpoint", cfg.AI.ExtractorEndpoint)
 		}
-		indexer := ai.NewIndexer(repo, store, extractor, ai.NewChunker(), embedder, logger)
+		indexer := ai.NewIndexer(repo, store, extractor, &ai.Chunker{Window: cfg.AI.ChunkWindow, Overlap: cfg.AI.ChunkOverlap}, embedder, logger)
 		if bm != nil {
 			indexer.WithChunkSink(bm)
 		}
@@ -237,6 +247,10 @@ func run() error {
 			indexer.WithPII(ai.NewPIIDetector(), cfg.AI.PIIRedact)
 			logger.Info("pii scan enabled", "redact", cfg.AI.PIIRedact)
 		}
+		// Wire the indexer as a synchronous chunk cleaner on hard deletes so
+		// BM25/vector entries are removed even when the event-driven path races
+		// with an object-not-found error after the row is gone.
+		svc.WithChunkCleaner(indexer)
 
 		// The indexer becomes an event→job bridge; the shared pool runs the heavy
 		// extract/embed work with durable retry. Without a pool it stays inline.
@@ -403,6 +417,9 @@ func run() error {
 	}
 
 	rl := middleware.NewRateLimiter(cfg.RateLimit.RPS, cfg.RateLimit.Burst)
+	aiRL := middleware.NewRateLimiter(cfg.RateLimit.AIRPS, cfg.RateLimit.AIBurst)
+	rl.Start(ctx)
+	aiRL.Start(ctx)
 
 	// Prometheus exporter (optional second metric reader)
 	var promHandler http.Handler
@@ -449,11 +466,15 @@ func run() error {
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
 
-	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody))
+	aiTimeout := time.Duration(cfg.App.RequestTimeoutSec) * time.Second
+	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, aiTimeout))
 	if cfg.S3Compat.Prefix != "" {
 		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger))
 	}
 	mcpServer := mcp.NewServer(svc, repo, search, "default", logger)
+	if chat != nil {
+		mcpServer.WithChat(chat)
+	}
 	r.Method(http.MethodPost, "/mcp", mcp.HTTPHandler(mcpServer))
 
 	if cfg.WebUI.Enabled {
@@ -492,7 +513,7 @@ func run() error {
 			AllowedOrigins: cfg.CORS.AllowedOrigins,
 			AllowedHeaders: cfg.CORS.AllowedHeaders,
 			AllowedMethods: cfg.CORS.AllowedMethods,
-			ExposeHeaders:  []string{"ETag", "X-Request-ID", "X-Version-Id"},
+			ExposeHeaders:  append([]string{"ETag", "Idempotency-Replayed", "Retry-After", "X-Request-ID", "X-Version-Id"}, cfg.CORS.ExposeHeaders...),
 		}),
 		middleware.RequestID, // outermost
 	} {
@@ -503,6 +524,8 @@ func run() error {
 		Addr:              cfg.App.Addr,
 		Handler:           finalHandler,
 		ReadHeaderTimeout: 15 * time.Second,
+		WriteTimeout:      time.Duration(cfg.App.WriteTimeoutSec) * time.Second,
+		IdleTimeout:       time.Duration(cfg.App.IdleTimeoutSec) * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -559,11 +582,21 @@ func runMCP() error {
 	}
 	svc := service.NewFileService(store, repo, logger)
 	embedder := buildEmbedder(cfg, logger)
+	llm := buildLLM(cfg, logger)
 	var search *ai.Search
 	if embedder != nil {
 		search = ai.NewSearch(repo, embedder, logger)
 	}
+	var chat *ai.Chat
+	if search != nil && llm != nil {
+		chat = ai.NewChat(search, llm, repo, logger).
+			WithPricing(cfg.AI.ChatCostPromptPer1K, cfg.AI.ChatCostCompletionPer1K).
+			WithBudget(cfg.AI.TenantDailyBudgetUSD)
+	}
 	server := mcp.NewServer(svc, repo, search, "default", logger)
+	if chat != nil {
+		server.WithChat(chat)
+	}
 	logger.Info("mcp stdio server starting")
 	return mcp.ServeStdio(ctx, server, os.Stdin, os.Stdout)
 }
@@ -661,6 +694,9 @@ func buildReranker(cfg *config.Config, logger *slog.Logger) ai.Reranker {
 	}
 	return nil
 }
+
+// Compile-time interface satisfaction checks.
+var _ service.ChunkCleaner = (*ai.Indexer)(nil)
 
 // apiKeyStore adapts the repository to auth.PersistentStore, keeping the auth
 // package decoupled from the repository types. Wired only when AUTH_PERSIST_KEYS

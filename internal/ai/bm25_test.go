@@ -17,10 +17,28 @@ type fakeChunkRepo struct {
 	chunks []repository.Chunk
 }
 
-func (f *fakeChunkRepo) ListObjects(_ context.Context, _, _, _, _ string, _ int) (repository.ListPage, error) {
+func (f *fakeChunkRepo) ListBuckets(_ context.Context, _ string) ([]string, error) {
+	seen := map[string]bool{}
+	var buckets []string
+	for _, c := range f.chunks {
+		if !seen[c.Bucket] {
+			seen[c.Bucket] = true
+			buckets = append(buckets, c.Bucket)
+		}
+	}
+	if len(buckets) == 0 {
+		buckets = []string{"default"}
+	}
+	return buckets, nil
+}
+
+func (f *fakeChunkRepo) ListObjects(_ context.Context, _, bucket, _, _ string, _ int) (repository.ListPage, error) {
 	seen := map[int64]bool{}
 	var objs []repository.Object
 	for _, c := range f.chunks {
+		if c.Bucket != bucket {
+			continue
+		}
 		if !seen[c.ObjectID] {
 			seen[c.ObjectID] = true
 			objs = append(objs, repository.Object{ID: c.ObjectID})

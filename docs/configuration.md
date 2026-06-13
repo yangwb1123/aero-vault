@@ -28,6 +28,11 @@ Validation (fails fast on startup): the storage backend must be one of
 |----------|---------|-------------|
 | `APP_ADDR` | `:8080` | HTTP listen address. |
 | `APP_LOG_LEVEL` | `info` | Log level: `debug` \| `info` \| `warn`/`warning` \| `error`. Invalid values fail startup. |
+| `APP_WRITE_TIMEOUT` | `60` | HTTP write timeout in seconds. SSE streams exempt themselves via `SetWriteDeadline`. Set to `0` to disable. |
+| `APP_IDLE_TIMEOUT` | `120` | HTTP idle (keep-alive) timeout in seconds. Set to `0` to disable. |
+| `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`). Set to `0` to disable. |
+| `EVENTS_SUB_BUFFER` | `64` | Per-subscriber in-process event channel buffer depth. Increase if subscribers fall behind under high event throughput. Set to `0` to use the default. |
+| `CORS_EXPOSE_HEADERS` | _(empty)_ | Comma-separated extra response headers browsers may read. Default set: `ETag`, `Idempotency-Replayed`, `Retry-After`, `X-Request-ID`, `X-Version-Id`. |
 
 ## Storage backend selection
 
@@ -105,6 +110,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JOBS_WORKERS` | `4` | Background worker-pool size. `>0` routes indexing/antivirus/replication through the durable jobs table with retry; `0` makes the indexer process events inline (and disables antivirus/replication, which require the pool). |
+| `JOBS_MAX_DEPTH` | `0` | `>0` caps pending-job backlog; enqueue is rejected with `ErrQueueFull` once the backlog reaches this size, allowing callers to shed load or return `429`. `0` = no cap. |
 
 ## AI / RAG
 
@@ -112,6 +118,10 @@ Validation (fails fast on startup): the storage backend must be one of
 |----------|---------|-------------|
 | `AI_INDEX_ENABLED` | `false` | Enable text extraction + chunking + embedding of uploaded objects. Master switch for the AI pipeline. |
 | `AI_HYBRID_SEARCH` | `false` | Fuse vector + BM25 retrieval with reciprocal-rank fusion. |
+| `AI_EMBED_CACHE_SIZE` | `0` | `>0` memoizes up to N query embeddings in a bounded in-memory cache, cutting repeated embed latency and provider cost. `0` disables. |
+| `AI_SEARCH_CACHE_SIZE` | `0` | `>0` caches up to N whole search results; identical normalized queries skip embed + retrieval + rerank. `0` disables. |
+| `AI_SEARCH_CACHE_TTL_SECONDS` | `30` | TTL (seconds) bounding staleness of cached search results. Only used when `AI_SEARCH_CACHE_SIZE > 0`. |
+| `AI_REINDEX_STALE_ON_START` | `false` | On boot, re-embed objects whose stored chunks reference a different embedding model than the current embedder. One-shot; safe to run repeatedly (idempotent). |
 | `AI_EMBED_PROVIDER` | `hash` | Embedder: `hash` (built-in, dependency-free) or `http` (OpenAI-compatible). Lower-cased. |
 | `AI_EMBED_ENDPOINT` | _(empty)_ | Embedding service base URL, e.g. `http://localhost:11434` (Ollama). **Required when** `AI_INDEX_ENABLED=true` **and** `AI_EMBED_PROVIDER=http`. |
 | `AI_EMBED_MODEL` | `text-embedding-3-small` | Embedding model name. |
@@ -121,6 +131,8 @@ Validation (fails fast on startup): the storage backend must be one of
 | `AI_CHAT_ENDPOINT` | _(empty)_ | Chat service base URL, e.g. `http://localhost:11434`. |
 | `AI_CHAT_MODEL` | `gpt-4o-mini` | Chat model name. |
 | `AI_CHAT_API_KEY` | _(empty)_ | API key for the chat endpoint. |
+| `AI_COST_PROMPT_PER_1K` | `0` | USD cost per 1 000 prompt tokens sent to the chat LLM. Used to estimate and record per-call spend. `0` = don't estimate. |
+| `AI_COST_COMPLETION_PER_1K` | `0` | USD cost per 1 000 completion tokens from the chat LLM. |
 | `AI_TENANT_DAILY_BUDGET_USD` | `0` | Default per-tenant daily AI spend cap (USD); 0 = unlimited. Chat returns `402` once a tenant's recorded same-day spend reaches the cap. Requires `AI_COST_*` pricing to estimate spend. |
 | `AI_PER_TENANT_BUDGETS` | `false` | Let each tenant override the default cap via `PUT /v1/admin/tenants/{tenant}/budget` (`{"daily_budget_usd": N}`). A tenant's override (when > 0) wins over the default — and enforces even when no default is set; `0` clears it. |
 | `AI_RERANK_PROVIDER` | _(empty = off)_ | Reranker: `http` (Cohere/Voyage/bge-reranker wire shape) or `heuristic` (dependency-free fallback). Lower-cased. |
@@ -145,6 +157,8 @@ Validation (fails fast on startup): the storage backend must be one of
 | `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = operator (any tenant). Empty disables API-key auth (MVP/open mode). |
 | `AUTH_JWT_SECRET` | _(empty)_ | Secret enabling HS256 JWT verification and issuance (`POST /v1/admin/jwt`). |
 | `AUTH_ANONYMOUS_PUBLIC_READ` | `false` | Allow unauthenticated `GET`/`HEAD` of public-read objects (the handler still enforces the object ACL). |
+| `AUTH_PERSIST_KEYS` | `false` | Back runtime API keys with the DB (`api_keys` table, tokens sha256-hashed). Keys survive restart and are shared across replicas. Also acts as an implicit auth switch: setting this without `AUTH_KEYS` still enables auth. |
+| `AUTH_KEY_CACHE_TTL_SECONDS` | `0` | `>0` adds a bounded TTL'd read-through cache in front of the DB key lookup, reducing per-request DB hits. Revokes are bounded by this TTL — keep short (e.g. 30). When `EVENTS_TRANSPORT_DSN` is set, add/revoke also broadcasts immediately via a dedicated Postgres LISTEN/NOTIFY channel (`aero_key_invalidate`) so other replicas drop the cache entry without waiting for TTL expiry. |
 | `S3_SIGV4_CREDENTIALS` | _(empty)_ | AWS SigV4 credentials for the S3 endpoint: `accessKey:secretKey:tenant[:scope+scope]`, comma-separated (e.g. `AKIA...:secret...:acme:read+write`). |
 
 ## CORS *(config.go only)*
@@ -163,6 +177,8 @@ Validation (fails fast on startup): the storage backend must be one of
 |----------|---------|-------------|
 | `RATE_LIMIT_RPS` | `0` | Per-tenant token-bucket refill rate (requests/sec). `0` disables rate limiting. |
 | `RATE_LIMIT_BURST` | `0` | Token-bucket burst capacity. |
+| `AI_RATE_LIMIT_RPS` | `0` | Per-tenant AI endpoint rate limit (req/s). Applies to `/v1/search`, `/v1/chat`, `/v1/chat/stream`, `/v1/agent`, and `/v1/lineage` independently of `RATE_LIMIT_RPS`. `0` disables. |
+| `AI_RATE_LIMIT_BURST` | `0` | Burst size for the AI rate limiter. `0` disables. |
 
 ## Antivirus
 
@@ -205,6 +221,8 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 |----------|---------|-------------|
 | `EVENTS_WEBHOOK_URL` | _(empty)_ | POST object-lifecycle events to this URL. Empty disables webhooks. |
 | `EVENTS_WEBHOOK_SECRET` | _(empty)_ | HMAC-SHA256 signing key; signature is sent in `X-Aero-Signature`. |
+| `EVENTS_TRANSPORT` | _(empty = in-process)_ | Cross-instance event transport: `postgres` (Postgres `LISTEN`/`NOTIFY`, requires `EVENTS_TRANSPORT_DSN`). Empty keeps the default in-process fan-out. |
+| `EVENTS_TRANSPORT_DSN` | _(empty)_ | Postgres DSN for the `postgres` event transport (and for the `aero_key_invalidate` cross-replica key-invalidation channel). |
 
 ## Background reconcile / lifecycle
 
@@ -214,6 +232,8 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 | `RECONCILE_DELETE_ORPHAN_BLOBS` | `false` | Delete blobs that have no remaining DB reference during reconciliation. |
 | `RECONCILE_ORPHAN_GRACE_MINUTES` | `60` | Minimum age (minutes) an orphan blob must reach before it is eligible for deletion. |
 | `RECONCILE_TENANTS` | `default` | Comma-separated list of tenants to scan. Empty/unset defaults to `default`. |
+| `RECONCILE_CLUSTER_SINGLETON` | `false` | Run reconcile and lifecycle sweeps on only one instance at a time, using a DB advisory `leases` table. Prevents duplicate destructive sweeps when running multiple replicas. Requires `RECONCILE_INTERVAL_MINUTES > 0`. |
+| `RECONCILE_RETENTION_DAYS` | `0` | `>0` permanently purges rows soft-deleted more than N days ago (and their blobs) during the retention sweep. `0` disables. Runs as a cluster singleton when `RECONCILE_CLUSTER_SINGLETON=true`. |
 
 ## Write idempotency (`/v1`)
 

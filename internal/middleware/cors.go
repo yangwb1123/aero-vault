@@ -27,7 +27,7 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 		cfg.AllowedMethods = []string{"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"}
 	}
 	if len(cfg.AllowedHeaders) == 0 {
-		cfg.AllowedHeaders = []string{"Authorization", "Content-Type", "X-Aero-Tenant", "X-Api-Key", "X-Request-ID", "Range"}
+		cfg.AllowedHeaders = []string{"Authorization", "Content-Type", "Idempotency-Key", "X-Aero-Tenant", "X-Api-Key", "X-Request-ID", "Range"}
 	}
 	if cfg.MaxAgeSeconds == 0 {
 		cfg.MaxAgeSeconds = 600

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"sync"
@@ -30,6 +31,8 @@ const (
 	// rlIdleTTL is how long an untouched bucket lives before eviction. A bucket idle
 	// this long has refilled to full, so dropping it loses no rate-limit state.
 	rlIdleTTL = 10 * time.Minute
+	// rlEvictInterval is how often the background sweep runs.
+	rlEvictInterval = 60 * time.Second
 )
 
 func NewRateLimiter(rps, burst float64) *RateLimiter {
@@ -37,6 +40,33 @@ func NewRateLimiter(rps, burst float64) *RateLimiter {
 		return nil
 	}
 	return &RateLimiter{rps: rps, burst: burst, buckets: make(map[string]*bucket)}
+}
+
+// Start launches a background goroutine that evicts idle buckets every
+// rlEvictInterval. It returns immediately; the goroutine stops when ctx is
+// cancelled. Safe to call on a nil receiver (no-op).
+func (rl *RateLimiter) Start(ctx context.Context) {
+	rl.startWithInterval(ctx, rlEvictInterval)
+}
+
+func (rl *RateLimiter) startWithInterval(ctx context.Context, interval time.Duration) {
+	if rl == nil {
+		return
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				rl.mu.Lock()
+				rl.evictIdle(now)
+				rl.mu.Unlock()
+			}
+		}
+	}()
 }
 
 // evictIdle drops buckets untouched for longer than rlIdleTTL. Caller holds rl.mu.

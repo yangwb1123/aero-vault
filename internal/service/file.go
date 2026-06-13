@@ -39,16 +39,25 @@ type EventSink interface {
 	Publish(ctx context.Context, e repository.Event)
 }
 
+// ChunkCleaner is an optional hook called synchronously on hard delete, before
+// the repository row is removed, to clean up any secondary chunk index entries
+// (BM25, vector store, etc.). Non-fatal: a failure is logged but the hard
+// delete proceeds.
+type ChunkCleaner interface {
+	DeleteObjectChunks(ctx context.Context, objectID int64) error
+}
+
 type noopSink struct{}
 
 func (noopSink) Publish(context.Context, repository.Event) {}
 
 // FileService is the single entry point shared by REST + S3-compat handlers.
 type FileService struct {
-	store  storage.Storage
-	repo   repository.Repository
-	logger *slog.Logger
-	sink   EventSink
+	store        storage.Storage
+	repo         repository.Repository
+	logger       *slog.Logger
+	sink         EventSink
+	chunkCleaner ChunkCleaner
 }
 
 func NewFileService(store storage.Storage, repo repository.Repository, logger *slog.Logger) *FileService {
@@ -65,6 +74,13 @@ func (s *FileService) WithEventSink(sink EventSink) *FileService {
 	} else {
 		s.sink = sink
 	}
+	return s
+}
+
+// WithChunkCleaner attaches a synchronous chunk-cleanup hook for hard deletes.
+// Returns the service for fluent wiring.
+func (s *FileService) WithChunkCleaner(cc ChunkCleaner) *FileService {
+	s.chunkCleaner = cc
 	return s
 }
 
@@ -260,6 +276,12 @@ func (s *FileService) Delete(ctx context.Context, tenant, bucket, key string, ha
 	if hard {
 		if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
 			return fmt.Errorf("%w: hard delete blocked until %s", ErrLocked, obj.LockedUntil.Format(time.RFC3339))
+		}
+		if s.chunkCleaner != nil {
+			if err := s.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
+				s.logger.Warn("chunk cleanup on hard delete failed", "key", key, "err", err)
+				// non-fatal: proceed with hard delete
+			}
 		}
 		if err := s.store.Delete(ctx, obj.StorageKey); err != nil {
 			return fmt.Errorf("storage delete: %w", err)

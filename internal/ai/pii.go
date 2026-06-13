@@ -5,6 +5,39 @@ import (
 	"strings"
 )
 
+// digitsOnly returns s with all non-digit characters removed.
+func digitsOnly(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, s)
+}
+
+// luhn returns true when the digit string s passes the Luhn check.
+// Returns false if the number of digits is outside the 13–19 range.
+func luhn(s string) bool {
+	digits := digitsOnly(s)
+	n := len(digits)
+	if n < 13 || n > 19 {
+		return false
+	}
+	sum := 0
+	parity := n % 2
+	for i, ch := range digits {
+		d := int(ch - '0')
+		if i%2 == parity {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+	}
+	return sum%10 == 0
+}
+
 // PIIDetector flags common personally-identifiable patterns. Hits are
 // returned both as a count map and as a redacted copy of the text.
 //
@@ -38,6 +71,15 @@ func (p *PIIDetector) Scan(text string) map[string]int {
 	out := map[string]int{}
 	for _, r := range p.rules {
 		m := r.re.FindAllString(text, -1)
+		if r.kind == "credit_card" {
+			valid := m[:0]
+			for _, match := range m {
+				if luhn(match) {
+					valid = append(valid, match)
+				}
+			}
+			m = valid
+		}
 		if len(m) > 0 {
 			out[r.kind] = len(m)
 		}
@@ -51,6 +93,16 @@ func (p *PIIDetector) Scan(text string) map[string]int {
 func (p *PIIDetector) Redact(text string, pickKinds map[string]bool) string {
 	for _, r := range p.rules {
 		if pickKinds != nil && !pickKinds[r.kind] {
+			continue
+		}
+		if r.kind == "credit_card" {
+			repl := r.repl
+			text = r.re.ReplaceAllStringFunc(text, func(match string) string {
+				if luhn(match) {
+					return repl
+				}
+				return match
+			})
 			continue
 		}
 		text = r.re.ReplaceAllString(text, r.repl)

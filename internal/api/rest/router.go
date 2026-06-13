@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -20,7 +21,10 @@ var errInvalidPostKey = errors.New("invalid request: use /files/<key>/presign or
 
 // NewRouter returns a sub-router mounted at /v1. idemHashBody folds a hash of
 // the request body into Idempotency-Key fingerprints (IDEMPOTENCY_HASH_BODY).
-func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger, idemHashBody bool) chi.Router {
+// aiRL is an optional independent rate limiter applied only to AI endpoints
+// (/search, /chat, /chat/stream, /agent, /lineage); nil disables AI-specific limiting.
+// aiTimeout, when > 0, is applied as a per-request context deadline on AI endpoints.
+func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger, idemHashBody bool, aiRL *mw.RateLimiter, aiTimeout time.Duration) chi.Router {
 	h := NewHandler(svc, logger)
 	aih := NewAIHandler(repo, search, chat, agent, logger)
 	sse := NewSSEHandler(bus, repo, logger)
@@ -47,11 +51,19 @@ func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.
 	r.Post("/multipart/{uploadID}/complete", h.CompleteMultipart)
 	r.Delete("/multipart/{uploadID}", h.AbortMultipart)
 
-	r.Post("/search", aih.Search)
-	r.Post("/chat", aih.Chat)
-	r.Post("/chat/stream", aih.ChatStream)
-	r.Post("/agent", aih.Agent)
-	r.Get("/lineage/objects/{id}", aih.Lineage)
+	// AI endpoints get their own independent rate limiter (AI_RATE_LIMIT_*) and
+	// an optional per-request context deadline (REQUEST_TIMEOUT_SECONDS).
+	r.Group(func(r chi.Router) {
+		if aiRL != nil {
+			r.Use(aiRL.Middleware())
+		}
+		r.Use(mw.RequestTimeout(aiTimeout))
+		r.Post("/search", aih.Search)
+		r.Post("/chat", aih.Chat)
+		r.Post("/chat/stream", aih.ChatStream)
+		r.Post("/agent", aih.Agent)
+		r.Get("/lineage/objects/{id}", aih.Lineage)
+	})
 	r.Get("/events/stream", sse.Stream)
 
 	// Bucket policies

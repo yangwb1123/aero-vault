@@ -16,10 +16,13 @@ import (
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
+const defaultSubBuffer = 64
+
 // Bus is the concrete publisher. It satisfies service.EventSink.
 type Bus struct {
-	repo   repository.Repository
-	logger *slog.Logger
+	repo      repository.Repository
+	logger    *slog.Logger
+	subBuffer int // per-subscriber channel buffer depth
 
 	mu        sync.RWMutex
 	subs      []chan repository.Event
@@ -32,10 +35,19 @@ type Bus struct {
 func (b *Bus) Dropped() int64 { return b.dropped.Load() }
 
 func New(repo repository.Repository, logger *slog.Logger) *Bus {
+	return NewWithBuffer(repo, logger, defaultSubBuffer)
+}
+
+// NewWithBuffer creates a Bus where each subscriber channel is buffered to
+// bufSize events. bufSize <= 0 falls back to defaultSubBuffer.
+func NewWithBuffer(repo repository.Repository, logger *slog.Logger, bufSize int) *Bus {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Bus{repo: repo, logger: logger}
+	if bufSize <= 0 {
+		bufSize = defaultSubBuffer
+	}
+	return &Bus{repo: repo, logger: logger, subBuffer: bufSize}
 }
 
 // WithTransport attaches an optional cross-instance transport (e.g. Postgres
@@ -82,7 +94,7 @@ func (b *Bus) Deliver(e repository.Event) {
 // is buffered (64); if a consumer falls behind, events are dropped (the
 // durable copy in the DB remains the source of truth).
 func (b *Bus) Subscribe() <-chan repository.Event {
-	ch := make(chan repository.Event, 64)
+	ch := make(chan repository.Event, b.subBuffer)
 	b.mu.Lock()
 	b.subs = append(b.subs, ch)
 	b.mu.Unlock()

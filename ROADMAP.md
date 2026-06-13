@@ -53,8 +53,7 @@ seam (`VectorIndex.SearchVectors`) and the write seam (`ChunkSink`) — over
 Qdrant's REST API (stdlib `net/http`, no new deps), wired opt-in via
 `AI_VECTOR_BACKEND=qdrant` (+ `AI_VECTOR_URL`/`_API_KEY`/`_COLLECTION`) and
 registered on both `Search` and the indexer so writes propagate. Pinned by
-`httptest` contract tests; live round-trip against a real Qdrant is UNVERIFIED in
-CI by design. *Remaining (external):* the pgvector/Qdrant live round-trips need a
+`httptest` contract tests; live round-trip against a real Qdrant is opt-in CI via `make test-integration-qdrant` (Docker); skips gracefully when no Qdrant is reachable. *Remaining (external):* the pgvector/Qdrant live round-trips need a
 running backend to verify (pgvector is already exercised by `make
 test-integration`).
 - **Postgres path:** pgvector with an HNSW/IVFFlat index → approximate top-k in
@@ -77,11 +76,11 @@ test-integration`).
   `deploy/postgres/pgvector-setup.sql` and confirmed to apply on PG 16.
 - **Dev path:** keep the brute-force/SQLite implementation for zero-dependency
   local use.
-- **External option:** an interface-level adapter for a dedicated vector store
-  (Qdrant/Milvus) for very large deployments.
-- Enforce **embedding-model identity at query time** (the `embed_model`/`dim`
-  columns already exist) so vectors from different models aren't compared — see
-  also edge case in #5.
+- **External option:** ✅ *shipped*: `ai.QdrantIndex` (`internal/ai/qdrant.go`) is the Qdrant adapter — implements both `VectorIndex` (read) and `ChunkSink` (write), wired opt-in via `AI_VECTOR_BACKEND=qdrant`. See the "External vector store" entry above for full detail.
+- ✅ **Embedding-model identity at query time** enforced: `Search` drops vector
+  hits whose `embed_model` differs from the query embedder's `Name()`, so
+  vectors from different models are never compared even at matching dimension;
+  re-index on model change via `AI_REINDEX_STALE_ON_START`. See Direction #5.
 
 ---
 
@@ -112,12 +111,18 @@ burst.
   gauges** ✅ *also added*: `jobs_pending` (queue depth) + per-tenant
   `storage_bytes`/`storage_objects` (via `repo.ListTenantQuotas`), collected on
   scrape (verified). Ships with a Grafana dashboard
-  (`deploy/grafana/aero-vault-ai-ops-dashboard.json`) and Prometheus alert rules
-  (`deploy/prometheus/alerts.yml`: 5xx rate, p95 latency, per-tenant spend,
-  orphan-blob accumulation, replay storms, dropped events). **Embedding/search
-  latency histograms** ✅ *added* (`ai_embed_duration_ms{model}`,
-  `ai_search_duration_ms{mode}`). *Remaining (external):* validating live
-  dashboards against a running Grafana/collector.
+  (`deploy/grafana/aero-vault-ai-ops-dashboard.json`, **12 panels**) and
+  Prometheus alert rules (`deploy/prometheus/alerts.yml`, **4 groups, 8
+  rules**). **Embedding/search latency histograms** ✅ *added*
+  (`ai_embed_duration_ms{model}`, `ai_search_duration_ms{mode}`). **Dashboard
+  extended** ✅: 6 new panels (ids 7–12) cover embed/search latency p50/p95,
+  embed requests+tokens/sec by model, job queue depth, and storage
+  bytes/objects per tenant — all implemented-but-previously-unvisualized
+  metrics. **Alert coverage extended** ✅: `aero-vault-ai-latency` group adds
+  `HighEmbedLatencyP95` (p95 > 500ms for 10m), `HighSearchLatencyP95` (p95 >
+  2s for 10m), and `JobQueueDepthHigh` (> 1000 for 5m). *Remaining
+  (external):* validating live dashboards against a running
+  Grafana/collector.
 - **Cost accounting:** extend `Usage` with token counts + estimated cost +
   latency, and enforce **per-tenant AI budgets/quotas** at the `Chat`/`Embed`
   seam (reuse the existing quota machinery). ✅ *Accounting implemented.*
@@ -142,7 +147,13 @@ burst.
   via admin retry); added a **depth cap** — `Queue.WithMaxDepth`
   (`JOBS_MAX_DEPTH`) backed by `repo.CountJobsByStatus("pending")` returns
   `ErrQueueFull` once the backlog is reached, so enqueue sites can shed load /
-  return 429.
+  return 429. **AI-specific rate limiting** ✅ *added*: `AI_RATE_LIMIT_RPS` /
+  `AI_RATE_LIMIT_BURST` create a second per-tenant token bucket applied only to
+  `/v1/search`, `/v1/chat`, `/v1/chat/stream`, `/v1/agent`, `/v1/lineage`, so
+  expensive AI operations have an independent quota from storage I/O. **Indexer
+  skip observability** ✅ *added*: `indexer_skip_total{reason}` counter
+  (reason=`unsupported`/`error`/`empty`) surfaces in Prometheus so operators
+  can see how many objects are skipped and why.
 - **Caching:** memoize embeddings and hot search results to cut both latency and
   cost. ✅ *Embedding cache implemented.* `ai.NewCachingEmbedder`
   (`AI_EMBED_CACHE_SIZE`) wraps any embedder in a bounded in-memory cache so
@@ -202,8 +213,7 @@ most basic production topology.
   (`Enable`/`Guard`, fail-safe on lease error) that the reconcile, lifecycle and
   retention sweeps share — a generic leader-election primitive for any future
   singleton task.
-- **Shared index + config** so replicas don't each rebuild/hold their own
-  (couples naturally with #1's persisted index and #4's persisted keys).
+- **Shared index + config** ✅ *addressed*: the external vector stores (#1: Qdrant / pgvector) serve as the shared vector index — replicas read/write the same external store rather than each holding a private copy. API keys and tenant records are persisted in the shared DB (#4: `AUTH_PERSIST_KEYS`, migration `0015`), so config changes survive restart and propagate across replicas. The in-process BM25 per-replica is the opt-in trade-off; `AI_LEXICAL_BACKEND=pgfts` gives a fully shared lexical index.
 
 ---
 

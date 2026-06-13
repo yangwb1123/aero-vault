@@ -27,6 +27,10 @@ var (
 	mReconcileDeleted     metric.Int64Counter
 	mIdempotencyReplays   metric.Int64Counter
 	mEventsDropped        metric.Int64Counter
+	mIndexerSkip          metric.Int64Counter
+	mJobsCompleted        metric.Int64Counter
+	mJobsFailed           metric.Int64Counter
+	mJobsRetried          metric.Int64Counter
 )
 
 func initDomain() {
@@ -43,6 +47,10 @@ func initDomain() {
 		mReconcileDeleted, _ = m.Int64Counter("reconcile.orphan_blobs_deleted")
 		mIdempotencyReplays, _ = m.Int64Counter("idempotency.replays")
 		mEventsDropped, _ = m.Int64Counter("events.dropped")
+		mIndexerSkip, _ = m.Int64Counter("indexer.skip_total")
+		mJobsCompleted, _ = m.Int64Counter("jobs.completed_total")
+		mJobsFailed, _ = m.Int64Counter("jobs.failed_total")
+		mJobsRetried, _ = m.Int64Counter("jobs.retried_total")
 	})
 }
 
@@ -105,6 +113,34 @@ func IncIdempotencyReplay(ctx context.Context) {
 func IncEventDropped(ctx context.Context) {
 	initDomain()
 	mEventsDropped.Add(ctx, 1)
+}
+
+// IncIndexerSkip counts one indexer skip, attributed by reason (e.g.
+// "unsupported", "error", "empty") so operators can observe how many objects
+// are bypassed and why.
+func IncIndexerSkip(ctx context.Context, reason string) {
+	initDomain()
+	mIndexerSkip.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+}
+
+// IncJobCompleted counts one successful job execution, attributed by job_type.
+func IncJobCompleted(ctx context.Context, jobType string) {
+	initDomain()
+	mJobsCompleted.Add(ctx, 1, metric.WithAttributes(attribute.String("job_type", jobType)))
+}
+
+// IncJobFailed counts one permanently-failed job (max retries exhausted or no
+// handler registered), attributed by job_type.
+func IncJobFailed(ctx context.Context, jobType string) {
+	initDomain()
+	mJobsFailed.Add(ctx, 1, metric.WithAttributes(attribute.String("job_type", jobType)))
+}
+
+// IncJobRetried counts one transient job failure that will be retried,
+// attributed by job_type.
+func IncJobRetried(ctx context.Context, jobType string) {
+	initDomain()
+	mJobsRetried.Add(ctx, 1, metric.WithAttributes(attribute.String("job_type", jobType)))
 }
 
 // TenantStorage is one tenant's storage usage, emitted by the storage gauges.
