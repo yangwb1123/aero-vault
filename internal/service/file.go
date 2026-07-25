@@ -152,10 +152,19 @@ func validateMetadata(meta map[string]string) error {
 	return nil
 }
 
-// validateKey rejects empty keys, absolute paths, and path-traversal keys.
+// MaxKeyLen is the maximum length of an object key. Keys longer than this
+// are rejected to prevent filesystem "file name too long" errors on local
+// storage backends (where the key becomes part of the file path).
+const MaxKeyLen = 200
+
+// validateKey rejects empty keys, absolute paths, path-traversal keys, and
+// keys exceeding MaxKeyLen.
 func validateKey(key string) error {
 	if key == "" {
 		return fmt.Errorf("%w: empty key", ErrInvalidArgs)
+	}
+	if len(key) > MaxKeyLen {
+		return fmt.Errorf("%w: key length %d exceeds maximum %d", ErrInvalidArgs, len(key), MaxKeyLen)
 	}
 	if strings.Contains(key, "..") || strings.HasPrefix(key, "/") {
 		return fmt.Errorf("%w: illegal key %q", ErrInvalidArgs, key)
