@@ -89,6 +89,14 @@ def test_empty_key_rejected():
     print(f"  ✅ PUT empty key rejected -> {status}")
 
 
+def test_long_key_rejected():
+    """Key exceeding 200 chars should be rejected (filesystem limit)."""
+    long_key = "k" + "a" * 200  # 201 chars
+    status, data = req("PUT", f"/v1/files/{long_key}", body="x")
+    assert status == 400, f"long key: got {status}, expected 400"
+    print(f"  ✅ Long key (201 chars) rejected -> 400")
+
+
 def test_overwrite_object():
     """PUT to existing key should overwrite (no versioning)."""
     key = f"adv/overwrite-{uuid.uuid4().hex[:8]}"
