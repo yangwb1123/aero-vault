@@ -90,3 +90,11 @@ jobs:
 
       - name: SDK Go build
         run: cd sdk/go/aerovault && go build ./...
+
+      - name: E2E tests (with server)
+        run: |
+          go build -o /tmp/av-e2e ./cmd/server
+          APP_ADDR=:9199 /tmp/av-e2e &
+          sleep 2
+          BASE_URL=http://localhost:9199 python3 tests/run_all.py
+          kill %1 2>/dev/null || true
