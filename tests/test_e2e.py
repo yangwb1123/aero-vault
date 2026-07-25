@@ -248,6 +248,28 @@ def test_cors():
     print(f"  ✅ DELETE /v1/buckets/default/cors -> 200")
 
 
+def test_mcp():
+    """MCP protocol: tools/list and resources/list."""
+    import json
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+    req = urllib.request.Request(BASE_URL + "/mcp", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    resp = urllib.request.urlopen(req, timeout=5)
+    result = json.loads(resp.read())
+    tools = result.get("result", {}).get("tools", [])
+    names = [t["name"] for t in tools]
+    assert "list_files" in names, f"MCP tools: {names}"
+    print(f"  ✅ MCP tools/list -> {len(tools)} tools")
+
+    # resources/list
+    body2 = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}}).encode()
+    req2 = urllib.request.Request(BASE_URL + "/mcp", data=body2, method="POST")
+    req2.add_header("Content-Type", "application/json")
+    resp2 = urllib.request.urlopen(req2, timeout=5)
+    json.loads(resp2.read())
+    print(f"  ✅ MCP resources/list -> OK")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 ALL_TESTS = [
@@ -256,6 +278,7 @@ ALL_TESTS = [
     ("Tags", [test_tags]),
     ("Multipart", [test_multipart]),
     ("Buckets", [test_bucket_crud, test_bucket_policy, test_cors]),
+    ("MCP", [test_mcp]),
     ("Admin", [test_admin]),
 ]
 
