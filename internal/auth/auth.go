@@ -89,6 +89,9 @@ func Parse(raw string) (*Registry, error) {
 			}
 			k.Scopes[Scope(sc)] = true
 		}
+		if len(k.Scopes) == 0 {
+			return nil, errors.New("AUTH_KEYS: " + rec + ": must have at least one scope")
+		}
 		reg.keys[k.Token] = k
 	}
 	reg.enabled = len(reg.keys) > 0
@@ -164,46 +167,56 @@ func (r *Registry) Lookup(ctx context.Context, token string) (Key, bool) {
 	k, ok := r.keys[token]
 	store := r.store
 	jwt := r.jwt
-	cache := r.keyCache
 	r.mu.RUnlock()
 	if ok {
 		return k, true
 	}
-	// Persisted (hashed) runtime keys.
 	if store != nil {
-		hash := HashToken(token)
-		now := time.Now()
-		// Read-through cache: serve fresh positive hits without touching the DB.
-		if cache != nil {
-			if ck, hit := cache.get(hash, now); hit {
-				return ck, true
-			}
-		}
-		if pk, found, err := store.GetAPIKeyByHash(ctx, hash); err == nil && found {
-			var keyExpiry time.Time
-			if pk.ExpiresAt != "" {
-				if exp, perr := time.Parse(time.RFC3339, pk.ExpiresAt); perr == nil {
-					if now.After(exp) {
-						return Key{}, false // expired
-					}
-					keyExpiry = exp
-				}
-			}
-			// Best-effort last-used bookkeeping; never block auth on it.
-			_ = store.TouchAPIKey(ctx, hash, now.UTC().Format(time.RFC3339Nano))
-			resolved := Key{Token: token, Tenant: pk.TenantID, Scopes: parseScopeString(pk.Scopes)}
-			if cache != nil {
-				// Never cache past the key's own expiry.
-				cache.put(hash, resolved, keyExpiry, now)
-			}
+		if resolved, ok := r.lookupStore(ctx, HashToken(token), token); ok {
 			return resolved, true
 		}
 	}
-	// Fall through to JWT verification when configured.
 	if jwt != nil {
-		if k, err := jwt.Verify(token); err == nil {
-			return k, true
+		if resolved, ok := r.lookupJWT(ctx, token); ok {
+			return resolved, true
 		}
+	}
+	return Key{}, false
+}
+
+func (r *Registry) lookupStore(ctx context.Context, hash, token string) (Key, bool) {
+	now := time.Now()
+	if r.keyCache != nil {
+		if ck, hit := r.keyCache.get(hash, now); hit {
+			return ck, true
+		}
+	}
+	pk, found, err := r.store.GetAPIKeyByHash(ctx, hash)
+	if err != nil || !found {
+		return Key{}, false
+	}
+	var keyExpiry time.Time
+	if pk.ExpiresAt != "" {
+		exp, perr := time.Parse(time.RFC3339, pk.ExpiresAt)
+		if perr != nil {
+			return Key{}, false
+		}
+		if now.After(exp) {
+			return Key{}, false
+		}
+		keyExpiry = exp
+	}
+	_ = r.store.TouchAPIKey(ctx, hash, now.UTC().Format(time.RFC3339Nano))
+	resolved := Key{Token: token, Tenant: pk.TenantID, Scopes: parseScopeString(pk.Scopes)}
+	if r.keyCache != nil {
+		r.keyCache.put(hash, resolved, keyExpiry, now)
+	}
+	return resolved, true
+}
+
+func (r *Registry) lookupJWT(_ context.Context, token string) (Key, bool) {
+	if k, err := r.jwt.Verify(token); err == nil {
+		return k, true
 	}
 	return Key{}, false
 }
@@ -368,135 +381,3 @@ func FromContext(ctx context.Context) (Key, bool) {
 // the registry is enabled. When disabled, requests pass through unchanged.
 //
 // Authorization header format: "Bearer <token>" or "ApiKey <token>".
-func (r *Registry) Middleware() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			if !r.Enabled() {
-				next.ServeHTTP(w, req)
-				return
-			}
-			// Health probes, Prometheus scraping, public UI, OpenAPI doc bypass auth.
-			path := req.URL.Path
-			if path == "/healthz" || path == "/readyz" || path == "/metrics" ||
-				path == "/openapi.json" || path == "/docs" ||
-				strings.HasPrefix(path, "/ui") {
-				next.ServeHTTP(w, req)
-				return
-			}
-			// AWS SigV4 (S3 clients): verify and resolve to a Key.
-			if r.sigv4 != nil && IsSigned(req) {
-				k, err := r.sigv4.Verify(req)
-				if err != nil {
-					forbidden(w, err.Error())
-					return
-				}
-				if k.Tenant != "*" {
-					req.Header.Set("X-Aero-Tenant", k.Tenant)
-				}
-				required := ScopeWrite
-				switch req.Method {
-				case http.MethodGet, http.MethodHead, http.MethodOptions:
-					required = ScopeRead
-				}
-				if !k.Has(required) {
-					forbidden(w, "missing scope: "+string(required))
-					return
-				}
-				decodeStreamingBody(req)
-				ctx := context.WithValue(req.Context(), ctxKeyKey, k)
-				next.ServeHTTP(w, req.WithContext(ctx))
-				return
-			}
-			token := extractToken(req)
-			if token == "" {
-				// Anonymous public-read: admit object GET/HEAD without a token;
-				// the handler enforces the object's ACL.
-				if r.anonRead && isObjectReadPath(req.Method, req.URL.Path) {
-					ctx := context.WithValue(req.Context(), anonCtxKey, true)
-					next.ServeHTTP(w, req.WithContext(ctx))
-					return
-				}
-				unauthorized(w, "missing Authorization header")
-				return
-			}
-			k, ok := r.Lookup(req.Context(), token)
-			if !ok {
-				unauthorized(w, "invalid API key")
-				return
-			}
-			// Pin tenant if the key is tenant-scoped.
-			if k.Tenant != "*" {
-				if hdr := req.Header.Get("X-Aero-Tenant"); hdr != "" && hdr != k.Tenant {
-					forbidden(w, "tenant mismatch")
-					return
-				}
-				req.Header.Set("X-Aero-Tenant", k.Tenant)
-			}
-			// Method-based scope check. Read methods include WebDAV's PROPFIND/PROPPATCH.
-			required := ScopeWrite
-			switch req.Method {
-			case http.MethodGet, http.MethodHead, http.MethodOptions, "PROPFIND", "PROPPATCH":
-				required = ScopeRead
-			}
-			if !k.Has(required) {
-				forbidden(w, "missing scope: "+string(required))
-				return
-			}
-			ctx := context.WithValue(req.Context(), ctxKeyKey, k)
-			next.ServeHTTP(w, req.WithContext(ctx))
-		})
-	}
-}
-
-// Require returns a per-route guard that enforces a scope. Pair with chi:
-//
-//	r.With(reg.Require(auth.ScopeWrite)).Put(...)
-//
-// When the registry is disabled, the guard is a pass-through.
-func (r *Registry) Require(s Scope) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			// Use Enabled() (env keys OR jwt OR sigv4 OR store), not the env-keys-only
-			// `enabled` field, so a JWT/SigV4/store-only config still enforces scopes.
-			if !r.Enabled() {
-				next.ServeHTTP(w, req)
-				return
-			}
-			k, ok := FromContext(req.Context())
-			if !ok {
-				unauthorized(w, "not authenticated")
-				return
-			}
-			if !k.Has(s) {
-				forbidden(w, "missing scope: "+string(s))
-				return
-			}
-			next.ServeHTTP(w, req)
-		})
-	}
-}
-
-func extractToken(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); h != "" {
-		for _, prefix := range []string{"Bearer ", "ApiKey ", "bearer ", "apikey "} {
-			if strings.HasPrefix(h, prefix) {
-				return strings.TrimSpace(h[len(prefix):])
-			}
-		}
-	}
-	// AWS SDK doesn't send Authorization with --no-sign-request; allow
-	// X-Api-Key as a fallback for S3-compat callers.
-	if h := r.Header.Get("X-Api-Key"); h != "" {
-		return h
-	}
-	return ""
-}
-
-func unauthorized(w http.ResponseWriter, msg string) {
-	w.Header().Set("WWW-Authenticate", `Bearer realm="aero-vault"`)
-	http.Error(w, msg, http.StatusUnauthorized)
-}
-
-func forbidden(w http.ResponseWriter, msg string) {
-	http.Error(w, msg, http.StatusForbidden)
-}

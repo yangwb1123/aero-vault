@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/http"
 	"time"
 )
 
@@ -11,6 +13,7 @@ var (
 	ErrNotFound      = errors.New("object not found")
 	ErrAlreadyExists = errors.New("object already exists")
 	ErrInvalidKey    = errors.New("invalid object key")
+	ErrUnsupported   = errors.New("operation not supported by this backend")
 )
 
 // ObjectInfo describes a stored object.
@@ -46,6 +49,69 @@ type MultipartInit struct {
 type MultipartPart struct {
 	PartNumber int32
 	ETag       string
+}
+
+// CopyOptions controls how Copy transfers an object between keys.
+type CopyOptions struct {
+	// MetadataDirective controls metadata handling during copy.
+	// "COPY" preserves source metadata (default).
+	// "REPLACE" uses the Metadata and ContentType fields.
+	MetadataDirective string
+
+	// Metadata replaces source metadata when MetadataDirective is "REPLACE".
+	Metadata map[string]string
+
+	// ContentType overrides the content type when MetadataDirective is "REPLACE".
+	ContentType string
+}
+
+// TimeoutConfig controls HTTP client timeouts for cloud storage backends
+// (S3, OSS, COS). Zero values disable the corresponding timeout.
+type TimeoutConfig struct {
+	ConnectTimeout time.Duration
+	ReadTimeout    time.Duration
+	WriteTimeout   time.Duration
+}
+
+// DefaultTimeoutConfig returns recommended defaults for production use.
+func DefaultTimeoutConfig() TimeoutConfig {
+	return TimeoutConfig{
+		ConnectTimeout: 5 * time.Second,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+	}
+}
+
+// NewHTTPClient creates an *http.Client with connect/read/write timeouts set at
+// the transport level. Pass TimeoutConfig{} (zero) to get a client with no
+// explicit timeout (http.DefaultClient behaviour).
+func NewHTTPClient(tc TimeoutConfig) *http.Client {
+	if tc.ConnectTimeout == 0 && tc.ReadTimeout == 0 && tc.WriteTimeout == 0 {
+		return http.DefaultClient
+	}
+	overall := max(tc.ConnectTimeout, max(tc.ReadTimeout, tc.WriteTimeout))
+	if overall == 0 {
+		overall = 60 * time.Second
+	}
+	return &http.Client{
+		Timeout: overall,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   nonZero(tc.ConnectTimeout, 5*time.Second),
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ResponseHeaderTimeout: nonZero(tc.ReadTimeout, 30*time.Second),
+			TLSHandshakeTimeout:   nonZero(tc.ConnectTimeout, 5*time.Second),
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+}
+
+func nonZero(d, fallback time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return fallback
 }
 
 // Storage is the contract every backend (local FS, S3, OSS, ...) implements.
@@ -85,6 +151,23 @@ type Storage interface {
 	// AbortMultipart cancels a multipart upload and discards its parts.
 	AbortMultipart(ctx context.Context, key, uploadID string) error
 
+	// CleanupParts removes any storage-level artifacts (files, S3 parts) for an
+	// expired or aborted multipart upload. It is used by the upload GC sweep to
+	// ensure no orphaned parts remain after the DB row has been cleaned up.
+	// Implementations should be idempotent: cleaning an already-clean upload is
+	// not an error.
+	CleanupParts(ctx context.Context, key, uploadID string) error
+
 	// Backend identifies the underlying provider (e.g. "local", "s3").
 	Backend() string
+
+	// CanCopy returns true when the backend supports server-side Copy between
+	// keys. If false, callers must fall back to Get+Put (client-stream copy).
+	CanCopy() bool
+
+	// Copy duplicates the object at srcKey to dstKey within the same backend.
+	// Implementations SHOULD avoid reading the body into server memory when
+	// the underlying storage supports server-side copy (e.g. S3 CopyObject).
+	// Returns ErrUnsupported when the backend cannot perform the copy.
+	Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error)
 }

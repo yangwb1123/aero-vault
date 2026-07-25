@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -15,22 +16,32 @@ import (
 // exists at package-init time. They surface at /metrics with names like
 // ai_requests_total, ai_cost_micros_total, reconcile_orphan_blobs_total, etc.
 var (
-	domainOnce            sync.Once
-	mAIRequests           metric.Int64Counter
-	mAITokens             metric.Int64Counter
-	mAICostMicros         metric.Int64Counter
-	mAIEmbedRequests      metric.Int64Counter
-	mAIEmbedTokens        metric.Int64Counter
-	mAISearchLatency      metric.Float64Histogram
-	mAIEmbedLatency       metric.Float64Histogram
-	mReconcileOrphanBlobs metric.Int64Counter
-	mReconcileDeleted     metric.Int64Counter
-	mIdempotencyReplays   metric.Int64Counter
-	mEventsDropped        metric.Int64Counter
-	mIndexerSkip          metric.Int64Counter
-	mJobsCompleted        metric.Int64Counter
-	mJobsFailed           metric.Int64Counter
-	mJobsRetried          metric.Int64Counter
+	domainOnce              sync.Once
+	mAIRequests             metric.Int64Counter
+	mAITokens               metric.Int64Counter
+	mAICostMicros           metric.Int64Counter
+	mAIEmbedRequests        metric.Int64Counter
+	mAIEmbedTokens          metric.Int64Counter
+	mAISearchLatency        metric.Float64Histogram
+	mAIEmbedLatency         metric.Float64Histogram
+	mReconcileOrphanBlobs   metric.Int64Counter
+	mReconcileDeleted       metric.Int64Counter
+	mIdempotencyReplays     metric.Int64Counter
+	mEventsDropped          metric.Int64Counter
+	mIndexerSkip            metric.Int64Counter
+	mJobsCompleted          metric.Int64Counter
+	mJobsFailed             metric.Int64Counter
+	mJobsRetried            metric.Int64Counter
+	mScrubTotal             metric.Int64Counter
+	mWebhookRetries         metric.Int64Counter
+	mWebhookDelivery        metric.Int64Counter
+	mWebhookDeliveryLatency metric.Float64Histogram
+	mWebhookDeadLetter      metric.Int64Counter
+	mStorageSizeMismatch    metric.Int64Counter
+	mETagVerifyMismatch     metric.Int64Counter
+	mPresignGenerated       metric.Int64Counter
+	mPresignConsumed        metric.Int64Counter
+	mMiddlewareDuration     metric.Float64Histogram
 )
 
 func initDomain() {
@@ -51,6 +62,16 @@ func initDomain() {
 		mJobsCompleted, _ = m.Int64Counter("jobs.completed_total")
 		mJobsFailed, _ = m.Int64Counter("jobs.failed_total")
 		mJobsRetried, _ = m.Int64Counter("jobs.retried_total")
+		mScrubTotal, _ = m.Int64Counter("scrub.total")
+		mWebhookRetries, _ = m.Int64Counter("webhook.retries_total")
+		mWebhookDelivery, _ = m.Int64Counter("webhook.delivery_total")
+		mWebhookDeliveryLatency, _ = m.Float64Histogram("webhook.delivery_latency_ms")
+		mWebhookDeadLetter, _ = m.Int64Counter("webhook.dead_letter_total")
+		mStorageSizeMismatch, _ = m.Int64Counter("storage.size_mismatch_total")
+		mETagVerifyMismatch, _ = m.Int64Counter("etag.verify_mismatch_total")
+		mPresignGenerated, _ = m.Int64Counter("presign.generated_total")
+		mPresignConsumed, _ = m.Int64Counter("presign.consumed_total")
+		mMiddlewareDuration, _ = m.Float64Histogram("middleware.duration_ms")
 	})
 }
 
@@ -143,6 +164,56 @@ func IncJobRetried(ctx context.Context, jobType string) {
 	mJobsRetried.Add(ctx, 1, metric.WithAttributes(attribute.String("job_type", jobType)))
 }
 
+// IncScrubResult records the outcome of an integrity scrub.
+func IncScrubResult(ctx context.Context, status string) {
+	initDomain()
+	mScrubTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("status", status)))
+}
+
+// IncWebhookRetry records a webhook retry attempt, attributed by URL host.
+func IncWebhookRetry(ctx context.Context, url string) {
+	initDomain()
+	mWebhookRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("url", url)))
+}
+
+// RecordWebhookDelivery counts one webhook delivery attempt, attributed by
+// URL and HTTP status code, so operators can observe per-endpoint success rates.
+func RecordWebhookDelivery(ctx context.Context, url string, statusCode int) {
+	initDomain()
+	mWebhookDelivery.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("url", url),
+		attribute.Int("status_code", statusCode),
+	))
+}
+
+// RecordWebhookDeliveryLatency records the round-trip latency (ms) of one
+// webhook POST attempt, attributed by URL.
+func RecordWebhookDeliveryLatency(ctx context.Context, url string, ms float64) {
+	initDomain()
+	mWebhookDeliveryLatency.Record(ctx, ms, metric.WithAttributes(attribute.String("url", url)))
+}
+
+// IncWebhookDeadLetter counts one event that has exhausted its retry budget
+// and entered the dead-letter state, attributed by URL.
+func IncWebhookDeadLetter(ctx context.Context, url string) {
+	initDomain()
+	mWebhookDeadLetter.Add(ctx, 1, metric.WithAttributes(attribute.String("url", url)))
+}
+
+// RegisterWebhookQueueDepthGauge registers an observable gauge
+// (webhook_retry_queue_depth) whose value is read from fn on each scrape.
+// The url attribute distinguishes per-endpoint queue depths.
+func RegisterWebhookQueueDepthGauge(fn func(context.Context) map[string]int64) {
+	m := otel.Meter("aero-vault/domain")
+	_, _ = m.Int64ObservableGauge("webhook.retry_queue_depth", metric.WithInt64Callback(
+		func(ctx context.Context, o metric.Int64Observer) error {
+			for url, depth := range fn(ctx) {
+				o.Observe(depth, metric.WithAttributes(attribute.String("url", url)))
+			}
+			return nil
+		}))
+}
+
 // TenantStorage is one tenant's storage usage, emitted by the storage gauges.
 type TenantStorage struct {
 	Tenant  string
@@ -162,7 +233,20 @@ func RegisterQueueDepthGauge(fn func(context.Context) int64) {
 		}))
 }
 
-// RegisterStorageGauges registers per-tenant storage gauges (storage_bytes,
+// RegisterStorageClassGauge registers an observable gauge reading per-class
+// object counts from fn on each scrape.
+func RegisterStorageClassGauge(fn func(context.Context, string) map[string]int64) {
+	m := otel.Meter("aero-vault/domain")
+	_, _ = m.Int64ObservableGauge("storage.class_objects", metric.WithInt64Callback(
+		func(ctx context.Context, o metric.Int64Observer) error {
+			// Sample default tenant; multi-tenant setups should register per tenant.
+			for cls, count := range fn(ctx, "default") {
+				o.Observe(count, metric.WithAttributes(attribute.String("class", cls), attribute.String("tenant", "default")))
+			}
+			return nil
+		}))
+}
+
 // storage_objects) sourced from fn on each scrape.
 func RegisterStorageGauges(fn func(context.Context) []TenantStorage) {
 	m := otel.Meter("aero-vault/domain")
@@ -176,4 +260,35 @@ func RegisterStorageGauges(fn func(context.Context) []TenantStorage) {
 		}
 		return nil
 	}, bytesG, objsG)
+}
+
+// IncStorageSizeMismatch counts one Content-Length vs actual body size mismatch.
+func IncStorageSizeMismatch(ctx context.Context) {
+	initDomain()
+	mStorageSizeMismatch.Add(ctx, 1)
+}
+
+// IncETagVerifyMismatch counts one ETag verification failure during GET.
+func IncETagVerifyMismatch(ctx context.Context) {
+	initDomain()
+	mETagVerifyMismatch.Add(ctx, 1)
+}
+
+// IncPresignGenerated counts one presigned URL generation.
+func IncPresignGenerated(ctx context.Context) {
+	initDomain()
+	mPresignGenerated.Add(ctx, 1)
+}
+
+// IncPresignConsumed counts one presigned URL consumption.
+func IncPresignConsumed(ctx context.Context) {
+	initDomain()
+	mPresignConsumed.Add(ctx, 1)
+}
+
+// RecordMiddlewareLatency records the duration of a single middleware layer.
+func RecordMiddlewareLatency(ctx context.Context, name string, dur time.Duration) {
+	initDomain()
+	mMiddlewareDuration.Record(ctx, float64(dur.Milliseconds()),
+		metric.WithAttributes(attribute.String("middleware", name)))
 }

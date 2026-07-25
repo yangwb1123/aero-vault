@@ -13,7 +13,9 @@ import (
 // BM25 is an in-memory BM25 index over chunks. It is seeded once from the
 // repository (BuildFromRepo) and then maintained incrementally as the indexer
 // fans out per-object chunk changes through the ChunkSink seam — no periodic
-// full-corpus rebuild.
+// full-corpus rebuild. The index can be saved to and restored from an
+// external storage backend via Save / Load, so a cold start does not require
+// a full repository scan.
 //
 // In production, swap this for an inverted index in Postgres (tsvector) or
 // Meilisearch/Tantivy via an HTTP adapter.
@@ -27,6 +29,8 @@ type BM25 struct {
 	avgLen   float64
 	totalDoc int
 	totalLen int // running sum of doc lengths, so avgLen stays O(1) to update
+
+	dirty bool // true when in-memory state diverges from persisted snapshot
 }
 
 type bm25Doc struct {
@@ -41,7 +45,13 @@ type bm25Doc struct {
 }
 
 func NewBM25() *BM25 {
-	return &BM25{k1: 1.5, b: 0.75, docs: map[int64]bm25Doc{}, df: map[string]int{}, objDocs: map[int64][]int64{}}
+	return &BM25{
+		k1:      1.5,
+		b:       0.75,
+		docs:    map[int64]bm25Doc{},
+		df:      map[string]int{},
+		objDocs: map[int64][]int64{},
+	}
 }
 
 var tokenRe = regexp.MustCompile(`[\p{L}\p{N}]+`)
@@ -170,6 +180,7 @@ func (b *BM25) UpsertObjectChunks(_ context.Context, objectID int64, chunks []re
 		b.insertDocLocked(c)
 	}
 	b.recomputeAvgLenLocked()
+	b.dirty = true
 	return nil
 }
 
@@ -180,9 +191,11 @@ func (b *BM25) DeleteObjectChunks(_ context.Context, objectID int64) error {
 	defer b.mu.Unlock()
 	b.removeObjectLocked(objectID)
 	b.recomputeAvgLenLocked()
+	b.dirty = true
 	return nil
 }
 
+// Compile-time interface checks.
 var _ ChunkSink = (*BM25)(nil)
 
 type bm25Hit struct {
@@ -198,6 +211,11 @@ func (b *BM25) Search(query string, bucket string, limit int) []bm25Hit {
 	if b.totalDoc == 0 || limit <= 0 {
 		return nil
 	}
+	candidates := b.collectCandidates(query, bucket, limit)
+	return rankAndTrim(candidates, limit)
+}
+
+func (b *BM25) collectCandidates(query string, bucket string, _ int) []bm25Hit {
 	terms := tokenize(query)
 	if len(terms) == 0 {
 		return nil
@@ -225,12 +243,15 @@ func (b *BM25) Search(query string, bucket string, limit int) []bm25Hit {
 			out = append(out, bm25Hit{ChunkID: id, Score: score, Doc: d})
 		}
 	}
-	// Top-N sort
-	sortHitsDesc(out)
-	if len(out) > limit {
-		out = out[:limit]
-	}
 	return out
+}
+
+func rankAndTrim(candidates []bm25Hit, k int) []bm25Hit {
+	sortHitsDesc(candidates)
+	if len(candidates) > k {
+		candidates = candidates[:k]
+	}
+	return candidates
 }
 
 func sortHitsDesc(h []bm25Hit) {
@@ -241,4 +262,13 @@ func sortHitsDesc(h []bm25Hit) {
 			j--
 		}
 	}
+}
+
+// IsDirty returns true when the in-memory index has diverged from the last
+// persisted snapshot (i.e. UpsertObjectChunks or DeleteObjectChunks has been
+// called since the last Save or Load).
+func (b *BM25) IsDirty() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.dirty
 }

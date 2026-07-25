@@ -11,6 +11,19 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// WithMiddlewareTiming wraps each middleware layer with a duration histogram
+// so the time spent in every middleware can be observed independently.
+// The name is used as the `middleware` label in the middleware.duration_ms metric.
+func WithMiddlewareTiming(name string, mw func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			mw(next).ServeHTTP(w, r)
+			RecordMiddlewareLatency(r.Context(), name, time.Since(start))
+		})
+	}
+}
+
 // HTTPMiddleware wraps an http.Handler with a span per request and a
 // metric for request count + latency. Safe to chain after RequestID/Tenant.
 func HTTPMiddleware(serviceName string) func(http.Handler) http.Handler {

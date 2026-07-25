@@ -36,6 +36,7 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	etag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, maxW, maxH)
 	if etagListMatches(r.Header.Get("If-None-Match"), etag) {
 		w.Header().Set("ETag", `"`+etag+`"`)
+		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}

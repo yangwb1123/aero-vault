@@ -46,21 +46,20 @@ func (s *sqlStore) NextPendingFailures(ctx context.Context, limit int) ([]Webhoo
 		limit = 32
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	rows, err := s.db.QueryContext(ctx, s.rebind(`
+	var q string
+	if s.dialect == dialectPostgres {
+		// Postgres uses booleans for the succeeded flag.
+		q = `
 SELECT id, event_id, url, payload, attempts, last_error, last_status, next_retry_at, succeeded, created_at
-FROM webhook_failures WHERE succeeded = 0 AND next_retry_at <= $1 ORDER BY id LIMIT $2`), now, limit)
+FROM webhook_failures WHERE succeeded = false AND next_retry_at <= $1 ORDER BY id LIMIT $2`
+	} else {
+		q = `
+SELECT id, event_id, url, payload, attempts, last_error, last_status, next_retry_at, succeeded, created_at
+FROM webhook_failures WHERE succeeded = 0 AND next_retry_at <= $1 ORDER BY id LIMIT $2`
+	}
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), now, limit)
 	if err != nil {
-		// Postgres uses booleans
-		if s.dialect == dialectPostgres {
-			rows, err = s.db.QueryContext(ctx, `
-SELECT id, event_id, url, payload, attempts, last_error, last_status, next_retry_at, succeeded, created_at
-FROM webhook_failures WHERE succeeded = false AND next_retry_at <= $1 ORDER BY id LIMIT $2`, time.Now(), limit)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
+		return nil, err
 	}
 	defer rows.Close()
 	var out []WebhookFailure

@@ -90,6 +90,12 @@ func (rl *RateLimiter) Allow(tenant string) (bool, time.Duration) {
 		// Bound the map: when it's full, reclaim idle buckets before adding a new one.
 		if len(rl.buckets) >= rlMaxBuckets {
 			rl.evictIdle(now)
+			// If eviction freed nothing (every bucket is active), refuse to add
+			// rather than let the map exceed rlMaxBuckets. Reject with a short
+			// retry; the background sweep reclaims capacity as buckets go idle.
+			if len(rl.buckets) >= rlMaxBuckets {
+				return false, rlEvictInterval
+			}
 		}
 		b = &bucket{tokens: rl.burst, last: now}
 		rl.buckets[tenant] = b
@@ -109,6 +115,24 @@ func (rl *RateLimiter) Allow(tenant string) (bool, time.Duration) {
 	return false, wait
 }
 
+func (rl *RateLimiter) isAllowed(ctx context.Context) (bool, time.Duration) {
+	t := TenantFrom(ctx)
+	if t == "" {
+		t = "default"
+	}
+	return rl.Allow(t)
+}
+
+func (rl *RateLimiter) writeRateLimitHeaders(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+}
+
+func rateLimitBypass(p string) bool {
+	return p == "/healthz" || p == "/readyz" || p == "/metrics" ||
+		p == "/openapi.json" || p == "/docs" ||
+		p == "/ui" || len(p) >= 4 && p[:4] == "/ui/"
+}
+
 // Middleware returns the http.Handler chain enforcer. System endpoints
 // (/healthz, /readyz, /ui) bypass the limiter so dashboards/probes can't lock
 // the bucket. Requests without a tenant share the "default" bucket.
@@ -116,24 +140,15 @@ func (rl *RateLimiter) Middleware() func(http.Handler) http.Handler {
 	if rl == nil {
 		return func(next http.Handler) http.Handler { return next }
 	}
-	bypass := func(p string) bool {
-		return p == "/healthz" || p == "/readyz" || p == "/metrics" ||
-			p == "/openapi.json" || p == "/docs" ||
-			p == "/ui" || len(p) >= 4 && p[:4] == "/ui/"
-	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if bypass(r.URL.Path) {
+			if rateLimitBypass(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
-			t := TenantFrom(r.Context())
-			if t == "" {
-				t = "default"
-			}
-			ok, wait := rl.Allow(t)
+			ok, wait := rl.isAllowed(r.Context())
 			if !ok {
-				w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+				rl.writeRateLimitHeaders(w, wait)
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}

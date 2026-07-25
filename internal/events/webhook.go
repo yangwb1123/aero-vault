@@ -4,17 +4,35 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
+
+// jitterFraction returns duration ±25% random jitter for the given base.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	// ±25%: [0.75, 1.25] * d
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(d/2)))
+	if err != nil {
+		return d // fallback: no jitter
+	}
+	offset := n.Int64()
+	base := int64(d)
+	return time.Duration(base - base/4 + offset/2)
+}
 
 // Webhook is an outbound fanout: every event seen on the bus is POSTed to the
 // configured URL(s). Failed deliveries are recorded in the repository so the
@@ -97,8 +115,10 @@ func (w *Webhook) deliver(ctx context.Context, e repository.Event) {
 
 // postOne handles a single delivery attempt + persists a retry row on failure.
 func (w *Webhook) postOne(ctx context.Context, eventID int64, url string, body []byte, sig string, attempt int) {
+	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
+		telemetry.RecordWebhookDelivery(ctx, url, 0)
 		w.persistFailure(ctx, eventID, url, body, err.Error(), 0, attempt)
 		return
 	}
@@ -108,11 +128,16 @@ func (w *Webhook) postOne(ctx context.Context, eventID int64, url string, body [
 		req.Header.Set("X-Aero-Event-Id", fmtInt(eventID))
 	}
 	resp, err := w.client.Do(req)
+	latency := time.Since(start).Seconds() * 1000
 	if err != nil {
+		telemetry.RecordWebhookDelivery(ctx, url, 0)
+		telemetry.RecordWebhookDeliveryLatency(ctx, url, latency)
 		w.persistFailure(ctx, eventID, url, body, err.Error(), 0, attempt)
 		return
 	}
 	defer resp.Body.Close()
+	telemetry.RecordWebhookDelivery(ctx, url, resp.StatusCode)
+	telemetry.RecordWebhookDeliveryLatency(ctx, url, latency)
 	if resp.StatusCode >= 300 {
 		w.persistFailure(ctx, eventID, url, body, "non-2xx", resp.StatusCode, attempt)
 		return
@@ -124,11 +149,12 @@ func (w *Webhook) persistFailure(ctx context.Context, eventID int64, url string,
 	if w.repo == nil {
 		return
 	}
-	// exp backoff: 30s * 2^(attempt-1), cap 1h
+	// exp backoff: 30s * 2^(attempt-1), cap 1h, +jitter
 	backoff := time.Duration(30) * time.Second
 	for i := 1; i < attempt && backoff < time.Hour; i++ {
 		backoff *= 2
 	}
+	backoff = jitter(backoff)
 	next := time.Now().Add(backoff)
 	if _, err := w.repo.RecordWebhookFailure(ctx, repository.WebhookFailure{
 		EventID: eventID, URL: url, Payload: string(body),
@@ -185,6 +211,7 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 	}
 	resp, err := w.client.Do(req)
 	attempts := f.Attempts + 1
+	telemetry.IncWebhookRetry(ctx, f.URL)
 	if err == nil {
 		defer resp.Body.Close()
 		if resp.StatusCode < 300 {
@@ -193,15 +220,24 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 		}
 		err = fmt.Errorf("non-2xx: %d", resp.StatusCode)
 	}
-	// give up after 10 attempts
+	// give up after 10 attempts: record the final failure detail, then retire the
+	// row so it is no longer re-selected by NextPendingFailures. The schema only
+	// has a binary `succeeded` flag (no dedicated dead-letter state), so we reuse
+	// MarkWebhookSucceeded as the terminal transition — this intentionally
+	// conflates "permanently dead" with "succeeded" to stop perpetual retries and
+	// unbounded table growth. ListWebhookFailures still surfaces the last_error
+	// for operators to inspect.
 	if attempts >= 10 {
-		_ = w.repo.UpdateWebhookFailure(ctx, f.ID, err.Error(), 0, time.Now().Add(24*time.Hour), attempts)
+		telemetry.IncWebhookDeadLetter(ctx, f.URL)
+		_ = w.repo.UpdateWebhookFailure(ctx, f.ID, "dead-lettered after "+fmtInt(int64(attempts))+" attempts: "+err.Error(), 0, time.Now(), attempts)
+		_ = w.repo.MarkWebhookSucceeded(ctx, f.ID)
 		return
 	}
 	backoff := time.Duration(30) * time.Second
 	for i := 1; i < attempts && backoff < time.Hour; i++ {
 		backoff *= 2
 	}
+	backoff = jitter(backoff)
 	_ = w.repo.UpdateWebhookFailure(ctx, f.ID, err.Error(), 0, time.Now().Add(backoff), attempts)
 }
 

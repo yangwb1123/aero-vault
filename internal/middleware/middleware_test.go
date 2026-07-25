@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -324,6 +325,143 @@ func TestCORS_OriginCaseInsensitive(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Header().Get("Access-Control-Allow-Origin") != "https://app.example.com" {
 		t.Fatalf("origin match should be case-insensitive, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+// --- ConcurrencyLimiter ---
+
+func TestConcurrencyLimiter_Disabled(t *testing.T) {
+	cl := NewConcurrencyLimiter(0)
+	h := cl.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disabled limiter should pass through, got %d", rec.Code)
+	}
+}
+
+func TestConcurrencyLimiter_AllowsUnderLimit(t *testing.T) {
+	cl := NewConcurrencyLimiter(4)
+	calls := 0
+	h := cl.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	// 2 GET (weight 1 each) + 1 PUT (weight 2) = 4 units, within limit.
+	reqs := []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		httptest.NewRequest(http.MethodPut, "/", nil),
+	}
+	for _, req := range reqs {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 handler calls, got %d", calls)
+	}
+}
+
+func TestConcurrencyLimiter_RejectsOverLimit(t *testing.T) {
+	cl := NewConcurrencyLimiter(1) // only 1 unit capacity
+	block := make(chan struct{})
+	h := cl.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block // never unblocked -> holds the slot
+	}))
+	// First request acquires the only slot (GET = 1 unit).
+	go h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	runtime.Gosched() // let it acquire
+
+	// Second request should get 429.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") != "1" {
+		t.Fatalf("expected Retry-After: 1, got %q", rec.Header().Get("Retry-After"))
+	}
+	close(block) // cleanup
+}
+
+func TestConcurrencyLimiter_ReleasesOnCompletion(t *testing.T) {
+	cl := NewConcurrencyLimiter(1)
+	h := cl.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	// First request acquires, completes, releases.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first request: expected 200, got %d", rec1.Code)
+	}
+	// Second request should succeed because the slot was released.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request after release: expected 200, got %d", rec2.Code)
+	}
+}
+
+func TestConcurrencyLimiter_WeightedCost(t *testing.T) {
+	cl := NewConcurrencyLimiter(2) // 2 units = 1 PUT (weight 2) or 2 GETs (weight 1 each)
+	h := cl.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	// PUT uses all 2 units, fills the semaphore.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodPut, "/", nil))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("put: expected 200, got %d", rec1.Code)
+	}
+	// PUT completed and released; GET should work.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodPut, "/", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second put after release: expected 200, got %d", rec2.Code)
+	}
+}
+
+func TestConcurrencyLimiter_ReturnsErrorBody(t *testing.T) {
+	cl2 := NewConcurrencyLimiter(1)
+	block := make(chan struct{})
+	h := cl2.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block
+	}))
+	go h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	runtime.Gosched()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "too many concurrent requests\n" && body != "too many concurrent requests" {
+		t.Fatalf("unexpected body: %q", body)
+	}
+	close(block)
+}
+
+func TestReqWeight(t *testing.T) {
+	tests := []struct {
+		method string
+		want   int
+	}{
+		{http.MethodGet, 1},
+		{http.MethodHead, 1},
+		{http.MethodOptions, 1},
+		{http.MethodPut, 2},
+		{http.MethodPost, 2},
+		{http.MethodDelete, 2},
+		{http.MethodPatch, 2},
+	}
+	for _, tt := range tests {
+		if got := reqWeight(tt.method); got != tt.want {
+			t.Errorf("reqWeight(%q) = %d, want %d", tt.method, got, tt.want)
+		}
 	}
 }
 

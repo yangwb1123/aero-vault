@@ -39,7 +39,9 @@ func (c *cachingEmbedder) Embed(ctx context.Context, texts []string) ([][]float3
 	c.mu.Lock()
 	for i, t := range texts {
 		if v, ok := c.cache[t]; ok {
-			out[i] = v
+			// Hand back an independent copy; callers must not be able to mutate
+			// the cached vector (and vice-versa).
+			out[i] = cloneVec(v)
 		} else {
 			missIdx = append(missIdx, i)
 			missText = append(missText, t)
@@ -57,12 +59,19 @@ func (c *cachingEmbedder) Embed(ctx context.Context, texts []string) ([][]float3
 	}
 	c.mu.Lock()
 	for j, idx := range missIdx {
+		// Cache and output must be independent: store a clone and return the
+		// other, so neither the caller nor a later cache hit can corrupt the
+		// other's vector.
 		out[idx] = vecs[j]
-		c.put(missText[j], vecs[j])
+		c.put(missText[j], cloneVec(vecs[j]))
 	}
 	c.mu.Unlock()
 	return out, nil
 }
+
+// cloneVec returns an independent copy of v so cached and returned vectors
+// never alias each other.
+func cloneVec(v []float32) []float32 { return append([]float32(nil), v...) }
 
 // put inserts with naive capacity bounding: evict one arbitrary entry when full.
 func (c *cachingEmbedder) put(k string, v []float32) {

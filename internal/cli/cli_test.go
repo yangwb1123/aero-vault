@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1103,6 +1104,312 @@ func TestRun_Lineage_Dispatches(t *testing.T) {
 			t.Errorf("Run([lineage obj-abc]) = %d; want 0", code)
 		}
 	})
+}
+
+// --------------------------------------------------------------------------
+// cmdAdminTenants — quota / budget
+// --------------------------------------------------------------------------
+
+func TestCmdAdminTenants_Quota_PUTsBody(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		fmt.Fprint(w, `{"tenant":"acme"}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	captureStdout(t, func() {
+		code := c.cmdAdminTenants("quota", []string{"acme", "1048576", "1000"})
+		if code != 0 {
+			t.Errorf("quota returned %d; want 0", code)
+		}
+	})
+	if gotMethod != "PUT" {
+		t.Errorf("method = %q; want PUT", gotMethod)
+	}
+	if gotPath != "/v1/admin/tenants/acme/quota" {
+		t.Errorf("path = %q; want /v1/admin/tenants/acme/quota", gotPath)
+	}
+	if mb, _ := gotBody["max_bytes"].(float64); mb != 1048576 {
+		t.Errorf("max_bytes = %v; want 1048576", gotBody["max_bytes"])
+	}
+	if mo, _ := gotBody["max_objects"].(float64); mo != 1000 {
+		t.Errorf("max_objects = %v; want 1000", gotBody["max_objects"])
+	}
+}
+
+func TestCmdAdminTenants_Quota_TooFewArgs_Returns2(t *testing.T) {
+	c := &Client{http: &http.Client{}}
+	captureStderr(t, func() {
+		code := c.cmdAdminTenants("quota", []string{"acme", "1048576"})
+		if code != 2 {
+			t.Errorf("quota too few args = %d; want 2", code)
+		}
+	})
+}
+
+func TestCmdAdminTenants_Budget_PUTsBody(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		fmt.Fprint(w, `{"tenant":"acme"}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	captureStdout(t, func() {
+		code := c.cmdAdminTenants("budget", []string{"acme", "12.50"})
+		if code != 0 {
+			t.Errorf("budget returned %d; want 0", code)
+		}
+	})
+	if gotMethod != "PUT" {
+		t.Errorf("method = %q; want PUT", gotMethod)
+	}
+	if gotPath != "/v1/admin/tenants/acme/budget" {
+		t.Errorf("path = %q; want /v1/admin/tenants/acme/budget", gotPath)
+	}
+	if b, _ := gotBody["daily_budget_usd"].(float64); b != 12.50 {
+		t.Errorf("daily_budget_usd = %v; want 12.5", gotBody["daily_budget_usd"])
+	}
+}
+
+func TestCmdAdminTenants_Budget_TooFewArgs_Returns2(t *testing.T) {
+	c := &Client{http: &http.Client{}}
+	captureStderr(t, func() {
+		code := c.cmdAdminTenants("budget", []string{"acme"})
+		if code != 2 {
+			t.Errorf("budget too few args = %d; want 2", code)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// cmdAdminJobs
+// --------------------------------------------------------------------------
+
+func TestCmdAdminJobs_List_GetsCorrectPath(t *testing.T) {
+	var gotMethod, gotURL string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotURL = r.URL.String()
+		fmt.Fprint(w, `{"jobs":[],"stats":{}}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	out := captureStdout(t, func() {
+		code := c.cmdAdminJobs("list", nil)
+		if code != 0 {
+			t.Errorf("jobs list returned %d; want 0", code)
+		}
+	})
+	if gotMethod != "GET" {
+		t.Errorf("method = %q; want GET", gotMethod)
+	}
+	if gotURL != "/v1/admin/jobs?" {
+		t.Errorf("URL = %q; want /v1/admin/jobs?", gotURL)
+	}
+	if !strings.Contains(out, "jobs") {
+		t.Errorf("output %q missing jobs", out)
+	}
+}
+
+func TestCmdAdminJobs_List_WithFilters(t *testing.T) {
+	var gotQuery url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		fmt.Fprint(w, `{"jobs":[]}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	captureStdout(t, func() {
+		c.cmdAdminJobs("list", []string{"--status", "failed", "--type", "embed", "--limit", "50"})
+	})
+	if gotQuery.Get("status") != "failed" {
+		t.Errorf("status = %q; want failed", gotQuery.Get("status"))
+	}
+	if gotQuery.Get("type") != "embed" {
+		t.Errorf("type = %q; want embed", gotQuery.Get("type"))
+	}
+	if gotQuery.Get("limit") != "50" {
+		t.Errorf("limit = %q; want 50", gotQuery.Get("limit"))
+	}
+}
+
+func TestCmdAdminJobs_Retry_PostsCorrectPath(t *testing.T) {
+	var gotMethod, gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		fmt.Fprint(w, `{"id":42,"status":"pending"}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	out := captureStdout(t, func() {
+		code := c.cmdAdminJobs("retry", []string{"42"})
+		if code != 0 {
+			t.Errorf("jobs retry returned %d; want 0", code)
+		}
+	})
+	if gotMethod != "POST" {
+		t.Errorf("method = %q; want POST", gotMethod)
+	}
+	if gotPath != "/v1/admin/jobs/42/retry" {
+		t.Errorf("path = %q; want /v1/admin/jobs/42/retry", gotPath)
+	}
+	if !strings.Contains(out, "pending") {
+		t.Errorf("output %q missing pending", out)
+	}
+}
+
+func TestCmdAdminJobs_Retry_NoArgs_Returns2(t *testing.T) {
+	c := &Client{http: &http.Client{}}
+	captureStderr(t, func() {
+		code := c.cmdAdminJobs("retry", nil)
+		if code != 2 {
+			t.Errorf("jobs retry no args = %d; want 2", code)
+		}
+	})
+}
+
+func TestCmdAdminJobs_Retry_HTTPError_Returns1(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	var code int
+	captureStderr(t, func() {
+		code = c.cmdAdminJobs("retry", []string{"999"})
+	})
+	if code != 1 {
+		t.Errorf("jobs retry on 404 = %d; want 1", code)
+	}
+}
+
+func TestCmdAdminJobs_UnknownAction_Returns2(t *testing.T) {
+	c := &Client{http: &http.Client{}}
+	captureStderr(t, func() {
+		code := c.cmdAdminJobs("frob", nil)
+		if code != 2 {
+			t.Errorf("jobs frob = %d; want 2", code)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// cmdAdminAudit
+// --------------------------------------------------------------------------
+
+func TestCmdAdminAudit_List_GetsCorrectPath(t *testing.T) {
+	var gotMethod, gotURL string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotURL = r.URL.String()
+		fmt.Fprint(w, `{"audit":[]}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	out := captureStdout(t, func() {
+		code := c.cmdAdminAudit("list", nil)
+		if code != 0 {
+			t.Errorf("audit list returned %d; want 0", code)
+		}
+	})
+	if gotMethod != "GET" {
+		t.Errorf("method = %q; want GET", gotMethod)
+	}
+	if gotURL != "/v1/admin/audit?" {
+		t.Errorf("URL = %q; want /v1/admin/audit?", gotURL)
+	}
+	if !strings.Contains(out, "audit") {
+		t.Errorf("output %q missing audit", out)
+	}
+}
+
+func TestCmdAdminAudit_List_WithLimit(t *testing.T) {
+	var gotLimit string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLimit = r.URL.Query().Get("limit")
+		fmt.Fprint(w, `{"audit":[]}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	captureStdout(t, func() {
+		c.cmdAdminAudit("list", []string{"--limit", "25"})
+	})
+	if gotLimit != "25" {
+		t.Errorf("limit = %q; want 25", gotLimit)
+	}
+}
+
+func TestCmdAdminAudit_UnknownAction_Returns2(t *testing.T) {
+	c := &Client{http: &http.Client{}}
+	captureStderr(t, func() {
+		code := c.cmdAdminAudit("frob", nil)
+		if code != 2 {
+			t.Errorf("audit frob = %d; want 2", code)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// Run / cmdAdmin — admin dispatch for jobs & audit
+// --------------------------------------------------------------------------
+
+func TestRun_AdminJobs_Dispatches(t *testing.T) {
+	var gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		fmt.Fprint(w, `{"jobs":[]}`)
+	}))
+	defer ts.Close()
+	t.Setenv("AERO_ENDPOINT", ts.URL)
+	t.Setenv("AERO_API_KEY", "")
+	t.Setenv("AERO_TENANT", "")
+	captureStdout(t, func() {
+		code := Run([]string{"admin", "jobs", "list"})
+		if code != 0 {
+			t.Errorf("Run([admin jobs list]) = %d; want 0", code)
+		}
+	})
+	if gotPath != "/v1/admin/jobs" {
+		t.Errorf("path = %q; want /v1/admin/jobs", gotPath)
+	}
+}
+
+func TestRun_AdminAudit_Dispatches(t *testing.T) {
+	var gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		fmt.Fprint(w, `{"audit":[]}`)
+	}))
+	defer ts.Close()
+	t.Setenv("AERO_ENDPOINT", ts.URL)
+	t.Setenv("AERO_API_KEY", "")
+	t.Setenv("AERO_TENANT", "")
+	captureStdout(t, func() {
+		code := Run([]string{"admin", "audit", "list"})
+		if code != 0 {
+			t.Errorf("Run([admin audit list]) = %d; want 0", code)
+		}
+	})
+	if gotPath != "/v1/admin/audit" {
+		t.Errorf("path = %q; want /v1/admin/audit", gotPath)
+	}
 }
 
 // --------------------------------------------------------------------------

@@ -552,6 +552,19 @@ export class Client {
   }
 
   /**
+   * Apply an object lock retaining the object for ``seconds`` from now.
+   * POST /v1/files/<key>/lock
+   * @param {string} key - object key
+   * @param {number} seconds - retention duration in seconds
+   * @returns {Promise<object>}
+   */
+  async lock(key, seconds) {
+    return this._requestJSON("POST", "/v1/files/" + escapeKey(key) + "/lock", {
+      body: { seconds },
+    });
+  }
+
+  /**
    * Get an object's canned ACL (GET /v1/files/<key>/acl).
    * @param {string} key
    * @returns {Promise<{acl: string}>}
@@ -568,6 +581,27 @@ export class Client {
    */
   async setAcl(key, acl) {
     return this._requestJSON("PUT", "/v1/files/" + escapeKey(key) + "/acl", { json: { acl } });
+  }
+
+  /**
+   * Get a bucket's canned ACL (GET /v1/buckets/<bucket>/acl).
+   * @param {string} bucket
+   * @returns {Promise<{acl: string}>}
+   */
+  async getBucketACL(bucket) {
+    return this._requestJSON("GET", "/v1/buckets/" + encodeURIComponent(bucket) + "/acl");
+  }
+
+  /**
+   * Set a bucket's canned ACL (PUT /v1/buckets/<bucket>/acl).
+   * @param {string} bucket
+   * @param {"private"|"public-read"|"public-read-write"|"authenticated-read"} acl
+   * @returns {Promise<any>}
+   */
+  async setBucketACL(bucket, acl) {
+    return this._requestJSON("PUT", "/v1/buckets/" + encodeURIComponent(bucket) + "/acl", {
+      json: { acl },
+    });
   }
 
   // ---- multipart uploads ----------------------------------------------
@@ -710,6 +744,18 @@ export class Client {
     return (await this._requestJSON("POST", "/v1/agent", { json: { query } })) || {};
   }
 
+  /**
+   * AI consumption history for an object (GET /v1/lineage/objects/<id>).
+   * @param {number} objectId
+   * @param {number} [limit] 0 lets the server pick its default.
+   * @returns {Promise<{object_id: number, entries: any[]}>}
+   */
+  async lineage(objectId, limit = 0) {
+    return this._requestJSON("GET", `/v1/lineage/objects/${encodeURIComponent(objectId)}`, {
+      params: { limit: limit || undefined },
+    });
+  }
+
   // ---- ops -------------------------------------------------------------
 
   /**
@@ -735,10 +781,17 @@ export class Client {
 
   // ---- admin ----
 
-  /** Add an API key. @returns {Promise<{token?: string}>} */
-  async addKey(label, opts = {}) {
+  /**
+   * Add an API key (POST /v1/admin/keys). The server requires `token`,
+   * `tenant` and `scopes`; `tenant` is taken from this client's tenant.
+   * @param {string} token
+   * @param {string[]} scopes
+   * @param {{label?: string, expires?: string}} [opts] `expires` is an optional RFC3339 timestamp.
+   * @returns {Promise<{tenant?: string, scopes?: string[]}>}
+   */
+  async addKey(token, scopes, opts = {}) {
     return this._requestJSON("POST", "/v1/admin/keys", {
-      json: { label, ...opts },
+      json: { token, tenant: this.tenant, scopes, ...opts },
     });
   }
 
@@ -800,11 +853,9 @@ export class Client {
 
   /** List audit log entries. */
   async listAudit(opts = {}) {
-    const params = new URLSearchParams();
-    if (opts.limit) params.set("limit", String(opts.limit));
-    if (opts.before) params.set("before", opts.before);
-    const qs = params.toString();
-    return this._requestJSON("GET", "/v1/admin/audit" + (qs ? "?" + qs : ""));
+    return this._requestJSON("GET", "/v1/admin/audit", {
+      params: { limit: opts.limit, before: opts.before },
+    });
   }
 
   /** Set tenant storage quota. */

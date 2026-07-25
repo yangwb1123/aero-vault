@@ -292,6 +292,9 @@ func (s *Server) toolWriteFile(ctx context.Context, args map[string]any) (any, *
 		return errResult(errors.New("key required")), nil
 	}
 	content := stringArg(args, "content", "")
+	if content == "" {
+		return errResult(errors.New("content required")), nil
+	}
 	ct := stringArg(args, "content_type", "text/plain")
 	_, err := s.svc.Put(ctx, s.tenantFor(ctx), service.DefaultBucket, key, strings.NewReader(content), int64(len(content)), service.PutOptions{ContentType: ct})
 	if err != nil {
@@ -361,7 +364,15 @@ func (s *Server) readResource(ctx context.Context, raw json.RawMessage) (any, *r
 	if len(parts) < 3 {
 		return nil, &rpcError{Code: -32602, Message: "uri must be aero-vault://{tenant}/{bucket}/{key}"}
 	}
-	rc, obj, err := s.svc.Get(ctx, parts[0], parts[1], parts[2])
+	// Security: enforce tenant boundary. The URI tenant must match the
+	// request-scoped tenant from the middleware or the server default (stdio).
+	// This prevents cross-tenant data access via crafted URIs.
+	uriTenant := parts[0]
+	allowedTenant := s.tenantFor(ctx)
+	if uriTenant != allowedTenant {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("tenant mismatch: requested %q but authenticated as %q", uriTenant, allowedTenant)}
+	}
+	rc, obj, err := s.svc.Get(ctx, allowedTenant, parts[1], parts[2])
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}

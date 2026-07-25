@@ -147,7 +147,7 @@ func (s *sqlStore) ClaimJob(ctx context.Context, worker string) (Job, bool, erro
 func (s *sqlStore) CompleteJob(ctx context.Context, id int64, result string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, s.rebind(
-		`UPDATE jobs SET status='succeeded', result=$1, last_error='', finished_at=$2, updated_at=$3 WHERE id=$4`),
+		`UPDATE jobs SET status='succeeded', result=$1, last_error='', finished_at=$2, updated_at=$3 WHERE id=$4 AND status='running'`),
 		result, now, now, id)
 	return err
 }
@@ -157,7 +157,7 @@ func (s *sqlStore) CompleteJob(ctx context.Context, id int64, result string) err
 func (s *sqlStore) RetryJob(ctx context.Context, id int64, lastErr string, runAfter time.Time) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, s.rebind(
-		`UPDATE jobs SET status='pending', last_error=$1, run_after=$2, worker='', updated_at=$3 WHERE id=$4`),
+		`UPDATE jobs SET status='pending', last_error=$1, run_after=$2, worker='', updated_at=$3 WHERE id=$4 AND status='running'`),
 		lastErr, runAfter.UTC().Format(time.RFC3339Nano), now, id)
 	return err
 }
@@ -166,7 +166,7 @@ func (s *sqlStore) RetryJob(ctx context.Context, id int64, lastErr string, runAf
 func (s *sqlStore) FailJob(ctx context.Context, id int64, lastErr string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, s.rebind(
-		`UPDATE jobs SET status='failed', last_error=$1, finished_at=$2, updated_at=$3 WHERE id=$4`),
+		`UPDATE jobs SET status='failed', last_error=$1, finished_at=$2, updated_at=$3 WHERE id=$4 AND status='running'`),
 		lastErr, now, now, id)
 	return err
 }

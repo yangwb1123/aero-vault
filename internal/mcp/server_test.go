@@ -309,6 +309,135 @@ func TestCallTool_ReadFile_NotFound(t *testing.T) {
 	}
 }
 
+// ---- tools/call: write_file ----
+
+func TestCallTool_WriteFile_Success(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write_file","arguments":{"key":"out.txt","content":"hello there"}}}`
+	raw := handleResult(t, srv, req)
+
+	var result toolResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected isError: %s", result.Content[0].Text)
+	}
+	if !strings.Contains(result.Content[0].Text, "out.txt") {
+		t.Errorf("expected key in write confirmation, got: %s", result.Content[0].Text)
+	}
+
+	// Read it back through the read_file tool to confirm it was persisted.
+	readReq := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"key":"out.txt"}}}`
+	readRaw := handleResult(t, srv, readReq)
+	var readResult toolResult
+	if err := json.Unmarshal(readRaw, &readResult); err != nil {
+		t.Fatalf("decode read: %v", err)
+	}
+	if readResult.IsError {
+		t.Fatalf("read-back isError: %s", readResult.Content[0].Text)
+	}
+	if readResult.Content[0].Text != "hello there" {
+		t.Errorf("read-back body = %q, want %q", readResult.Content[0].Text, "hello there")
+	}
+}
+
+func TestCallTool_WriteFile_MissingKey(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+	// key absent → isError with "key required"
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write_file","arguments":{"content":"orphan"}}}`
+	raw := handleResult(t, srv, req)
+
+	var result toolResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected isError=true for missing key")
+	}
+	if !strings.Contains(result.Content[0].Text, "key required") {
+		t.Errorf("expected 'key required', got: %s", result.Content[0].Text)
+	}
+}
+
+func TestCallTool_WriteFile_MissingContent(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+	// content absent (required by schema) → isError with "content required"
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write_file","arguments":{"key":"empty.txt"}}}`
+	raw := handleResult(t, srv, req)
+
+	var result toolResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected isError=true for missing content")
+	}
+	if !strings.Contains(result.Content[0].Text, "content required") {
+		t.Errorf("expected 'content required', got: %s", result.Content[0].Text)
+	}
+}
+
+// ---- tools/call: delete_file ----
+
+func TestCallTool_DeleteFile_Success(t *testing.T) {
+	srv, svc, _ := newTestServer(t, nil)
+	seedObject(t, svc, "default", "default", "gone.txt", "remove me")
+
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_file","arguments":{"key":"gone.txt"}}}`
+	raw := handleResult(t, srv, req)
+
+	var result toolResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected isError: %s", result.Content[0].Text)
+	}
+	if !strings.Contains(result.Content[0].Text, "gone.txt") {
+		t.Errorf("expected key in delete confirmation, got: %s", result.Content[0].Text)
+	}
+
+	// A second read should now fail (object soft-deleted).
+	readReq := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"key":"gone.txt"}}}`
+	readRaw := handleResult(t, srv, readReq)
+	var readResult toolResult
+	json.Unmarshal(readRaw, &readResult)
+	if !readResult.IsError {
+		t.Error("expected read of deleted object to error")
+	}
+}
+
+func TestCallTool_DeleteFile_MissingKey(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_file","arguments":{}}}`
+	raw := handleResult(t, srv, req)
+
+	var result toolResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected isError=true for missing key")
+	}
+	if !strings.Contains(result.Content[0].Text, "key required") {
+		t.Errorf("expected 'key required', got: %s", result.Content[0].Text)
+	}
+}
+
+func TestCallTool_DeleteFile_NotFound(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_file","arguments":{"key":"never-existed.txt"}}}`
+	raw := handleResult(t, srv, req)
+
+	var result toolResult
+	json.Unmarshal(raw, &result)
+	if !result.IsError {
+		t.Error("expected isError=true for delete of nonexistent object")
+	}
+}
+
 // ---- tools/call: unknown tool ----
 
 func TestCallTool_UnknownTool(t *testing.T) {

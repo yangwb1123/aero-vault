@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"time"
 
@@ -264,6 +263,34 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 	defer rc.Close()
 
 	text, err := ix.extractor.Extract(ctx, obj.ContentType, rc)
+	text, err = ix.applyPII(ctx, obj, text, err)
+	if err != nil {
+		return ix.handleExtractError(obj.Key, err)
+	}
+	pieces := ix.chunker.Chunk(text)
+	if len(pieces) == 0 {
+		telemetry.IncIndexerSkip(ctx, "empty")
+		return nil
+	}
+	vectors, err := ix.embedder.Embed(ctx, pieces)
+	if err != nil {
+		return fmt.Errorf("embed %q: %w", obj.Key, err)
+	}
+	if err := ix.repo.DeleteChunksForObject(ctx, obj.ID); err != nil {
+		ix.logger.Warn("indexer: delete old chunks", "id", obj.ID, "err", err)
+	}
+	chunks := ix.buildChunks(obj, pieces, vectors)
+	if err := ix.repo.InsertChunks(ctx, chunks); err != nil {
+		return fmt.Errorf("insert chunks %d: %w", obj.ID, err)
+	}
+	if err := ix.pushToSinks(ctx, obj); err != nil {
+		return err
+	}
+	ix.logger.Info("indexed", "tenant", obj.TenantID, "key", obj.Key, "chunks", len(chunks), "model", ix.embedder.Name())
+	return nil
+}
+
+func (ix *Indexer) applyPII(ctx context.Context, obj repository.Object, text string, err error) (string, error) {
 	if err == nil && ix.pii != nil {
 		if hits := ix.pii.Scan(text); len(hits) > 0 {
 			tags := map[string]string{}
@@ -277,30 +304,20 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 			text = ix.pii.Redact(text, nil)
 		}
 	}
-	if err != nil {
-		if errors.Is(err, ErrUnsupported) {
-			ix.logger.Info("indexer: skipping unsupported content", "key", obj.Key, "content_type", obj.ContentType)
-			telemetry.IncIndexerSkip(ctx, "unsupported")
-			return nil
-		}
-		// drain any unread bytes silently
-		_, _ = io.Copy(io.Discard, rc)
-		telemetry.IncIndexerSkip(ctx, "error")
-		return fmt.Errorf("extract %q: %w", obj.Key, err)
-	}
-	pieces := ix.chunker.Chunk(text)
-	if len(pieces) == 0 {
-		telemetry.IncIndexerSkip(ctx, "empty")
+	return text, err
+}
+
+func (ix *Indexer) handleExtractError(key string, err error) error {
+	if errors.Is(err, ErrUnsupported) {
+		ix.logger.Info("indexer: skipping unsupported content", "key", key)
+		telemetry.IncIndexerSkip(context.Background(), "unsupported")
 		return nil
 	}
-	vectors, err := ix.embedder.Embed(ctx, pieces)
-	if err != nil {
-		return fmt.Errorf("embed %q: %w", obj.Key, err)
-	}
-	if err := ix.repo.DeleteChunksForObject(ctx, obj.ID); err != nil {
-		ix.logger.Warn("indexer: delete old chunks", "id", obj.ID, "err", err)
-		// keep going; may end up with duplicates but search still works
-	}
+	telemetry.IncIndexerSkip(context.Background(), "error")
+	return fmt.Errorf("extract %q: %w", key, err)
+}
+
+func (ix *Indexer) buildChunks(obj repository.Object, pieces []string, vectors [][]float32) []repository.Chunk {
 	chunks := make([]repository.Chunk, 0, len(pieces))
 	for i, p := range pieces {
 		c := repository.Chunk{
@@ -318,12 +335,11 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 		}
 		chunks = append(chunks, c)
 	}
-	if err := ix.repo.InsertChunks(ctx, chunks); err != nil {
-		return fmt.Errorf("insert chunks %d: %w", obj.ID, err)
-	}
+	return chunks
+}
+
+func (ix *Indexer) pushToSinks(ctx context.Context, obj repository.Object) error {
 	if len(ix.sinks) > 0 {
-		// InsertChunks does not backfill IDs; re-read the canonical rows so
-		// sinks see real chunk IDs (hybrid rank fusion dedupes by chunk ID).
 		rows, err := ix.repo.ListChunksForObject(ctx, obj.ID)
 		if err != nil {
 			return fmt.Errorf("list chunks for sinks %d: %w", obj.ID, err)
@@ -334,6 +350,5 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 			}
 		}
 	}
-	ix.logger.Info("indexed", "tenant", obj.TenantID, "key", obj.Key, "chunks", len(chunks), "model", ix.embedder.Name())
 	return nil
 }

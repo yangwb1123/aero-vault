@@ -1,0 +1,15 @@
+*
+!go.mod
+!go.sum
+!*.go
+!cmd/
+!internal/
+!sdk/
+!deploy/
+!webui/
+!engineering.yaml
+!pyproject.toml
+!checks/
+!cli.py
+!*.md
+!LICENSE

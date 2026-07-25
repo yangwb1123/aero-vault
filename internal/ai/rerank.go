@@ -61,6 +61,37 @@ type rerankResp struct {
 	} `json:"results"`
 }
 
+func (r *HTTPReranker) buildRerankPayload(query string, hits []Hit, topK int) ([]byte, error) {
+	docs := make([]string, len(hits))
+	for i, h := range hits {
+		docs[i] = h.Chunk
+	}
+	return json.Marshal(rerankReq{Model: r.Model, Query: query, Documents: docs, TopN: topK})
+}
+
+func (r *HTTPReranker) parseRerankResponse(body []byte, hits []Hit, topK int) ([]Hit, error) {
+	var out rerankResp
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Results) == 0 {
+		return hits[:topK], nil
+	}
+	final := make([]Hit, 0, len(out.Results))
+	for _, res := range out.Results {
+		if res.Index < 0 || res.Index >= len(hits) {
+			continue
+		}
+		h := hits[res.Index]
+		h.Score = float32(res.RelevanceScore)
+		final = append(final, h)
+	}
+	if len(final) > topK {
+		final = final[:topK]
+	}
+	return final, nil
+}
+
 func (r *HTTPReranker) Rerank(ctx context.Context, query string, hits []Hit, topK int) ([]Hit, error) {
 	if len(hits) == 0 {
 		return nil, nil
@@ -68,11 +99,10 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, hits []Hit, top
 	if topK <= 0 || topK > len(hits) {
 		topK = len(hits)
 	}
-	docs := make([]string, len(hits))
-	for i, h := range hits {
-		docs[i] = h.Chunk
+	body, err := r.buildRerankPayload(query, hits, topK)
+	if err != nil {
+		return nil, err
 	}
-	body, _ := json.Marshal(rerankReq{Model: r.Model, Query: query, Documents: docs, TopN: topK})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Endpoint+"/rerank", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -90,27 +120,11 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, hits []Hit, top
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("reranker http %d: %s", resp.StatusCode, string(raw))
 	}
-	var out rerankResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
-	if len(out.Results) == 0 {
-		return hits[:topK], nil
-	}
-	// Reorder by the returned indices/scores.
-	final := make([]Hit, 0, len(out.Results))
-	for _, res := range out.Results {
-		if res.Index < 0 || res.Index >= len(hits) {
-			continue
-		}
-		h := hits[res.Index]
-		h.Score = float32(res.RelevanceScore)
-		final = append(final, h)
-	}
-	if len(final) > topK {
-		final = final[:topK]
-	}
-	return final, nil
+	return r.parseRerankResponse(respBody, hits, topK)
 }
 
 // HeuristicReranker is a dep-free fallback that boosts shorter chunks and

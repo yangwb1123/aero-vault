@@ -117,33 +117,24 @@ type ChatResp struct {
 
 const defaultSystemPrompt = `You are aero-vault, an assistant that answers questions using the provided knowledge base context. Cite sources inline as [#n] referring to the numbered chunks. If the context doesn't contain the answer, say so explicitly.`
 
-// AnswerStream is the streaming variant. It invokes the LLM with the same
-// retrieval prelude as Answer, but pipes each token chunk to onChunk as the
-// model emits it. The final consolidated ChatResp is returned at the end.
-func (c *Chat) AnswerStream(ctx context.Context, req ChatReq, onChunk func(string)) (ChatResp, error) {
-	if c.llm == nil {
-		return ChatResp{}, fmt.Errorf("chat disabled: no LLM configured")
-	}
+func (c *Chat) buildChatPrompt(ctx context.Context, req ChatReq) ([]ChatMessage, []Hit, error) {
 	if req.Query == "" {
-		return ChatResp{}, fmt.Errorf("query required")
+		return nil, nil, fmt.Errorf("query required")
 	}
 	if req.K <= 0 || req.K > 20 {
 		req.K = 5
 	}
-	if req.Caller == "" {
-		req.Caller = "rest:chat-stream"
-	}
 	if over, err := c.overBudget(ctx, req.Tenant); err != nil {
-		return ChatResp{}, fmt.Errorf("budget check: %w", err)
+		return nil, nil, fmt.Errorf("budget check: %w", err)
 	} else if over {
-		return ChatResp{}, ErrBudgetExceeded
+		return nil, nil, ErrBudgetExceeded
 	}
 	hits, err := c.search.Query(ctx, Request{
 		Tenant: req.Tenant, Bucket: req.Bucket, Query: req.Query,
 		K: req.K, Mode: req.Mode, Caller: req.Caller, ReqID: req.ReqID,
 	})
 	if err != nil {
-		return ChatResp{}, fmt.Errorf("retrieval: %w", err)
+		return nil, nil, fmt.Errorf("retrieval: %w", err)
 	}
 	var ctxBlock strings.Builder
 	ctxBlock.WriteString("Knowledge base context:\n\n")
@@ -156,6 +147,21 @@ func (c *Chat) AnswerStream(ctx context.Context, req ChatReq, onChunk func(strin
 	}
 	messages = append(messages, req.Prior...)
 	messages = append(messages, ChatMessage{Role: "user", Content: req.Query})
+	return messages, hits, nil
+}
+
+// AnswerStream is the streaming variant. It invokes the LLM with the same
+// retrieval prelude as Answer, but pipes each token chunk to onChunk as the
+// model emits it. The final consolidated ChatResp is returned at the end.
+func (c *Chat) AnswerStream(ctx context.Context, req ChatReq, onChunk func(string)) (ChatResp, error) {
+	if c.llm == nil {
+		return ChatResp{}, fmt.Errorf("chat disabled: no LLM configured")
+	}
+	req.Caller = "rest:chat-stream"
+	messages, hits, err := c.buildChatPrompt(ctx, req)
+	if err != nil {
+		return ChatResp{}, err
+	}
 	start := time.Now()
 	resp, err := c.llm.ChatStream(ctx, ChatRequest{Messages: messages, Temperature: req.Temperature}, onChunk)
 	if err != nil {
@@ -192,42 +198,11 @@ func (c *Chat) Answer(ctx context.Context, req ChatReq) (ChatResp, error) {
 	if c.llm == nil {
 		return ChatResp{}, fmt.Errorf("chat disabled: no LLM configured")
 	}
-	if req.Query == "" {
-		return ChatResp{}, fmt.Errorf("query required")
-	}
-	if req.K <= 0 || req.K > 20 {
-		req.K = 5
-	}
-	if req.Caller == "" {
-		req.Caller = "rest:chat"
-	}
-	if over, err := c.overBudget(ctx, req.Tenant); err != nil {
-		return ChatResp{}, fmt.Errorf("budget check: %w", err)
-	} else if over {
-		return ChatResp{}, ErrBudgetExceeded
-	}
-	// Retrieval.
-	hits, err := c.search.Query(ctx, Request{
-		Tenant: req.Tenant, Bucket: req.Bucket, Query: req.Query,
-		K: req.K, Mode: req.Mode, Caller: req.Caller, ReqID: req.ReqID,
-	})
+	req.Caller = "rest:chat"
+	messages, hits, err := c.buildChatPrompt(ctx, req)
 	if err != nil {
-		return ChatResp{}, fmt.Errorf("retrieval: %w", err)
+		return ChatResp{}, err
 	}
-
-	// Format the system prompt + the user question with numbered chunks.
-	var ctxBlock strings.Builder
-	ctxBlock.WriteString("Knowledge base context:\n\n")
-	for i, h := range hits {
-		fmt.Fprintf(&ctxBlock, "[#%d] %s/%s (score %.3f)\n%s\n\n", i+1, h.Bucket, h.ObjectKey, h.Score, h.Chunk)
-	}
-
-	messages := []ChatMessage{
-		{Role: "system", Content: defaultSystemPrompt},
-		{Role: "system", Content: ctxBlock.String()},
-	}
-	messages = append(messages, req.Prior...)
-	messages = append(messages, ChatMessage{Role: "user", Content: req.Query})
 	start := time.Now()
 	resp, err := c.llm.Chat(ctx, ChatRequest{
 		Messages: messages, Temperature: req.Temperature,

@@ -19,6 +19,15 @@ type CORSConfig struct {
 // CORS returns a middleware that handles preflight (OPTIONS) requests and
 // stamps the necessary headers on every response. Pass an empty config to
 // disable CORS (the middleware becomes a pass-through).
+// CORS returns a middleware that handles preflight (OPTIONS) requests and
+// stamps the necessary headers on every response. Pass an empty config to
+// disable CORS (the middleware becomes a pass-through).
+//
+// When AllowedOrigins contains "*", all origins are permitted. When it contains
+// specific origins (e.g. "https://example.com"), only those are allowed and the
+// Vary: Origin header is set so browsers cache the response per origin.
+// Credentials (cookies, auth headers) are only forwarded when a single
+// specific origin is matched (never with "*" per CORS spec).
 func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 	if len(cfg.AllowedOrigins) == 0 {
 		return func(next http.Handler) http.Handler { return next }
@@ -32,28 +41,44 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 	if cfg.MaxAgeSeconds == 0 {
 		cfg.MaxAgeSeconds = 600
 	}
-	originAllowed := compileOriginCheck(cfg.AllowedOrigins)
-	methods := strings.Join(cfg.AllowedMethods, ", ")
-	headers := strings.Join(cfg.AllowedHeaders, ", ")
-	exposed := strings.Join(cfg.ExposeHeaders, ", ")
-
+	allowAll := false
+	for _, o := range cfg.AllowedOrigins {
+		if o == "*" {
+			allowAll = true
+			break
+		}
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
-			if origin != "" && originAllowed(origin) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
-				w.Header().Set("Access-Control-Allow-Methods", methods)
-				w.Header().Set("Access-Control-Allow-Headers", headers)
-				if exposed != "" {
-					w.Header().Set("Access-Control-Expose-Headers", exposed)
+			isPreflight := r.Method == http.MethodOptions
+
+			// No Origin header: not a CORS request.
+			// Bare OPTIONS (no Origin) still gets a 204 for health checks.
+			if origin == "" {
+				if isPreflight {
+					w.WriteHeader(http.StatusNoContent)
+					return
 				}
-				if cfg.AllowCreds {
-					w.Header().Set("Access-Control-Allow-Credentials", "true")
-				}
-				w.Header().Set("Access-Control-Max-Age", strFromInt(cfg.MaxAgeSeconds))
+				next.ServeHTTP(w, r)
+				return
 			}
-			if r.Method == http.MethodOptions {
+
+			// Origin present but not allowed.
+			if !allowAll && !matchOrigin(origin, cfg.AllowedOrigins) {
+				if isPreflight {
+					http.Error(w, "origin not allowed", http.StatusForbidden)
+					return
+				}
+				// Non-preflight with disallowed origin: omit CORS headers so the
+				// browser blocks the response client-side.
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Allowed origin: write CORS headers.
+			writeCORSHeaders(w, r, cfg, origin, allowAll)
+			if isPreflight {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -62,20 +87,34 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 	}
 }
 
-func compileOriginCheck(allowed []string) func(string) bool {
+func matchOrigin(origin string, allowed []string) bool {
 	for _, a := range allowed {
 		if a == "*" {
-			return func(string) bool { return true }
+			return true
+		}
+		if strings.EqualFold(origin, a) {
+			return true
 		}
 	}
-	set := make(map[string]struct{}, len(allowed))
-	for _, a := range allowed {
-		set[strings.ToLower(a)] = struct{}{}
+	return false
+}
+
+func writeCORSHeaders(w http.ResponseWriter, r *http.Request, cfg CORSConfig, origin string, _ bool) {
+	// Always reflect the specific origin, even for wildcard configs.
+	// This is safer because Access-Control-Allow-Origin: * cannot be used
+	// with credentials (cookies, auth headers). Reflecting the specific
+	// origin allows credentials to work when needed.
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Vary", "Origin")
+	w.Header().Set("Access-Control-Allow-Methods", strings.Join(cfg.AllowedMethods, ", "))
+	w.Header().Set("Access-Control-Allow-Headers", strings.Join(cfg.AllowedHeaders, ", "))
+	if len(cfg.ExposeHeaders) > 0 {
+		w.Header().Set("Access-Control-Expose-Headers", strings.Join(cfg.ExposeHeaders, ", "))
 	}
-	return func(o string) bool {
-		_, ok := set[strings.ToLower(o)]
-		return ok
+	if cfg.AllowCreds {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
+	w.Header().Set("Access-Control-Max-Age", strFromInt(cfg.MaxAgeSeconds))
 }
 
 func strFromInt(n int) string {

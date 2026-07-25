@@ -1,0 +1,1 @@
+ALTER TABLE buckets ADD COLUMN cors_rules JSONB NOT NULL DEFAULT '[]';

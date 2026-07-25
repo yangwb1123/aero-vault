@@ -84,7 +84,7 @@ func TestNew_NilLoggerDefaults(t *testing.T) {
 func TestPublish_DeliversToSubscriber(t *testing.T) {
 	repo := &fakeRepo{}
 	b := New(repo, quietLogger())
-	ch := b.Subscribe()
+	ch, _ := b.Subscribe()
 
 	in := repository.Event{TenantID: "t1", Bucket: "b", Key: "k", Type: repository.EventCreated}
 	b.Publish(context.Background(), in)
@@ -110,7 +110,7 @@ func TestPublish_FanOutToMultipleSubscribers(t *testing.T) {
 	const n = 5
 	chans := make([]<-chan repository.Event, n)
 	for i := range chans {
-		chans[i] = b.Subscribe()
+		chans[i], _ = b.Subscribe()
 	}
 
 	b.Publish(context.Background(), repository.Event{Key: "fan", Type: repository.EventDeleted})
@@ -129,7 +129,7 @@ func TestPublish_FanOutToMultipleSubscribers(t *testing.T) {
 func TestPublish_InsertFailureSuppressesBroadcast(t *testing.T) {
 	repo := &fakeRepo{err: context.DeadlineExceeded}
 	b := New(repo, quietLogger())
-	ch := b.Subscribe()
+	ch, _ := b.Subscribe()
 
 	// Publish must not panic and must not broadcast when persistence fails.
 	b.Publish(context.Background(), repository.Event{Key: "k", Type: repository.EventCreated})
@@ -143,7 +143,7 @@ func TestSubscribe_BufferedAndDropsWhenFull(t *testing.T) {
 	// blocking Publish. We publish well past the buffer and assert Publish
 	// returns promptly each time.
 	b := New(&fakeRepo{}, quietLogger())
-	ch := b.Subscribe()
+	ch, _ := b.Subscribe()
 
 	const total = 200 // > buffer (64)
 	done := make(chan struct{})
@@ -184,8 +184,8 @@ counted:
 
 func TestClose_ShutsSubscriberChannels(t *testing.T) {
 	b := New(&fakeRepo{}, quietLogger())
-	ch1 := b.Subscribe()
-	ch2 := b.Subscribe()
+	ch1, _ := b.Subscribe()
+	ch2, _ := b.Subscribe()
 
 	b.Close()
 
@@ -200,7 +200,7 @@ func TestClose_ShutsSubscriberChannels(t *testing.T) {
 
 func TestClose_IsIdempotent(t *testing.T) {
 	b := New(&fakeRepo{}, quietLogger())
-	_ = b.Subscribe()
+	_, _ = b.Subscribe()
 	b.Close()
 	// Second Close must not panic (subs are cleared to nil after the first).
 	b.Close()
@@ -210,7 +210,7 @@ func TestPublish_AfterCloseDoesNotPanic(t *testing.T) {
 	// After Close clears subscribers, Publish should be a safe no-op broadcast.
 	repo := &fakeRepo{}
 	b := New(repo, quietLogger())
-	_ = b.Subscribe()
+	_, _ = b.Subscribe()
 	b.Close()
 	b.Publish(context.Background(), repository.Event{Key: "post-close"})
 	if repo.insertCount() != 1 {
@@ -222,7 +222,7 @@ func TestPublish_ConcurrentSafe(t *testing.T) {
 	// Exercise the RWMutex: many concurrent publishers + a subscriber draining.
 	// Run under -race to catch data races.
 	b := New(&fakeRepo{}, quietLogger())
-	ch := b.Subscribe()
+	ch, _ := b.Subscribe()
 
 	var received int64
 	stop := make(chan struct{})

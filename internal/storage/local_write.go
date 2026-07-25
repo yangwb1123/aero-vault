@@ -1,0 +1,133 @@
+package storage
+
+import (
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error) {
+	ctx, span := storeTracer.Start(ctx, "LocalStorage.Put",
+		trace.WithAttributes(
+			attribute.String("key", key),
+			attribute.Int64("size", size),
+		),
+	)
+	defer span.End()
+
+	path, err := s.objectPath(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return ObjectInfo{}, err
+	}
+	meta, err := s.writeObject(ctx, path, key, r, size, opts)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := writeMeta(s.metaPath(path), meta); err != nil {
+		_ = os.Remove(path)
+		return ObjectInfo{}, err
+	}
+	return meta.toInfo(), nil
+}
+
+func (s *LocalStorage) writeObject(ctx context.Context, path, key string, r io.Reader, size int64, opts PutOptions) (localMeta, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".upload-*")
+	if err != nil {
+		return localMeta{}, err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	h := md5.New()
+	var (
+		reader   io.Reader = io.TeeReader(r, h)
+		envelope string
+	)
+	if s.enc != nil {
+		plain, err := io.ReadAll(reader)
+		if err != nil {
+			return localMeta{}, err
+		}
+		ct, env, err := s.enc.encrypt(plain)
+		if err != nil {
+			return localMeta{}, err
+		}
+		envelope = env
+		reader = bytesReader(ct)
+	}
+	written, err := io.Copy(tmp, reader)
+	if err != nil {
+		return localMeta{}, err
+	}
+	if err := tmp.Sync(); err != nil {
+		return localMeta{}, err
+	}
+	if err := tmp.Close(); err != nil {
+		return localMeta{}, err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return localMeta{}, err
+	}
+	return localMeta{
+		Key:          key,
+		Size:         plaintextSize(written, s.enc != nil),
+		ETag:         hex.EncodeToString(h.Sum(nil)),
+		ContentType:  opts.ContentType,
+		LastModified: time.Now().UTC(),
+		Metadata:     opts.Metadata,
+		Envelope:     envelope,
+	}, nil
+}
+
+func plaintextSize(written int64, encrypted bool) int64 {
+	if !encrypted {
+		return written
+	}
+	s := written - 16
+	if s < 0 {
+		return 0
+	}
+	return s
+}
+
+func (s *LocalStorage) Delete(ctx context.Context, key string) error {
+	path, err := s.objectPath(key)
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(s.metaPath(path))
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// bytesReader is a tiny adapter so we can swap a *bytes.Reader into the io.Reader chain.
+func bytesReader(b []byte) io.Reader { return &byteSliceReader{b: b} }
+
+type byteSliceReader struct {
+	b   []byte
+	off int
+}
+
+func (r *byteSliceReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.off:])
+	r.off += n
+	return n, nil
+}

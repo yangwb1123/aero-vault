@@ -158,6 +158,54 @@ func TestSigV4Middleware(t *testing.T) {
 	}
 }
 
+// A non-empty scope segment that parses to nothing ("+", "++") would silently
+// strip all permissions; ParseSigV4Credentials must reject it. (A bare trailing
+// colon / whitespace-only segment is trimmed away at the record level and means
+// "no explicit scopes" → defaults, not an error — covered by the default path
+// below.) The default-scopes path (no 4th segment) must keep {read,write}.
+func TestParseSigV4Credentials_ScopeHandling(t *testing.T) {
+	// Explicit, non-empty scope segment that parses to zero scopes → error.
+	for _, raw := range []string{
+		"AK:SK:acme:+",  // separator only
+		"AK:SK:acme:++", // separators only
+	} {
+		if _, err := ParseSigV4Credentials(raw); err == nil {
+			t.Fatalf("ParseSigV4Credentials(%q): expected an error for a scope segment with no valid scope", raw)
+		}
+	}
+
+	// A bare trailing colon (empty 4th segment after trimming) is NOT an error —
+	// it is treated as "no explicit scopes" and keeps the {read,write} defaults.
+	if v, err := ParseSigV4Credentials("AK:SK:acme:"); err != nil {
+		t.Fatalf("bare trailing colon should default scopes, got error: %v", err)
+	} else if c := v.creds["AK"]; !c.key.Has(ScopeRead) || !c.key.Has(ScopeWrite) {
+		t.Fatalf("bare trailing colon should keep read+write defaults, got %+v", c.key.Scopes)
+	}
+
+	// No 4th segment → default {read,write} preserved.
+	v, err := ParseSigV4Credentials("AK:SK:acme")
+	if err != nil {
+		t.Fatalf("ParseSigV4Credentials default-scopes path: %v", err)
+	}
+	c, ok := v.creds["AK"]
+	if !ok {
+		t.Fatal("AK should be registered")
+	}
+	if !c.key.Has(ScopeRead) || !c.key.Has(ScopeWrite) {
+		t.Fatalf("default scopes should be read+write, got %+v", c.key.Scopes)
+	}
+
+	// Explicit non-empty scope → exactly that scope.
+	v2, err := ParseSigV4Credentials("AK:SK:acme:read")
+	if err != nil {
+		t.Fatalf("ParseSigV4Credentials explicit read: %v", err)
+	}
+	c2 := v2.creds["AK"]
+	if !c2.key.Has(ScopeRead) || c2.key.Has(ScopeWrite) {
+		t.Fatalf("explicit read-only scope wrong: %+v", c2.key.Scopes)
+	}
+}
+
 func TestIsSigned(t *testing.T) {
 	r1, _ := http.NewRequest("GET", "http://x/s3/b/k", nil)
 	if IsSigned(r1) {

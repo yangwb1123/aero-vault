@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
+	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
@@ -101,7 +102,7 @@ func (h *Handler) getObjectTagging(w http.ResponseWriter, r *http.Request, bucke
 
 func (h *Handler) putObjectTagging(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	var in tagging
-	if err := xml.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := decodeXMLBody(r.Body, DefaultXMLMaxBytes, &in); err != nil {
 		writeS3Error(w, r, service.ErrInvalidArgs)
 		return
 	}
@@ -153,10 +154,21 @@ func (h *Handler) putObjectACL(w http.ResponseWriter, r *http.Request, bucket, k
 func (h *Handler) createMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
-	up, err := h.svc.InitMultipart(r.Context(), mw.TenantFrom(r.Context()), bucket, key, service.PutOptions{
+	opts := service.PutOptions{
 		ContentType: r.Header.Get("Content-Type"),
 		Metadata:    extractMetaHeaders(r.Header),
-	})
+	}
+	if r.URL.Query().Has("tagging") {
+		var in tagging
+		if err := decodeXMLBody(r.Body, DefaultXMLMaxBytes, &in); err == nil {
+			tags := make(map[string]string, len(in.TagSet))
+			for _, t := range in.TagSet {
+				tags[t.Key] = t.Value
+			}
+			opts.Tags = tags
+		}
+	}
+	up, err := h.svc.InitMultipart(r.Context(), mw.TenantFrom(r.Context()), bucket, key, opts)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
@@ -185,11 +197,26 @@ func (h *Handler) completeMultipartUpload(w http.ResponseWriter, r *http.Request
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
 	uploadID := r.URL.Query().Get("uploadId")
-	// The client-supplied part manifest is parsed for compatibility but the
-	// server's persisted parts are authoritative.
-	_ = xml.NewDecoder(r.Body).Decode(&completeMultipartUpload{})
 
-	obj, err := h.svc.CompleteMultipart(r.Context(), uploadID)
+	// Parse the client-supplied part manifest and verify ETags against the
+	// server's stored parts before completing. This catches bit rot / partial
+	// writes that could otherwise cause silent data corruption.
+	var manifest completeMultipartUpload
+	if err := decodeXMLBody(r.Body, DefaultXMLMaxBytes, &manifest); err != nil {
+		writeS3Error(w, r, errMalformedXML)
+		return
+	}
+
+	// Convert client parts to the format expected by the service layer.
+	var clientParts []repository.PartRecord
+	for _, p := range manifest.Parts {
+		clientParts = append(clientParts, repository.PartRecord{
+			PartNumber: p.PartNumber,
+			ETag:       p.ETag,
+		})
+	}
+
+	obj, err := h.svc.CompleteMultipartWithParts(r.Context(), uploadID, clientParts)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
@@ -217,20 +244,59 @@ func (h *Handler) listParts(w http.ResponseWriter, r *http.Request, bucket, key,
 		writeS3Error(w, r, err)
 		return
 	}
-	out := listPartsResult{Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: uploadID, StorageClass: "STANDARD"}
+	// ListParts returns all parts ordered by part_number ASC; paginate in-handler
+	// per the S3 API (part-number-marker = exclusive start, max-parts = page size,
+	// default/cap 1000).
+	pnm, _ := strconv.Atoi(r.URL.Query().Get("part-number-marker")) // empty/invalid -> 0
+	marker := int32(pnm)
+	maxParts, _ := strconv.Atoi(r.URL.Query().Get("max-parts"))
+	if maxParts <= 0 || maxParts > 1000 {
+		maxParts = 1000
+	}
+	out := listPartsResult{
+		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: uploadID,
+		StorageClass: "STANDARD", PartNumberMarker: marker, MaxParts: maxParts,
+	}
 	for _, p := range parts {
+		if p.PartNumber <= marker {
+			continue
+		}
+		if len(out.Parts) >= maxParts {
+			out.IsTruncated = true
+			break
+		}
 		out.Parts = append(out.Parts, listPartItem{PartNumber: p.PartNumber, ETag: `"` + p.ETag + `"`, Size: p.Size})
+		out.NextPartNumberMarker = p.PartNumber
 	}
 	writeXML(w, http.StatusOK, out)
 }
 
 func (h *Handler) listMultipartUploads(w http.ResponseWriter, r *http.Request, bucket string) {
-	ups, err := h.svc.Repo().ListUploads(r.Context(), mw.TenantFrom(r.Context()), bucket, 1000)
+	q := r.URL.Query()
+	keyMarker := q.Get("key-marker")
+	uploadIDMarker := q.Get("upload-id-marker")
+	maxUploads, _ := strconv.Atoi(q.Get("max-uploads")) // empty/invalid -> 0 -> clamped below
+	if maxUploads <= 0 || maxUploads > 1000 {
+		maxUploads = 1000
+	}
+	// Fetch one extra to detect truncation (results are ordered by key,upload_id).
+	ups, err := h.svc.Repo().ListUploads(r.Context(), mw.TenantFrom(r.Context()), bucket, keyMarker, uploadIDMarker, maxUploads+1)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
-	out := listMultipartUploadsResult{Xmlns: s3Namespace, Bucket: bucket, Prefix: r.URL.Query().Get("prefix")}
+	out := listMultipartUploadsResult{
+		Xmlns: s3Namespace, Bucket: bucket, Prefix: q.Get("prefix"),
+		KeyMarker: keyMarker, UploadIDMarker: uploadIDMarker, MaxUploads: maxUploads,
+	}
+	if len(ups) > maxUploads {
+		ups = ups[:maxUploads]
+		out.IsTruncated = true
+		if n := len(ups); n > 0 {
+			out.NextKeyMarker = ups[n-1].Key
+			out.NextUploadIDMarker = ups[n-1].ID
+		}
+	}
 	for _, u := range ups {
 		out.Uploads = append(out.Uploads, uploadListItem{Key: u.Key, UploadID: u.ID, Initiated: u.CreatedAt.UTC()})
 	}
@@ -241,7 +307,7 @@ func (h *Handler) listMultipartUploads(w http.ResponseWriter, r *http.Request, b
 
 func (h *Handler) deleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
 	var in deleteRequest
-	if err := xml.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := decodeXMLBody(r.Body, DefaultXMLMaxBytes, &in); err != nil {
 		writeS3Error(w, r, service.ErrInvalidArgs)
 		return
 	}

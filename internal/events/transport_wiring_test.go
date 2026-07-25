@@ -22,7 +22,7 @@ func TestBus_TransportHookLocalOnly(t *testing.T) {
 		atomic.AddInt32(&transportCalls, 1)
 		return nil
 	})
-	sub := bus.Subscribe()
+	sub, _ := bus.Subscribe()
 
 	// Local publish.
 	bus.Publish(context.Background(), repository.Event{Type: repository.EventCreated, Key: "local"})
@@ -54,7 +54,7 @@ func TestBus_TransportHookLocalOnly(t *testing.T) {
 func TestBus_DropsOnBackpressure(t *testing.T) {
 	repo := &fakeRepo{}
 	bus := New(repo, quietLogger())
-	_ = bus.Subscribe() // intentionally never drained
+	_, _ = bus.Subscribe() // intentionally never drained
 
 	for i := 0; i < 200; i++ {
 		bus.Publish(context.Background(), repository.Event{Type: repository.EventCreated, Key: "k"})

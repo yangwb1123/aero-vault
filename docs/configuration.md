@@ -260,7 +260,7 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 
 ## Demo configuration reference
 
-The values used by `docker-compose.demo.yml` (a realistic production-shaped
+The values used by `deploy/docker-compose.demo.yml` (a realistic production-shaped
 config) are a good worked example:
 
 ```env

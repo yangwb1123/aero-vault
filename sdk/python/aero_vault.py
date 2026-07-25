@@ -380,14 +380,66 @@ class Client:
             "PUT", "/v1/files/" + _escape_key(key) + "/tags", json_body=dict(tags)
         )
 
+    def delete_tags(self, key: str) -> None:
+        """Clear all tags on an object (DELETE /v1/files/<key>/tags)."""
+        self._request_json("DELETE", "/v1/files/" + _escape_key(key) + "/tags")
+
     def list_versions(self, key: str) -> t.Any:
         return self._request_json("GET", "/v1/files/" + _escape_key(key) + "/versions")
 
-    def lock(self, key: str, until: str) -> t.Any:
-        """Apply an object lock retaining the object until an RFC3339 timestamp."""
+    def lock(self, key: str, seconds: int) -> t.Any:
+        """Apply an object lock retaining the object for ``seconds`` from now."""
         return self._request_json(
-            "POST", "/v1/files/" + _escape_key(key) + "/lock", json_body={"until": until}
+            "POST", "/v1/files/" + _escape_key(key) + "/lock", json_body={"seconds": seconds}
         )
+
+    # ---- bucket ACL ----------------------------------------------------
+
+    def get_bucket_acl(self, bucket: str) -> str:
+        """Get a bucket's canned ACL (GET /v1/buckets/<bucket>/acl)."""
+        out = self._request_json(
+            "GET", "/v1/buckets/" + urllib.parse.quote(bucket, safe="") + "/acl"
+        ) or {}
+        return out.get("acl", "")
+
+    def set_bucket_acl(self, bucket: str, acl: str) -> t.Any:
+        """Set a bucket's canned ACL (PUT /v1/buckets/<bucket>/acl)."""
+        return self._request_json(
+            "PUT", "/v1/buckets/" + urllib.parse.quote(bucket, safe="") + "/acl",
+            json_body={"acl": acl},
+        )
+
+    # ---- object ACL -----------------------------------------------------
+
+    def get_acl(self, key: str) -> str:
+        """Get an object's canned ACL (GET /v1/files/<key>/acl)."""
+        out = self._request_json(
+            "GET", "/v1/files/" + _escape_key(key) + "/acl"
+        ) or {}
+        return out.get("acl", "")
+
+    def set_acl(self, key: str, acl: str) -> t.Any:
+        """Set an object's canned ACL (PUT /v1/files/<key>/acl)."""
+        return self._request_json(
+            "PUT", "/v1/files/" + _escape_key(key) + "/acl",
+            json_body={"acl": acl},
+        )
+
+    # ---- thumbnail -------------------------------------------------------
+
+    def thumbnail(self, key: str, w: int = 256, h: int = 256) -> bytes:
+        """Generate a JPEG thumbnail of an image (GET /v1/files/<key>/thumbnail).
+
+        Args:
+            key: Object key.
+            w: Max width (clamped to 2048).
+            h: Max height (clamped to 2048).
+
+        Returns:
+            JPEG bytes.
+        """
+        params = {"w": str(w), "h": str(h)}
+        return self._open("GET", "/v1/files/" + _escape_key(key) + "/thumbnail", params=params).read()
 
     # ---- AI: search / chat / agent -------------------------------------
 
@@ -487,12 +539,17 @@ class Client:
 
     # ---- admin -------
 
-    def add_key(self, label: str, scopes: t.Optional[t.List[str]] = None,
-                expires_at: t.Optional[str] = None) -> t.Dict[str, t.Any]:
-        """Add an API key (POST /v1/admin/keys)."""
-        body: t.Dict[str, t.Any] = {"label": label}
-        if scopes: body["scopes"] = scopes
-        if expires_at: body["expires_at"] = expires_at
+    def add_key(self, token: str, scopes: t.List[str], label: str = "",
+                expires: t.Optional[str] = None) -> t.Dict[str, t.Any]:
+        """Add an API key (POST /v1/admin/keys).
+
+        The server requires ``token``, ``tenant`` and ``scopes``; ``tenant`` is
+        taken from this client's tenant. ``expires`` is an optional RFC3339
+        timestamp (no expiry when omitted).
+        """
+        body: t.Dict[str, t.Any] = {"token": token, "tenant": self.tenant, "scopes": scopes}
+        if label: body["label"] = label
+        if expires: body["expires"] = expires
         return self._request_json("POST", "/v1/admin/keys", json_body=body) or {}
 
     def list_keys(self) -> t.List[t.Any]:
@@ -501,12 +558,12 @@ class Client:
 
     def revoke_key(self, token: str) -> None:
         """Revoke an API key (DELETE /v1/admin/keys/{token})."""
-        self._request_json("DELETE", f"/v1/admin/keys/{token}")
+        self._request_json("DELETE", "/v1/admin/keys/" + urllib.parse.quote(token, safe=""))
 
     def issue_jwt(self, tenant: str, scopes: t.Optional[t.List[str]] = None,
-                  expires_in: int = 3600) -> t.Dict[str, t.Any]:
+                  ttl_seconds: int = 3600) -> t.Dict[str, t.Any]:
         """Issue a JWT (POST /v1/admin/jwt)."""
-        body: t.Dict[str, t.Any] = {"tenant": tenant, "expires_in": expires_in}
+        body: t.Dict[str, t.Any] = {"tenant": tenant, "ttl_seconds": ttl_seconds}
         if scopes: body["scopes"] = scopes
         return self._request_json("POST", "/v1/admin/jwt", json_body=body) or {}
 
@@ -537,7 +594,7 @@ class Client:
 
     def delete_tenant(self, tenant_id: str) -> None:
         """Delete a tenant (DELETE /v1/admin/tenants/{tenant})."""
-        self._request_json("DELETE", f"/v1/admin/tenants/{tenant_id}")
+        self._request_json("DELETE", "/v1/admin/tenants/" + urllib.parse.quote(tenant_id, safe=""))
 
     def set_tenant_status(self, tenant_id: str, status: str) -> t.Dict[str, t.Any]:
         """Set tenant status to 'active' or 'disabled' (PUT /v1/admin/tenants/{tenant}/status)."""

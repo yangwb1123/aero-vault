@@ -56,14 +56,16 @@ type remoteExtractResp struct {
 }
 
 func (e *RemoteExtractor) Extract(ctx context.Context, contentType string, r io.Reader) (string, error) {
-	// Fast-path text content via the fallback extractor.
 	ct := strings.ToLower(contentType)
 	if strings.HasPrefix(ct, "text/") || ct == "" ||
 		strings.HasPrefix(ct, "application/json") || strings.HasPrefix(ct, "application/xml") ||
 		strings.HasPrefix(ct, "application/yaml") || strings.Contains(ct, "+xml") || strings.Contains(ct, "+json") {
 		return e.Fallback.Extract(ctx, contentType, r)
 	}
-	// Otherwise stream through the remote.
+	return e.extractRemote(ctx, contentType, r)
+}
+
+func (e *RemoteExtractor) extractRemote(ctx context.Context, contentType string, r io.Reader) (string, error) {
 	body := &bytes.Buffer{}
 	mw := multipart.NewWriter(body)
 	fw, err := mw.CreateFormFile("file", "object")

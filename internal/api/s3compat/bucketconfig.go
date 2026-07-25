@@ -8,6 +8,8 @@ import (
 	"strconv"
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
+	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 )
 
 // bucketConfigBodyLimit bounds the XML body of bucket sub-resource PUTs. These
@@ -214,10 +216,14 @@ func (h *Handler) putBucketObjectLock(w http.ResponseWriter, r *http.Request, bu
 // IsTruncated=true and <NextKeyMarker> carries the continuation key — so buckets
 // with more than one page of keys are enumerated fully across requests rather
 // than silently truncated.
+//
+// Deep pagination within a single key's version list is supported via
+// ?version-id-marker. When set, versions are enumerated starting after that ID.
 func (h *Handler) listObjectVersions(w http.ResponseWriter, r *http.Request, bucket string) {
 	q := r.URL.Query()
 	prefix := q.Get("prefix")
 	keyMarker := q.Get("key-marker")
+	versionIDMarker := q.Get("version-id-marker")
 	tenant := mw.TenantFrom(r.Context())
 
 	maxKeys, _ := strconv.Atoi(q.Get("max-keys"))
@@ -231,23 +237,30 @@ func (h *Handler) listObjectVersions(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 	out := listVersionsResult{
-		Xmlns:       s3Namespace,
-		Name:        bucket,
-		Prefix:      prefix,
-		KeyMarker:   keyMarker,
-		MaxKeys:     maxKeys,
-		IsTruncated: page.HasMore,
+		Xmlns:           s3Namespace,
+		Name:            bucket,
+		Prefix:          prefix,
+		KeyMarker:       keyMarker,
+		VersionIdMarker: versionIDMarker,
+		MaxKeys:         maxKeys,
+		IsTruncated:     page.HasMore,
 	}
 	if page.HasMore {
 		out.NextKeyMarker = page.NextMarker
 	}
 	for _, k := range page.Objects {
-		versions, err := h.svc.Repo().ListObjectVersions(r.Context(), tenant, bucket, k.Key)
+		vopts := repository.VersionListOpts{}
+		// Only pass version-id-marker for the first/matching key.
+		if versionIDMarker != "" && out.NextVersionIdMarker == "" {
+			vopts.VersionIDMarker = versionIDMarker
+			versionIDMarker = "" // consumed for this key; subsequent keys iterate from start
+		}
+		vpage, err := h.svc.Repo().ListObjectVersionsWithOpts(r.Context(), tenant, bucket, k.Key, vopts)
 		if err != nil {
 			writeS3Error(w, r, err)
 			return
 		}
-		for i, v := range versions {
+		for i, v := range vpage.Versions {
 			out.Versions = append(out.Versions, versionEntry{
 				Key:          v.Key,
 				VersionID:    v.VersionID,
@@ -255,8 +268,14 @@ func (h *Handler) listObjectVersions(w http.ResponseWriter, r *http.Request, buc
 				LastModified: v.UpdatedAt.UTC(),
 				ETag:         `"` + v.ETag + `"`,
 				Size:         v.Size,
-				StorageClass: "STANDARD",
+				StorageClass: service.StorageClassOrDefault(v.StorageClass),
 			})
+		}
+		if vpage.HasMore {
+			out.IsTruncated = true
+			out.NextVersionIdMarker = vpage.NextVersionID
+			out.NextKeyMarker = k.Key
+			break
 		}
 	}
 	writeXML(w, http.StatusOK, out)

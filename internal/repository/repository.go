@@ -1,48 +1,88 @@
 package repository
 
 import (
-	"context"
 	"errors"
-	"fmt"
-	"strings"
 	"time"
 )
 
 var (
-	ErrNotFound       = errors.New("object not found")
-	ErrDuplicate      = errors.New("object already exists")
-	ErrUploadNotFound = errors.New("upload not found")
+	ErrNotFound        = errors.New("object not found")
+	ErrDuplicate       = errors.New("object already exists")
+	ErrUploadNotFound  = errors.New("upload not found")
+	ErrLegalHoldActive = errors.New("object is under legal hold and cannot be deleted")
 )
 
 // Object is the persisted view of a stored object.
 type Object struct {
-	ID          int64
-	TenantID    string
-	Bucket      string
-	Key         string
-	VersionID   string // set per-insert; stable for the life of the row
-	Backend     string
-	StorageKey  string
-	Size        int64
-	ETag        string
-	ContentType string
-	Metadata    map[string]string
-	Tags        map[string]string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	DeletedAt   *time.Time
-	LockedUntil *time.Time // present when Object Lock is active
+	ID               int64
+	TenantID         string
+	Bucket           string
+	Key              string
+	VersionID        string
+	Backend          string
+	StorageKey       string
+	Size             int64
+	ETag             string
+	ContentType      string
+	Metadata         map[string]string
+	Tags             map[string]string
+	StorageClass     string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	DeletedAt        *time.Time
+	LockedUntil      *time.Time
+	VersionTombstone bool
 }
 
-// BucketConfig is the per-bucket policy bundle (versioning + lock + lifecycle).
+// BucketConfig is the per-bucket policy bundle.
 type BucketConfig struct {
 	TenantID          string
 	Name              string
 	Versioning        bool
 	ObjectLockSeconds int
 	ExpireAfterDays   int
-	ExpireAction      string // "soft_delete" | "hard_delete"
-	ACL               string // canned ACL: private | public-read | public-read-write | authenticated-read
+	ExpireAction      string
+	NoncurrentDays    int
+	NoncurrentCount   int
+	ACL               string
+	Policy            string
+	CORSRules         []CORSRule
+	LoggingTarget     string
+	LoggingPrefix     string
+	NotificationRules []NotificationRule
+}
+
+// NotificationRule maps S3 events to notification targets.
+type NotificationRule struct {
+	ID        string   `json:"Id"`
+	Events    []string `json:"Events"`
+	FilterKey string   `json:"FilterKey,omitempty"`
+	QueueARN  string   `json:"QueueArn,omitempty"`
+	TopicARN  string   `json:"TopicArn,omitempty"`
+	LambdaARN string   `json:"LambdaFunctionArn"`
+}
+
+// CORSRule defines one CORS rule for a bucket.
+type CORSRule struct {
+	AllowedOrigins []string `json:"AllowedOrigins"`
+	AllowedMethods []string `json:"AllowedMethods"`
+	AllowedHeaders []string `json:"AllowedHeaders"`
+	ExposeHeaders  []string `json:"ExposeHeaders"`
+	MaxAgeSeconds  int      `json:"MaxAgeSeconds"`
+}
+
+// LoggingConfig holds the server-access-logging target for a bucket.
+type LoggingConfig struct {
+	Enabled bool
+	Target  string
+	Prefix  string
+}
+
+// BucketStats holds aggregate storage statistics for a single bucket.
+type BucketStats struct {
+	Bucket      string `json:"bucket"`
+	ObjectCount int64  `json:"object_count"`
+	TotalSize   int64  `json:"total_size_bytes"`
 }
 
 // ListPage is a paginated slice of Object rows.
@@ -52,37 +92,48 @@ type ListPage struct {
 	HasMore    bool
 }
 
-// Upload tracks a multipart upload session by upload ID.
+// VersionListOpts controls paginated version listing.
+type VersionListOpts struct {
+	VersionIDMarker string
+	Limit           int
+}
+
+// VersionListPage is a paginated slice of Object versions.
+type VersionListPage struct {
+	Versions      []Object
+	NextVersionID string
+	HasMore       bool
+}
+
+// Upload tracks an in-progress multipart upload.
 type Upload struct {
-	ID         string
-	TenantID   string
-	Bucket     string
-	Key        string
-	Backend    string
-	BackendUID string
-	StorageKey string // physical backend key the parts assemble to (versioned when the bucket has versioning on)
-	Metadata   map[string]string
+	ID             string
+	TenantID       string
+	Bucket         string
+	Key            string
+	StorageKey     string
+	UploadID       string
+	ContentType    string
+	Metadata       map[string]string
+	StorageClass   string
+	Backend        string
+	BackendUID     string
+	TotalParts     int
+	CompletedParts int
+	CreatedAt      time.Time
+}
+
+// PartRecord tracks a single uploaded part.
+type PartRecord struct {
+	ID         int64
+	UploadID   string
+	PartNumber int32
+	Size       int64
+	ETag       string
 	CreatedAt  time.Time
 }
 
-// PartRecord is a part that has been uploaded.
-type PartRecord struct {
-	UploadID   string
-	PartNumber int32
-	ETag       string
-	Size       int64
-}
-
-// EventType enumerates lifecycle events emitted by the FileService.
-type EventType string
-
-const (
-	EventCreated  EventType = "created"
-	EventDeleted  EventType = "deleted"
-	EventAccessed EventType = "accessed"
-)
-
-// Event is a persisted lifecycle event awaiting consumption.
+// Event lifecycle event.
 type Event struct {
 	ID        int64
 	TenantID  string
@@ -95,7 +146,17 @@ type Event struct {
 	CreatedAt time.Time
 }
 
-// Chunk is a text slice extracted from an object, optionally with an embedding.
+// EventType categorises an Event.
+type EventType string
+
+const (
+	EventCreated  EventType = "created"
+	EventUpdated  EventType = "updated"
+	EventDeleted  EventType = "deleted"
+	EventAccessed EventType = "accessed"
+)
+
+// Chunk holds an embedded text chunk with its vector.
 type Chunk struct {
 	ID         int64
 	ObjectID   int64
@@ -104,55 +165,58 @@ type Chunk struct {
 	ObjectKey  string
 	Seq        int
 	Content    string
+	Model      string
 	Embedding  []float32
 	Dim        int
 	EmbedModel string
 	CreatedAt  time.Time
 }
 
-// Usage records that an AI caller looked up specific chunks/objects.
+// Usage records one AI consumption event.
 type Usage struct {
-	ID        int64
-	TenantID  string
-	Caller    string
-	Query     string
-	ChunkIDs  []int64
-	ObjectIDs []int64
-	RequestID string
-	CreatedAt time.Time
-
+	ID               int64
+	TenantID         string
+	Caller           string
+	Query            string
+	ChunkIDs         []int64
+	ObjectIDs        []int64
+	RequestID        string
 	Model            string
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
 	LatencyMs        int64
 	CostMicros       int64
+	CreatedAt        time.Time
 }
 
-// SearchHit is one ranked chunk returned by Repository.SearchChunks.
+// SearchHit is a ranked result from vector/hybrid search.
 type SearchHit struct {
-	Chunk Chunk
-	Score float32
+	Chunk      Chunk
+	Score      float32
+	Rank       int
+	ObjectID   int64
+	ObjectKey  string
+	Bucket     string
+	EmbedModel string
 }
 
-// IdempotencyRecord is a persisted request-deduplication entry keyed by
-// (tenant, key). A claim starts 'in_progress'; once the original request
-// finishes its response is captured so retries can replay it.
+// IdempotencyRecord tracks a claimed Idempotency-Key.
 type IdempotencyRecord struct {
-	TenantID       string
-	Key            string
-	Fingerprint    string
-	Status         string // "in_progress" | "completed"
-	ResponseStatus int
-	ResponseBody   []byte
-	ResponseCT     string
-	RequestID      string
-	CreatedAt      string
-	CompletedAt    string
+	TenantID        string
+	Key             string
+	Fingerprint     string
+	Status          string
+	RequestID       string
+	ResponseStatus  int
+	ResponseBody    []byte
+	ResponseCT      string
+	ResponseHeaders map[string][]string
+	CompletedAt     string
+	CreatedAt       string
 }
 
-// APIKeyRecord is a persisted, hashed API-key entry. The token itself is never
-// stored; TokenHash is the caller-supplied sha256 hex of the token.
+// APIKeyRecord is the persisted form of an API key.
 type APIKeyRecord struct {
 	TokenHash  string
 	TenantID   string
@@ -163,145 +227,39 @@ type APIKeyRecord struct {
 	LastUsedAt string
 }
 
-// TenantRecord is a persisted tenant, letting an operator onboard or disable
-// tenants at runtime without a redeploy.
+// TenantRecord holds runtime tenant metadata.
 type TenantRecord struct {
-	TenantID    string
-	DisplayName string
-	Status      string
-	CreatedAt   string
+	TenantID          string `json:"tenant_id"`
+	DisplayName       string `json:"display_name"`
+	Status            string `json:"status"`
+	DailyBudgetMicros int64  `json:"daily_budget_micros"`
+	StorageUsedBytes  int64  `json:"storage_used_bytes"`
+	ObjectCount       int64  `json:"object_count"`
+	CreatedAt         string `json:"created_at"`
 }
 
-// AuditEntry is a persisted record of an admin/security-sensitive action: who
-// did what, to which target, with optional freeform detail.
+// LegalHold records a compliance hold on an object.
+type LegalHold struct {
+	ID         int64  `json:"id"`
+	ObjectID   int64  `json:"object_id"`
+	VersionID  string `json:"version_id"`
+	TenantID   string `json:"tenant_id"`
+	Bucket     string `json:"bucket"`
+	ObjectKey  string `json:"object_key"`
+	HoldReason string `json:"hold_reason"`
+	CreatedAt  string `json:"created_at"`
+	CreatedBy  string `json:"created_by"`
+}
+
+// AuditEntry records an admin action.
 type AuditEntry struct {
-	ID        int64
-	CreatedAt string
-	Actor     string
-	Action    string
-	Target    string
-	TenantID  string
-	Detail    string
+	ID        int64  `json:"id"`
+	Actor     string `json:"actor"`
+	Action    string `json:"action"`
+	Target    string `json:"target"`
+	TenantID  string `json:"tenant_id"`
+	Detail    string `json:"detail"`
+	CreatedAt string `json:"created_at"`
 }
 
-// Repository persists object metadata, multipart state, events, chunks, and audit.
-type Repository interface {
-	Ping(ctx context.Context) error
-	Close() error
-	Migrate(ctx context.Context) error
-
-	UpsertObject(ctx context.Context, obj Object) (Object, error)
-	InsertObjectVersion(ctx context.Context, obj Object) (Object, error)
-	GetObject(ctx context.Context, tenant, bucket, key string) (Object, error)
-	GetObjectByID(ctx context.Context, id int64) (Object, error)
-	GetObjectVersion(ctx context.Context, tenant, bucket, key, versionID string) (Object, error)
-	ListObjects(ctx context.Context, tenant, bucket, prefix, marker string, limit int) (ListPage, error)
-	ListObjectVersions(ctx context.Context, tenant, bucket, key string) ([]Object, error)
-	SoftDeleteObject(ctx context.Context, tenant, bucket, key string) error
-	HardDeleteObject(ctx context.Context, tenant, bucket, key string) error
-	UpdateTags(ctx context.Context, tenant, bucket, key string, tags map[string]string) error
-	SetLockedUntil(ctx context.Context, tenant, bucket, key string, until time.Time) error
-	StorageKeyReferenced(ctx context.Context, storageKey string) (bool, error)
-
-	CreateBucket(ctx context.Context, tenant, bucket string) error
-	BucketExists(ctx context.Context, tenant, bucket string) (bool, error)
-	ListBuckets(ctx context.Context, tenant string) ([]string, error)
-	GetBucketConfig(ctx context.Context, tenant, bucket string) (BucketConfig, error)
-	SetBucketVersioning(ctx context.Context, tenant, bucket string, enabled bool) error
-	SetBucketObjectLock(ctx context.Context, tenant, bucket string, seconds int) error
-	SetBucketLifecycle(ctx context.Context, tenant, bucket string, expireAfterDays int, expireAction string) error
-	SetBucketACL(ctx context.Context, tenant, bucket, acl string) error
-	SetObjectACL(ctx context.Context, tenant, bucket, key, acl string) error
-	GetObjectACL(ctx context.Context, tenant, bucket, key string) (string, error)
-	ListExpired(ctx context.Context, limit int) ([]Object, error)
-	ListSoftDeletedBefore(ctx context.Context, before string, limit int) ([]Object, error)
-
-	CreateUpload(ctx context.Context, u Upload) error
-	GetUpload(ctx context.Context, uploadID string) (Upload, error)
-	DeleteUpload(ctx context.Context, uploadID string) error
-	ListUploads(ctx context.Context, tenant, bucket string, limit int) ([]Upload, error)
-
-	RecordPart(ctx context.Context, p PartRecord) error
-	ListParts(ctx context.Context, uploadID string) ([]PartRecord, error)
-
-	// Events
-	InsertEvent(ctx context.Context, e Event) (int64, error)
-	NextUnconsumedEvents(ctx context.Context, limit int) ([]Event, error)
-	MarkEventConsumed(ctx context.Context, id int64) error
-
-	// Chunks
-	DeleteChunksForObject(ctx context.Context, objectID int64) error
-	InsertChunks(ctx context.Context, chunks []Chunk) error
-	ListChunksForObject(ctx context.Context, objectID int64) ([]Chunk, error)
-	SearchChunks(ctx context.Context, tenant, bucket string, query []float32, limit int) ([]SearchHit, error)
-	ListObjectIDsToReindex(ctx context.Context, tenant, currentModel string, limit int) ([]int64, error)
-
-	// Audit
-	RecordUsage(ctx context.Context, u Usage) error
-	ListUsageForObject(ctx context.Context, tenant string, objectID int64, limit int) ([]Usage, error)
-	// SumAICostMicros totals recorded AI cost (USD-millionths) for a tenant since
-	// the given RFC3339 timestamp — used to enforce per-tenant budgets.
-	SumAICostMicros(ctx context.Context, tenant, since string) (int64, error)
-
-	// Quota
-	GetTenantQuota(ctx context.Context, tenant string) (TenantQuota, error)
-	ListTenantQuotas(ctx context.Context) ([]TenantQuota, error)
-	SetTenantQuota(ctx context.Context, tenant string, maxBytes, maxObjects int64) error
-	SetTenantBudgetMicros(ctx context.Context, tenant string, micros int64) error
-	AddTenantUsage(ctx context.Context, tenant string, deltaBytes, deltaObjects int64) (TenantQuota, error)
-
-	// Webhook retries
-	RecordWebhookFailure(ctx context.Context, f WebhookFailure) (int64, error)
-	NextPendingFailures(ctx context.Context, limit int) ([]WebhookFailure, error)
-	MarkWebhookSucceeded(ctx context.Context, id int64) error
-	UpdateWebhookFailure(ctx context.Context, id int64, lastErr string, lastStatus int, nextRetryAt time.Time, attempts int) error
-	ListWebhookFailures(ctx context.Context, limit int) ([]WebhookFailure, error)
-
-	// Background job queue
-	EnqueueJob(ctx context.Context, j Job) (id int64, deduped bool, err error)
-	ClaimJob(ctx context.Context, worker string) (Job, bool, error)
-	CompleteJob(ctx context.Context, id int64, result string) error
-	RetryJob(ctx context.Context, id int64, lastErr string, runAfter time.Time) error
-	FailJob(ctx context.Context, id int64, lastErr string) error
-	ListJobs(ctx context.Context, status, jobType string, limit int) ([]Job, error)
-	CountJobsByStatus(ctx context.Context, status string) (int, error)
-	JobStats(ctx context.Context) (map[string]int64, error)
-	ReapStuckJobs(ctx context.Context, maxAge time.Duration) (int64, error)
-
-	// Idempotency keys
-	ClaimIdempotencyKey(ctx context.Context, tenant, key, fingerprint, requestID string) (rec IdempotencyRecord, claimed bool, err error)
-	CompleteIdempotencyKey(ctx context.Context, tenant, key string, status int, body []byte, contentType string) error
-	DeleteIdempotencyKey(ctx context.Context, tenant, key string) error
-	DeleteIdempotencyKeysBefore(ctx context.Context, before string) (int64, error)
-
-	// API keys (stored only as sha256 hashes)
-	PutAPIKey(ctx context.Context, k APIKeyRecord) error
-	GetAPIKeyByHash(ctx context.Context, hash string) (APIKeyRecord, bool, error)
-	DeleteAPIKeyByHash(ctx context.Context, hash string) (bool, error)
-	ListAPIKeys(ctx context.Context, tenant string) ([]APIKeyRecord, error)
-	TouchAPIKey(ctx context.Context, hash, when string) error
-
-	// Distributed leases (singleton coordination across replicas)
-	AcquireLease(ctx context.Context, name, holder string, ttl time.Duration) (bool, error)
-
-	// Tenants (runtime onboarding / disabling)
-	UpsertTenant(ctx context.Context, tr TenantRecord) error
-	GetTenant(ctx context.Context, tenantID string) (TenantRecord, bool, error)
-	ListTenants(ctx context.Context) ([]TenantRecord, error)
-	DeleteTenant(ctx context.Context, tenantID string) (bool, error)
-
-	// Audit log (admin/security actions)
-	RecordAudit(ctx context.Context, e AuditEntry) error
-	ListAudit(ctx context.Context, limit int) ([]AuditEntry, error)
-}
-
-func Open(ctx context.Context, driver, dsn string) (Repository, error) {
-	switch strings.ToLower(driver) {
-	case "postgres":
-		return openPostgres(ctx, dsn)
-	case "sqlite":
-		return openSQLite(ctx, dsn)
-	default:
-		return nil, fmt.Errorf("unknown driver %q", driver)
-	}
-}
+const defaultStorageClass = "STANDARD"

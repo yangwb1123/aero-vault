@@ -13,11 +13,13 @@ import (
 )
 
 // OSSConfig configures the Alibaba Cloud OSS backend.
+// Timeouts control the underlying HTTP client; zero uses the SDK default.
 type OSSConfig struct {
 	Endpoint  string // e.g. https://oss-cn-hangzhou.aliyuncs.com
 	Bucket    string
 	AccessKey string
 	SecretKey string
+	Timeouts  TimeoutConfig
 }
 
 // OSSStorage implements Storage on top of Alibaba Cloud OSS using the native SDK
@@ -33,7 +35,7 @@ func NewOSS(cfg OSSConfig) (*OSSStorage, error) {
 	if cfg.Endpoint == "" || cfg.Bucket == "" {
 		return nil, errors.New("oss storage: endpoint and bucket are required")
 	}
-	client, err := oss.New(cfg.Endpoint, cfg.AccessKey, cfg.SecretKey)
+	client, err := oss.New(cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, oss.HTTPClient(NewHTTPClient(cfg.Timeouts)))
 	if err != nil {
 		return nil, fmt.Errorf("oss client: %w", err)
 	}
@@ -181,6 +183,17 @@ func (s *OSSStorage) AbortMultipart(ctx context.Context, key, uploadID string) e
 	return s.bucket.AbortMultipartUpload(s.imur(key, uploadID))
 }
 
+func (s *OSSStorage) CleanupParts(ctx context.Context, key, uploadID string) error {
+	// OSS storage-level cleanup uses the same AbortMultipart API.
+	// If the upload is already gone, the OSS SDK returns a 404 which we treat
+	// as success (idempotent).
+	err := s.bucket.AbortMultipartUpload(s.imur(key, uploadID))
+	if err != nil && isOSSNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 func ossObjectInfo(key string, h http.Header) ObjectInfo {
 	info := ObjectInfo{
 		Key:         key,
@@ -205,6 +218,13 @@ func ossObjectInfo(key string, h http.Header) ObjectInfo {
 		}
 	}
 	return info
+}
+
+func (s *OSSStorage) CanCopy() bool { return false }
+
+func (s *OSSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
+	// TODO: implement using OSS CopyObject API
+	return ObjectInfo{}, ErrUnsupported
 }
 
 func isOSSNotFound(err error) bool {

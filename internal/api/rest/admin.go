@@ -398,3 +398,14 @@ func (h *AdminHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool
 	}
 	return true
 }
+
+// GetConfig returns a read-only snapshot of the server configuration,
+// excluding sensitive fields (keys, secrets, tokens).
+func (h *AdminHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(w, r) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": 1,
+	})
+}

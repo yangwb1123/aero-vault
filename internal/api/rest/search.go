@@ -20,22 +20,35 @@ import (
 // AIHandler exposes /v1/search, /v1/lineage, /v1/chat, /v1/chat/stream,
 // /v1/agent on top of the FileService's repository.
 type AIHandler struct {
-	repo   repository.Repository
-	search *ai.Search
-	chat   *ai.Chat
-	agent  *ai.Agent
-	logger *slog.Logger
+	repo     repository.Repository
+	search   *ai.Search
+	chat     *ai.Chat
+	agent    *ai.Agent
+	logger   *slog.Logger
+	degraded bool // when true, all AI endpoints return 503 immediately
 }
 
-func NewAIHandler(repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, logger *slog.Logger) *AIHandler {
+func NewAIHandler(repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, logger *slog.Logger, degraded bool) *AIHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &AIHandler{repo: repo, search: search, chat: chat, agent: agent, logger: logger}
+	return &AIHandler{repo: repo, search: search, chat: chat, agent: agent, logger: logger, degraded: degraded}
+}
+
+// aiDegraded checks whether AI is in degraded mode and returns early with 503.
+func (h *AIHandler) aiDegraded(w http.ResponseWriter, r *http.Request) bool {
+	if h.degraded {
+		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: errorPayload{Code: "Unavailable", Message: "AI service is temporarily unavailable (degraded mode)"}})
+		return true
+	}
+	return false
 }
 
 // POST /v1/search
 func (h *AIHandler) Search(w http.ResponseWriter, r *http.Request) {
+	if h.aiDegraded(w, r) {
+		return
+	}
 	if h.search == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: errorPayload{Code: "Unavailable", Message: "search disabled (no embedder configured)"}})
 		return
@@ -71,6 +84,9 @@ func (h *AIHandler) Search(w http.ResponseWriter, r *http.Request) {
 // POST /v1/chat/stream — SSE response, each token chunk as a data: frame.
 // The final frame carries the citation list as event: citations.
 func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
+	if h.aiDegraded(w, r) {
+		return
+	}
 	if h.chat == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: errorPayload{Code: "Unavailable", Message: "chat disabled"}})
 		return
@@ -137,6 +153,9 @@ func writeSSEError(w http.ResponseWriter, f http.Flusher, code, message string) 
 
 // POST /v1/agent — runs a tool-calling loop and returns the final answer.
 func (h *AIHandler) Agent(w http.ResponseWriter, r *http.Request) {
+	if h.aiDegraded(w, r) {
+		return
+	}
 	if h.agent == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: errorPayload{Code: "Unavailable", Message: "agent disabled (no LLM configured)"}})
 		return
@@ -160,6 +179,9 @@ func (h *AIHandler) Agent(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/chat
 func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
+	if h.aiDegraded(w, r) {
+		return
+	}
 	if h.chat == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: errorPayload{Code: "Unavailable", Message: "chat disabled (no LLM configured)"}})
 		return
@@ -198,6 +220,9 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/lineage/objects/{id}
 func (h *AIHandler) Lineage(w http.ResponseWriter, r *http.Request) {
+	if h.aiDegraded(w, r) {
+		return
+	}
 	idStr := chi.URLParam(r, "id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {

@@ -106,12 +106,12 @@ database at `./var/aero.db`.
 
 ### One-command RAG demo
 
-`docker-compose.demo.yml` brings up the full platform plus a local LLM
+`deploy/docker-compose.demo.yml` brings up the full platform plus a local LLM
 ([Ollama](https://ollama.com)), an S3-compatible object store (MinIO), a
 PostgreSQL metadata DB, and an OpenTelemetry collector:
 
 ```bash
-docker compose -f docker-compose.demo.yml up --build
+docker compose -f deploy/docker-compose.demo.yml up --build
 ```
 
 The first run downloads the Ollama models (a few hundred MB up to ~1.3 GB), so
@@ -127,7 +127,7 @@ Models are overridable:
 
 ```bash
 DEMO_CHAT_MODEL=llama3.2:3b DEMO_EMBED_MODEL=nomic-embed-text \
-  docker compose -f docker-compose.demo.yml up --build
+  docker compose -f deploy/docker-compose.demo.yml up --build
 ```
 
 The demo enables AI indexing, hybrid search, Postgres, S3 (MinIO), the job pool,
@@ -242,8 +242,25 @@ make tidy      # go mod tidy
 make docker    # docker build -t aero-vault:dev .
 ```
 
-CI (GitHub Actions) builds, vets, tests, and `gofmt`-checks on every push and
-pull request; see [`.github/workflows/`](.github/workflows).
+The project also ships a **Python engineering CLI** for code-quality gating:
+
+```bash
+# One-time setup
+python3 cli.py setup          # install tools + pre-commit hook
+
+# Daily use
+python3 cli.py check           # quick check (filesize + vet)
+python3 cli.py harness         # full gates (filesize + complexity + arch)
+python3 cli.py accept          # full acceptance suite (HARNESS.md)
+python3 cli.py invariants      # engineering invariants I1–I6
+python3 cli.py adr-compliance  # ADR compliance check
+python3 cli.py diagnose        # system diagnosis
+python3 cli.py health-report   # health report
+```
+
+Thresholds are declared in [`engineering.yaml`](engineering.yaml).
+CI (GitHub Actions) runs the same CLI gates on every push and
+pull request; see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ---
 

@@ -37,26 +37,50 @@ func hasS3GetConditional(r *http.Request) bool {
 		h.Get("If-Modified-Since") != "" || h.Get("If-Unmodified-Since") != ""
 }
 
+func evalIfMatch(etag, header string) bool {
+	return s3ETagListMatches(header, etag)
+}
+
+func evalIfNoneMatch(etag, header string) bool {
+	return !s3ETagListMatches(header, etag)
+}
+
+func evalIfModifiedSince(modTime time.Time, header string) bool {
+	t, err := http.ParseTime(header)
+	if err != nil {
+		return true
+	}
+	return modTime.Truncate(time.Second).After(t)
+}
+
+func evalIfUnmodifiedSince(modTime time.Time, header string) bool {
+	t, err := http.ParseTime(header)
+	if err != nil {
+		return true
+	}
+	return !modTime.Truncate(time.Second).After(t)
+}
+
 // evalS3GetPreconditions evaluates RFC 7232 preconditions for a GET/HEAD and
 // returns the HTTP status to short-circuit with (304 Not Modified or 412
 // Precondition Failed), or 0 to proceed. Precedence per RFC 7232 §6: If-Match,
 // then If-Unmodified-Since, then If-None-Match, then If-Modified-Since.
 func evalS3GetPreconditions(r *http.Request, obj repository.Object) int {
 	if im := r.Header.Get("If-Match"); im != "" {
-		if !s3ETagListMatches(im, obj.ETag) {
+		if !evalIfMatch(obj.ETag, im) {
 			return http.StatusPreconditionFailed
 		}
 	} else if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
-		if t, err := http.ParseTime(ius); err == nil && obj.UpdatedAt.Truncate(time.Second).After(t) {
+		if !evalIfUnmodifiedSince(obj.UpdatedAt, ius) {
 			return http.StatusPreconditionFailed
 		}
 	}
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if s3ETagListMatches(inm, obj.ETag) {
+		if !evalIfNoneMatch(obj.ETag, inm) {
 			return http.StatusNotModified
 		}
 	} else if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		if t, err := http.ParseTime(ims); err == nil && !obj.UpdatedAt.Truncate(time.Second).After(t) {
+		if !evalIfModifiedSince(obj.UpdatedAt, ims) {
 			return http.StatusNotModified
 		}
 	}

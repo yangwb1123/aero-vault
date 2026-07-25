@@ -38,8 +38,16 @@ func Create(outPath, dbPath, objectsRoot string) error {
 	tw := tar.NewWriter(gz)
 	defer tw.Close()
 
-	// DB files: the main database is mandatory — a snapshot without it is a silent
-	// empty backup. The WAL/SHM sidecars are optional (may be checkpointed away).
+	if err := addDBFiles(tw, dbFile); err != nil {
+		return err
+	}
+	if err := addObjectFiles(tw, objectsRoot); err != nil {
+		return err
+	}
+	return nil
+}
+
+func addDBFiles(tw *tar.Writer, dbFile string) error {
 	if _, err := os.Stat(dbFile); err != nil {
 		return fmt.Errorf("snapshot: database file %q not found: %w", dbFile, err)
 	}
@@ -55,8 +63,11 @@ func Create(outPath, dbPath, objectsRoot string) error {
 			return err
 		}
 	}
-	// Object root
-	err = filepath.Walk(objectsRoot, func(path string, info os.FileInfo, walkErr error) error {
+	return nil
+}
+
+func addObjectFiles(tw *tar.Writer, objectsRoot string) error {
+	err := filepath.Walk(objectsRoot, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -82,7 +93,23 @@ func Restore(snapPath, dbPath, objectsRoot string) error {
 	if dbFile == "" {
 		return errors.New("snapshot: cannot derive sqlite file from DSN")
 	}
-	f, err := os.Open(snapPath)
+	if err := validateSnapshot(snapPath); err != nil {
+		return err
+	}
+	return unpackSnapshot(snapPath, dbFile, objectsRoot)
+}
+
+func validateSnapshot(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	return nil
+}
+
+func unpackSnapshot(src, dbFile, objectsRoot string) error {
+	f, err := os.Open(src)
 	if err != nil {
 		return err
 	}

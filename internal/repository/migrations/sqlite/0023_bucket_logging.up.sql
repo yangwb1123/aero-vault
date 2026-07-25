@@ -1,0 +1,2 @@
+ALTER TABLE buckets ADD COLUMN logging_target TEXT NOT NULL DEFAULT '';
+ALTER TABLE buckets ADD COLUMN logging_prefix TEXT NOT NULL DEFAULT '';

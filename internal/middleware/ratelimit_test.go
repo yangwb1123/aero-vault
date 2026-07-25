@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -252,6 +253,76 @@ func TestStart_BackgroundEviction(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("background sweep did not evict stale bucket within 100ms")
+}
+
+// TestAllow_MapNeverExceedsMax verifies the bucket map stays bounded at
+// rlMaxBuckets even when it is full of *active* buckets (so eviction frees
+// nothing). The next distinct tenant must be rejected rather than admitted past
+// the cap. Regression test for the off-by-one that let the map reach
+// rlMaxBuckets+1.
+func TestAllow_MapNeverExceedsMax(t *testing.T) {
+	rl := NewRateLimiter(1e-9, 5)
+
+	// Fill the map to exactly rlMaxBuckets with fresh (active) buckets so
+	// evictIdle reclaims nothing.
+	now := time.Now()
+	rl.mu.Lock()
+	for i := 0; i < rlMaxBuckets; i++ {
+		rl.buckets["t"+strconv.Itoa(i)] = &bucket{tokens: rl.burst, last: now}
+	}
+	rl.mu.Unlock()
+
+	// A brand-new tenant must be refused (map is full of active buckets).
+	ok, wait := rl.Allow("overflow")
+	if ok {
+		t.Fatal("new tenant should be rejected when the map is full of active buckets")
+	}
+	if wait <= 0 {
+		t.Fatalf("rejected request should report a positive retry wait, got %v", wait)
+	}
+
+	rl.mu.Lock()
+	n := len(rl.buckets)
+	_, admitted := rl.buckets["overflow"]
+	rl.mu.Unlock()
+	if admitted {
+		t.Fatal("overflow tenant must not be added to the map")
+	}
+	if n > rlMaxBuckets {
+		t.Fatalf("bucket map grew to %d, must never exceed rlMaxBuckets=%d", n, rlMaxBuckets)
+	}
+}
+
+// TestAllow_AdmitsAfterEvictionFreesSlot verifies that when the map is full but
+// some buckets are idle, eviction reclaims room and the new tenant is admitted.
+func TestAllow_AdmitsAfterEvictionFreesSlot(t *testing.T) {
+	rl := NewRateLimiter(1e-9, 5)
+
+	now := time.Now()
+	stale := now.Add(-rlIdleTTL - time.Minute)
+	rl.mu.Lock()
+	// One short of the cap with active buckets, plus one idle bucket to reach
+	// the cap. Eviction drops the idle one, freeing a slot.
+	for i := 0; i < rlMaxBuckets-1; i++ {
+		rl.buckets["t"+strconv.Itoa(i)] = &bucket{tokens: rl.burst, last: now}
+	}
+	rl.buckets["idle"] = &bucket{tokens: rl.burst, last: stale}
+	rl.mu.Unlock()
+
+	ok, _ := rl.Allow("newcomer")
+	if !ok {
+		t.Fatal("newcomer should be admitted after eviction frees an idle slot")
+	}
+	rl.mu.Lock()
+	n := len(rl.buckets)
+	_, idleGone := rl.buckets["idle"]
+	rl.mu.Unlock()
+	if idleGone {
+		t.Fatal("idle bucket should have been evicted")
+	}
+	if n > rlMaxBuckets {
+		t.Fatalf("bucket map grew to %d, must never exceed rlMaxBuckets=%d", n, rlMaxBuckets)
+	}
 }
 
 func TestMiddleware_PerTenantBuckets(t *testing.T) {

@@ -2,11 +2,10 @@ package rest
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
@@ -21,8 +21,9 @@ import (
 
 // Handler binds REST routes to the FileService.
 type Handler struct {
-	svc    *service.FileService
-	logger *slog.Logger
+	svc          *service.FileService
+	logger       *slog.Logger
+	corsProvider mw.BucketCORSProvider
 }
 
 func NewHandler(svc *service.FileService, logger *slog.Logger) *Handler {
@@ -32,17 +33,49 @@ func NewHandler(svc *service.FileService, logger *slog.Logger) *Handler {
 	return &Handler{svc: svc, logger: logger}
 }
 
+// WithCORSProvider attaches a BucketCORSProvider for cache invalidation on
+// CORS rule updates. Returns the handler for fluent wiring.
+func (h *Handler) WithCORSProvider(p mw.BucketCORSProvider) *Handler {
+	h.corsProvider = p
+	return h
+}
+
 func keyFromPath(r *http.Request) string {
-	// chi wildcard match comes back as "*" param.
 	k := chi.URLParam(r, "*")
 	return strings.TrimPrefix(k, "/")
 }
 
+// checkBucketPolicy loads the bucket policy and denies the request when the
+// action is not allowed. Returns true when the request may proceed.
+func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, action string) bool {
+	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket)
+	if err != nil || cfg.Policy == "" {
+		return true
+	}
+	p, perr := auth.ParsePolicy(cfg.Policy)
+	if perr != nil {
+		h.logger.Warn("bucket policy parse error, skipping enforcement", "bucket", service.DefaultBucket, "err", perr)
+		return true
+	}
+	host, _, splitErr := net.SplitHostPort(r.RemoteAddr)
+	if splitErr != nil {
+		host = r.RemoteAddr
+	}
+	if !auth.Allowed(p, action, host) {
+		h.writeError(w, r, service.ErrForbidden)
+		return false
+	}
+	return true
+}
+
+// ── Core CRUD ──────────────────────────────────────────────────────────────────
+
 // PUT /v1/files/*key — raw upload.
 func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
-	// Write preconditions: If-Match (overwrite-if-matches) / If-None-Match:*
-	// (create-only) for optimistic concurrency.
+	if !h.checkBucketPolicy(w, r, "s3:PutObject") {
+		return
+	}
 	if r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != "" {
 		cur, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key)
 		if !h.checkWritePreconditions(w, r, cur, err == nil) {
@@ -52,7 +85,13 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	size := r.ContentLength
 	ct := r.Header.Get("Content-Type")
 	meta := extractMetadataHeaders(r.Header)
-	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, r.Body, size, service.PutOptions{ContentType: ct, Metadata: meta})
+	meta = addContentHeaders(meta, r.Header)
+	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, r.Body, size, service.PutOptions{
+		ContentType:  ct,
+		Metadata:     meta,
+		ContentMD5:   r.Header.Get("Content-MD5"),
+		StorageClass: r.Header.Get("x-amz-storage-class"),
+	})
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -77,11 +116,13 @@ func (h *Handler) PostForm(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		key = header.Filename
 	}
+	if !h.checkBucketPolicy(w, r, "s3:PutObject") {
+		return
+	}
 	ct := header.Header.Get("Content-Type")
 	if ct == "" {
 		ct = mime.TypeByExtension(strings.ToLower(extOf(header.Filename)))
 	}
-
 	var metadata map[string]string
 	if raw := r.FormValue("metadata"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
@@ -89,8 +130,12 @@ func (h *Handler) PostForm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, file, header.Size, service.PutOptions{ContentType: ct, Metadata: metadata})
+	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, file, header.Size, service.PutOptions{
+		ContentType:  ct,
+		Metadata:     addContentHeaders(metadata, r.Header),
+		ContentMD5:   r.Header.Get("Content-MD5"),
+		StorageClass: r.Header.Get("x-amz-storage-class"),
+	})
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -101,6 +146,9 @@ func (h *Handler) PostForm(w http.ResponseWriter, r *http.Request) {
 // GET /v1/files/*key — download. Supports ?version=ID for historical versions.
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
+	if !h.checkBucketPolicy(w, r, "s3:GetObject") {
+		return
+	}
 	if !h.allowAnonymous(w, r, key) {
 		return
 	}
@@ -109,26 +157,10 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant := mw.TenantFrom(r.Context())
-	// Conditional (304) and Range (206) both need the object's metadata first.
 	if hasConditional(r) {
 		if obj, err := h.svc.Stat(r.Context(), tenant, service.DefaultBucket, key); err == nil {
-			if notModified(r, obj) {
-				w.Header().Set("ETag", `"`+obj.ETag+`"`)
-				w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-				w.WriteHeader(http.StatusNotModified)
+			if h.handleConditional(w, r, obj) {
 				return
-			}
-			if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
-				off, length, ok, unsat := service.ParseByteRange(rangeHdr, obj.Size)
-				if unsat {
-					w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(obj.Size, 10))
-					h.writeError(w, r, service.ErrRangeNotSatisfiable)
-					return
-				}
-				if ok {
-					h.serveRange(w, r, tenant, key, obj, off, length)
-					return
-				}
 			}
 		}
 	}
@@ -138,43 +170,15 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.Close()
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("ETag", `"`+obj.ETag+`"`)
-	if obj.ContentType != "" {
-		w.Header().Set("Content-Type", obj.ContentType)
-	}
-	if obj.Size > 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
-	}
-	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	writeMetadataHeaders(w, obj.Metadata)
-	_, _ = io.Copy(w, rc)
-}
-
-// serveRange streams a single byte range as 206 Partial Content.
-func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, tenant, key string, obj repository.Object, off, length int64) {
-	rc, _, err := h.svc.GetRange(r.Context(), tenant, service.DefaultBucket, key, off, length)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	defer rc.Close()
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("ETag", `"`+obj.ETag+`"`)
-	if obj.ContentType != "" {
-		w.Header().Set("Content-Type", obj.ContentType)
-	}
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+length-1, obj.Size))
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	writeMetadataHeaders(w, obj.Metadata)
-	w.WriteHeader(http.StatusPartialContent)
-	_, _ = io.Copy(w, rc)
+	h.handleRangeOrFull(w, r, rc, obj)
 }
 
 // HEAD /v1/files/*key
 func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
+	if !h.checkBucketPolicy(w, r, "s3:GetObject") {
+		return
+	}
 	if !h.allowAnonymous(w, r, key) {
 		return
 	}
@@ -197,12 +201,18 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 	writeMetadataHeaders(w, obj.Metadata)
+	writeContentMD5(w, obj.Metadata)
+	writeContentResponseHeaders(w, obj.Metadata)
+	writeStorageClass(w, obj.StorageClass)
 	w.WriteHeader(http.StatusOK)
 }
 
 // DELETE /v1/files/*key
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
+	if !h.checkBucketPolicy(w, r, "s3:DeleteObject") {
+		return
+	}
 	hard := r.URL.Query().Get("hard") == "1"
 	if err := h.svc.Delete(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, hard); err != nil {
 		h.writeError(w, r, err)
@@ -213,11 +223,20 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/files — list.
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	if !h.checkBucketPolicy(w, r, "s3:ListBucket") {
+		return
+	}
 	q := r.URL.Query()
 	prefix := q.Get("prefix")
 	marker := q.Get("marker")
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	page, err := h.svc.List(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, marker, limit)
+	var page repository.ListPage
+	var err error
+	if q.Get("deleted") == "true" {
+		page, err = h.svc.ListDeleted(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, marker, limit)
+	} else {
+		page, err = h.svc.List(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, marker, limit)
+	}
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -228,6 +247,8 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, out)
 }
+
+// ── Presign & Multipart ────────────────────────────────────────────────────────
 
 // POST /v1/files/*key/presign?op=get|put&expires=<seconds>
 func (h *Handler) Presign(w http.ResponseWriter, r *http.Request) {
@@ -315,76 +336,4 @@ func (h *Handler) AbortMultipart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) {
-	code, message, status := classify(err)
-	writeJSON(w, status, errorBody{Error: errorPayload{
-		Code: code, Message: message, RequestID: mw.RequestIDFrom(r.Context()),
-	}})
-}
-
-func classify(err error) (string, string, int) {
-	if code, msg, status, ok := classifyLock(err); ok {
-		return code, msg, status
-	}
-	switch {
-	case errors.Is(err, service.ErrQuotaExceeded):
-		return "QuotaExceeded", err.Error(), http.StatusInsufficientStorage
-	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):
-		return "NotFound", "object not found", http.StatusNotFound
-	case errors.Is(err, service.ErrUploadNotFound), errors.Is(err, repository.ErrUploadNotFound):
-		return "NoSuchUpload", "upload not found", http.StatusNotFound
-	case errors.Is(err, service.ErrInvalidArgs):
-		return "InvalidArgument", err.Error(), http.StatusBadRequest
-	case errors.Is(err, service.ErrRangeNotSatisfiable):
-		return "InvalidRange", "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable
-	case errors.Is(err, service.ErrPreconditionFailed):
-		return "PreconditionFailed", "precondition failed", http.StatusPreconditionFailed
-	case errors.Is(err, service.ErrForbidden):
-		return "AccessDenied", "access denied", http.StatusForbidden
-	default:
-		return "InternalError", err.Error(), http.StatusInternalServerError
-	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-// writeMetadataHeaders emits stored user metadata as X-Meta-<key> response headers
-// (the inverse of extractMetadataHeaders), so GET/HEAD return the metadata a PUT
-// stored — previously it was write-only.
-func writeMetadataHeaders(w http.ResponseWriter, meta map[string]string) {
-	for k, v := range meta {
-		w.Header().Set("X-Meta-"+k, v)
-	}
-}
-
-// extractMetadataHeaders pulls user-metadata from X-Amz-Meta-* and X-Meta-*.
-func extractMetadataHeaders(h http.Header) map[string]string {
-	out := map[string]string{}
-	for k, v := range h {
-		lower := strings.ToLower(k)
-		switch {
-		case strings.HasPrefix(lower, "x-amz-meta-"):
-			out[strings.TrimPrefix(lower, "x-amz-meta-")] = strings.Join(v, ",")
-		case strings.HasPrefix(lower, "x-meta-"):
-			out[strings.TrimPrefix(lower, "x-meta-")] = strings.Join(v, ",")
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func extOf(name string) string {
-	i := strings.LastIndex(name, ".")
-	if i < 0 {
-		return ""
-	}
-	return name[i:]
 }

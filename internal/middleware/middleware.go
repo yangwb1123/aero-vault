@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -103,6 +104,65 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 // Auth is the placeholder authentication middleware.
 func Auth(next http.Handler) http.Handler { return next }
 
+// ConcurrencyLimiter limits in-flight requests by a weighted buffered channel
+// (a counting semaphore). GET/HEAD/OPTIONS cost 1; PUT/POST/DELETE cost 2.
+// When full, new requests get 429 Too Many Requests with Retry-After: 1.
+// A max of 0 or less disables limiting entirely (zero-cost pass-through).
+type ConcurrencyLimiter struct {
+	sem chan struct{}
+}
+
+// NewConcurrencyLimiter creates a limiter that allows up to max weighted units.
+func NewConcurrencyLimiter(max int) *ConcurrencyLimiter {
+	if max <= 0 {
+		return &ConcurrencyLimiter{}
+	}
+	return &ConcurrencyLimiter{sem: make(chan struct{}, max)}
+}
+
+func reqWeight(method string) int {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// Middleware wraps an http.Handler with concurrency limiting.
+func (cl *ConcurrencyLimiter) Middleware() func(http.Handler) http.Handler {
+	if cl.sem == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cost := reqWeight(r.Method)
+			// Non-blocking acquire of all slots at once.
+			acquired := 0
+			for i := 0; i < cost; i++ {
+				select {
+				case cl.sem <- struct{}{}:
+					acquired++
+				default:
+					// Failed to acquire all; release what we got.
+					for j := 0; j < acquired; j++ {
+						<-cl.sem
+					}
+					w.Header().Set("Retry-After", "1")
+					http.Error(w, "too many concurrent requests", http.StatusTooManyRequests)
+					return
+				}
+			}
+			defer func() {
+				for i := 0; i < cost; i++ {
+					<-cl.sem
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -126,5 +186,83 @@ func (s *statusWriter) Write(b []byte) (int, error) {
 func (s *statusWriter) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+// PerTenantConcurrencyLimiter extends concurrency limiting with per-tenant
+// tracking so a single misbehaving tenant can't exhaust the global pool.
+type PerTenantConcurrencyLimiter struct {
+	global    *ConcurrencyLimiter
+	perTenant int
+	inflight  map[string]int
+	mu        sync.Mutex
+}
+
+// NewPerTenantConcurrencyLimiter creates a combined global + per-tenant limiter.
+func NewPerTenantConcurrencyLimiter(globalMax, perTenantMax int) *PerTenantConcurrencyLimiter {
+	return &PerTenantConcurrencyLimiter{
+		global:    NewConcurrencyLimiter(globalMax),
+		perTenant: perTenantMax,
+		inflight:  make(map[string]int),
+	}
+}
+
+// Middleware returns an HTTP middleware that enforces both limits.
+func (pt *PerTenantConcurrencyLimiter) Middleware() func(http.Handler) http.Handler {
+	if pt.global == nil || pt.global.sem == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cost := reqWeight(r.Method)
+			tenant := TenantFrom(r.Context())
+
+			// Acquire global slot(s) first.
+			acquired := 0
+			for i := 0; i < cost; i++ {
+				select {
+				case pt.global.sem <- struct{}{}:
+					acquired++
+				default:
+					for j := 0; j < acquired; j++ {
+						<-pt.global.sem
+					}
+					w.Header().Set("Retry-After", "1")
+					http.Error(w, "too many concurrent requests", http.StatusTooManyRequests)
+					return
+				}
+			}
+
+			// Check per-tenant budget.
+			if pt.perTenant > 0 {
+				pt.mu.Lock()
+				if pt.inflight[tenant] >= pt.perTenant {
+					pt.mu.Unlock()
+					for i := 0; i < cost; i++ {
+						<-pt.global.sem
+					}
+					w.Header().Set("Retry-After", "1")
+					http.Error(w, "tenant has too many concurrent requests", http.StatusTooManyRequests)
+					return
+				}
+				pt.inflight[tenant] += cost
+				pt.mu.Unlock()
+			}
+
+			defer func() {
+				for i := 0; i < cost; i++ {
+					<-pt.global.sem
+				}
+				if pt.perTenant > 0 {
+					pt.mu.Lock()
+					pt.inflight[tenant] -= cost
+					if pt.inflight[tenant] <= 0 {
+						delete(pt.inflight, tenant)
+					}
+					pt.mu.Unlock()
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
 	}
 }

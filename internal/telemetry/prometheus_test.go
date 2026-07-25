@@ -13,6 +13,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/metric"
 )
 
 // promOnce holds the result of the single EnablePrometheus() call shared across
@@ -30,6 +33,43 @@ func TestEnablePrometheus_ReturnsHandler(t *testing.T) {
 	}
 	if sharedPromHandler == nil {
 		t.Fatal("EnablePrometheus returned nil handler")
+	}
+}
+
+// TestEnablePrometheus_InstalledSDKProvider verifies that the single
+// EnablePrometheus() call made by TestMain (with OTLP disabled, so no SDK
+// provider was pre-installed) installed an SDK *metric.MeterProvider globally,
+// so domain metrics surface at /metrics.
+func TestEnablePrometheus_InstalledSDKProvider(t *testing.T) {
+	if sharedPromErr != nil {
+		t.Skip("EnablePrometheus errored during setup")
+	}
+	if _, ok := otel.GetMeterProvider().(*metric.MeterProvider); !ok {
+		t.Fatalf("expected global meter provider to be *metric.MeterProvider after EnablePrometheus on the no-OTLP path, got %T", otel.GetMeterProvider())
+	}
+}
+
+// TestEnablePrometheus_PreservesExistingOTLPProvider verifies the guard that
+// prevents EnablePrometheus from clobbering an OTLP provider Setup installed.
+// The SDK can't merge a second reader onto a live provider, so when one is
+// already present EnablePrometheus must leave it in place. We assert the global
+// provider identity is unchanged across a second call (which fails on duplicate
+// Prometheus registration but must never swap the provider).
+func TestEnablePrometheus_PreservesExistingOTLPProvider(t *testing.T) {
+	before, ok := otel.GetMeterProvider().(*metric.MeterProvider)
+	if !ok {
+		t.Skip("no SDK meter provider installed; guard not exercisable")
+	}
+	// A second call: prometheus.New re-registers the same collector with the
+	// default registerer and returns an error, but the global provider must be
+	// untouched regardless of which branch is reached.
+	_, _ = EnablePrometheus()
+	after, ok := otel.GetMeterProvider().(*metric.MeterProvider)
+	if !ok {
+		t.Fatalf("global meter provider was replaced with a non-SDK provider")
+	}
+	if before != after {
+		t.Fatalf("EnablePrometheus replaced the existing meter provider (OTLP export would be lost): before=%p after=%p", before, after)
 	}
 }
 

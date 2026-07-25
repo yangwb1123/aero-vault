@@ -289,6 +289,62 @@ func TestObjectACL(t *testing.T) {
 	}
 }
 
+func TestS3ContentMD5RoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	const md5b64 = "XrY7u+Ae7tCTyyK7j1rNww==" // "hello world" MD5 base64
+	base := s.URL + "/bucket/md5test.txt"
+
+	// PUT with Content-MD5.
+	resp, _ := do(t, "PUT", base, []byte("hello world"), map[string]string{
+		"Content-MD5": md5b64,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT: status=%d want 200", resp.StatusCode)
+	}
+
+	// GET should echo x-amz-checksum-md5.
+	resp, body := do(t, "GET", base, nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET: status=%d want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("x-amz-checksum-md5") != md5b64 {
+		t.Errorf("GET: x-amz-checksum-md5=%q want %q", resp.Header.Get("x-amz-checksum-md5"), md5b64)
+	}
+	if string(body) != "hello world" {
+		t.Errorf("GET: body=%q want %q", body, "hello world")
+	}
+
+	// HEAD should also echo x-amz-checksum-md5.
+	resp, body = do(t, "HEAD", base, nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("HEAD: status=%d want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("x-amz-checksum-md5") != md5b64 {
+		t.Errorf("HEAD: x-amz-checksum-md5=%q want %q", resp.Header.Get("x-amz-checksum-md5"), md5b64)
+	}
+	if len(body) != 0 {
+		t.Errorf("HEAD: body should be empty, got %q", body)
+	}
+
+	// PUT without Content-MD5 header.
+	resp, _ = do(t, "PUT", s.URL+"/bucket/nomd5.txt", []byte("data"), nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT no-md5: status=%d want 200", resp.StatusCode)
+	}
+	resp, body = do(t, "GET", s.URL+"/bucket/nomd5.txt", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET no-md5: status=%d want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("x-amz-checksum-md5") != "" {
+		t.Errorf("GET without MD5: x-amz-checksum-md5 should be empty, got %q", resp.Header.Get("x-amz-checksum-md5"))
+	}
+
+	// System _aero_ prefix should not leak into x-amz-meta-* headers.
+	if v := resp.Header.Get("x-amz-meta-_aero-content-md5"); v != "" {
+		t.Errorf("system metadata should not be leaked: x-amz-meta-_aero-content-md5=%q", v)
+	}
+}
+
 func TestRangeRequests(t *testing.T) {
 	s := newTestServer(t)
 	base := s.URL
@@ -745,5 +801,47 @@ func TestListObjectsV1Pagination(t *testing.T) {
 	}
 	if len(p2.Contents) != 1 {
 		t.Fatalf("page2 expected 1 content, got %d: %s", len(p2.Contents), body)
+	}
+}
+
+func TestBucketPolicyEnforcement(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL + "/bucket"
+
+	// Create bucket by PUTting an object first.
+	resp, _ := do(t, "PUT", base+"/init.txt", []byte("init"), nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("init: status=%d", resp.StatusCode)
+	}
+
+	// Set a policy: allow all, but deny GetObject from 127.0.0.1 (our test client).
+	policy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:*"},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Condition":{"IpAddress":{"aws:SourceIp":["127.0.0.1/32"]}}}]}`
+	resp, _ = do(t, "PUT", base+"/?policy", []byte(policy), nil)
+	if resp.StatusCode != 204 {
+		t.Fatalf("PUT policy: status=%d want 204", resp.StatusCode)
+	}
+
+	// GET should be denied (403) because our source IP matches the Deny.
+	resp, _ = do(t, "GET", base+"/init.txt", nil, nil)
+	if resp.StatusCode != 403 {
+		t.Fatalf("GET after Deny policy: status=%d want 403", resp.StatusCode)
+	}
+
+	// PUT should still work (only GetObject was denied).
+	resp, _ = do(t, "PUT", base+"/new.txt", []byte("new"), nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT after Deny policy: status=%d want 200", resp.StatusCode)
+	}
+
+	// Clear the policy.
+	resp, _ = do(t, "DELETE", base+"/?policy", nil, nil)
+	if resp.StatusCode != 204 {
+		t.Fatalf("DELETE policy: status=%d want 204", resp.StatusCode)
+	}
+
+	// GET should work again.
+	resp, _ = do(t, "GET", base+"/init.txt", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET after policy cleared: status=%d want 200", resp.StatusCode)
 	}
 }

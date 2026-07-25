@@ -11,6 +11,12 @@ import (
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
+// ChunkCleaner is the minimal interface RetentionJob needs to clean up AI
+// chunks when purging soft-deleted objects. Satisfied by *ai.Indexer.
+type ChunkCleaner interface {
+	DeleteObjectChunks(ctx context.Context, objectID int64) error
+}
+
 // RetentionJob permanently purges rows that have been soft-deleted for longer
 // than a retention window, together with their backing blobs. Without it,
 // soft-deleted rows (and their blobs) accumulate forever. It mirrors
@@ -19,13 +25,14 @@ import (
 const leaseRetentionGC = "retention-gc"
 
 type RetentionJob struct {
-	repo      repository.Repository
-	store     storage.Storage
-	interval  time.Duration
-	retention time.Duration
-	idemTTL   time.Duration
-	singleton *cluster.Singleton
-	logger    *slog.Logger
+	repo         repository.Repository
+	store        storage.Storage
+	interval     time.Duration
+	retention    time.Duration
+	idemTTL      time.Duration
+	singleton    *cluster.Singleton
+	chunkCleaner ChunkCleaner
+	logger       *slog.Logger
 }
 
 func NewRetention(repo repository.Repository, store storage.Storage, interval time.Duration, retention time.Duration, logger *slog.Logger) *RetentionJob {
@@ -46,6 +53,14 @@ func (r *RetentionJob) WithIdempotencyTTL(ttl time.Duration) *RetentionJob {
 // replica at a time, gated by a repository lease held by `holder`.
 func (r *RetentionJob) WithClusterSingleton(holder string) *RetentionJob {
 	r.singleton.Enable(holder)
+	return r
+}
+
+// WithChunkCleaner attaches a ChunkCleaner so that AI chunks are removed when
+// soft-deleted objects are permanently purged. Without this, chunks orphaned
+// by retention GC remain searchable indefinitely.
+func (r *RetentionJob) WithChunkCleaner(cc ChunkCleaner) *RetentionJob {
+	r.chunkCleaner = cc
 	return r
 }
 
@@ -107,20 +122,34 @@ func (r *RetentionJob) purgeSoftDeleted(ctx context.Context) {
 	}
 	purged := 0
 	for _, obj := range objs {
-		if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
-			continue // can't purge while object lock is active
+		if r.purgeOneSoftDeleted(ctx, obj) {
+			purged++
 		}
-		if err := r.store.Delete(ctx, obj.StorageKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			r.logger.Warn("retention storage delete", "key", obj.Key, "err", err)
-			continue
-		}
-		if err := r.repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err != nil {
-			r.logger.Warn("retention hard delete", "key", obj.Key, "err", err)
-			continue
-		}
-		purged++
 	}
 	if purged > 0 {
-		r.logger.Info("retention sweep", "purged", purged)
+		r.logger.Info("retention sweep", "chunk_cleanup_enabled", r.chunkCleaner != nil, "purged", purged)
 	}
+}
+
+// purgeOneSoftDeleted attempts to permanently remove one soft-deleted object.
+// Returns true when the object was purged. Does NOT fail on chunk cleanup or
+// storage delete errors (best-effort).
+func (r *RetentionJob) purgeOneSoftDeleted(ctx context.Context, obj repository.Object) bool {
+	if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
+		return false
+	}
+	if r.chunkCleaner != nil {
+		if err := r.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
+			r.logger.Warn("retention chunk cleanup", "id", obj.ID, "key", obj.Key, "err", err)
+		}
+	}
+	if err := r.store.Delete(ctx, obj.StorageKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		r.logger.Warn("retention storage delete", "key", obj.Key, "err", err)
+		return false
+	}
+	if err := r.repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err != nil {
+		r.logger.Warn("retention hard delete", "key", obj.Key, "err", err)
+		return false
+	}
+	return true
 }

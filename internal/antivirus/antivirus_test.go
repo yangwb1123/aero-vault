@@ -126,3 +126,33 @@ func TestWorkerNoQuarantineKeepsButTags(t *testing.T) {
 		t.Fatalf("expected infected tags, got %v", got.Tags)
 	}
 }
+
+func TestSignatureScannerName(t *testing.T) {
+	s := NewSignatureScanner(nil)
+	if s.Name() != "signature" {
+		t.Fatalf("expected 'signature', got %q", s.Name())
+	}
+}
+
+func TestEncodeDecodeObjectID(t *testing.T) {
+	payload := EncodeObjectID(42)
+	if payload == "" {
+		t.Fatal("expected non-empty payload")
+	}
+	id, err := DecodeObjectID(payload)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if id != 42 {
+		t.Fatalf("expected 42, got %d", id)
+	}
+}
+
+func TestDecodeObjectID_Invalid(t *testing.T) {
+	if _, err := DecodeObjectID(`{"object_id":0}`); err == nil {
+		t.Fatal("expected error for missing object_id")
+	}
+	if _, err := DecodeObjectID(`not json`); err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}

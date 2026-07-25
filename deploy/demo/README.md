@@ -4,7 +4,7 @@ One command brings up the whole platform with a local LLM, S3-compatible
 storage, a Postgres metadata DB, and an OpenTelemetry collector.
 
 ```bash
-docker compose -f docker-compose.demo.yml up --build
+docker compose -f deploy/docker-compose.demo.yml up --build
 ```
 
 | Service        | Role                                   | URL / Port                          |
@@ -56,5 +56,5 @@ python -c "from aero_vault import Client; print(Client().chat('what is aero-vaul
 ## Teardown
 
 ```bash
-docker compose -f docker-compose.demo.yml down -v   # -v also drops volumes
+docker compose -f deploy/docker-compose.demo.yml down -v   # -v also drops volumes
 ```

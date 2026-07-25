@@ -107,14 +107,17 @@ type completeMultipartUploadResult struct {
 }
 
 type listPartsResult struct {
-	XMLName      xml.Name       `xml:"ListPartsResult"`
-	Xmlns        string         `xml:"xmlns,attr"`
-	Bucket       string         `xml:"Bucket"`
-	Key          string         `xml:"Key"`
-	UploadID     string         `xml:"UploadId"`
-	StorageClass string         `xml:"StorageClass"`
-	IsTruncated  bool           `xml:"IsTruncated"`
-	Parts        []listPartItem `xml:"Part"`
+	XMLName              xml.Name       `xml:"ListPartsResult"`
+	Xmlns                string         `xml:"xmlns,attr"`
+	Bucket               string         `xml:"Bucket"`
+	Key                  string         `xml:"Key"`
+	UploadID             string         `xml:"UploadId"`
+	StorageClass         string         `xml:"StorageClass"`
+	PartNumberMarker     int32          `xml:"PartNumberMarker"`
+	NextPartNumberMarker int32          `xml:"NextPartNumberMarker"`
+	MaxParts             int            `xml:"MaxParts"`
+	IsTruncated          bool           `xml:"IsTruncated"`
+	Parts                []listPartItem `xml:"Part"`
 }
 
 type listPartItem struct {
@@ -124,11 +127,17 @@ type listPartItem struct {
 }
 
 type listMultipartUploadsResult struct {
-	XMLName xml.Name         `xml:"ListMultipartUploadsResult"`
-	Xmlns   string           `xml:"xmlns,attr"`
-	Bucket  string           `xml:"Bucket"`
-	Prefix  string           `xml:"Prefix"`
-	Uploads []uploadListItem `xml:"Upload"`
+	XMLName            xml.Name         `xml:"ListMultipartUploadsResult"`
+	Xmlns              string           `xml:"xmlns,attr"`
+	Bucket             string           `xml:"Bucket"`
+	Prefix             string           `xml:"Prefix"`
+	KeyMarker          string           `xml:"KeyMarker"`
+	UploadIDMarker     string           `xml:"UploadIdMarker"`
+	NextKeyMarker      string           `xml:"NextKeyMarker"`
+	NextUploadIDMarker string           `xml:"NextUploadIdMarker"`
+	MaxUploads         int              `xml:"MaxUploads"`
+	IsTruncated        bool             `xml:"IsTruncated"`
+	Uploads            []uploadListItem `xml:"Upload"`
 }
 
 type uploadListItem struct {
@@ -238,15 +247,18 @@ type objectLockRetention struct {
 
 // listVersionsResult is the body of GET /{bucket}?versions.
 type listVersionsResult struct {
-	XMLName       xml.Name       `xml:"ListVersionsResult"`
-	Xmlns         string         `xml:"xmlns,attr"`
-	Name          string         `xml:"Name"`
-	Prefix        string         `xml:"Prefix"`
-	KeyMarker     string         `xml:"KeyMarker"`
-	NextKeyMarker string         `xml:"NextKeyMarker,omitempty"`
-	MaxKeys       int            `xml:"MaxKeys"`
-	IsTruncated   bool           `xml:"IsTruncated"`
-	Versions      []versionEntry `xml:"Version"`
+	XMLName             xml.Name       `xml:"ListVersionsResult"`
+	Xmlns               string         `xml:"xmlns,attr"`
+	Name                string         `xml:"Name"`
+	Prefix              string         `xml:"Prefix"`
+	KeyMarker           string         `xml:"KeyMarker"`
+	VersionIdMarker     string         `xml:"VersionIdMarker,omitempty"`
+	NextKeyMarker       string         `xml:"NextKeyMarker,omitempty"`
+	NextVersionIdMarker string         `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int            `xml:"MaxKeys"`
+	IsTruncated         bool           `xml:"IsTruncated"`
+	Versions            []versionEntry `xml:"Version"`
+	DeleteMarkers       []versionEntry `xml:"DeleteMarker,omitempty"`
 }
 
 type versionEntry struct {
@@ -293,30 +305,41 @@ func policyToCanned(p accessControlPolicy) string {
 	for _, g := range p.Grants {
 		switch g.Grantee.URI {
 		case allUsersURI:
-			switch g.Permission {
-			case "READ":
-				allUsersRead = true
-			case "WRITE":
-				allUsersWrite = true
-			case "FULL_CONTROL":
-				allUsersRead, allUsersWrite = true, true
-			}
+			allUsersRead, allUsersWrite = allUsersPermission(g.Permission, allUsersRead, allUsersWrite)
 		case authUsersURI:
-			if g.Permission == "READ" || g.Permission == "FULL_CONTROL" {
-				authRead = true
-			}
+			authRead = authRead || authUserPermission(g.Permission)
 		}
 	}
-	switch {
-	case allUsersRead && allUsersWrite:
-		return "public-read-write"
-	case allUsersRead:
-		return "public-read"
-	case authRead:
-		return "authenticated-read"
-	default:
-		return "private"
+	return cannedFromFlags(allUsersRead, allUsersWrite, authRead)
+}
+
+func allUsersPermission(perm string, curRead, curWrite bool) (bool, bool) {
+	switch perm {
+	case "READ":
+		return true, curWrite
+	case "WRITE":
+		return curRead, true
+	case "FULL_CONTROL":
+		return true, true
 	}
+	return curRead, curWrite
+}
+
+func authUserPermission(perm string) bool {
+	return perm == "READ" || perm == "FULL_CONTROL"
+}
+
+func cannedFromFlags(allUsersRead, allUsersWrite, authRead bool) string {
+	if allUsersRead && allUsersWrite {
+		return "public-read-write"
+	}
+	if allUsersRead {
+		return "public-read"
+	}
+	if authRead {
+		return "authenticated-read"
+	}
+	return "private"
 }
 
 // locationConstraint is the body of GET /{bucket}?location. aero-vault is
@@ -325,4 +348,91 @@ type locationConstraint struct {
 	XMLName  xml.Name `xml:"LocationConstraint"`
 	Xmlns    string   `xml:"xmlns,attr"`
 	Location string   `xml:",chardata"`
+}
+
+// --- Bucket CORS ---
+
+type corsRule struct {
+	XMLName        xml.Name `xml:"CORSRule"`
+	AllowedOrigins []string `xml:"AllowedOrigins"`
+	AllowedMethods []string `xml:"AllowedMethods"`
+	AllowedHeaders []string `xml:"AllowedHeaders"`
+	ExposeHeaders  []string `xml:"ExposeHeaders"`
+	MaxAgeSeconds  int      `xml:"MaxAgeSeconds"`
+}
+
+type corsConfiguration struct {
+	XMLName xml.Name   `xml:"CORSConfiguration"`
+	Xmlns   string     `xml:"xmlns,attr,omitempty"`
+	Rules   []corsRule `xml:"CORSRule"`
+}
+
+type corsInput struct {
+	XMLName xml.Name   `xml:"CORSConfiguration"`
+	Rules   []corsRule `xml:"CORSRule"`
+}
+
+// Server access logging types.
+type bucketLoggingStatus struct {
+	XMLName xml.Name       `xml:"BucketLoggingStatus"`
+	Logging loggingEnabled `xml:"LoggingEnabled"`
+}
+
+type loggingEnabled struct {
+	XMLName      xml.Name `xml:"LoggingEnabled"`
+	TargetBucket string   `xml:"TargetBucket"`
+	TargetPrefix string   `xml:"TargetPrefix"`
+	TargetGrants []grant  `xml:"TargetGrants>Grant,omitempty"`
+}
+
+type grant struct {
+	XMLName xml.Name `xml:"Grant"`
+	Grantee struct {
+		XMLName xml.Name `xml:",attr"`
+		Type    string   `xml:"Type,attr"`
+		ID      string   `xml:"Owner>ID,omitempty"`
+	} `xml:"Grantee"`
+}
+
+// Notification XML types.
+type notificationConfiguration struct {
+	XMLName       xml.Name       `xml:"NotificationConfiguration"`
+	Xmlns         string         `xml:"xmlns,attr,omitempty"`
+	TopicConfigs  []topicConfig  `xml:"TopicConfiguration,omitempty"`
+	QueueConfigs  []queueConfig  `xml:"QueueConfiguration,omitempty"`
+	LambdaConfigs []lambdaConfig `xml:"LambdaFunctionConfiguration,omitempty"`
+}
+
+type topicConfig struct {
+	ID       string   `xml:"Id,omitempty"`
+	Events   []string `xml:"Event"`
+	TopicARN string   `xml:"Topic"`
+	Filter   *filter  `xml:"Filter,omitempty"`
+}
+
+type queueConfig struct {
+	ID       string   `xml:"Id,omitempty"`
+	Events   []string `xml:"Event"`
+	QueueARN string   `xml:"Queue"`
+	Filter   *filter  `xml:"Filter,omitempty"`
+}
+
+type lambdaConfig struct {
+	ID        string   `xml:"Id,omitempty"`
+	Events    []string `xml:"Event"`
+	LambdaARN string   `xml:"LambdaFunctionArn"`
+	Filter    *filter  `xml:"Filter,omitempty"`
+}
+
+type filter struct {
+	S3Key filterRule `xml:"S3Key"`
+}
+
+type filterRule struct {
+	Name  string    `xml:"Name"`
+	Value filterVal `xml:"Value"`
+}
+
+type filterVal struct {
+	Value string `xml:",chardata"`
 }

@@ -93,12 +93,28 @@ func (b *Bus) Deliver(e repository.Event) {
 // Subscribe returns a channel of events for in-process consumers. The channel
 // is buffered (64); if a consumer falls behind, events are dropped (the
 // durable copy in the DB remains the source of truth).
-func (b *Bus) Subscribe() <-chan repository.Event {
+// Callers MUST invoke the returned cancel func when they stop consuming to
+// prevent goroutine leaks in the bus's subscriber list.
+func (b *Bus) Subscribe() (<-chan repository.Event, func()) {
 	ch := make(chan repository.Event, b.subBuffer)
 	b.mu.Lock()
 	b.subs = append(b.subs, ch)
 	b.mu.Unlock()
-	return ch
+	return ch, func() { b.Unsubscribe(ch) }
+}
+
+// Unsubscribe removes a subscriber channel from the bus. Safe to call
+// multiple times; subsequent calls are no-ops.
+func (b *Bus) Unsubscribe(ch chan repository.Event) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, sub := range b.subs {
+		if sub == ch {
+			b.subs = append(b.subs[:i], b.subs[i+1:]...)
+			close(ch)
+			return
+		}
+	}
 }
 
 // Close shuts every subscriber channel (e.g. on graceful shutdown).

@@ -52,7 +52,7 @@ running just the app.
 
 ## Docker Compose (full RAG demo)
 
-`docker-compose.demo.yml` brings up the whole platform plus its dependencies with
+`deploy/docker-compose.demo.yml` brings up the whole platform plus its dependencies with
 one command:
 
 | Service | Image | Purpose |
@@ -66,7 +66,7 @@ one command:
 | `otel-collector` | `otel/opentelemetry-collector-contrib` | OTLP gRPC `:4317`, OTLP HTTP `:4318`, Prometheus scrape `:8889`. |
 
 ```bash
-docker compose -f docker-compose.demo.yml up --build
+docker compose -f deploy/docker-compose.demo.yml up --build
 ```
 
 The first run downloads the Ollama models (a few hundred MB up to ~1.3 GB). The

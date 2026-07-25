@@ -1,30 +1,24 @@
 package s3compat
 
 import (
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
+	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
-// Handler implements a small subset of the S3 REST API in path-style form:
-//
-//	PUT    /{bucket}/{key+}      PutObject
-//	GET    /{bucket}/{key+}      GetObject
-//	HEAD   /{bucket}/{key+}      HeadObject
-//	DELETE /{bucket}/{key+}      DeleteObject
-//	GET    /{bucket}/?list-type=2 ListObjectsV2 (else ListObjects v1)
-//	HEAD   /{bucket}/            HeadBucket
-//	PUT    /{bucket}/            CreateBucket (no-op-ish; registers bucket)
+// Handler implements a small subset of the S3 REST API in path-style form.
 type Handler struct {
 	svc    *service.FileService
 	logger *slog.Logger
@@ -37,10 +31,35 @@ func NewHandler(svc *service.FileService, logger *slog.Logger) *Handler {
 	return &Handler{svc: svc, logger: logger}
 }
 
+func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, bucket, action string) bool {
+	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	if err != nil || cfg.Policy == "" {
+		return true
+	}
+	p, err := auth.ParsePolicy(cfg.Policy)
+	if err != nil {
+		h.logger.Warn("bucket policy parse error, skipping enforcement", "bucket", bucket, "err", err)
+		return true
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host == "" {
+		host = r.RemoteAddr
+	}
+	if !auth.Allowed(p, action, host) {
+		writeS3Error(w, r, service.ErrForbidden)
+		return false
+	}
+	return true
+}
+
+// ── Core Object CRUD ────────────────────────────────────────────────────────
+
 func (h *Handler) PutObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
-	// Sub-resource dispatch by header/query.
+	if !h.checkBucketPolicy(w, r, bucket, "s3:PutObject") {
+		return
+	}
 	if src := r.Header.Get("x-amz-copy-source"); src != "" {
 		h.copyObject(w, r, bucket, key, src)
 		return
@@ -57,16 +76,27 @@ func (h *Handler) PutObject(w http.ResponseWriter, r *http.Request) {
 		h.putObjectACL(w, r, bucket, key)
 		return
 	}
-	meta := extractMetaHeaders(r.Header)
+	meta := s3PutMeta(r.Header)
+	if lh := r.Header.Get("x-amz-object-lock-legal-hold"); lh == "ON" || lh == "on" {
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta["_aero_legal_hold"] = "ON"
+	}
+	if r.URL.Query().Has("restore") {
+		h.restoreObject(w, r, bucket, key)
+		return
+	}
 	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), bucket, key, r.Body, r.ContentLength, service.PutOptions{
-		ContentType: r.Header.Get("Content-Type"),
-		Metadata:    meta,
+		ContentType:  r.Header.Get("Content-Type"),
+		Metadata:     meta,
+		ContentMD5:   r.Header.Get("Content-MD5"),
+		StorageClass: r.Header.Get("x-amz-storage-class"),
 	})
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
-	// Canned ACL via x-amz-acl header at write time.
 	if acl := r.Header.Get("x-amz-acl"); acl != "" {
 		_ = h.svc.SetObjectACL(r.Context(), mw.TenantFrom(r.Context()), bucket, key, acl)
 	}
@@ -77,6 +107,9 @@ func (h *Handler) PutObject(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
+	if !h.checkBucketPolicy(w, r, bucket, "s3:GetObject") {
+		return
+	}
 	if r.URL.Query().Has("tagging") {
 		h.getObjectTagging(w, r, bucket, key)
 		return
@@ -90,7 +123,6 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant := mw.TenantFrom(r.Context())
-	// Version-specific read: GET ...?versionId=<id> serves that stored version.
 	if vid := r.URL.Query().Get("versionId"); vid != "" {
 		rc, obj, err := h.svc.GetVersion(r.Context(), tenant, bucket, key, vid)
 		if err != nil {
@@ -98,26 +130,36 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer rc.Close()
-		writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
+		writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat), obj.StorageClass, obj.Metadata)
 		w.Header().Set("x-amz-version-id", obj.VersionID)
-		for k, v := range obj.Metadata {
-			w.Header().Set("x-amz-meta-"+k, v)
-		}
+		writeS3ObjectMeta(w, obj.Metadata)
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.Copy(w, rc)
 		return
 	}
-	// RFC 7232 conditional GET (If-Match / If-None-Match / If-[Un]Modified-Since).
 	if hasS3GetConditional(r) {
 		if obj, err := h.svc.Stat(r.Context(), tenant, bucket, key); err == nil {
-			if code := evalS3GetPreconditions(r, obj); code != 0 {
-				writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
-				w.WriteHeader(code)
+			if status, ok := h.getObjectPreconditions(r, obj); ok {
+				writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat), obj.StorageClass, obj.Metadata)
+				w.WriteHeader(status)
 				return
 			}
 		}
 	}
-	// Range request → 206 Partial Content.
+	h.serveObjectContent(w, r, tenant, bucket, key)
+}
+
+func (h *Handler) getObjectPreconditions(r *http.Request, obj repository.Object) (int, bool) {
+	if !hasS3GetConditional(r) {
+		return 0, false
+	}
+	if code := evalS3GetPreconditions(r, obj); code != 0 {
+		return code, true
+	}
+	return 0, false
+}
+
+func (h *Handler) serveObjectContent(w http.ResponseWriter, r *http.Request, tenant, bucket, key string) {
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
 		if obj, err := h.svc.Stat(r.Context(), tenant, bucket, key); err == nil {
 			off, length, ok, unsat := service.ParseByteRange(rangeHdr, obj.Size)
@@ -133,11 +175,9 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				defer rc.Close()
-				writeObjectHeaders(w, obj.ContentType, length, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
+				writeObjectHeaders(w, obj.ContentType, length, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat), obj.StorageClass, obj.Metadata)
 				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+length-1, obj.Size))
-				for k, v := range obj.Metadata {
-					w.Header().Set("x-amz-meta-"+k, v)
-				}
+				writeS3ObjectMeta(w, obj.Metadata)
 				w.WriteHeader(http.StatusPartialContent)
 				_, _ = io.Copy(w, rc)
 				return
@@ -150,10 +190,8 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.Close()
-	writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
-	for k, v := range obj.Metadata {
-		w.Header().Set("x-amz-meta-"+k, v)
-	}
+	writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat), obj.StorageClass, obj.Metadata)
+	writeS3ObjectMeta(w, obj.Metadata)
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, rc)
 }
@@ -161,6 +199,9 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HeadObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
+	if !h.checkBucketPolicy(w, r, bucket, "s3:GetObject") {
+		return
+	}
 	tenant := mw.TenantFrom(r.Context())
 	if vid := r.URL.Query().Get("versionId"); vid != "" {
 		rc, obj, err := h.svc.GetVersion(r.Context(), tenant, bucket, key, vid)
@@ -168,12 +209,10 @@ func (h *Handler) HeadObject(w http.ResponseWriter, r *http.Request) {
 			writeS3Error(w, r, err)
 			return
 		}
-		_ = rc.Close() // HEAD: metadata only
-		writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
+		_ = rc.Close()
+		writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat), obj.StorageClass, obj.Metadata)
 		w.Header().Set("x-amz-version-id", obj.VersionID)
-		for k, v := range obj.Metadata {
-			w.Header().Set("x-amz-meta-"+k, v)
-		}
+		writeS3ObjectMeta(w, obj.Metadata)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -182,16 +221,17 @@ func (h *Handler) HeadObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, err)
 		return
 	}
-	writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat))
-	for k, v := range obj.Metadata {
-		w.Header().Set("x-amz-meta-"+k, v)
-	}
+	writeObjectHeaders(w, obj.ContentType, obj.Size, obj.ETag, obj.UpdatedAt.Format(http.TimeFormat), obj.StorageClass, obj.Metadata)
+	writeS3ObjectMeta(w, obj.Metadata)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
+	if !h.checkBucketPolicy(w, r, bucket, "s3:DeleteObject") {
+		return
+	}
 	if r.URL.Query().Has("tagging") {
 		h.deleteObjectTagging(w, r, bucket, key)
 		return
@@ -207,49 +247,15 @@ func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ── Bucket Dispatch ─────────────────────────────────────────────────────────
+
 func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
-	// Bucket-scoped operations: ListObjects v1/v2 (GET), HeadBucket (HEAD), CreateBucket (PUT).
 	bucket := chi.URLParam(r, "bucket")
 	q := r.URL.Query()
-	// Bucket sub-resources are dispatched before the default list/create paths so
-	// that e.g. GET ?versioning no longer falls through to ListObjects.
-	switch {
-	case q.Has("versioning"):
-		if r.Method == http.MethodPut {
-			h.putBucketVersioning(w, r, bucket)
-		} else {
-			h.getBucketVersioning(w, r, bucket)
-		}
+	if h.dispatchBucketSubresource(w, r, bucket, q) {
 		return
-	case q.Has("lifecycle"):
-		switch r.Method {
-		case http.MethodPut:
-			h.putBucketLifecycle(w, r, bucket)
-		case http.MethodDelete:
-			h.deleteBucketLifecycle(w, r, bucket)
-		default:
-			h.getBucketLifecycle(w, r, bucket)
-		}
-		return
-	case q.Has("object-lock"):
-		if r.Method == http.MethodPut {
-			h.putBucketObjectLock(w, r, bucket)
-		} else {
-			h.getBucketObjectLock(w, r, bucket)
-		}
-		return
-	case q.Has("acl"):
-		if r.Method == http.MethodPut {
-			h.putBucketACL(w, r, bucket)
-		} else {
-			h.getBucketACL(w, r, bucket)
-		}
-		return
-	case q.Has("location"):
-		h.getBucketLocation(w, r, bucket)
-		return
-	case q.Has("versions"):
-		h.listObjectVersions(w, r, bucket)
+	}
+	if !h.checkBucketPolicy(w, r, bucket, "s3:ListBucket") {
 		return
 	}
 	switch r.Method {
@@ -258,14 +264,30 @@ func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
 			h.listMultipartUploads(w, r, bucket)
 			return
 		}
+		if q.Has("cors") {
+			h.getBucketCORS(w, r, bucket)
+			return
+		}
 		h.listObjects(w, r, bucket)
 	case http.MethodHead:
 		h.headBucket(w, r, bucket)
 	case http.MethodPut:
+		if q.Has("cors") {
+			h.putBucketCORS(w, r, bucket)
+			return
+		}
+		if q.Has("delete") {
+			h.deleteObjects(w, r, bucket)
+			return
+		}
 		h.createBucket(w, r, bucket)
 	case http.MethodPost:
-		if r.URL.Query().Has("delete") {
+		if q.Has("delete") {
 			h.deleteObjects(w, r, bucket)
+			return
+		}
+		if q.Has("cors") {
+			h.deleteBucketCORS(w, r, bucket)
 			return
 		}
 		http.Error(w, "unsupported bucket POST", http.StatusBadRequest)
@@ -274,121 +296,9 @@ func (h *Handler) BucketDispatch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket string) {
-	if r.URL.Query().Get("list-type") == "2" {
-		h.listObjectsV2(w, r, bucket)
-		return
-	}
-	h.listObjectsV1(w, r, bucket)
-}
+// ── Response helpers ────────────────────────────────────────────────────────
 
-func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
-	q := r.URL.Query()
-	prefix := q.Get("prefix")
-	token := q.Get("continuation-token")
-	maxKeys, _ := strconv.Atoi(q.Get("max-keys"))
-	if maxKeys <= 0 {
-		maxKeys = 1000
-	}
-	page, err := h.svc.List(r.Context(), mw.TenantFrom(r.Context()), bucket, prefix, token, maxKeys)
-	if err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	out := listBucketResult{
-		Xmlns:             s3Namespace,
-		Name:              bucket,
-		Prefix:            prefix,
-		KeyCount:          len(page.Objects),
-		MaxKeys:           maxKeys,
-		IsTruncated:       page.HasMore,
-		ContinuationToken: token,
-		StartAfter:        q.Get("start-after"),
-	}
-	if page.HasMore {
-		out.NextContinuationToken = page.NextMarker
-	}
-	for _, o := range page.Objects {
-		out.Contents = append(out.Contents, listContent{
-			Key:          o.Key,
-			LastModified: o.UpdatedAt.UTC(),
-			ETag:         `"` + o.ETag + `"`,
-			Size:         o.Size,
-			StorageClass: "STANDARD",
-		})
-	}
-	writeListResult(w, out)
-}
-
-func (h *Handler) listObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
-	q := r.URL.Query()
-	prefix := q.Get("prefix")
-	marker := q.Get("marker")
-	maxKeys, _ := strconv.Atoi(q.Get("max-keys"))
-	if maxKeys <= 0 {
-		maxKeys = 1000
-	}
-	page, err := h.svc.List(r.Context(), mw.TenantFrom(r.Context()), bucket, prefix, marker, maxKeys)
-	if err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	out := listBucketResultV1{
-		Xmlns:       s3Namespace,
-		Name:        bucket,
-		Prefix:      prefix,
-		Marker:      marker,
-		MaxKeys:     maxKeys,
-		IsTruncated: page.HasMore,
-	}
-	if page.HasMore {
-		out.NextMarker = page.NextMarker
-	}
-	for _, o := range page.Objects {
-		out.Contents = append(out.Contents, listContent{
-			Key:          o.Key,
-			LastModified: o.UpdatedAt.UTC(),
-			ETag:         `"` + o.ETag + `"`,
-			Size:         o.Size,
-			StorageClass: "STANDARD",
-		})
-	}
-	writeListResult(w, out)
-}
-
-func writeListResult(w http.ResponseWriter, out any) {
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(xml.Header))
-	_ = xml.NewEncoder(w).Encode(out)
-}
-
-func (h *Handler) headBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	exists, err := h.svc.HeadBucket(r.Context(), mw.TenantFrom(r.Context()), bucket)
-	if err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	if !exists {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	if err := h.svc.CreateBucket(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	if acl := r.Header.Get("x-amz-acl"); acl != "" {
-		_ = h.svc.SetBucketACL(r.Context(), mw.TenantFrom(r.Context()), bucket, acl)
-	}
-	w.Header().Set("Location", "/"+bucket)
-	w.WriteHeader(http.StatusOK)
-}
-
-func writeObjectHeaders(w http.ResponseWriter, contentType string, size int64, etag, lastModified string) {
+func writeObjectHeaders(w http.ResponseWriter, contentType string, size int64, etag, lastModified, storageClass string, meta map[string]string) {
 	if contentType != "" {
 		w.Header().Set("Content-Type", contentType)
 	}
@@ -398,6 +308,15 @@ func writeObjectHeaders(w http.ResponseWriter, contentType string, size int64, e
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.Header().Set("Last-Modified", lastModified)
 	w.Header().Set("Accept-Ranges", "bytes")
+	if storageClass != "" && storageClass != service.DefaultStorageClass {
+		w.Header().Set("x-amz-storage-class", storageClass)
+	}
+	if v, ok := meta["_aero_content_disposition"]; ok && v != "" {
+		w.Header().Set("Content-Disposition", v)
+	}
+	if v, ok := meta["_aero_content_encoding"]; ok && v != "" {
+		w.Header().Set("Content-Encoding", v)
+	}
 }
 
 func keyFromURL(r *http.Request) string {
@@ -405,12 +324,44 @@ func keyFromURL(r *http.Request) string {
 	return strings.TrimPrefix(k, "/")
 }
 
+func s3PutMeta(h http.Header) map[string]string {
+	meta := extractMetaHeaders(h)
+	if v := h.Get("Content-Disposition"); v != "" {
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta["_aero_content_disposition"] = v
+	}
+	if v := h.Get("Content-Encoding"); v != "" {
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta["_aero_content_encoding"] = v
+	}
+	return meta
+}
+
+func writeS3ObjectMeta(w http.ResponseWriter, meta map[string]string) {
+	for k, v := range meta {
+		if strings.HasPrefix(k, "_aero_") {
+			continue
+		}
+		w.Header().Set("x-amz-meta-"+k, v)
+	}
+	if v, ok := meta["_aero_content_md5"]; ok && v != "" {
+		w.Header().Set("x-amz-checksum-md5", v)
+	}
+}
+
 func extractMetaHeaders(h http.Header) map[string]string {
 	out := map[string]string{}
 	for k, v := range h {
+		if len(v) == 0 {
+			continue
+		}
 		lower := strings.ToLower(k)
 		if strings.HasPrefix(lower, "x-amz-meta-") {
-			out[strings.TrimPrefix(lower, "x-amz-meta-")] = strings.Join(v, ",")
+			out[strings.TrimPrefix(lower, "x-amz-meta-")] = v[0]
 		}
 	}
 	if len(out) == 0 {

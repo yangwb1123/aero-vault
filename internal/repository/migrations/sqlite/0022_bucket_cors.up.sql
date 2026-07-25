@@ -1,0 +1,1 @@
+ALTER TABLE buckets ADD COLUMN cors_rules TEXT NOT NULL DEFAULT '[]';

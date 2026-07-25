@@ -1,0 +1,18 @@
+* text=auto eol=lf
+
+*.go text
+*.py text
+*.js text diff=javascript
+*.ts text diff=typescript
+*.md text diff=markdown
+*.yml text
+*.yaml text
+*.sql text
+*.sh text eol=lf
+*.bat text eol=crlf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pyc binary

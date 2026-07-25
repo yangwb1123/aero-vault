@@ -5,10 +5,10 @@
 #      Exposes http_server_* request metrics plus go_* / process_* runtime
 #      metrics through the OpenTelemetry Prometheus exporter.
 #   2. The OpenTelemetry Collector's Prometheus exporter (:8889 in the demo
-#      stack, docker-compose.demo.yml), which re-exports the same OTLP metrics
+#      stack, deploy/docker-compose.demo.yml), which re-exports the same OTLP metrics
 #      shipped over OTEL_EXPORTER_OTLP_ENDPOINT.
 #
-# Hostnames below assume the docker-compose.demo.yml network (service names
+# Hostnames below assume the deploy/docker-compose.demo.yml network (service names
 # "app" and "otel-collector"). Adjust targets for your environment, e.g.
 # "localhost:8080" when running everything on the host.
 #

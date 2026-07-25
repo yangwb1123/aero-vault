@@ -159,15 +159,9 @@ func (l *HTTPLLM) ChatStream(ctx context.Context, req ChatRequest, onChunk func(
 		req.Model = l.Model
 	}
 	req.Stream = true
-	body, _ := json.Marshal(req)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, l.Endpoint+"/v1/chat/completions", bytes.NewReader(body))
+	httpReq, err := l.buildChatRequest(ctx, req)
 	if err != nil {
 		return ChatResponse{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	if l.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+l.APIKey)
 	}
 	resp, err := l.Client.Do(httpReq)
 	if err != nil {
@@ -179,32 +173,53 @@ func (l *HTTPLLM) ChatStream(ctx context.Context, req ChatRequest, onChunk func(
 		return ChatResponse{}, fmt.Errorf("llm stream http %d: %s", resp.StatusCode, string(raw))
 	}
 	var content strings.Builder
-	var model string
-	var toolCalls []ToolCall
 	scanner := newSSEScanner(resp.Body)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "[DONE]" {
-			break
-		}
-		var ch streamChunk
-		if err := json.Unmarshal([]byte(line), &ch); err != nil {
+		token, done, err := parseSSELine(scanner.Text())
+		if err != nil {
 			continue
 		}
-		if model == "" && ch.Model != "" {
-			model = ch.Model
+		if done {
+			break
 		}
-		for _, c := range ch.Choices {
-			if c.Delta.Content != "" {
-				content.WriteString(c.Delta.Content)
-				if onChunk != nil {
-					onChunk(c.Delta.Content)
-				}
+		if token != "" {
+			content.WriteString(token)
+			if onChunk != nil {
+				onChunk(token)
 			}
-			toolCalls = append(toolCalls, c.Delta.ToolCalls...)
 		}
 	}
-	return ChatResponse{Content: content.String(), Model: model, ToolCalls: toolCalls}, scanner.Err()
+	return ChatResponse{Content: content.String(), Model: req.Model}, scanner.Err()
+}
+
+func parseSSELine(line string) (token string, done bool, err error) {
+	if line == "[DONE]" {
+		return "", true, nil
+	}
+	var ch streamChunk
+	if err := json.Unmarshal([]byte(line), &ch); err != nil {
+		return "", false, err
+	}
+	for _, c := range ch.Choices {
+		if c.Delta.Content != "" {
+			token += c.Delta.Content
+		}
+	}
+	return token, false, nil
+}
+
+func (l *HTTPLLM) buildChatRequest(ctx context.Context, req ChatRequest) (*http.Request, error) {
+	body, _ := json.Marshal(req)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, l.Endpoint+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	if l.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+l.APIKey)
+	}
+	return httpReq, nil
 }
 
 // newSSEScanner returns an SSE line scanner that yields the JSON body of each

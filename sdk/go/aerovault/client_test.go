@@ -692,6 +692,72 @@ func TestAgent(t *testing.T) {
 	}
 }
 
+func TestLineage(t *testing.T) {
+	c, rec := newStub(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, LineageResponse{
+			ObjectID: 42,
+			Entries:  []LineageEntry{{UsageID: 1, Caller: "rest:chat", TotalTokens: 12}},
+		})
+	})
+	resp, err := c.Lineage(context.Background(), 42, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.path != "/v1/lineage/objects/42" {
+		t.Errorf("path = %q", rec.path)
+	}
+	if q := parseQuery(rec.rawQ); q["limit"] != "5" {
+		t.Errorf("query = %v", q)
+	}
+	if resp.ObjectID != 42 || len(resp.Entries) != 1 || resp.Entries[0].Caller != "rest:chat" {
+		t.Errorf("resp = %+v", resp)
+	}
+}
+
+func TestLineageOmitsZeroLimit(t *testing.T) {
+	c, rec := newStub(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, LineageResponse{ObjectID: 7})
+	})
+	if _, err := c.Lineage(context.Background(), 7, 0); err != nil {
+		t.Fatal(err)
+	}
+	if rec.rawQ != "" {
+		t.Errorf("expected no query, got %q", rec.rawQ)
+	}
+}
+
+func TestBucketACL(t *testing.T) {
+	c, rec := newStub(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			var b map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			writeJSON(w, 200, map[string]string{"acl": b["acl"]})
+			return
+		}
+		writeJSON(w, 200, map[string]string{"acl": "public-read"})
+	})
+
+	acl, err := c.GetBucketACL(context.Background(), "my-bucket")
+	if err != nil || acl != "public-read" {
+		t.Fatalf("GetBucketACL = %q, %v", acl, err)
+	}
+	if rec.path != "/v1/buckets/my-bucket/acl" {
+		t.Errorf("path = %q", rec.path)
+	}
+
+	if err := c.SetBucketACL(context.Background(), "my-bucket", "private"); err != nil {
+		t.Fatal(err)
+	}
+	if rec.method != http.MethodPut || rec.path != "/v1/buckets/my-bucket/acl" {
+		t.Errorf("SetBucketACL method/path = %s %q", rec.method, rec.path)
+	}
+	var sent map[string]string
+	_ = json.Unmarshal(rec.body, &sent)
+	if sent["acl"] != "private" {
+		t.Errorf("SetBucketACL body = %v", sent)
+	}
+}
+
 func TestUsage(t *testing.T) {
 	c, rec := newStub(t, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, Usage{Tenant: "acme", UsedBytes: 1024, UsedObjects: 7, MaxBytes: 1 << 30, MaxObjects: 1000})

@@ -66,7 +66,8 @@ func TestIdempotencyClaimAndReplay(t *testing.T) {
 
 	// 3. Complete, then a re-claim returns the completed response.
 	body := []byte(`{"ok":true}`)
-	if err := repo.CompleteIdempotencyKey(ctx, tenant, "k1", 201, body, "application/json"); err != nil {
+	hdrs := map[string][]string{"Etag": {`"abc123"`}, "Location": {"/v1/files/x"}}
+	if err := repo.CompleteIdempotencyKey(ctx, tenant, "k1", 201, body, "application/json", hdrs); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	rec3, claimed3, err := repo.ClaimIdempotencyKey(ctx, tenant, "k1", "fp", "req3")
@@ -87,6 +88,12 @@ func TestIdempotencyClaimAndReplay(t *testing.T) {
 	}
 	if rec3.ResponseCT != "application/json" {
 		t.Fatalf("response_ct=%q, want application/json", rec3.ResponseCT)
+	}
+	if got := rec3.ResponseHeaders["Etag"]; len(got) != 1 || got[0] != `"abc123"` {
+		t.Fatalf("replayed Etag header=%v, want [\"abc123\"]", got)
+	}
+	if got := rec3.ResponseHeaders["Location"]; len(got) != 1 || got[0] != "/v1/files/x" {
+		t.Fatalf("replayed Location header=%v, want [/v1/files/x]", got)
 	}
 
 	// 4. Delete releases the claim; the next claim wins fresh.

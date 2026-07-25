@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -61,35 +62,80 @@ func (l *LifecycleJob) maybeSweep(ctx context.Context) {
 }
 
 func (l *LifecycleJob) sweep(ctx context.Context) {
+	soft, hard := l.sweepExpired(ctx)
+	noncurrent := l.sweepNonCurrentVersions(ctx)
+	if soft > 0 || hard > 0 || noncurrent > 0 {
+		l.logger.Info("lifecycle sweep", "soft_deleted", soft, "hard_deleted", hard, "noncurrent_versions_purged", noncurrent)
+	}
+}
+
+func (l *LifecycleJob) sweepExpired(ctx context.Context) (soft, hard int) {
 	expired, err := l.repo.ListExpired(ctx, 200)
 	if err != nil {
 		l.logger.Warn("lifecycle list expired", "err", err)
 		return
 	}
-	if len(expired) == 0 {
-		return
-	}
-	soft, hard := 0, 0
 	for _, obj := range expired {
 		action := obj.Metadata["__expire_action"]
-		if action == "hard_delete" {
-			if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
-				continue // can't hard delete while locked
-			}
-			if err := l.store.Delete(ctx, obj.StorageKey); err != nil {
-				l.logger.Warn("lifecycle storage delete", "key", obj.Key, "err", err)
-				continue
-			}
-			if err := l.repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err == nil {
+		if l.handleExpiredObject(ctx, obj, action) {
+			if action == "hard_delete" {
 				hard++
-			}
-		} else {
-			if err := l.repo.SoftDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err == nil {
+			} else {
 				soft++
 			}
 		}
 	}
-	if soft > 0 || hard > 0 {
-		l.logger.Info("lifecycle sweep", "soft_deleted", soft, "hard_deleted", hard)
+	return
+}
+
+func (l *LifecycleJob) handleExpiredObject(ctx context.Context, obj repository.Object, action string) bool {
+	if action == "hard_delete" {
+		if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
+			return false
+		}
+		if err := l.store.Delete(ctx, obj.StorageKey); err != nil {
+			l.logger.Warn("lifecycle storage delete", "key", obj.Key, "err", err)
+			return false
+		}
+		return l.repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key) == nil
 	}
+	return l.repo.SoftDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key) == nil
+}
+
+// sweepNonCurrentVersions permanently removes version tombstones (old versions
+// from versioning-enabled buckets) whose bucket's noncurrent_days window has
+// passed. Returns the count of purged rows.
+func (l *LifecycleJob) sweepNonCurrentVersions(ctx context.Context) int {
+	versions, err := l.repo.ListExpiredNonCurrentVersions(ctx, 200)
+	if err != nil {
+		l.logger.Warn("lifecycle list non-current versions", "err", err)
+		return 0
+	}
+	purged := 0
+	for _, v := range versions {
+		// Double-check that this is not protected by an object lock.
+		if v.LockedUntil != nil && v.LockedUntil.After(time.Now()) {
+			continue
+		}
+		// Delete the backing blob.
+		if err := l.store.Delete(ctx, v.StorageKey); err != nil {
+			l.logger.Warn("lifecycle non-current storage delete", "key", v.Key, "version", v.VersionID, "err", err)
+			continue
+		}
+		// Hard delete the row. The repository method checks for legal holds
+		// (the SQL query already excluded legal holds, but this is a safety net).
+		if err := l.repo.HardDeleteObjectByID(ctx, v.ID); err != nil {
+			if errors.Is(err, repository.ErrLegalHoldActive) {
+				l.logger.Warn("lifecycle non-current version skipped: legal hold", "key", v.Key, "version", v.VersionID)
+			} else {
+				l.logger.Warn("lifecycle non-current version hard delete", "key", v.Key, "version", v.VersionID, "err", err)
+			}
+			continue
+		}
+		purged++
+	}
+	if purged > 0 {
+		l.logger.Info("lifecycle non-current versions purged", "count", purged)
+	}
+	return purged
 }

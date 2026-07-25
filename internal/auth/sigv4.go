@@ -60,6 +60,12 @@ func ParseSigV4Credentials(raw string) (*SigV4Verifier, error) {
 					k.Scopes[Scope(sc)] = true
 				}
 			}
+			// An explicit scope segment that parses to nothing (e.g. "+" or
+			// whitespace) would silently drop all permissions — reject it rather
+			// than leave the credential with no scopes.
+			if len(k.Scopes) == 0 {
+				return nil, errors.New("S3_SIGV4_CREDENTIALS: " + rec + ": scope segment has no valid scope")
+			}
 		}
 		v.creds[parts[0]] = sigV4Cred{secret: parts[1], key: k}
 	}
@@ -117,11 +123,7 @@ func (v *SigV4Verifier) verifyHeader(r *http.Request) (Key, error) {
 }
 
 func (v *SigV4Verifier) verifyPresigned(r *http.Request) (Key, error) {
-	q := r.URL.Query()
-	if q.Get("X-Amz-Algorithm") != sigV4Algorithm {
-		return Key{}, errors.New("sigv4: bad presign algorithm")
-	}
-	accessKey, scope, err := splitCredential(q.Get("X-Amz-Credential"))
+	q, accessKey, err := parsePresignedURL(r)
 	if err != nil {
 		return Key{}, err
 	}
@@ -129,38 +131,49 @@ func (v *SigV4Verifier) verifyPresigned(r *http.Request) (Key, error) {
 	if !ok {
 		return Key{}, errors.New("sigv4: unknown access key")
 	}
-	amzDate := q.Get("X-Amz-Date")
-	if amzDate == "" {
-		return Key{}, errors.New("sigv4: missing X-Amz-Date")
-	}
-	signedAt, err := time.Parse("20060102T150405Z", amzDate)
-	if err != nil {
-		return Key{}, errors.New("sigv4: invalid X-Amz-Date")
-	}
-	signedHeaders := strings.Split(q.Get("X-Amz-SignedHeaders"), ";")
-	providedSig := q.Get("X-Amz-Signature")
-
-	// Expiry check. When X-Amz-Expires is present it MUST be valid and unexpired,
-	// measured from the (now validated) signing date. Previously a missing or
-	// unparseable X-Amz-Date silently skipped expiry entirely, so a URL could
-	// dodge its own expiry by corrupting the date.
-	if exp := q.Get("X-Amz-Expires"); exp != "" {
-		secs, err := strconv.Atoi(exp)
-		if err != nil || secs <= 0 {
-			return Key{}, errors.New("sigv4: invalid X-Amz-Expires")
-		}
-		if time.Now().UTC().After(signedAt.Add(time.Duration(secs) * time.Second)) {
-			return Key{}, errors.New("sigv4: presigned URL expired")
-		}
-	}
-
-	// Canonical query excludes the signature itself.
-	q.Del("X-Amz-Signature")
-	sig := v.signWith(r.Method, r.URL.EscapedPath(), encodeQuery(q), r, scope, signedHeaders, unsignedPayload, amzDate, c.secret)
-	if !hmac.Equal([]byte(sig), []byte(providedSig)) {
+	if !v.verifyPresignedSig(r, q, c.secret) {
 		return Key{}, errors.New("sigv4: presigned signature mismatch")
 	}
 	return c.key, nil
+}
+
+func parsePresignedURL(r *http.Request) (url.Values, string, error) {
+	q := r.URL.Query()
+	if q.Get("X-Amz-Algorithm") != sigV4Algorithm {
+		return nil, "", errors.New("sigv4: bad presign algorithm")
+	}
+	accessKey, _, err := splitCredential(q.Get("X-Amz-Credential"))
+	if err != nil {
+		return nil, "", err
+	}
+	amzDate := q.Get("X-Amz-Date")
+	if amzDate == "" {
+		return nil, "", errors.New("sigv4: missing X-Amz-Date")
+	}
+	signedAt, err := time.Parse("20060102T150405Z", amzDate)
+	if err != nil {
+		return nil, "", errors.New("sigv4: invalid X-Amz-Date")
+	}
+	if exp := q.Get("X-Amz-Expires"); exp != "" {
+		secs, err := strconv.Atoi(exp)
+		if err != nil || secs <= 0 {
+			return nil, "", errors.New("sigv4: invalid X-Amz-Expires")
+		}
+		if time.Now().UTC().After(signedAt.Add(time.Duration(secs) * time.Second)) {
+			return nil, "", errors.New("sigv4: presigned URL expired")
+		}
+	}
+	return q, accessKey, nil
+}
+
+func (v *SigV4Verifier) verifyPresignedSig(r *http.Request, params url.Values, secret string) bool {
+	_, scope, _ := splitCredential(params.Get("X-Amz-Credential"))
+	signedHeaders := strings.Split(params.Get("X-Amz-SignedHeaders"), ";")
+	amzDate := params.Get("X-Amz-Date")
+	providedSig := params.Get("X-Amz-Signature")
+	params.Del("X-Amz-Signature")
+	sig := v.signWith(r.Method, r.URL.EscapedPath(), encodeQuery(params), r, scope, signedHeaders, unsignedPayload, amzDate, secret)
+	return hmac.Equal([]byte(sig), []byte(providedSig))
 }
 
 // sign builds the signature for a header-authenticated request.

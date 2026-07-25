@@ -2,12 +2,16 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
+
+var errUnsatisfiable = errors.New("unsatisfiable")
 
 // ParseByteRange parses a single HTTP Range header ("bytes=...") against the
 // object size.
@@ -27,49 +31,83 @@ func ParseByteRange(header string, size int64) (offset, length int64, ok, unsati
 	if i := strings.IndexByte(spec, ','); i >= 0 {
 		spec = strings.TrimSpace(spec[:i]) // first range only
 	}
+
+	start, end, err := parseRangeSpec(spec)
+	if err != nil {
+		return 0, 0, false, false
+	}
+
+	offset, length, err = clampRange(start, end, size)
+	if errors.Is(err, errUnsatisfiable) {
+		return 0, 0, false, true
+	}
+	return offset, length, true, false
+}
+
+// parseRangeSpec parses a single range spec ("start-end", "start-", or "-suffix").
+// It returns (start, end, nil) where end < 0 means "to end" and start < 0 means
+// suffix form (value is -N).
+func parseRangeSpec(spec string) (start, end int64, err error) {
 	dash := strings.IndexByte(spec, '-')
 	if dash < 0 {
-		return 0, 0, false, false
+		return 0, 0, fmt.Errorf("no dash in range")
 	}
 	startStr := strings.TrimSpace(spec[:dash])
 	endStr := strings.TrimSpace(spec[dash+1:])
 
-	// Suffix form: bytes=-N → final N bytes.
 	if startStr == "" {
-		n, err := strconv.ParseInt(endStr, 10, 64)
-		if err != nil || n <= 0 {
-			return 0, 0, false, false
+		n, parseErr := strconv.ParseInt(endStr, 10, 64)
+		if parseErr != nil || n <= 0 {
+			return 0, 0, fmt.Errorf("invalid suffix range")
 		}
+		return -n, 0, nil
+	}
+
+	start, parseErr := strconv.ParseInt(startStr, 10, 64)
+	if parseErr != nil || start < 0 {
+		return 0, 0, fmt.Errorf("invalid start")
+	}
+
+	if endStr == "" {
+		return start, -1, nil
+	}
+
+	end, parseErr = strconv.ParseInt(endStr, 10, 64)
+	if parseErr != nil {
+		return 0, 0, fmt.Errorf("invalid end")
+	}
+	return start, end, nil
+}
+
+// clampRange validates and clamps a parsed range against the object size.
+// start < 0 indicates suffix form, end < 0 means "to end of object".
+func clampRange(start, end, size int64) (offset, length int64, err error) {
+	if start < 0 {
+		n := -start
 		if size == 0 {
-			return 0, 0, false, true
+			return 0, 0, errUnsatisfiable
 		}
 		if n > size {
 			n = size
 		}
-		return size - n, n, true, false
+		return size - n, n, nil
 	}
 
-	start, err := strconv.ParseInt(startStr, 10, 64)
-	if err != nil || start < 0 {
-		return 0, 0, false, false
-	}
 	if start >= size {
-		return 0, 0, false, true // unsatisfiable
+		return 0, 0, errUnsatisfiable
 	}
-	if endStr == "" {
-		return start, size - start, true, false
+
+	if end < 0 {
+		return start, size - start, nil
 	}
-	end, err := strconv.ParseInt(endStr, 10, 64)
-	if err != nil {
-		return 0, 0, false, false
-	}
+
 	if end >= size {
 		end = size - 1
 	}
 	if end < start {
-		return 0, 0, false, true
+		return 0, 0, errUnsatisfiable
 	}
-	return start, end - start + 1, true, false
+	return start, end - start + 1, nil
 }
 
 // GetRange streams a byte range of an object. length<0 means "to the end".

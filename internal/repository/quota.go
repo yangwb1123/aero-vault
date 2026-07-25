@@ -106,7 +106,7 @@ func (s *sqlStore) AddTenantUsage(ctx context.Context, tenant string, deltaBytes
 	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT OR IGNORE INTO tenant_quotas (tenant_id) VALUES ($1)`), tenant); err != nil {
 		// Postgres syntax differs.
 		if s.dialect == dialectPostgres {
-			if _, e2 := tx.ExecContext(ctx, `INSERT INTO tenant_quotas (tenant_id) VALUES ($1) ON CONFLICT DO NOTHING`, tenant); e2 != nil {
+			if _, e2 := tx.ExecContext(ctx, `INSERT INTO tenant_quotas (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING`, tenant); e2 != nil {
 				return TenantQuota{}, e2
 			}
 		} else {

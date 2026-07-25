@@ -15,10 +15,12 @@ import (
 
 // COSConfig configures the Tencent Cloud COS backend. BucketURL is the full
 // per-bucket endpoint, e.g. https://my-bucket-1250000000.cos.ap-guangzhou.myqcloud.com
+// Timeouts control the underlying HTTP client; zero uses the SDK default.
 type COSConfig struct {
 	BucketURL string
 	SecretID  string
 	SecretKey string
+	Timeouts  TimeoutConfig
 }
 
 // COSStorage implements Storage on top of Tencent Cloud COS using the native SDK.
@@ -36,8 +38,14 @@ func NewCOS(cfg COSConfig) (*COSStorage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cos bucket url: %w", err)
 	}
+	hc := NewHTTPClient(cfg.Timeouts)
 	client := cos.NewClient(&cos.BaseURL{BucketURL: u}, &http.Client{
-		Transport: &cos.AuthorizationTransport{SecretID: cfg.SecretID, SecretKey: cfg.SecretKey},
+		Timeout: hc.Timeout,
+		Transport: &cos.AuthorizationTransport{
+			SecretID:  cfg.SecretID,
+			SecretKey: cfg.SecretKey,
+			Transport: hc.Transport,
+		},
 	})
 	return &COSStorage{cfg: cfg, client: client}, nil
 }
@@ -183,6 +191,14 @@ func (s *COSStorage) AbortMultipart(ctx context.Context, key, uploadID string) e
 	return err
 }
 
+func (s *COSStorage) CleanupParts(ctx context.Context, key, uploadID string) error {
+	_, err := s.client.Object.AbortMultipartUpload(ctx, key, uploadID)
+	if err != nil && isCOSNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 func cosObjectInfo(key string, h http.Header) ObjectInfo {
 	info := ObjectInfo{
 		Key:         key,
@@ -207,6 +223,13 @@ func cosObjectInfo(key string, h http.Header) ObjectInfo {
 		}
 	}
 	return info
+}
+
+func (s *COSStorage) CanCopy() bool { return false }
+
+func (s *COSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
+	// TODO: implement using COS CopyObject API
+	return ObjectInfo{}, ErrUnsupported
 }
 
 func isCOSNotFound(err error) bool {

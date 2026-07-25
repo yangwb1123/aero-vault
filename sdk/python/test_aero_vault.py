@@ -99,6 +99,68 @@ class JSONRequestTests(unittest.TestCase):
         self.assertEqual(h["X-Aero-Tenant"], "acme")
 
 
+class ContractTests(unittest.TestCase):
+    """Request shapes that must match the server REST contract."""
+
+    def test_lock_sends_seconds(self):
+        c = StubClient(FakeResp(b"{}"))
+        c.lock("docs/a.txt", 3600)
+        call = c.calls[-1]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["path"], "/v1/files/docs/a.txt/lock")
+        self.assertEqual(json.loads(call["data"]), {"seconds": 3600})
+
+    def test_add_key_includes_token_tenant_scopes(self):
+        c = StubClient(FakeResp(b"{}"), tenant="acme")
+        c.add_key("secret-tok", ["read", "write"], label="ci")
+        call = c.calls[-1]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["path"], "/v1/admin/keys")
+        self.assertEqual(
+            json.loads(call["data"]),
+            {"token": "secret-tok", "tenant": "acme", "scopes": ["read", "write"], "label": "ci"},
+        )
+
+    def test_issue_jwt_sends_ttl_seconds(self):
+        c = StubClient(FakeResp(b"{}"))
+        c.issue_jwt("acme", scopes=["read"], ttl_seconds=120)
+        body = json.loads(c.calls[-1]["data"])
+        self.assertEqual(body["ttl_seconds"], 120)
+        self.assertNotIn("expires_in", body)
+
+    def test_delete_tags(self):
+        c = StubClient(FakeResp(b""))
+        c.delete_tags("docs/a.txt")
+        call = c.calls[-1]
+        self.assertEqual(call["method"], "DELETE")
+        self.assertEqual(call["path"], "/v1/files/docs/a.txt/tags")
+
+    def test_get_bucket_acl(self):
+        c = StubClient(FakeResp(json.dumps({"acl": "public-read"}).encode()))
+        acl = c.get_bucket_acl("my-bucket")
+        self.assertEqual(c.calls[-1]["method"], "GET")
+        self.assertEqual(c.calls[-1]["path"], "/v1/buckets/my-bucket/acl")
+        self.assertEqual(acl, "public-read")
+
+    def test_set_bucket_acl(self):
+        c = StubClient(FakeResp(json.dumps({"acl": "private"}).encode()))
+        c.set_bucket_acl("my-bucket", "private")
+        call = c.calls[-1]
+        self.assertEqual(call["method"], "PUT")
+        self.assertEqual(call["path"], "/v1/buckets/my-bucket/acl")
+        self.assertEqual(json.loads(call["data"]), {"acl": "private"})
+
+    def test_revoke_key_escapes_token(self):
+        c = StubClient(FakeResp(b""))
+        c.revoke_key("a/b token")
+        self.assertEqual(c.calls[-1]["path"], "/v1/admin/keys/a%2Fb%20token")
+
+    def test_delete_tenant_escapes_id(self):
+        c = StubClient(FakeResp(b""))
+        c.delete_tenant("a/b")
+        self.assertEqual(c.calls[-1]["path"], "/v1/admin/tenants/a%2Fb")
+
+
 class ErrorTests(unittest.TestCase):
     def test_http_error_maps_to_aerovaulterror(self):
         body = json.dumps({"error": {"code": "NotFound", "message": "nope", "request_id": "r1"}}).encode()

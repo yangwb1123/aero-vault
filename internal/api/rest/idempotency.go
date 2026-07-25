@@ -39,21 +39,24 @@ import (
 // to the downstream handler unchanged; a body that cannot be read fails closed
 // with 500 before any claim is taken.
 func idempotency(repo repository.Repository, logger *slog.Logger, hashBody bool) func(http.Handler) http.Handler {
+	h := &IdempotencyHandler{repo: repo, logger: logger, hashBody: hashBody}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := r.Header.Get("Idempotency-Key")
-			if key == "" || !isWriteMethod(r.Method) {
+			key, ok := extractIdempotencyKey(r)
+			if !ok {
 				next.ServeHTTP(w, r)
 				return
 			}
+
 			ctx := r.Context()
 			tenant := mw.TenantFrom(ctx)
 			reqID := mw.RequestIDFrom(ctx)
 			fp := fingerprint(r)
-			if hashBody {
+
+			if h.hashBody {
 				sp, bodyHash, err := spoolBody(r)
 				if err != nil {
-					logger.Warn("idempotency body spool failed", "err", err, "key", key, "tenant", tenant)
+					h.logger.Warn("idempotency body spool failed", "err", err, "key", key, "tenant", tenant)
 					writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{
 						Code: "InternalError", Message: "could not buffer request body", RequestID: reqID,
 					}})
@@ -63,39 +66,16 @@ func idempotency(repo repository.Repository, logger *slog.Logger, hashBody bool)
 				fp = bodyFingerprint(r, bodyHash)
 			}
 
-			rec, claimed, err := repo.ClaimIdempotencyKey(ctx, tenant, key, fp, reqID)
-			if err != nil {
-				logger.Warn("idempotency claim failed", "err", err, "key", key, "tenant", tenant)
-				writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{
-					Code: "InternalError", Message: "idempotency store unavailable", RequestID: reqID,
-				}})
+			if h.handleIdempotentRequest(w, r, key, fp, tenant, reqID) {
 				return
 			}
 
-			if !claimed {
-				switch {
-				case rec.Fingerprint != fp:
-					idemConflict(w, reqID, "Idempotency-Key reused for a different request")
-				case rec.Status == "completed":
-					telemetry.IncIdempotencyReplay(ctx)
-					replay(w, rec)
-				default: // in_progress
-					idemConflict(w, reqID, "a request with this Idempotency-Key is already in progress")
-				}
-				return
-			}
-
-			// We own the claim. Capture the response while streaming it to the
-			// client, then persist it (or release the claim on failure).
 			cap := &idemCapture{ResponseWriter: w, status: http.StatusOK}
 			done := false
 			defer func() {
-				// Panic path: the handler blew up before we committed. Release
-				// the claim so a retry can re-run, then let the panic propagate
-				// to the global Recoverer.
 				if !done {
-					if delErr := repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
-						logger.Warn("idempotency release (panic) failed", "err", delErr, "key", key, "tenant", tenant)
+					if delErr := h.repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
+						h.logger.Warn("idempotency release (panic) failed", "err", delErr, "key", key, "tenant", tenant)
 					}
 				}
 			}()
@@ -104,13 +84,13 @@ func idempotency(repo repository.Repository, logger *slog.Logger, hashBody bool)
 			done = true
 
 			if cap.status >= 500 {
-				if delErr := repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
-					logger.Warn("idempotency release failed", "err", delErr, "key", key, "tenant", tenant)
+				if delErr := h.repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
+					h.logger.Warn("idempotency release failed", "err", delErr, "key", key, "tenant", tenant)
 				}
 				return
 			}
-			if cmpErr := repo.CompleteIdempotencyKey(ctx, tenant, key, cap.status, cap.body, cap.Header().Get("Content-Type")); cmpErr != nil {
-				logger.Warn("idempotency complete failed", "err", cmpErr, "key", key, "tenant", tenant)
+			if cmpErr := h.repo.CompleteIdempotencyKey(ctx, tenant, key, cap.status, cap.body, cap.Header().Get("Content-Type"), replayableHeaders(cap.Header())); cmpErr != nil {
+				h.logger.Warn("idempotency complete failed", "err", cmpErr, "key", key, "tenant", tenant)
 			}
 		})
 	}
@@ -146,9 +126,37 @@ func replay(w http.ResponseWriter, rec repository.IdempotencyRecord) {
 	if rec.ResponseCT != "" {
 		w.Header().Set("Content-Type", rec.ResponseCT)
 	}
+	// Restore any handler-set headers (ETag, Last-Modified, Location,
+	// X-Version-Id, X-Meta-*, …) so a replayed response is byte-for-byte what the
+	// original sent, keeping cache validation and client-side metadata intact.
+	for k, vals := range rec.ResponseHeaders {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
 	w.Header().Set("Idempotency-Replayed", "true")
 	w.WriteHeader(rec.ResponseStatus)
 	_, _ = w.Write(rec.ResponseBody)
+}
+
+// replayableHeaders snapshots the handler's response headers for memoization,
+// excluding ones that must not be replayed verbatim: Content-Type is stored
+// separately, and Content-Length/Date are recomputed by the server on replay.
+func replayableHeaders(h http.Header) map[string][]string {
+	var out map[string][]string
+	for k, vals := range h {
+		switch http.CanonicalHeaderKey(k) {
+		case "Content-Type", "Content-Length", "Date":
+			continue
+		}
+		if out == nil {
+			out = make(map[string][]string, len(h))
+		}
+		cp := make([]string, len(vals))
+		copy(cp, vals)
+		out[k] = cp
+	}
+	return out
 }
 
 func idemConflict(w http.ResponseWriter, reqID, msg string) {
@@ -259,6 +267,42 @@ func spoolBody(r *http.Request) (*idemSpool, string, error) {
 		r.Body = body
 	}
 	return sp, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+type IdempotencyHandler struct {
+	repo     repository.Repository
+	logger   *slog.Logger
+	hashBody bool
+}
+
+func extractIdempotencyKey(r *http.Request) (string, bool) {
+	key := r.Header.Get("Idempotency-Key")
+	return key, key != "" && isWriteMethod(r.Method)
+}
+
+func (h *IdempotencyHandler) handleIdempotentRequest(w http.ResponseWriter, r *http.Request, key, fp, tenant, reqID string) bool {
+	ctx := r.Context()
+	rec, claimed, err := h.repo.ClaimIdempotencyKey(ctx, tenant, key, fp, reqID)
+	if err != nil {
+		h.logger.Warn("idempotency claim failed", "err", err, "key", key, "tenant", tenant)
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{
+			Code: "InternalError", Message: "idempotency store unavailable", RequestID: reqID,
+		}})
+		return true
+	}
+	if !claimed {
+		switch {
+		case rec.Fingerprint != fp:
+			idemConflict(w, reqID, "Idempotency-Key reused for a different request")
+		case rec.Status == "completed":
+			telemetry.IncIdempotencyReplay(ctx)
+			replay(w, rec)
+		default:
+			idemConflict(w, reqID, "a request with this Idempotency-Key is already in progress")
+		}
+		return true
+	}
+	return false
 }
 
 func isWriteMethod(m string) bool {

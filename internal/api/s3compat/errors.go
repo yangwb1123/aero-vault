@@ -28,6 +28,10 @@ func writeS3Error(w http.ResponseWriter, r *http.Request, err error) {
 // AWS reports as a 404 NoSuchLifecycleConfiguration rather than an empty body.
 var errNoSuchLifecycle = errors.New("the lifecycle configuration does not exist")
 
+// errNoSuchBucketPolicy signals that a bucket has no policy, which AWS reports
+// as a 404 NoSuchBucketPolicy rather than an empty body.
+var errNoSuchBucketPolicy = errors.New("the bucket policy does not exist")
+
 // errMalformedXML signals an unparsable request body (400 MalformedXML).
 var errMalformedXML = errors.New("the XML you provided was not well-formed or did not validate")
 
@@ -35,31 +39,83 @@ var errMalformedXML = errors.New("the XML you provided was not well-formed or di
 // (404 NoSuchBucket).
 var errNoSuchBucket = errors.New("the specified bucket does not exist")
 
-func classify(err error) (string, string, int) {
-	switch {
-	case errors.Is(err, errMalformedXML):
-		return "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.", http.StatusBadRequest
-	case errors.Is(err, errNoSuchBucket):
-		return "NoSuchBucket", "The specified bucket does not exist.", http.StatusNotFound
-	case errors.Is(err, errNoSuchLifecycle):
-		return "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist.", http.StatusNotFound
-	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):
-		return "NoSuchKey", "The specified key does not exist.", http.StatusNotFound
-	case errors.Is(err, service.ErrInvalidArgs):
-		return "InvalidArgument", err.Error(), http.StatusBadRequest
-	case errors.Is(err, service.ErrRangeNotSatisfiable):
-		return "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable
-	case errors.Is(err, service.ErrPreconditionFailed):
-		return "PreconditionFailed", "At least one of the preconditions you specified did not hold.", http.StatusPreconditionFailed
-	case errors.Is(err, service.ErrUploadNotFound), errors.Is(err, repository.ErrUploadNotFound):
-		return "NoSuchUpload", "The specified multipart upload does not exist.", http.StatusNotFound
-	case errors.Is(err, service.ErrLocked):
-		return "AccessDenied", "Object is under retention lock (WORM).", http.StatusForbidden
-	case errors.Is(err, service.ErrQuotaExceeded):
-		return "QuotaExceeded", "The tenant storage quota has been exceeded.", http.StatusForbidden
-	case errors.Is(err, service.ErrForbidden):
-		return "AccessDenied", "Access denied.", http.StatusForbidden
-	default:
-		return "InternalError", err.Error(), http.StatusInternalServerError
+var s3CodeStatus = map[string]int{
+	"MalformedJSON":                http.StatusBadRequest,
+	"MalformedXML":                 http.StatusBadRequest,
+	"NoSuchBucket":                 http.StatusNotFound,
+	"NoSuchBucketPolicy":           http.StatusNotFound,
+	"NoSuchLifecycleConfiguration": http.StatusNotFound,
+	"NoSuchKey":                    http.StatusNotFound,
+	"InvalidRange":                 http.StatusRequestedRangeNotSatisfiable,
+	"PreconditionFailed":           http.StatusPreconditionFailed,
+	"NoSuchUpload":                 http.StatusNotFound,
+	"InvalidArgument":              http.StatusBadRequest,
+	"AccessDenied":                 http.StatusForbidden,
+	"AccessDenied.Locked":          http.StatusForbidden,
+	"ObjectCorrupt":                http.StatusGone,
+	"QuotaExceeded":                http.StatusForbidden,
+}
+
+var s3CodeMessage = map[string]string{
+	"MalformedXML":                 "The XML you provided was not well-formed or did not validate against our published schema.",
+	"NoSuchBucket":                 "The specified bucket does not exist.",
+	"NoSuchBucketPolicy":           "The bucket policy does not exist.",
+	"NoSuchLifecycleConfiguration": "The lifecycle configuration does not exist.",
+	"NoSuchKey":                    "The specified key does not exist.",
+	"InvalidRange":                 "The requested range is not satisfiable",
+	"PreconditionFailed":           "At least one of the preconditions you specified did not hold.",
+	"NoSuchUpload":                 "The specified multipart upload does not exist.",
+	"InvalidArgument":              "",
+	"AccessDenied":                 "Access denied.",
+	"AccessDenied.Locked":          "Object is under retention lock (WORM).",
+	"ObjectCorrupt":                "Object is marked as corrupt.",
+	"QuotaExceeded":                "The tenant storage quota has been exceeded.",
+}
+
+var errToS3Code = []struct {
+	err  error
+	code string
+}{
+	{errMalformedXML, "MalformedXML"},
+	{errNoSuchBucket, "NoSuchBucket"},
+	{errNoSuchBucketPolicy, "NoSuchBucketPolicy"},
+	{errNoSuchLifecycle, "NoSuchLifecycleConfiguration"},
+	{service.ErrNotFound, "NoSuchKey"},
+	{repository.ErrNotFound, "NoSuchKey"},
+	{service.ErrInvalidArgs, "InvalidArgument"},
+	{service.ErrRangeNotSatisfiable, "InvalidRange"},
+	{service.ErrPreconditionFailed, "PreconditionFailed"},
+	{service.ErrUploadNotFound, "NoSuchUpload"},
+	{repository.ErrUploadNotFound, "NoSuchUpload"},
+	{service.ErrLocked, "AccessDenied.Locked"},
+	{service.ErrQuotaExceeded, "QuotaExceeded"},
+	{service.ErrForbidden, "AccessDenied"},
+	{service.ErrObjectCorrupt, "ObjectCorrupt"},
+}
+
+func s3ErrorCode(err error) string {
+	for _, m := range errToS3Code {
+		if errors.Is(err, m.err) {
+			return m.code
+		}
 	}
+	return "InternalError"
+}
+
+func s3ErrorResponse(code string) (int, string) {
+	status, ok := s3CodeStatus[code]
+	if !ok {
+		return http.StatusInternalServerError, ""
+	}
+	return status, s3CodeMessage[code]
+}
+
+func classify(err error) (string, string, int) {
+	code := s3ErrorCode(err)
+	if code == "InvalidArgument" || code == "InternalError" {
+		status, _ := s3ErrorResponse(code)
+		return code, err.Error(), status
+	}
+	status, msg := s3ErrorResponse(code)
+	return code, msg, status
 }

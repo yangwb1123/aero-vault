@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -725,5 +726,168 @@ func TestGetStoredContentTypeBeatsSniff(t *testing.T) {
 	}
 	if !bytes.Equal(got, body) {
 		t.Fatalf("GET body: got %q, want %q", got, body)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Readdir pagination — a directory with more than maxListPage (1000) objects
+// must list completely. PROPFIND Depth:1 walks the collection via Readdir(0),
+// whose contract is to return EVERY entry; before the pagination fix the listing
+// was hard-capped at the first 1000 rows and silently truncated.
+// ----------------------------------------------------------------------------
+
+func TestPropfindListsBeyondOnePage(t *testing.T) {
+	srv, svc := newTestServerWithSvc(t)
+
+	// Seed 1001 objects so the listing spans two List() pages (maxListPage=1000).
+	// Zero-padded names sort lexicographically, so big-1000.txt is the very last
+	// row and would be dropped by a single-page (limit 1000) listing.
+	const n = 1001
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("big/f%04d.txt", i)
+		if _, err := svc.Put(context.Background(), service.DefaultTenant, service.DefaultBucket,
+			key, strings.NewReader("x"), 1, service.PutOptions{}); err != nil {
+			t.Fatalf("seed Put %s: %v", key, err)
+		}
+	}
+
+	resp, body := do(t, srv, "PROPFIND", "/webdav/big/", []byte(propfindAllprop), map[string]string{
+		"Depth":        "1",
+		"Content-Type": "application/xml",
+	})
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND big/ depth=1: got %d, want 207", resp.StatusCode)
+	}
+
+	var ms propfindResponse
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		t.Fatalf("PROPFIND response not valid XML: %v", err)
+	}
+	// Depth:1 yields the collection itself plus one <response> per member, so the
+	// total must be n+1. A truncated listing would fall short of this.
+	if got := len(ms.Responses); got != n+1 {
+		t.Fatalf("PROPFIND big/: got %d <response> elements, want %d (collection + %d members)", got, n+1, n)
+	}
+	// The last-sorted file must appear: it is exactly the entry the old 1000-cap
+	// would have dropped.
+	if !strings.Contains(string(body), "f1000.txt") {
+		t.Fatalf("PROPFIND big/: last entry f1000.txt missing — listing was truncated")
+	}
+	// And the first must still be there (no off-by-one at the page head).
+	if !strings.Contains(string(body), "f0000.txt") {
+		t.Fatalf("PROPFIND big/: first entry f0000.txt missing")
+	}
+}
+
+// TestPropfindCollapsesNestedDirsAcrossPages confirms a virtual subdirectory
+// whose objects straddle the maxListPage page boundary is emitted exactly once,
+// not duplicated, when the listing paginates.
+func TestPropfindCollapsesNestedDirsAcrossPages(t *testing.T) {
+	srv, svc := newTestServerWithSvc(t)
+
+	// 1001 files all under root/sub/ — they collapse to a single virtual dir
+	// "sub" but their object keys span two List() pages.
+	const n = 1001
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("root/sub/f%04d.txt", i)
+		if _, err := svc.Put(context.Background(), service.DefaultTenant, service.DefaultBucket,
+			key, strings.NewReader("y"), 1, service.PutOptions{}); err != nil {
+			t.Fatalf("seed Put %s: %v", key, err)
+		}
+	}
+
+	resp, body := do(t, srv, "PROPFIND", "/webdav/root/", []byte(propfindAllprop), map[string]string{
+		"Depth":        "1",
+		"Content-Type": "application/xml",
+	})
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND root/ depth=1: got %d, want 207", resp.StatusCode)
+	}
+
+	var ms propfindResponse
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		t.Fatalf("PROPFIND response not valid XML: %v", err)
+	}
+	// Collection + exactly one collapsed "sub" entry == 2 responses. A double
+	// emit across the page boundary would push this to 3.
+	if got := len(ms.Responses); got != 2 {
+		t.Fatalf("PROPFIND root/: got %d <response> elements, want 2 (collection + single collapsed sub/)", got)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// MOVE rollback — copy-then-delete must not leave both names when the delete of
+// the source fails after the destination is written.
+// ----------------------------------------------------------------------------
+
+// deleteFailStorage wraps a Storage and forces Delete to fail for any key whose
+// path contains failOn, so a MOVE's source delete fails after the destination
+// blob and row are already committed (the duplicate-leaving window).
+type deleteFailStorage struct {
+	storage.Storage
+	failOn string
+}
+
+func (s *deleteFailStorage) Delete(ctx context.Context, key string) error {
+	if strings.Contains(key, s.failOn) {
+		return fmt.Errorf("injected delete failure for %q", key)
+	}
+	return s.Storage.Delete(ctx, key)
+}
+
+// newRollbackServer builds a WebDAV server whose storage fails Delete for any
+// key containing failOn, returning the server plus the service for inspection.
+func newRollbackServer(t *testing.T, failOn string) (*httptest.Server, *service.FileService) {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("repository.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("repo.Migrate: %v", err)
+	}
+	base, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage.NewLocal: %v", err)
+	}
+	store := &deleteFailStorage{Storage: base, failOn: failOn}
+	svc := service.NewFileService(store, repo, nil)
+	h := mw.Tenant(webdav.Handler("/webdav", svc, nil))
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return srv, svc
+}
+
+func TestMoveRollbackOnDeleteFailure(t *testing.T) {
+	srv, svc := newRollbackServer(t, "rollback-src")
+
+	const content = "do not duplicate me"
+	if _, err := svc.Put(context.Background(), service.DefaultTenant, service.DefaultBucket,
+		"rollback-src.txt", strings.NewReader(content), int64(len(content)),
+		service.PutOptions{}); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	// MOVE: Put(dst) succeeds, Delete(src) fails (injected) → Rename returns an
+	// error, which x/net/webdav maps to 403.
+	resp, _ := do(t, srv, "MOVE", "/webdav/rollback-src.txt", nil, map[string]string{
+		"Destination": srv.URL + "/webdav/rollback-dst.txt",
+		"Overwrite":   "T",
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("MOVE with failing source delete: got %d, want 403", resp.StatusCode)
+	}
+
+	// The destination must have been rolled back: it must NOT exist, otherwise
+	// both names live on (the duplicate this fix prevents).
+	if _, err := svc.Stat(context.Background(), service.DefaultTenant, service.DefaultBucket, "rollback-dst.txt"); err == nil {
+		t.Fatalf("rollback-dst.txt still exists after failed MOVE — rollback did not run (duplicate)")
+	}
+
+	// The source remains intact (its delete failed before touching the repo row).
+	if _, err := svc.Stat(context.Background(), service.DefaultTenant, service.DefaultBucket, "rollback-src.txt"); err != nil {
+		t.Fatalf("rollback-src.txt should still exist after failed MOVE: %v", err)
 	}
 }

@@ -36,198 +36,9 @@ type AppConfig struct {
 	WriteTimeoutSec   int // APP_WRITE_TIMEOUT; 0 = disabled
 	IdleTimeoutSec    int // APP_IDLE_TIMEOUT; 0 = disabled
 	RequestTimeoutSec int // REQUEST_TIMEOUT_SECONDS; 0 = disabled
-}
-
-type StorageConfig struct {
-	Backend          string
-	SSERewrapOnStart bool
-	Local            LocalStorageConfig
-	S3               S3StorageConfig
-	OSS              OSSStorageConfig
-	COS              COSStorageConfig
-}
-
-type OSSStorageConfig struct {
-	Endpoint  string
-	Bucket    string
-	AccessKey string
-	SecretKey string
-}
-
-type COSStorageConfig struct {
-	BucketURL string
-	SecretID  string
-	SecretKey string
-}
-
-type LocalStorageConfig struct {
-	Root        string
-	PublicURL   string
-	SignKey     string
-	SSEKey      string
-	SSEKeyfile  string
-	SSEKeyURL   string
-	SSEKeyToken string
-	SSEKMSURL   string
-	SSEKMSKeyID string
-	SSEKMSToken string
-}
-
-type S3StorageConfig struct {
-	Endpoint       string
-	Region         string
-	Bucket         string
-	AccessKey      string
-	SecretKey      string
-	ForcePathStyle bool
-}
-
-type DBConfig struct {
-	Driver string
-	DSN    string
-}
-
-type S3CompatConfig struct {
-	Prefix string
-}
-
-type EventsConfig struct {
-	WebhookURL    string
-	WebhookSecret string
-	// Cross-instance event transport (multi-replica). "" = in-process only;
-	// "postgres" = LISTEN/NOTIFY bridge. Requires Postgres; opt-in.
-	Transport     string
-	TransportDSN  string
-	SubBufferSize int // EVENTS_SUB_BUFFER; per-subscriber channel depth (0 = default 64)
-}
-
-type AIConfig struct {
-	Enabled        bool
-	Provider       string
-	Endpoint       string
-	Model          string
-	APIKey         string
-	Dim            int
-	HybridSearch   bool
-	EmbedCacheSize int // >0 wraps the embedder in a bounded in-memory cache
-
-	SearchCacheSize       int  // >0 enables a bounded, TTL'd hot-result cache for identical repeated queries
-	SearchCacheTTLSeconds int  // TTL bounding staleness of cached search results
-	ReindexStaleOnStart   bool // re-index objects whose chunks use a different embed model (after embedder change)
-
-	// Vector retrieval backend. "" = brute-force (default); "pgvector" = ANN via
-	// Postgres pgvector; "qdrant" = an external Qdrant vector store. Each is
-	// opt-in; "" keeps the brute-force repository scan.
-	VectorBackend string
-	VectorDSN     string
-	// Qdrant external vector store (used when VectorBackend == "qdrant"). The
-	// adapter implements both the read (VectorIndex) and write (ChunkSink) seams.
-	VectorURL        string
-	VectorAPIKey     string
-	VectorCollection string
-	// Lexical retrieval backend. "" = in-process BM25 (default); "pgfts" =
-	// Postgres full-text search. Reuses VectorDSN for its connection; opt-in.
-	LexicalBackend string
-
-	ExtractorEndpoint string
-	ExtractorAPIKey   string
-
-	ChatProvider string // "http" | "mock" | ""
-	ChatEndpoint string
-	ChatModel    string
-	ChatAPIKey   string
-
-	// Estimated cost accounting (USD per 1000 tokens; 0 = don't price).
-	ChatCostPromptPer1K     float64
-	ChatCostCompletionPer1K float64
-	// Per-tenant daily AI spend cap (USD; 0 = unlimited). Enforced at the chat seam.
-	TenantDailyBudgetUSD float64
-	// PerTenantBudgets lets each tenant override TenantDailyBudgetUSD via its
-	// stored quota row (set through the admin budget endpoint).
-	PerTenantBudgets bool
-
-	RerankProvider string // "http" | "heuristic" | ""
-	RerankEndpoint string
-	RerankModel    string
-	RerankAPIKey   string
-
-	PIIScan   bool
-	PIIRedact bool
-
-	AgentMaxSteps int
-	ChunkWindow   int
-	ChunkOverlap  int
-}
-
-type AuthConfig struct {
-	Keys                string
-	JWTSecret           string
-	AnonymousPublicRead bool
-	SigV4Credentials    string // accessKey:secretKey:tenant[:scope+scope],...
-	PersistKeys         bool   // back runtime API keys with the repository (hashed, survive restart)
-	KeyCacheTTLSeconds  int    // >0 caches persisted-key lookups for this many seconds (revokes bounded by TTL across replicas)
-}
-
-type TelemetryCfg struct {
-	PrometheusEnabled bool
-}
-
-type CORSCfg struct {
-	AllowedOrigins []string
-	AllowedMethods []string
-	AllowedHeaders []string
-	ExposeHeaders  []string // CORS_EXPOSE_HEADERS; response headers browsers may read
-}
-
-type RateLimitCfg struct {
-	RPS     float64
-	Burst   float64
-	AIRPS   float64
-	AIBurst float64
-}
-
-type ReconcileCfg struct {
-	IntervalMinutes     int
-	DeleteOrphanBlobs   bool
-	OrphanGraceMinutes  int
-	Tenants             []string
-	ClusterSingleton    bool // when true, only one replica runs the sweep (DB lease)
-	RetentionDays       int  // >0 enables permanent GC of rows soft-deleted longer ago than this
-	IdempotencyTTLHours int  // >0 enables GC of idempotency keys older than this
-	IdempotencyHashBody bool // fold a request-body hash into /v1 idempotency fingerprints (catches same-key/different-bytes)
-}
-
-// JobsCfg controls the background job worker pool. Workers<=0 disables the
-// pool, in which case the indexer falls back to processing events inline.
-type JobsCfg struct {
-	Workers  int
-	MaxDepth int // >0 caps pending jobs (backpressure); Enqueue returns ErrQueueFull when reached
-}
-
-// AntivirusCfg controls malware scanning of uploaded objects (async via the job
-// pool). Provider "signature" is the built-in dependency-free scanner; "http"
-// defers to an external engine.
-type AntivirusCfg struct {
-	Enabled    bool
-	Provider   string // signature | http
-	Endpoint   string
-	APIKey     string
-	Quarantine bool // soft-delete infected objects
-}
-
-// ReplicationCfg configures asynchronous replication to a secondary storage
-// backend (a different region/provider). Storage holds the replica target.
-type ReplicationCfg struct {
-	Enabled bool
-	Storage StorageConfig
-}
-
-type WebDAVCfg struct {
-	Prefix string // empty disables
-}
-
-type WebUICfg struct {
-	Enabled bool
+	MaxInFlight       int // MAX_INFLIGHT_REQUESTS; 0 = unlimited
+	PerTenantMax      int // PER_TENANT_CONCURRENCY_MAX; 0 = unlimited
+	MaxBodySize       int // APP_MAX_BODY_SIZE; max request body bytes (0 = unlimited)
 }
 
 func Load() (*Config, error) {
@@ -245,10 +56,24 @@ func Load() (*Config, error) {
 			WriteTimeoutSec:   getEnvInt("APP_WRITE_TIMEOUT", 60),
 			IdleTimeoutSec:    getEnvInt("APP_IDLE_TIMEOUT", 120),
 			RequestTimeoutSec: getEnvInt("REQUEST_TIMEOUT_SECONDS", 120),
+			MaxInFlight:       getEnvInt("MAX_INFLIGHT_REQUESTS", 0),
+			PerTenantMax:      getEnvInt("PER_TENANT_CONCURRENCY_MAX", 0),
+			MaxBodySize:       getEnvInt("APP_MAX_BODY_SIZE", 0),
 		},
 		Storage: StorageConfig{
-			Backend:          strings.ToLower(getEnv("STORAGE_BACKEND", "local")),
-			SSERewrapOnStart: getEnvBool("STORAGE_SSE_REWRAP_ON_START", false),
+			Backend:            strings.ToLower(getEnv("STORAGE_BACKEND", "local")),
+			SSERewrapOnStart:   getEnvBool("STORAGE_SSE_REWRAP_ON_START", false),
+			DefaultClass:       getEnv("STORAGE_DEFAULT_CLASS", ""),
+			ConnectTimeout:     getEnvInt("STORAGE_CONNECT_TIMEOUT", 5),
+			ReadTimeout:        getEnvInt("STORAGE_READ_TIMEOUT", 30),
+			WriteTimeout:       getEnvInt("STORAGE_WRITE_TIMEOUT", 30),
+			VerifyOnRead:       getEnvBool("STORAGE_VERIFY_ON_READ", false),
+			VerifyMaxSize:      int64(getEnvInt("STORAGE_VERIFY_MAX_SIZE", 10*1024*1024)),
+			VerifySample:       getEnvBool("STORAGE_VERIFY_SAMPLE", true),
+			CBFailureThreshold: getEnvInt("STORAGE_CB_FAILURE_THRESHOLD", 0),
+			CBRecoveryTimeout:  getEnvInt("STORAGE_CB_RECOVERY_TIMEOUT", 0),
+			CBHalfOpenMax:      getEnvInt("STORAGE_CB_HALF_OPEN_MAX", 0),
+			CBEnabled:          getEnvBool("STORAGE_CB_ENABLED", false),
 			Local: LocalStorageConfig{
 				Root:        getEnv("STORAGE_LOCAL_ROOT", "./var/objects"),
 				PublicURL:   getEnv("STORAGE_LOCAL_PUBLIC_URL", ""),
@@ -340,10 +165,12 @@ func Load() (*Config, error) {
 			AgentMaxSteps: getEnvInt("AI_AGENT_MAX_STEPS", 4),
 			ChunkWindow:   getEnvInt("AI_CHUNK_WINDOW", 600),
 			ChunkOverlap:  getEnvInt("AI_CHUNK_OVERLAP", 80),
+			DegradedMode:  getEnvBool("AI_DEGRADED_MODE", false),
 		},
 		Auth: AuthConfig{
 			Keys:                getEnv("AUTH_KEYS", ""),
 			JWTSecret:           getEnv("AUTH_JWT_SECRET", ""),
+			JWTIssuer:           getEnv("AUTH_JWT_ISSUER", ""),
 			AnonymousPublicRead: getEnvBool("AUTH_ANONYMOUS_PUBLIC_READ", false),
 			SigV4Credentials:    getEnv("S3_SIGV4_CREDENTIALS", ""),
 			PersistKeys:         getEnvBool("AUTH_PERSIST_KEYS", false),
@@ -370,9 +197,12 @@ func Load() (*Config, error) {
 			OrphanGraceMinutes:  getEnvInt("RECONCILE_ORPHAN_GRACE_MINUTES", 60),
 			Tenants:             reconcileTenants(),
 			ClusterSingleton:    getEnvBool("RECONCILE_CLUSTER_SINGLETON", false),
+			ScrubEnabled:        getEnvBool("RECONCILE_SCRUB_ENABLED", false),
 			RetentionDays:       getEnvInt("RECONCILE_RETENTION_DAYS", 0),
 			IdempotencyTTLHours: getEnvInt("IDEMPOTENCY_TTL_HOURS", 0),
 			IdempotencyHashBody: getEnvBool("IDEMPOTENCY_HASH_BODY", false),
+			UploadGCHours:       getEnvInt("UPLOAD_GC_TTL_HOURS", 168),
+			UploadGCEnable:      false, // enabled below when >0
 		},
 		Jobs: JobsCfg{
 			Workers:  getEnvInt("JOBS_WORKERS", 4),
@@ -409,6 +239,9 @@ func Load() (*Config, error) {
 		WebUI:  WebUICfg{Enabled: getEnvBool("WEBUI_ENABLED", true)},
 	}
 
+	// Enable upload GC when TTL is configured.
+	cfg.Reconcile.UploadGCEnable = cfg.Reconcile.UploadGCHours > 0
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -416,6 +249,27 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) Validate() error {
+	if err := c.validateStorage(); err != nil {
+		return err
+	}
+	switch c.DB.Driver {
+	case "postgres", "sqlite":
+	default:
+		return fmt.Errorf("unknown DB_DRIVER %q", c.DB.Driver)
+	}
+	if c.DB.DSN == "" {
+		return errors.New("DB_DSN is required")
+	}
+	if c.AI.Enabled && c.AI.Provider == "http" && c.AI.Endpoint == "" {
+		return errors.New("AI_EMBED_ENDPOINT is required when AI_EMBED_PROVIDER=http")
+	}
+	if err := c.validateTimeouts(); err != nil {
+		return err
+	}
+	return c.validateRateLimits()
+}
+
+func (c *Config) validateStorage() error {
 	switch c.Storage.Backend {
 	case "local":
 		if c.Storage.Local.Root == "" {
@@ -436,16 +290,31 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("unknown STORAGE_BACKEND %q", c.Storage.Backend)
 	}
-	switch c.DB.Driver {
-	case "postgres", "sqlite":
-	default:
-		return fmt.Errorf("unknown DB_DRIVER %q", c.DB.Driver)
+	return nil
+}
+
+func (c *Config) validateTimeouts() error {
+	if c.App.WriteTimeoutSec < 0 {
+		return errors.New("APP_WRITE_TIMEOUT must be >= 0 (0 = disabled)")
 	}
-	if c.DB.DSN == "" {
-		return errors.New("DB_DSN is required")
+	if c.App.IdleTimeoutSec < 0 {
+		return errors.New("APP_IDLE_TIMEOUT must be >= 0 (0 = disabled)")
 	}
-	if c.AI.Enabled && c.AI.Provider == "http" && c.AI.Endpoint == "" {
-		return errors.New("AI_EMBED_ENDPOINT is required when AI_EMBED_PROVIDER=http")
+	if c.App.RequestTimeoutSec < 0 {
+		return errors.New("REQUEST_TIMEOUT_SECONDS must be >= 0 (0 = disabled)")
+	}
+	return nil
+}
+
+func (c *Config) validateRateLimits() error {
+	if (c.RateLimit.RPS > 0) != (c.RateLimit.Burst > 0) {
+		return errors.New("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be positive or both be zero")
+	}
+	if (c.RateLimit.AIRPS > 0) != (c.RateLimit.AIBurst > 0) {
+		return errors.New("AI_RATE_LIMIT_RPS and AI_RATE_LIMIT_BURST must both be positive or both be zero")
+	}
+	if c.RateLimit.RPS < 0 || c.RateLimit.Burst < 0 || c.RateLimit.AIRPS < 0 || c.RateLimit.AIBurst < 0 {
+		return errors.New("rate limit values must not be negative")
 	}
 	return nil
 }

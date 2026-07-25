@@ -18,30 +18,32 @@ type errorPayload struct {
 
 // objectDTO is the JSON view of a stored object.
 type objectDTO struct {
-	Bucket      string            `json:"bucket"`
-	Key         string            `json:"key"`
-	Size        int64             `json:"size"`
-	ETag        string            `json:"etag"`
-	ContentType string            `json:"content_type,omitempty"`
-	Backend     string            `json:"backend"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	Tags        map[string]string `json:"tags,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
+	Bucket       string            `json:"bucket"`
+	Key          string            `json:"key"`
+	Size         int64             `json:"size"`
+	ETag         string            `json:"etag"`
+	ContentType  string            `json:"content_type,omitempty"`
+	Backend      string            `json:"backend"`
+	StorageClass string            `json:"storage_class,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	Tags         map[string]string `json:"tags,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
+	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
 func toObjectDTO(o repository.Object) objectDTO {
 	return objectDTO{
-		Bucket:      o.Bucket,
-		Key:         o.Key,
-		Size:        o.Size,
-		ETag:        o.ETag,
-		ContentType: o.ContentType,
-		Backend:     o.Backend,
-		Metadata:    o.Metadata,
-		Tags:        o.Tags,
-		CreatedAt:   o.CreatedAt,
-		UpdatedAt:   o.UpdatedAt,
+		Bucket:       o.Bucket,
+		Key:          o.Key,
+		Size:         o.Size,
+		ETag:         o.ETag,
+		ContentType:  o.ContentType,
+		Backend:      o.Backend,
+		StorageClass: o.StorageClass,
+		Metadata:     o.Metadata,
+		Tags:         o.Tags,
+		CreatedAt:    o.CreatedAt,
+		UpdatedAt:    o.UpdatedAt,
 	}
 }
 

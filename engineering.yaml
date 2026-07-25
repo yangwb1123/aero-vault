@@ -1,0 +1,113 @@
+# Declarative config for the aero-vault engineering harness (cli.py + checks/).
+#
+# Thresholds declared here are the single source of truth — AGENTS.md references
+# this file rather than restating values. See docs/agent/BOOTSTRAP.md.
+#
+# Project-specific checks that don't generalize (checks/invariants.py's
+# assertions, checks/adr_compliance.py) stay hardcoded to this project.
+
+project:
+  name: aero-vault
+  module: github.com/aero-vault/aero-vault
+  language: go
+
+filesize:
+  max_lines: 500
+  ignore_patterns:
+    - "_test.go"
+    - "migrations/"
+    - "webui/static/"
+  exemptions: []
+  required_exemptions: []
+
+complexity:
+  max_cyclomatic: 10
+  gocyclo_path: "gocyclo"
+  ignore_pattern: "_test.go|migrations/|webui/|sdk/"
+  exempt_functions:
+    - "run"
+    - "NewRouter"
+    - "NewHandler"
+    - "main"
+
+architecture:
+  # layer -> [allowed_dependencies]: a package's first path segment is its layer.
+  # A layer may import any package in the layers listed below it.
+  layers:
+    "cmd": []
+    "internal/api": ["internal/service", "internal/ai", "internal/auth", "internal/events", "internal/middleware", "internal/repository"]
+    "internal/service": ["internal/storage", "internal/repository", "internal/events", "internal/middleware", "internal/telemetry"]
+    "internal/storage": ["internal/telemetry"]
+    "internal/repository": ["internal/telemetry"]
+    "internal/events": ["internal/repository", "internal/telemetry"]
+    "internal/ai": ["internal/repository", "internal/storage", "internal/service", "internal/telemetry"]
+    "internal/auth": ["internal/repository"]
+    "internal/jobs": ["internal/repository", "internal/telemetry"]
+    "internal/mcp": ["internal/service", "internal/ai", "internal/repository", "internal/middleware"]
+    "internal/middleware": ["internal/auth", "internal/repository", "internal/telemetry"]
+    "internal/reconcile": ["internal/repository", "internal/storage", "internal/cluster", "internal/telemetry"]
+    "internal/replication": ["internal/repository", "internal/storage"]
+    "internal/antivirus": ["internal/repository", "internal/storage"]
+    "internal/telemetry": []
+    "internal/thumbnail": []
+    "internal/webui": []
+    "internal/cli": ["internal/service", "internal/ai", "internal/repository", "internal/snapshot"]
+    "internal/cluster": ["internal/repository"]
+    "internal/config": []
+    "internal/shutdown": []
+    "internal/snapshot": ["internal/service", "internal/repository", "internal/storage"]
+    "sdk": []
+  excluded_dirs:
+    - .git
+    - .claude
+    - vendor
+    - bin
+    - var
+    - ai-dev
+    - deploy
+    - docs
+    - scripts
+    - skills
+    - "__pycache__"
+    - "checks"
+    - "integration"
+
+root_policy:
+  max_files: 20
+  allowed_files:
+    - "README.md"
+    - "LICENSE"
+    - "AGENTS.md"
+    - "HARNESS.md"
+    - "go.mod"
+    - "go.sum"
+    - "Makefile"
+    - "Dockerfile"
+    - "engineering.yaml"
+    - "cli.py"
+    - "pi-batch.py"
+    - "docker-compose.yml"
+    - ".env"
+    - ".env.example"
+    - ".gitignore"
+    - ".editorconfig"
+    - ".golangci.yml"
+    - ".air.toml"
+    - "server"
+    - "pyproject.toml"
+  banned_patterns:
+    - "*_handler.go"
+    - "*_service.go"
+    - "*_router.go"
+    - "*_main.go"
+    - "*_middleware.go"
+
+coverage:
+  targets:
+    "": 50  # project-wide
+
+build:
+  output_dir: bin
+  binaries:
+    - name: aero-vault
+      path: ./cmd/server

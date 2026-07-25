@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -13,7 +14,7 @@ const (
 	IdempotencyCompleted  = "completed"
 )
 
-const idempotencyCols = `tenant_id, idem_key, fingerprint, status, response_status, response_body, response_ct, request_id, created_at, completed_at`
+const idempotencyCols = `tenant_id, idem_key, fingerprint, status, response_status, response_body, response_ct, response_headers, request_id, created_at, completed_at`
 
 // ClaimIdempotencyKey attempts to reserve (tenant, key) for a new write by
 // inserting an 'in_progress' row. When the insert wins (no prior key) the fresh
@@ -53,14 +54,22 @@ func (s *sqlStore) ClaimIdempotencyKey(ctx context.Context, tenant, key, fingerp
 
 // CompleteIdempotencyKey records the original request's response so retries can
 // replay it, transitioning the row to 'completed'.
-func (s *sqlStore) CompleteIdempotencyKey(ctx context.Context, tenant, key string, status int, body []byte, contentType string) error {
+func (s *sqlStore) CompleteIdempotencyKey(ctx context.Context, tenant, key string, status int, body []byte, contentType string, headers map[string][]string) error {
 	tenant = defaultTenant(tenant)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var headerJSON string
+	if len(headers) > 0 {
+		b, err := json.Marshal(headers)
+		if err != nil {
+			return err
+		}
+		headerJSON = string(b)
+	}
 	_, err := s.db.ExecContext(ctx, s.rebind(
 		`UPDATE idempotency_keys
-		 SET status='completed', response_status=$1, response_body=$2, response_ct=$3, completed_at=$4
-		 WHERE tenant_id=$5 AND idem_key=$6`),
-		status, body, contentType, now, tenant, key)
+		 SET status='completed', response_status=$1, response_body=$2, response_ct=$3, response_headers=$4, completed_at=$5
+		 WHERE tenant_id=$6 AND idem_key=$7`),
+		status, body, contentType, headerJSON, now, tenant, key)
 	return err
 }
 
@@ -91,15 +100,19 @@ func (s *sqlStore) getIdempotencyKey(ctx context.Context, tenant, key string) (I
 	row := s.db.QueryRowContext(ctx, s.rebind(
 		`SELECT `+idempotencyCols+` FROM idempotency_keys WHERE tenant_id=$1 AND idem_key=$2`), tenant, key)
 	var (
-		rec  IdempotencyRecord
-		body []byte
+		rec        IdempotencyRecord
+		body       []byte
+		headerJSON sql.NullString
 	)
-	if err := row.Scan(&rec.TenantID, &rec.Key, &rec.Fingerprint, &rec.Status, &rec.ResponseStatus, &body, &rec.ResponseCT, &rec.RequestID, &rec.CreatedAt, &rec.CompletedAt); err != nil {
+	if err := row.Scan(&rec.TenantID, &rec.Key, &rec.Fingerprint, &rec.Status, &rec.ResponseStatus, &body, &rec.ResponseCT, &headerJSON, &rec.RequestID, &rec.CreatedAt, &rec.CompletedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return IdempotencyRecord{}, ErrNotFound
 		}
 		return IdempotencyRecord{}, err
 	}
 	rec.ResponseBody = body
+	if headerJSON.Valid && headerJSON.String != "" {
+		_ = json.Unmarshal([]byte(headerJSON.String), &rec.ResponseHeaders)
+	}
 	return rec, nil
 }

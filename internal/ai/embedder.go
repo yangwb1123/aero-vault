@@ -130,6 +130,28 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 		return nil, nil
 	}
 	start := time.Now()
+	req, err := e.buildEmbedRequest(ctx, texts)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := e.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	out, tokens, err := e.parseEmbedResponse(resp, len(texts))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > 0 && e.Dim == 0 {
+		e.Dim = len(out[0])
+	}
+	recordEmbedUsage(ctx, e.Model, tokens)
+	telemetry.RecordEmbedLatency(ctx, e.Model, float64(time.Since(start).Milliseconds()))
+	return out, nil
+}
+
+func (e *HTTPEmbedder) buildEmbedRequest(ctx context.Context, texts []string) (*http.Request, error) {
 	body, _ := json.Marshal(embedReq{Model: e.Model, Input: texts})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.Endpoint+"/v1/embeddings", bytes.NewReader(body))
 	if err != nil {
@@ -139,33 +161,24 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 	if e.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+e.APIKey)
 	}
-	resp, err := e.Client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	return req, nil
+}
+
+func (e *HTTPEmbedder) parseEmbedResponse(resp *http.Response, want int) ([][]float32, int, error) {
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("embedder http %d: %s", resp.StatusCode, string(b))
+		return nil, 0, fmt.Errorf("embedder http %d: %s", resp.StatusCode, string(b))
 	}
 	var er embedResp
 	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if len(er.Data) != len(texts) {
-		return nil, fmt.Errorf("embedder returned %d vectors for %d texts", len(er.Data), len(texts))
+	if len(er.Data) != want {
+		return nil, 0, fmt.Errorf("embedder returned %d vectors for %d texts", len(er.Data), want)
 	}
 	out := make([][]float32, len(er.Data))
 	for i, d := range er.Data {
 		out[i] = d.Embedding
 	}
-	if len(out) > 0 && e.Dim == 0 {
-		e.Dim = len(out[0])
-	}
-	// Surface provider-reported token usage so embedding spend is observable
-	// (ai_embed_tokens_total{model}); the request is counted even when the
-	// provider omits usage.
-	recordEmbedUsage(ctx, e.Model, er.Usage.TotalTokens)
-	telemetry.RecordEmbedLatency(ctx, e.Model, float64(time.Since(start).Milliseconds()))
-	return out, nil
+	return out, er.Usage.TotalTokens, nil
 }

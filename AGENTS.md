@@ -1,234 +1,188 @@
 # AGENTS.md
 
-> 本库 AI Agent/贡献者工作合约。全局概述 → `README.md`；配置详表 → `docs/configuration.md`；架构深度 → `docs/architecture.md`。
+> **Agent 启动加载顺序（由外到内）：** `docs/agent/BOOTSTRAP.md`（全局知识）→ **本文**（行为合约/架构/不变量）→ `docs/agent/CURRENT_SPRINT.md`（本轮范围）→ `docs/agent/TASK.md`（当前任务）→ `HARNESS.md`（提交前 `make check`）。
+>
+> 本文是 AI Agent/贡献者的**工作合约**：只写*契约、架构边界、不变量*。全局概述 → `README.md`；架构深度 → `docs/architecture.md`。
+>
+> **环境变量的名称以本文为准；具体默认值/取值以 `docs/configuration.md` + `.env.example` 为准，本文不内联易漂移的数值默认。**
 
 ---
 
-## 1. 系统全局架构与工作流 (System Overview & DAG)
+## 0. 工程约束 (Engineering Constraints)
 
-**Binary:** `github.com/aero-vault/aero-vault` · Go 1.25 · `cmd/server/main.go`  
-**启动装配顺序（main.go 唯一）：** `config → storage → repo → service → workers → middleware → router`
+**硬门禁（`make check` / CI 失败即拒绝合入）：** `gofmt -l` 无输出 · `go build ./...` · `go vet ./...` · `go test ./...`（SQLite+local FS，零网络/零 Docker）· **单文件 ≤ 500 行**。
+
+**约定（仅告警，不阻断——违反不会自动拒绝，但 review 会要求整改）：** 单函数 ≤ 50 行 · 圈复杂度 ≤ 10（`gocyclo -over 10` 仅 `WARN`）· 禁 God 类型（> 300 行）· 禁 `utils/` `common/` `helper/` 包（按领域分散）· 单测覆盖率 ≥ 50%（目标 80%）· **重构优先于功能**。
+
+> `make check` **不**运行 `go mod tidy` / `golines`（那是独立的 `make tidy`）——`HARNESS.md` §1 的“7 步等价”描述已过时，以本表为准。新增 `go.mod` 依赖需论证 + `go mod tidy`（见 I6）。
+
+---
+
+## 1. 系统架构与装配 (System Overview & DAG)
+
+**Binary:** `github.com/aero-vault/aero-vault` · Go 1.25 · `cmd/server/main.go`
+**装配顺序（main.go 唯一）：** `config → storage → repo → service → workers → middleware → router`
 
 ```mermaid
 flowchart LR
     subgraph Proto["Protocol Adapters (thin)"]
         R["/v1 REST"]
-        S["/s3 S3Compat"]
+        S["/s3 (S3_COMPAT_PREFIX)"]
         M["/mcp HTTP+stdio"]
         D["WebDAV (WEBDAV_PREFIX)"]
     end
-
     Proto --> FS["FileService\ninternal/service"]
-
-    FS --> ST[("Storage\nlocal★/s3/oss/cos")]
+    FS --> ST[("Storage\nlocal★/s3/oss/cos · 可选熔断/校验")]
     FS --> DB[("Repository\nSQLite★/Postgres")]
-    FS --> EB(["EventBus"])
-
-    EB --> WH["Webhook\nHMAC·durable retry"]
-    EB --> WK["Workers\nAV · Replication"]
-
-    JP["JobPool\n(jobs table)"] --> REC["Reconcile/GC\n(cluster singleton opt)"]
-    JP --> IDX
-
-    IDX["Indexer\nextract→chunk→embed"] --> AI["Search/Chat/Agent\nvector/BM25/hybrid+RRF"]
+    FS --> EB(["EventBus\n先持久化→本地广播(drop-on-full)"])
+    EB --> WH["Webhook\nHMAC · durable retry · DLQ"]
+    EB --> JP["JobPool (jobs 表)\nAV · Replication · Indexer"]
+    JP -.-> IDX["Indexer\nextract→chunk→embed"]
+    IDX --> AI["Search/Chat/Agent\nvector/BM25/hybrid+RRF"]
     AI <-.-> DB & ST
-
-    AUTH["Auth\nKey·JWT·SigV4"] -.->|middleware chain| FS
-    OBS["OTel·Prometheus\n/metrics"] -.->|instrument| FS & AI & JP
+    TMR["Reconcile/GC —— 定时器驱动，非 JobPool\nscrub · lifecycle · retention · upload-gc\n(leases 表单例锁，可选)"] -.-> DB & ST
+    AUTH["Auth middleware\nKey · JWT · SigV4 · 匿名公读"] -.->|chain| FS
+    OBS["OTel · Prometheus /metrics"] -.->|instrument| FS & AI & JP
 ```
 
-**★ 默认基线：** SQLite + local FS + 无鉴权 + AI off — CI gate 唯一验证路径。
+**★ CI 基线（唯一被 `go test` 验证的路径）：** SQLite + local FS + 无鉴权 + AI off。所有 AI/pgvector/Qdrant/events/cluster/retention/WebDAV/S3 网关均 **opt-in、默认关闭**（见 I5）。
 
 ---
 
-## 2. 核心智能体定义 (Core Agent Profiles)
+## 2. 组件契约 (Component Contracts)
 
-### 2.1 FileService（核心控制器）
+> 每个组件的“职责/禁止/激活”只在此定义一次；行为细节见 §4 不变量。
 
-| 属性 | 定义 |
-|------|------|
-| **Package** | `internal/service` |
-| **职责** | 对象 CRUD、配额、版本控制、对象锁/WORM、Tags、ACL、Range、条件请求、预签名、事件发布、ChunkCleaner 钩子 |
-| **输入** | 任意协议适配器调用 |
-| **输出** | `Object` 元数据 · 存储 key · 事件 payload |
-| **禁止** | ① 协议层绕过 FileService 直连 Storage；② handler 自行校验 key 合法性；③ `ChunkCleaner.DeleteObjectChunks` 失败不得阻断硬删除 |
+### 2.1 FileService — 核心控制器 · `internal/service`
 
-### 2.2 Protocol Adapters
+- **职责（唯一入口）：** 对象 CRUD + 软/硬删除 + Restore、配额（字节/对象数预检）、per-bucket 版本控制、对象锁/WORM、**法律保留（legal hold，独立于 WORM，均阻断硬删除）**、Tags/ACL、Range、预签名、事件发布、`ChunkCleaner` 钩子；写入侧完整性：Content-MD5 校验（失败 `ErrBadDigest` 并删除已写 blob）、元数据尺寸上限、可选 on-read ETag 校验、损坏对象守卫（`_aero_scrub_status=corrupt` → `ErrObjectCorrupt`）。
+- **key 合法性校验（禁空 / `/` 前缀 / `..`）在 FileService 与 storage 后端两层执行——唯独不在 adapter/handler 层**（见 I3）。
+- **禁止：** ① adapter 绕过 FileService 直连 Storage；② handler 自校验 key 合法性；③ `ChunkCleaner.DeleteObjectChunks` 失败**不得**阻断硬删除（warn log 后继续，见 §4）。
+- **注意：** 条件请求（If-Match/304/412）的判定属**协议适配器**职责，FileService 只暴露 `ErrPreconditionFailed` 哨兵。
 
-| Adapter | Package | 核心职责 | 禁止 |
+### 2.2 Protocol Adapters（thin；业务逻辑一律下沉 FileService）
+
+| Adapter | Package | 职责要点 | 禁止 |
 |---------|---------|---------|------|
-| REST `/v1` | `internal/api/rest` | JSON API：files/search/chat/agent/events-SSE/buckets/admin/ACL/thumbnail；`router.go` 注册；scope 校验；OpenAPI | 业务逻辑写入 handler |
-| S3 `/s3` | `internal/api/s3compat` | 对象 CRUD/listing(v1v2)/versions/multipart/tagging/ACL/copy/batch-delete/bucket 子资源(versioning·lock·lifecycle·acl·location)；SigV4 验签 | 绕过 FileService |
-| WebDAV | `internal/api/webdav` | PROPFIND/MKCOL/PUT/GET/DELETE；在 chi 外独立分发 | 修改 chi 路由注册 |
-| MCP | `internal/mcp` | 工具：`list_files` `read_file` `search` `write_file` `delete_file` `chat`(仅 `s.chat != nil`) | 硬编码工具列表；`chat` 在 AI 未配置时暴露 |
+| REST `/v1` | `api/rest` | JSON API；`router.go` 注册 + 方法派生 scope（读:GET/HEAD/OPTIONS，写:其余）+ `Require(scope)`；SSE、Idempotency、OpenAPI | 业务逻辑写入 handler |
+| S3 `/s3` | `api/s3compat` | 对象 CRUD/list(v1v2)/versions/multipart/tagging/acl/copy/batch-delete/`?restore`/legal-hold；bucket 子资源；**每次操作执行 bucket policy（IAM 风格 allow/deny + 源 IP）** | 绕过 FileService |
+| WebDAV | `api/webdav` | 基于 `x/net/webdav`：PROPFIND/PROPPATCH/MKCOL(虚拟 no-op)/PUT/GET/HEAD/DELETE/COPY/**MOVE(copy-then-delete)**/LOCK/UNLOCK(内存锁)；仅作用于 default bucket；在 chi 外独立分发 | 改动 chi 路由注册 |
+| MCP | `mcp` | tools=恒有`list_files·read_file·write_file·delete_file`，`search`(仅 embedder 就绪)、`chat`(仅 llm 就绪) 条件暴露；**resources/list·read**（`aero-vault://{tenant}/{bucket}/{key}`，跨租户 URI 拒绝）；HTTP+stdio | 硬编码工具列表；在依赖未就绪时暴露 search/chat |
 
-### 2.3 AI/RAG Pipeline（`AI_INDEX_ENABLED=true` 激活）
+> SigV4（请求头 + 预签名）的**验签在 `internal/auth` 中间件完成，不在 /s3 adapter 内**（见 2.5）。
 
-| 阶段 | 组件 | 输入 → 输出 |
-|------|------|------------|
-| 提取 | `ai.Extractor` / `RemoteExtractor`(`AI_EXTRACTOR_ENDPOINT`) | 对象字节流 → 纯文本 |
-| 分块 | `ai.Chunker` | 文本 → `[]Chunk`；`AI_CHUNK_WINDOW(600)` / `AI_CHUNK_OVERLAP(80)` |
-| 向量化 | `Embedder`(`AI_EMBED_PROVIDER`) | `[]string` → `[][]float32`；`AI_EMBED_DIM(256)` |
-| 索引写入 | `ChunkSink`（BM25★ / pgvector / Qdrant） | Chunk+向量 → 持久化索引 |
-| 检索 | `Search.Query` | query + mode → `[]Hit`；RRF 融合，tiebreak `(score DESC, chunkID ASC)` |
-| 生成 | `Chat.Answer` / `Agent.Run` | `[]Hit` + 问题 → answer+citations；`AI_AGENT_MAX_STEPS(4)` |
-| PII | `PIIDetector` | 文本 → Scan 报告 / Redact 脱敏；信用卡规则加 Luhn 校验 |
-| 跳过计量 | `telemetry.IncIndexerSkip` | 跳过路径 → `indexer_skip_total{reason∈{unsupported,error,empty}}` |
+### 2.3 AI/RAG Pipeline（`AI_INDEX_ENABLED=true` 激活，默认关）
 
-**AI 专项限流：** `AI_RATE_LIMIT_RPS` / `AI_RATE_LIMIT_BURST` → 仅作用于 `/search` `/chat` `/chat/stream` `/agent` `/lineage`。  
-**nil 安全：** `embedder`/`llm`/`reranker` 为 `nil` 时不影响文件 CRUD。
+`Extractor`/`RemoteExtractor`(`AI_EXTRACTOR_ENDPOINT`) → `Chunker`(`AI_CHUNK_WINDOW`/`AI_CHUNK_OVERLAP`) → `Embedder`(`AI_EMBED_PROVIDER`/`AI_EMBED_DIM`) → `ChunkSink`(内存 BM25★ / pgvector / Qdrant)。
+
+- **检索 `Search.Query`(mode)：** `vector`/`bm25` 按后端序返回；**仅 `hybrid` 走 RRF 融合**，tiebreak `(score DESC, chunkID ASC)`。检索期跳过 `EmbedModel` 不匹配的 chunk；`AI_REINDEX_STALE_ON_START` 可启动时重嵌漂移 chunk。
+- **生成：** `Chat.Answer` → `{answer, model, citations}`；`Agent.Run` → `{answer, model, steps}`（工具轨迹，**无 citations**；工具=list_files/read_file/search(hybrid)；`AI_AGENT_MAX_STEPS` 为**步数**上限，非费用上限）。
+- **日费用预算：** 生效上限 = per-tenant 覆盖(`AI_PER_TENANT_BUDGETS`) 否则 `AI_TENANT_DAILY_BUDGET_USD`；超限 → `/chat` 返回 **HTTP 402 `BudgetExceeded`**，`/chat/stream` 发 **SSE `event:error code:BudgetExceeded`**。**Agent 不做费用预算检查。**
+- **PII `PIIDetector`：** 覆盖 email/phone/credit_card(Luhn)/ssn/ipv4；`Scan`/`Redact`(可选 kind 白名单)；Indexer 命中时将计数写入对象 tag `pii_scan`。
+- **限流/降级：** `AI_RATE_LIMIT_RPS`/`BURST` 独立作用于 `/search /chat /chat/stream /agent /lineage`；同组套 `REQUEST_TIMEOUT_SECONDS` 单请求超时；`AI_DEGRADED_MODE=true` → 所有 AI 端点返回 **503**。`embedder`/`llm`/`reranker` 为 `nil` 不影响文件 CRUD（I5）。
+- **计量：** `telemetry.IncIndexerSkip(reason∈{unsupported,error,empty})`（见 §4）。
 
 ### 2.4 EventBus + Workers
 
-| Worker | 触发 | 输出 | 失败策略 |
-|--------|------|------|---------|
-| Antivirus | `object.created` 事件 | 染毒 → 隔离/标记 | 跳过+记录，非致命 |
-| Replication | `object.created/deleted` 事件 | 跨区副本写入 | JobPool 重试 |
-| Reconcile/GC | `RECONCILE_INTERVAL_MINUTES` 定时 | 孤儿清理·版本保留·软删除清除 | 幂等，可重跑；`RECONCILE_CLUSTER_SINGLETON` 防重 |
-| Webhook | 任意事件 + `EVENTS_WEBHOOK_URL` | HMAC-SHA256 签名 HTTP POST | durable retry → `webhook_failures` 表 |
-| JobPool | `jobs` 表轮询 | 执行注册 handler | 超 `MaxAttempts` → `failed` |
+EventBus **先 `InsertEvent` 持久化，再非阻塞本地广播**（订阅者缓冲满则 drop 计数）。`JobPool` 轮询 `jobs` 表；`DedupeKey` 去重；`JOBS_WORKERS>0` 才启用 AV/Replication；`JOBS_MAX_DEPTH` 背压 → `ErrQueueFull`(429)；崩溃 worker 的 job 由 reaper 重排；重试指数退避 + 抖动，超 `MaxAttempts` → `failed`。
 
-### 2.5 Auth + Middleware（链路顺序不可变）
+| Worker | 触发 | 行为 / 失败策略 |
+|--------|------|----------------|
+| Antivirus | `created` 事件 → 桥接为 `virus_scan` job | 桥接失败非致命；扫描 job 失败由 JobPool 重试/终态。`AV_PROVIDER`=内置 EICAR 签名 / http 外部 |
+| Replication | **仅 `created` 事件**（删除不复制） | 目标后端副本；JobPool 重试。`REPLICATION_*` |
+| Webhook | 任意事件 + `EVENTS_WEBHOOK_URL`（可多个逗号分隔） | HMAC-SHA256(`EVENTS_WEBHOOK_SECRET`) POST；durable retry(退避+抖动)→ `webhook_failures` 表；> 上限进 DLQ |
+| **Reconcile/GC** | **定时器驱动（`RECONCILE_INTERVAL_MINUTES`），独立于 JobPool** | 四个独立 job：孤儿行/blob 回收(删 blob opt-in `RECONCILE_DELETE_ORPHAN_BLOBS`)+MD5 scrub · lifecycle 过期 · retention/软删清除+幂等键 GC · multipart upload GC(`UPLOAD_GC_TTL_HOURS`)。幂等可重跑；各 job 可选 `leases` 表单例锁（`RECONCILE_CLUSTER_SINGLETON=true`）|
 
+### 2.5 Auth + Middleware（链路顺序即契约）
+
+**全局链（入站执行序，共 12 环）：**
 ```
-RequestID → CORS → Auth → Tenant → RateLimit(global) → OTel → Recoverer → AccessLog
-                                   └─ RateLimit(AI)  → AI 路由组内
+RequestID → BucketCORS → CORS → SecureHeaders → MaxBodySize
+          → Auth → Tenant → RateLimit(global) → OTel → Recoverer → Concurrency → AccessLog
+                                  └─ RateLimit(AI) 在 AI 路由组内额外套一层
 ```
+> **不可变的载荷不变量**（I4）：`Auth ≺ Tenant ≺ RateLimit`；`RequestID` 最外、`AccessLog` 最内。**Handler 不自挂链**——隔离 handler 测试无 tenant/auth 是设计行为，非 bug。
 
-| 组件 | 职责 |
-|------|------|
-| Auth | Bearer JWT(`AUTH_JWT_SECRET`) / X-Api-Key(sha256 hash) / SigV4(S3) / 匿名公读 |
-| Tenant | JWT/Key/Header 提取 tenant；`*` = operator key；默认 `default` |
-| RateLimiter | Token-bucket per tenant；`RATE_LIMIT_RPS` 全局；`AI_RATE_LIMIT_RPS` AI 路由组独立 |
+- **Auth**（`api/rest` 之外的注册表中间件）：Bearer JWT(`AUTH_JWT_SECRET`/`AUTH_JWT_ISSUER`) · X-Api-Key(sha256；静态 `AUTH_KEYS` 或持久化 `AUTH_PERSIST_KEYS`) · SigV4(`S3_SIGV4_CREDENTIALS`，头+预签名) · 匿名公读。任一凭据源配置即启用；全未配置则整体透传。tenant-scoped key 与冲突 `X-Aero-Tenant` → 403。
+- **Tenant：** 从 JWT/Key/Header 提取；`*` = operator key；缺省 `default`。
+- **限流/并发：** token-bucket per-tenant（`RATE_LIMIT_RPS` 全局 + `AI_RATE_LIMIT_RPS` AI 组）；bucket map 上限 5w + 空闲淘汰；`Concurrency` 加权信号量（写=2/读=1，`MAX_INFLIGHT_REQUESTS`/`PER_TENANT_CONCURRENCY_MAX`）。
+- **免鉴权 & 免限流路径：** `/healthz` `/readyz` `/metrics` `/openapi.json` `/docs` `/ui*`（前缀）。
 
-**绕过 Auth：** `/healthz` `/metrics` `/openapi.json` `/docs` `/ui`  
-**Handler 不自挂中间件链**（isolated handler tests 无 tenant/auth — 设计行为，非 bug）。
+### 2.6 Storage + Repository
 
-### 2.6 Storage + Repository（持久化层）
-
-| 层 | 默认(★) | 可选 | 激活方式 |
-|----|---------|------|---------|
+| 层 | 默认 ★ | 可选 | 激活 |
+|----|--------|------|------|
 | Storage | `local ./var/objects` | `s3` `oss` `cos` | `STORAGE_BACKEND` |
+| ↳ 可选包装 | — | 熔断器 / on-read 校验 | `STORAGE_CB_ENABLED` / `STORAGE_VERIFY_ON_READ` |
 | Repository | SQLite `./var/aero.db` | Postgres | `DB_DRIVER=postgres` + `DB_DSN` |
 | Vector Index | 内存暴力扫描 | pgvector / Qdrant | `AI_VECTOR_BACKEND` |
 | Lexical Index | 内存 BM25 | pgFTS | `AI_LEXICAL_BACKEND=pgfts` |
-| SSE/KMS | keyfile | HTTP KMS | `STORAGE_SSE_KEY` / `STORAGE_SSE_KMS_*` |
+| local SSE/KMS | 明文 | keyfile/URL → **KMS**（优先级：KMS > SecretProvider > 单密钥） | `STORAGE_LOCAL_SSE_KEY` / `STORAGE_LOCAL_SSE_KEYFILE` / `STORAGE_LOCAL_SSE_KEY_URL` / `STORAGE_LOCAL_SSE_KMS_*`（**注意 `LOCAL` 段**；唯 `STORAGE_SSE_REWRAP_ON_START` 用裸前缀，启动时单次重包裹旧 envelope）|
 
 ---
 
-## 3. 已实现功能矩阵 (Feature Matrix & State Triggers)
+## 3. 接口与能力速查 (Surface Index)
 
-| 功能 | 触发条件/入口 | 确定性产物 | 激活标志 |
-|------|-------------|-----------|---------|
-| 对象 CRUD | 任意协议 PUT/GET/DELETE | Object 元数据 + storage blob | — |
-| 对象版本控制 | `VERSIONING_ENABLED` bucket | `@v<id>` blob + version 行 | bucket 配置 |
-| 对象锁/WORM | `x-amz-object-lock-*` / REST ACL | `locked_until` 字段 | — |
-| 多分片上传 | S3 multipart init/upload/complete/abort | 合并 blob + ETag | — |
-| Tags / ACL | PUT `/tags` · PUT `/acl` | tags/acl 元数据行 | — |
-| 预签名 URL | POST `/presign` | 时效 URL + HMAC | — |
-| 缩略图 | GET `/thumbnail?w=&h=` | JPEG/PNG bytes | — |
-| Range 请求 | `Range` header / GET with offset | 部分内容流 | — |
-| 条件请求 | `If-Match` / `If-None-Match` | 304/412 | — |
-| Idempotency-Key | `Idempotency-Key` 请求头 | 幂等响应缓存；`IDEMPOTENCY_HASH_BODY` 启用 body 指纹 | — |
-| 多租户隔离 | `X-Aero-Tenant` / JWT | 租户隔离元数据+存储 | — |
-| 租户管理 | POST/GET/DELETE `/v1/admin/tenants` | `TenantRecord` | admin scope |
-| 租户状态/配额/预算 | PUT `.../status` `.../quota` `.../budget` | 字段更新行 | admin scope |
-| API Key 管理 | POST/GET/DELETE `/v1/admin/keys` | sha256-hashed key 行 | admin scope |
-| JWT 签发 | POST `/v1/admin/jwt` | HS256 signed token | `AUTH_JWT_SECRET` |
-| 审计日志 | 所有 admin 操作写路径 | `audit_log` 行 | — |
-| SSE 加密 | `STORAGE_SSE_KEY` / KMS provider | 加密 blob；versioned key envelope | `STORAGE_SSE_*` |
-| Key 轮换重包装 | `STORAGE_SSE_REWRAP_ON_START=true` | 旧版本 envelope → 当前 primary key | 启动时单次 |
-| Webhook | 任意事件 + `EVENTS_WEBHOOK_URL` | HMAC POST；失败 → `webhook_failures` 持久化重试 | `EVENTS_WEBHOOK_URL` |
-| 跨区复制 | `REPLICATION_ENABLED=true` + 事件 | 目标后端副本写入 | `REPLICATION_*` |
-| Antivirus 扫描 | `object.created` + AV 配置 | 染毒 → 隔离/标记 | `AV_*` |
-| 软删除保留清除 | `RECONCILE_RETENTION_DAYS > 0` 定时 | 清除过期软删除行+blob | `RECONCILE_*` |
-| 集群单例 | `RECONCILE_CLUSTER_SINGLETON=true` | `leases` 表 advisory lock | Postgres |
-| S3 兼容 | `/s3/*` + SigV4 | 标准 S3 XML 响应 | — |
-| S3 bucket 子资源 | `?acl` `?versioning` `?lock` `?lifecycle` `?location` `?versions` | 对应 XML 响应 | — |
-| WebDAV | `WEBDAV_PREFIX` 路由 | PROPFIND/MKCOL XML | `WEBDAV_PREFIX` |
-| MCP (HTTP+stdio) | `/mcp` 或 `aero-vault mcp` | JSON-RPC 工具响应 | — |
-| 语义检索 | POST `/v1/search` mode=`vector` | `[]Hit` cosine 排序 | `AI_INDEX_ENABLED` |
-| BM25 检索 | POST `/v1/search` mode=`bm25` | `[]Hit` BM25 排序 | `AI_INDEX_ENABLED` |
-| 混合检索 RRF | POST `/v1/search` mode=`hybrid` | `[]Hit` RRF 融合；tiebreak `(score DESC, chunkID ASC)` | `AI_INDEX_ENABLED` |
-| 检索结果缓存 | `AI_SEARCH_CACHE_SIZE > 0` | TTL 命中跳过 embed+retrieval | `AI_SEARCH_CACHE_*` |
-| RAG Chat | POST `/v1/chat` | `{answer, model, citations}` | `AI_CHAT_PROVIDER` |
-| Chat SSE 流式 | POST `/v1/chat/stream` | `event:{token\|done\|citations\|error}` SSE 帧 | `AI_CHAT_PROVIDER` |
-| Agent 工具循环 | POST `/v1/agent` | `{steps, answer, model}`；max `AI_AGENT_MAX_STEPS` | `AI_CHAT_PROVIDER` |
-| PII 检测/脱敏 | `PIIDetector.Scan` / `.Redact` | Scan 报告 / 脱敏文本；credit_card 加 Luhn 校验 | 内部调用 |
-| 索引跳过计量 | Indexer 跳过路径 | `indexer_skip_total{reason}` OTel counter | OTel |
-| AI 专项限流 | AI 路由组 middleware | 429；独立于全局 RPS | `AI_RATE_LIMIT_RPS` |
-| 日费用预算 | `AI_TENANT_DAILY_BUDGET_USD` | 超限 → ChatStream `event:error code:BudgetExceeded` | `AI_TENANT_DAILY_BUDGET_USD` |
-| 对象血缘 | GET `/v1/lineage/objects/{id}` | 血缘图 JSON | — |
-| OTel 指标 | 全量请求路径 | 15 instruments → Prometheus `/metrics` | `OTEL_*` |
-| Grafana 仪表盘 | Prometheus 数据源 | 12 panels：embed/search 延迟·吞吐·队列·存储·租户 | `deploy/grafana/` |
-| Prometheus 告警 | 规则评估 | HighEmbedLatencyP95·HighSearchLatencyP95·JobQueueDepthHigh | `deploy/prometheus/` |
-| Qdrant 集成 | `AI_VECTOR_BACKEND=qdrant` | 集合自动创建(Cosine)·向量 CRUD | `AI_VECTOR_URL` |
-| pgvector/pgFTS | `AI_VECTOR_BACKEND=pgvector` | 可扩展 ANN + 全文检索 | `AI_VECTOR_DSN` |
-| Web UI | `/ui` embedded | 4-tab SPA：search/detail/lineage/chat；拖拽上传；SSE 流式渲染 | — |
-| Python/JS/Go SDK | 客户端调用 | 完整 API 覆盖 + 14 admin 方法 | `sdk/` |
-| CLI | `aero-vault cli …` | upload/get/ls/rm/search/tag/versions/lineage/snapshot | `internal/cli` |
+> 仅列**入口**；契约在 §2、不变量在 §4。默认关闭者标注门禁 flag。
+
+**REST `/v1`：** `files/*`(CRUD·Range·条件请求·`/metadata`·`/restore`·`/thumbnail?w=&h=` **仅 JPEG**) · `/presign` · `/tags` · `/acl` · `/legal-hold` · `/folders/*` · `/batch/{delete,tag}` · `/usage` · `/buckets`+子资源 · `/events/stream`(SSE，`Last-Event-ID` 回放+keepalive) · **AI 组**`/search`·`/chat`·`/chat/stream`·`/agent`·`/lineage/objects/{id}`(返回 AI-usage 列表，非图) · **Admin 组**(`requireAdmin`)`/admin/{tenants,keys,jwt,jobs,jobs/{id}/retry,config,webhook-failures}`。审计写 `audit_log` 的仅 quota/budget/key/tenant 变更（JWT 签发、job retry、lifecycle 不写审计）。
+
+**S3 `/s3`（`S3_COMPAT_PREFIX`，空串禁用网关）：** 对象 CRUD/list(v1v2)/versions/multipart/tagging/acl/copy/batch-delete/`?restore`/legal-hold header/canned `x-amz-acl`/`x-amz-expected-bucket-owner`。bucket 子资源：`?versioning ?object-lock ?lifecycle ?acl ?location ?versions ?policy ?cors ?logging ?notification ?accelerate ?uploads`。
+
+**MCP：** tools（见 2.2 条件暴露）+ resources；协议版 `2024-11-05`；`write_file`/`delete_file` 恒作用于 default bucket（delete 为软删）。
+
+**CLI `aero-vault cli …`：** `upload get ls rm search(-k,--mode=vector|bm25|hybrid) tag versions lineage snapshot lsbuckets bucket-rm` + `admin {keys,tenants,jobs,audit}`。
+
+**SDK `sdk/`：** Python·JS·Go，覆盖对象/搜索/chat + 管理面（数量随 API 演进，以各 SDK README 为准，勿在本文写死计数）。
+
+**Web UI `/ui`（`WEBUI_ENABLED`，默认开）：** 内嵌 vanilla-JS SPA，4 tab（search/detail/lineage/chat）+ 拖拽/文件上传 + SSE chat 流式；tenant/apikey 存 localStorage。
+
+**Ops：** `/healthz` `/readyz` · `/metrics`(**`PROMETHEUS_ENABLED`，默认关**；域指标 ~32 个 + HTTP + gauges，实时清单 `grep internal/telemetry`) · OTLP 推送(`OTEL_EXPORTER_OTLP_ENDPOINT`)。`deploy/`：2 个 Grafana 仪表盘（AI/Ops 12 panel + HTTP/runtime 17 panel）、`deploy/prometheus/alerts.yml` 共 12 条告警（http/latency/ai-cost/integrity 四组）。
 
 ---
 
-## 4. 全局约束与异常处理规则 (Global Constraints & Edge Cases)
-
-### CI Gate（每次变更提交前必须全绿）
-
-```bash
-gofmt -l .      # 必须无输出；触碰文件即 gofmt -w
-go build ./...
-go vet ./...
-go test ./...   # SQLite + local FS；零网络；零 Docker
-```
-
-Postgres/pgvector → `make test-integration`（Docker）；Qdrant → `make test-integration-qdrant`（Docker）— 均在 CI gate 外。
+## 4. 不变量与边界 (Invariants & Edge Cases)
 
 ### 硬性不变量
 
 | # | 规则 | 违反后果 |
 |---|------|---------|
-| **I1** | **SQL 占位符不可复用：** `$N` 经 `s.rebind`(`repository/sql.go`) 按个数改写为 `?`；每个 bind 独立编号（同值亦需新 `$N`）；时间统一 `RFC3339Nano` | SQLite 静默绑错参数 |
-| **I2** | **迁移双文件：** 每次 schema 变更 = `migrations/{sqlite,postgres}/NNNN_*.{up,down}.sql`；不得编辑或重编已应用文件；`repo.Migrate` 启动自动执行 | 升降级破坏 |
-| **I3** | **存储 key 唯一且不反解析：** `storageKey(tenant,bucket,key)` = `path.Join`；versioned blob 追加 `@v<id>` 后缀；GC 匹配精确 key，禁止反向解析；key 校验（禁空/`/`前缀/`..`）只在 FileService 层执行 | 数据覆盖/信息泄露 |
-| **I4** | **Middleware 链顺序固定：** `RequestID→CORS→Auth→Tenant→RateLimit→OTel→Recoverer→AccessLog`；handler 不自挂链；隔离 handler 测试无 tenant/auth — 设计行为 | 鉴权失效/上下文丢失 |
-| **I5** | **Opt-in 安全默认：** AI/pgvector/Qdrant/events/cluster/retention/WebDAV 均 flag-gated，默认 off；`nil` embedder/llm/reranker 不得破坏 core CRUD | 基线路径回归 |
-| **I6** | **Stdlib 优先：** 新 `go.mod` 依赖需论证 + `go mod tidy`；单元测试仅用标准 `testing` 包 | 依赖膨胀 |
+| **I1** | **SQL 占位符不可复用：** `s.rebind`(`repository/sql.go`) 将每个 `$N` 按文本出现顺序改写为 `?`（数字值被忽略），同值也须新占位符；时间统一 `RFC3339Nano` | SQLite 静默绑错参数 |
+| **I2** | **迁移双文件 + 单向自动执行：** schema 变更 = `internal/repository/migrations/{sqlite,postgres}/NNNN_*.{up,down}.sql`（`//go:embed` 进二进制）；`repo.Migrate` 启动按版本串跳过已应用（无校验和），**`.down.sql` 从不自动执行**（无回滚 runner）；不得编辑/重编已应用文件 | 升降级破坏 |
+| **I3** | **存储 key 唯一且不反解析：** `storageKey(tenant,bucket,key)=path.Join`；versioned blob 追加 `@v<id>` 后缀（该 id 即权威 version_id）；GC 按**精确 key** 匹配 `ListStorageKeys` 集合，禁反向解析 `@v`；key 校验在 FileService+storage 两层（非 adapter/handler） | 数据覆盖/信息泄露 |
+| **I4** | **Middleware 链顺序固定：** 见 §2.5（12 环，`Auth≺Tenant≺RateLimit`，`RequestID` 最外/`AccessLog` 最内）；handler 不自挂链 | 鉴权失效/上下文丢失 |
+| **I5** | **Opt-in 安全默认：** AI/pgvector/Qdrant/events-transport/cluster/retention/WebDAV/S3 网关/熔断/校验 均 flag-gated 默认 off；`nil` embedder/llm/reranker 不得破坏 core CRUD；`AI_DEGRADED_MODE` 为全局 AI kill-switch | 基线路径回归 |
+| **I6** | **Stdlib 优先：** 新增 `go.mod` 依赖需论证 + `go mod tidy`；单测**不引入断言框架**（testify 等），仅用 `testing`（少量测试为驱动生产码引入 chi/aws-sdk 属正常） | 依赖膨胀 |
 
 ### 异常处理规则
 
-| 场景 | 处理方式 |
-|------|---------|
-| ChatStream 运行时错误（SSE headers 已发） | `event: error\ndata: {"code":"…","message":"…"}\n\n`；不中断流 |
-| Indexer 跳过对象 | `telemetry.IncIndexerSkip(ctx, reason)`；reason ∈ `{unsupported,error,empty}`；非致命 |
-| BM25 孤儿清理失败 | `FileService` 硬删除路径同步调 `ChunkCleaner.DeleteObjectChunks`；失败 warn log，不阻断删除 |
-| Reranker 失败 | 降级为原始排序 + warn log；不向调用方返回错误 |
-| AI 日费用超限 | ChatStream 发送 `code:BudgetExceeded`；Agent 终止工具循环 |
-| 向量模型漂移 | 检索时跳过 `EmbedModel` 不匹配的 chunk（`search.go` 内过滤） |
+| 场景 | 处理 |
+|------|------|
+| ChatStream 运行时错误（SSE 头已发） | `event:error\ndata:{"code","message"}`；**SSE 事件仅 `token｜done｜error`；citations 内嵌于 `done` 帧**，无独立 citations 事件 |
+| Indexer 跳过对象 | `IncIndexerSkip(reason∈{unsupported,error,empty})`；非致命 |
+| ChunkCleaner 孤儿清理失败 | 硬删除路径同步调用；失败 warn log，**不阻断删除** |
+| Reranker 失败 | 降级为原始排序 + warn；不向调用方报错 |
+| AI 日费用超限 | `/chat` → 402 `BudgetExceeded`；`/chat/stream` → SSE error 帧（Agent 不检查费用） |
+| 对象损坏/WORM/legal-hold | scrub 标记 `corrupt` → Get/Stat 返回 `ErrObjectCorrupt`；WORM `locked_until` 或 legal hold 未释放 → 拒绝覆盖/硬删 |
 
 ### 测试模式
 
 ```go
-// 标准夹具
 repo, _ := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "x.db"))
 _ = repo.Migrate(ctx)
 store, _ := storage.NewLocal(storage.LocalConfig{Root: t.TempDir()})
-
-// AI mock（零网络）
-ai.MockLLM{}      // 确定性 LLM
-ai.HashEmbedder   // 确定性向量
+ai.MockLLM{}                 // 确定性 LLM
+ai.NewHashEmbedder(dim)      // 确定性向量（勿写裸 ai.HashEmbedder）
 ```
-
-- HTTP handler → `net/http/httptest.NewRecorder()`
-- 需 tenant/auth 上下文 → `mw.Tenant(mw.Auth(h))`（对齐 `main.go` 装配方式）
-- 新 Storage backend → 必须通过 `storage.contract_test.go`
-- Qdrant 集成测试 → `//go:build integration`，探测 `/readyz`，失败自动 skip
+- HTTP handler → `httptest.NewRecorder()`；需 tenant/auth 上下文 → `mw.Tenant(mw.Auth(h))`（对齐 main.go）。
+- 新 Storage backend → 必须过 `storage` contract suite；Qdrant/PG 集成测试 `//go:build integration`（探活失败自动 skip），在 CI gate 外（`make test-integration[-qdrant]`）；数据竞争 `make test-race`。
 
 ### 扩展入口
 
 | 扩展点 | 操作序列 |
 |--------|---------|
-| REST route | `rest/` handler → `router.go` 注册 + scope → `*_test.go` → `openapi.json` |
-| Storage backend | 实现 `storage.Storage` → `factory.go`+`BackendKind` → `config.go`+`main.go:buildStorageFrom` → 通过 contract suite |
-| DB schema | dual migration pair → `sql.go` Repository 方法（遵守 I1） |
-| Background job | job-type const + handler → `main.go:jobReg.Register` → `Queue.Enqueue` |
-| MCP tool | `listTools` + `callTool` switch in `mcp/server.go` |
+| REST route | `rest/` handler → `router.go` 注册 + scope → `*_test.go` → **同步 `openapi.json`**（当前已漂移，务必补齐） |
+| Storage backend | 实现 `storage.Storage` → `factory.go`+`BackendKind` → `config.go`+`main.go:buildStorageFrom` → 过 contract suite |
+| DB schema | 双迁移文件对 → `sql.go` Repository 方法（遵守 I1/I2） |
+| Background job | job-type const + handler → `main.go:jobReg.Register` → `Queue.Enqueue`（可设 `DedupeKey`） |
+| MCP tool/resource | `mcp/server.go` 的 `listTools`/`callTool`（或 `listResources`/`readResource`）switch |

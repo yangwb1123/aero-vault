@@ -103,6 +103,57 @@ func TestHTTPHandler_PUT_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+// A JSON-RPC error in the envelope must surface as a matching HTTP status
+// (here -32601 method-not-found → 400) rather than a blanket 200.
+func TestHTTPHandler_RPCError_MapsTo4xx(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+	h := HTTPHandler(srv)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"does/not/exist"}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for -32601 method-not-found", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp rpcResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal error envelope: %v\n  body: %s", err, rec.Body.String())
+	}
+	if resp.Error == nil || resp.Error.Code != -32601 {
+		t.Errorf("want -32601 in envelope, got %+v", resp.Error)
+	}
+}
+
+// A malformed request body yields a JSON-RPC parse error (-32700) and a 400
+// status carrying a JSON envelope (not a plain-text http.Error).
+func TestHTTPHandler_ParseError_MapsTo400(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+	h := HTTPHandler(srv)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{not json`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for parse error", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp rpcResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal error envelope: %v\n  body: %s", err, rec.Body.String())
+	}
+	if resp.Error == nil || resp.Error.Code != -32700 {
+		t.Errorf("want -32700 parse error, got %+v", resp.Error)
+	}
+}
+
 // Verify the JSON-RPC envelope shape including the "id" echo.
 func TestHTTPHandler_IDEcho(t *testing.T) {
 	srv, _, _ := newTestServer(t, nil)

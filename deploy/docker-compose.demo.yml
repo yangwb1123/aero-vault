@@ -1,0 +1,158 @@
+# Full-stack aero-vault RAG demo — one command brings up the platform plus a
+# local LLM, S3-compatible object store, Postgres metadata DB, and an OTel
+# collector:
+#
+#     docker compose -f deploy/docker-compose.demo.yml up --build
+#
+# First run downloads the Ollama models (a few hundred MB → ~1.3 GB), so it
+# takes a few minutes. Once "app" is listening, try the demo:
+#
+#     ./deploy/demo/seed.sh            # uploads a doc, runs a RAG chat
+#     open http://localhost:8080/docs  # Swagger UI
+#     open http://localhost:9001       # MinIO console (minioadmin/minioadmin)
+#
+# Models are overridable:  DEMO_CHAT_MODEL=llama3.2:3b DEMO_EMBED_MODEL=nomic-embed-text \
+#                          docker compose -f deploy/docker-compose.demo.yml up --build
+name: aero-vault-demo
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aero
+      POSTGRES_PASSWORD: aero
+      POSTGRES_DB: aero_vault
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aero -d aero_vault"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["miniodata:/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command: >
+      "mc alias set local http://minio:9000 minioadmin minioadmin &&
+       mc mb --ignore-existing local/aero-vault &&
+       echo 'bucket ready'"
+    restart: "no"
+
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: ["ollamadata:/root/.ollama"]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    # Uncomment to use an NVIDIA GPU (requires nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Pulls the chat + embedding models once, then exits. The app waits for this
+  # to finish so the first RAG query works without "model not found".
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "ollama pull ${DEMO_CHAT_MODEL:-llama3.2:1b} &&
+       ollama pull ${DEMO_EMBED_MODEL:-nomic-embed-text} &&
+       echo 'models ready'"
+    restart: "no"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus scrape (collector-exported metrics)
+
+  app:
+    build: ..
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      ollama-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    environment:
+      APP_ADDR: ":8080"
+      APP_LOG_LEVEL: info
+
+      # Metadata DB
+      DB_DRIVER: postgres
+      DB_DSN: postgres://aero:aero@postgres:5432/aero_vault?sslmode=disable
+
+      # Object storage → MinIO (S3-compatible)
+      STORAGE_BACKEND: s3
+      STORAGE_S3_ENDPOINT: http://minio:9000
+      STORAGE_S3_REGION: us-east-1
+      STORAGE_S3_BUCKET: aero-vault
+      STORAGE_S3_ACCESS_KEY: minioadmin
+      STORAGE_S3_SECRET_KEY: minioadmin
+      STORAGE_S3_FORCE_PATH_STYLE: "true"
+
+      # S3-compatible gateway prefix
+      S3_COMPAT_PREFIX: /s3
+
+      # AI: embeddings + chat via local Ollama (OpenAI-compatible API).
+      AI_INDEX_ENABLED: "true"
+      AI_HYBRID_SEARCH: "true"
+      AI_EMBED_PROVIDER: http
+      AI_EMBED_ENDPOINT: http://ollama:11434
+      AI_EMBED_MODEL: ${DEMO_EMBED_MODEL:-nomic-embed-text}
+      AI_EMBED_DIM: "768"            # nomic-embed-text → 768 dims
+      AI_CHAT_PROVIDER: http
+      AI_CHAT_ENDPOINT: http://ollama:11434
+      AI_CHAT_MODEL: ${DEMO_CHAT_MODEL:-llama3.2:1b}
+
+      # Background indexing job pool
+      JOBS_WORKERS: "4"
+
+      # Telemetry → OTel collector (OTLP/HTTP)
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      PROMETHEUS_ENABLED: "true"
+    ports: ["8080:8080"]
+
+volumes:
+  pgdata:
+  miniodata:
+  ollamadata:

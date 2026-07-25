@@ -149,56 +149,71 @@ func (a *Agent) Run(ctx context.Context, req AgentReq) (AgentResp, error) {
 	return AgentResp{Answer: resp.Content, Steps: steps, Model: lastModel}, nil
 }
 
+func (a *Agent) callListFiles(ctx context.Context, tenant string, args map[string]any) string {
+	prefix, _ := args["prefix"].(string)
+	limit := 20
+	if v, ok := args["limit"].(float64); ok {
+		limit = int(v)
+	}
+	page, err := a.svc.List(ctx, tenant, service.DefaultBucket, prefix, "", limit)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	var b strings.Builder
+	for _, o := range page.Objects {
+		fmt.Fprintf(&b, "%s\t%d bytes\n", o.Key, o.Size)
+	}
+	if b.Len() == 0 {
+		return "(no objects)"
+	}
+	return b.String()
+}
+
+func (a *Agent) callReadFile(ctx context.Context, tenant string, args map[string]any) string {
+	key, _ := args["key"].(string)
+	if key == "" {
+		return "error: key required"
+	}
+	rc, _, err := a.svc.Get(ctx, tenant, service.DefaultBucket, key)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	defer rc.Close()
+	body, _ := io.ReadAll(io.LimitReader(rc, 4<<10))
+	return string(body)
+}
+
+func (a *Agent) callSearch(ctx context.Context, tenant string, args map[string]any) string {
+	if a.search == nil {
+		return "error: search not enabled"
+	}
+	q, _ := args["query"].(string)
+	k := 5
+	if v, ok := args["k"].(float64); ok {
+		k = int(v)
+	}
+	if k <= 0 || k > 100 {
+		k = 5
+	}
+	hits, err := a.search.Query(ctx, Request{Tenant: tenant, Query: q, K: k, Mode: "hybrid", Caller: "agent:search"})
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	var b strings.Builder
+	for i, h := range hits {
+		fmt.Fprintf(&b, "[#%d] %s/%s#%d\n%s\n", i+1, h.Bucket, h.ObjectKey, h.Seq, h.Chunk)
+	}
+	return b.String()
+}
+
 func (a *Agent) dispatchTool(ctx context.Context, tenant, name string, args map[string]any) string {
 	switch name {
 	case "list_files":
-		prefix, _ := args["prefix"].(string)
-		limit := 20
-		if v, ok := args["limit"].(float64); ok {
-			limit = int(v)
-		}
-		page, err := a.svc.List(ctx, tenant, service.DefaultBucket, prefix, "", limit)
-		if err != nil {
-			return "error: " + err.Error()
-		}
-		var b strings.Builder
-		for _, o := range page.Objects {
-			fmt.Fprintf(&b, "%s\t%d bytes\n", o.Key, o.Size)
-		}
-		if b.Len() == 0 {
-			return "(no objects)"
-		}
-		return b.String()
+		return a.callListFiles(ctx, tenant, args)
 	case "read_file":
-		key, _ := args["key"].(string)
-		if key == "" {
-			return "error: key required"
-		}
-		rc, _, err := a.svc.Get(ctx, tenant, service.DefaultBucket, key)
-		if err != nil {
-			return "error: " + err.Error()
-		}
-		defer rc.Close()
-		body, _ := io.ReadAll(io.LimitReader(rc, 4<<10))
-		return string(body)
+		return a.callReadFile(ctx, tenant, args)
 	case "search":
-		if a.search == nil {
-			return "error: search not enabled"
-		}
-		q, _ := args["query"].(string)
-		k := 5
-		if v, ok := args["k"].(float64); ok {
-			k = int(v)
-		}
-		hits, err := a.search.Query(ctx, Request{Tenant: tenant, Query: q, K: k, Mode: "hybrid", Caller: "agent:search"})
-		if err != nil {
-			return "error: " + err.Error()
-		}
-		var b strings.Builder
-		for i, h := range hits {
-			fmt.Fprintf(&b, "[#%d] %s/%s#%d\n%s\n", i+1, h.Bucket, h.ObjectKey, h.Seq, h.Chunk)
-		}
-		return b.String()
+		return a.callSearch(ctx, tenant, args)
 	default:
 		return "error: unknown tool " + name
 	}

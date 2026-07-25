@@ -4,6 +4,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,7 +15,7 @@ concurrency:
 
 jobs:
   build-test:
-    name: build · vet · test · gofmt
+    name: build · vet · test · engineering-gates
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,21 +24,53 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # Pin to the version declared in go.mod.
           go-version-file: go.mod
           cache: true
 
-      - name: Download modules
-        run: go mod download
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-      - name: gofmt (check formatting)
+      - name: Install Python deps
+        run: pip install pyyaml
+
+      - name: Install Go analysis tools
+        run: go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
+
+      # ── Engineering gates (centralised in cli.py + engineering.yaml) ──
+
+      - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
-            echo "::error::The following files are not gofmt-formatted:"
+            echo "::error::以下文件未通过 gofmt 格式检查:"
             echo "$unformatted"
             exit 1
           fi
+
+      - name: Root directory policy
+        run: python3 cli.py root-policy
+
+      - name: File size (≤ 500 lines)
+        run: python3 cli.py check-filesize
+
+      - name: Engineering invariants (I1–I6)
+        run: python3 cli.py invariants
+
+      - name: ADR compliance
+        run: python3 cli.py adr-compliance
+
+      - name: Cyclomatic complexity
+        run: python3 cli.py complexity
+
+      - name: Exemption sync
+        run: python3 cli.py check-exemptions
+
+      # ── Go build & test ──
+
+      - name: Download modules
+        run: go mod download
 
       - name: Build
         run: go build ./...
@@ -47,3 +80,13 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      - name: Coverage
+        run: |
+          echo "::group::覆盖率报告"
+          go test -coverprofile=/tmp/cover.out ./...
+          go tool cover -func=/tmp/cover.out | tail -3
+          echo "::endgroup::"
+
+      - name: SDK Go build
+        run: cd sdk/go/aerovault && go build ./...

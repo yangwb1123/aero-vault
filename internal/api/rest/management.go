@@ -93,12 +93,23 @@ func (h *Handler) GetSpecificVersion(w http.ResponseWriter, r *http.Request, key
 		return
 	}
 	defer rc.Close()
+	// Honour conditional GETs on versioned downloads too: a cache-aware client
+	// must be able to receive 304 Not Modified (matches the non-versioned Get).
+	if notModified(r, obj) {
+		w.Header().Set("ETag", `"`+obj.ETag+`"`)
+		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+		w.Header().Set("X-Version-Id", obj.VersionID)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.Header().Set("ETag", `"`+obj.ETag+`"`)
 	if obj.ContentType != "" {
 		w.Header().Set("Content-Type", obj.ContentType)
 	}
 	w.Header().Set("X-Version-Id", obj.VersionID)
+	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+	writeMetadataHeaders(w, obj.Metadata)
 	_, _ = io.Copy(w, rc)
 }
 

@@ -41,6 +41,14 @@ type Job struct {
 	tenants           []string // tenants to scan; empty means scan default only
 	singleton         *cluster.Singleton
 	logger            *slog.Logger
+	scrub             scrubSettings
+}
+
+// WithScrub enables the data-integrity scrub that verifies stored Content-MD5
+// values every sweep cycle. batch controls page size (default 100).
+func (j *Job) WithScrub(enabled bool, batch int) *Job {
+	j.scrub = scrubSettings{enabled: enabled, batch: batch}
+	return j
 }
 
 // WithClusterSingleton makes the sweep run on only one replica at a time, gated
@@ -99,6 +107,8 @@ func (j *Job) sweep(ctx context.Context) {
 		orphanRows += or
 		orphanBlobs += ob
 		deletedBlobs += db
+		scrubScanned, _ := j.scrubAll(ctx, t, j.scrub)
+		scanned += scrubScanned
 	}
 	telemetry.RecordReconcileBlobs(ctx, orphanBlobs, deletedBlobs)
 	j.logger.Info("reconcile sweep done",
@@ -152,46 +162,79 @@ func (j *Job) sweepOrphanRows(ctx context.Context, tenant string) (scanned, orph
 // safe default. The blob walk is scoped to the tenant's "<tenant>/" prefix,
 // which also excludes backend-internal paths such as ".multipart/".
 func (j *Job) sweepOrphanBlobs(ctx context.Context, tenant string) (orphans, deleted int) {
+	referenced, err := j.collectReferencedKeys(ctx)
+	if err != nil {
+		j.logger.Warn("reconcile: collect referenced keys", "err", err)
+		return 0, 0
+	}
 	prefix := tenant + "/"
+	allKeys, keyAge := j.listStorageObjects(ctx, prefix)
+	for _, staleKey := range findStaleBlobs(allKeys, referenced) {
+		orphans++
+		if j.gracePeriod > 0 && time.Since(keyAge[staleKey]) <= j.gracePeriod {
+			continue
+		}
+		if !j.deleteOrphanBlobs {
+			j.logger.Warn("reconcile: orphan blob (cleanup disabled)",
+				"tenant", tenant, "storage_key", staleKey, "last_modified", keyAge[staleKey])
+			continue
+		}
+		if err := j.store.Delete(ctx, staleKey); err != nil {
+			j.logger.Warn("reconcile: orphan blob delete", "tenant", tenant, "storage_key", staleKey, "err", err)
+			continue
+		}
+		deleted++
+		j.logger.Info("reconcile: orphan blob deleted", "tenant", tenant, "storage_key", staleKey)
+	}
+	return orphans, deleted
+}
+
+func (j *Job) listStorageObjects(ctx context.Context, prefix string) ([]string, map[string]time.Time) {
+	var allKeys []string
+	keyAge := map[string]time.Time{}
 	var marker string
 	for {
 		page, err := j.store.List(ctx, prefix, marker, 200)
 		if err != nil {
-			j.logger.Warn("reconcile: list blobs", "tenant", tenant, "err", err)
+			j.logger.Warn("reconcile: list blobs", "prefix", prefix, "err", err)
 			break
 		}
 		for _, oi := range page.Objects {
-			referenced, err := j.repo.StorageKeyReferenced(ctx, oi.Key)
-			if err != nil {
-				j.logger.Warn("reconcile: storage-key lookup", "tenant", tenant, "storage_key", oi.Key, "err", err)
-				continue
-			}
-			if referenced {
-				continue // some object version (live or soft-deleted) still pins this blob
-			}
-			// Unreferenced blob. The write path stores the blob before its DB
-			// row, so a freshly written blob may simply be mid-commit; only act
-			// once it is older than the grace period.
-			if j.gracePeriod > 0 && time.Since(oi.LastModified) <= j.gracePeriod {
-				continue
-			}
-			orphans++
-			if !j.deleteOrphanBlobs {
-				j.logger.Warn("reconcile: orphan blob (cleanup disabled)",
-					"tenant", tenant, "storage_key", oi.Key, "last_modified", oi.LastModified)
-				continue
-			}
-			if err := j.store.Delete(ctx, oi.Key); err != nil {
-				j.logger.Warn("reconcile: orphan blob delete", "tenant", tenant, "storage_key", oi.Key, "err", err)
-				continue
-			}
-			deleted++
-			j.logger.Info("reconcile: orphan blob deleted", "tenant", tenant, "storage_key", oi.Key)
+			allKeys = append(allKeys, oi.Key)
+			keyAge[oi.Key] = oi.LastModified
 		}
 		if !page.HasMore {
 			break
 		}
 		marker = page.NextMarker
 	}
-	return orphans, deleted
+	return allKeys, keyAge
+}
+
+// collectReferencedKeys builds a set of every storage_key that exists in the
+// metadata repository, including keys from soft-deleted rows (they still pin
+// their blob). The set is used by sweepOrphanBlobs to identify unreferenced
+// storage blobs.
+func (j *Job) collectReferencedKeys(ctx context.Context) (map[string]bool, error) {
+	keys, err := j.repo.ListStorageKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ref := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		ref[k] = true
+	}
+	return ref, nil
+}
+
+// findStaleBlobs returns storage keys that exist in allKeys but not in the
+// referenced set.
+func findStaleBlobs(allKeys []string, referenced map[string]bool) []string {
+	var stale []string
+	for _, k := range allKeys {
+		if !referenced[k] {
+			stale = append(stale, k)
+		}
+	}
+	return stale
 }

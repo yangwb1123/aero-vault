@@ -17,6 +17,7 @@ import (
 
 // S3Config configures the S3 backend. Endpoint is optional; leave it empty for
 // AWS, or point it at MinIO / OSS S3 / COS S3 endpoints for those providers.
+// Timeouts control the underlying HTTP client; zero uses the SDK default.
 type S3Config struct {
 	Endpoint       string
 	Region         string
@@ -24,6 +25,7 @@ type S3Config struct {
 	AccessKey      string
 	SecretKey      string
 	ForcePathStyle bool
+	Timeouts       TimeoutConfig
 }
 
 // S3Storage implements Storage on top of an S3-compatible object store.
@@ -55,6 +57,7 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
+	awsCfg.HTTPClient = NewHTTPClient(cfg.Timeouts)
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		if cfg.Endpoint != "" {
@@ -276,6 +279,64 @@ func (s *S3Storage) AbortMultipart(ctx context.Context, key, uploadID string) er
 		UploadId: aws.String(uploadID),
 	})
 	return err
+}
+
+func (s *S3Storage) CleanupParts(ctx context.Context, key, uploadID string) error {
+	// S3 storage-level cleanup is the same as aborting the multipart upload.
+	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.cfg.Bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	})
+	// If the upload no longer exists (e.g. already completed), this is idempotent.
+	if err != nil {
+		// AWS returns 404 when the upload ID is not found; treat as success.
+		if isS3NotFound(err) {
+			return nil
+		}
+	}
+	return err
+}
+
+func (s *S3Storage) CanCopy() bool { return true }
+
+func (s *S3Storage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
+	input := &s3.CopyObjectInput{
+		Bucket:     aws.String(s.cfg.Bucket),
+		CopySource: aws.String(s.cfg.Bucket + "/" + srcKey),
+		Key:        aws.String(dstKey),
+	}
+	if opts.MetadataDirective == "REPLACE" {
+		input.MetadataDirective = s3types.MetadataDirectiveReplace
+		if opts.ContentType != "" {
+			input.ContentType = aws.String(opts.ContentType)
+		}
+		if len(opts.Metadata) > 0 {
+			input.Metadata = opts.Metadata
+		}
+	} else {
+		input.MetadataDirective = s3types.MetadataDirectiveCopy
+	}
+
+	out, err := s.client.CopyObject(ctx, input)
+	if err != nil {
+		return ObjectInfo{}, fmt.Errorf("s3 copy: %w", err)
+	}
+
+	info := ObjectInfo{
+		Key:  dstKey,
+		Size: -1, // S3 CopyObject response does not include content length
+	}
+	if out.CopyObjectResult != nil && out.CopyObjectResult.ETag != nil {
+		info.ETag = *out.CopyObjectResult.ETag
+	}
+	// Stat the destination to get accurate size.
+	st, err := s.Stat(ctx, dstKey)
+	if err == nil {
+		info.Size = st.Size
+		info.LastModified = st.LastModified
+	}
+	return info, nil
 }
 
 func isS3NotFound(err error) bool {

@@ -86,6 +86,29 @@ export interface AgentResponse {
   model?: string;
 }
 
+/** One AI-consumption record for an object (GET /v1/lineage/objects/{id}). */
+export interface LineageEntry {
+  usage_id: number;
+  caller: string;
+  query?: string;
+  chunk_ids: number[];
+  object_ids: number[];
+  request_id?: string;
+  created_at: string;
+  model?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  latency_ms?: number;
+  cost_micros?: number;
+}
+
+/** AI consumption history for an object (GET /v1/lineage/objects/{id}). */
+export interface LineageResponse {
+  object_id: number;
+  entries: LineageEntry[];
+}
+
 /** A minimal subset of the Fetch API's `fetch` signature. */
 export type FetchLike = (
   input: string | URL | Request,
@@ -229,8 +252,12 @@ export declare class Client {
   putTags(key: string, tags: Record<string, string>): Promise<unknown>;
   deleteTags(key: string): Promise<void>;
   listVersions(key: string): Promise<unknown>;
+  /** Lock an object for N seconds. */
+  lock(key: string, seconds: number): Promise<unknown>;
   getAcl(key: string): Promise<{ acl: string }>;
   setAcl(key: string, acl: CannedAcl): Promise<unknown>;
+  getBucketACL(bucket: string): Promise<{ acl: string }>;
+  setBucketACL(bucket: string, acl: CannedAcl): Promise<unknown>;
 
   // ---- multipart ----
   createMultipartUpload(key: string, opts?: CreateMultipartOptions): Promise<MultipartUpload>;
@@ -243,6 +270,7 @@ export declare class Client {
   chat(query: string, opts?: ChatOptions): Promise<ChatResponse>;
   chatStream(query: string, opts?: ChatStreamOptions): AsyncGenerator<string, void, unknown>;
   agent(query: string): Promise<AgentResponse>;
+  lineage(objectId: number, limit?: number): Promise<LineageResponse>;
 
   // ---- ops ----
   usage(): Promise<Usage>;

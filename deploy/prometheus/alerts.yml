@@ -87,6 +87,24 @@ groups:
           summary: "In-process event bus is dropping events"
           description: "Subscribers are falling behind the 64-deep buffer (SSE/indexer/webhook lag). The durable event table is unaffected, but live consumers miss events — scale consumers or enable a cross-instance transport."
 
+      - alert: WebhookRetryRateHigh
+        expr: sum(rate(webhook_retries_total[15m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High webhook retry rate"
+          description: "Webhook delivery retries exceed 10/15m. Check webhook endpoint availability and network connectivity."
+
+      - alert: ScrubFoundCorruptObjects
+        expr: sum(increase(scrub_total{status="corrupt"}[1h])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Data integrity scrub detected corrupt objects in the last hour"
+          description: "The periodic data-integrity scrub (RECONCILE_SCRUB_ENABLED) found one or more objects whose stored MD5 does not match the content. Immediate investigation required. Objects have been marked `_aero_scrub_status=corrupt` and a GET on them returns 410 Gone."
+
   - name: aero-vault-ai-latency
     rules:
       - alert: HighEmbedLatencyP95

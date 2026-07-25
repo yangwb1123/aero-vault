@@ -1,0 +1,627 @@
+# AeroVault 高价值扩展方向 v45 — 系统性交叉架构缺口
+
+> **分析范围：** 全代码库深度扫描（`cmd/server/main.go` + `internal/*` 全部 `.go` 文件，46K+ 行代码，24 对迁移文件，三套 SDK，`deploy/*`，`docs/*`）
+>
+> **分析视角：** 资深架构师 / 产品经理 — 聚焦此前 **44 期 expansion 分析（累计 200+ 方向）** + `docs/ROADMAP.md` + `docs/CHANGELOG.md` + `docs/TODO.md` + `docs/adr/DECISIONS.md` 中 **从未触及的系统性交叉架构缺口**
+>
+> **分析日期：** 2026-07-10
+>
+> **去重验证：** 对 `docs/requirements/` 下全部 44 份既有分析文档 + `ROADMAP.md` + `CHANGELOG.md` + `TODO.md` + `adr/DECISIONS.md` 进行穷尽式术语 `grep` 验证。每个方向在既有文档中 **零实质性独立架构分析**（表格一行过路引用/举例提及/单一子点均不构成实质性分析）。
+
+---
+
+## 前言
+
+此前 44 期 expansion 分析覆盖了 200+ 方向，从 AI/RAG 管线到 S3 协议实现纵深、从存储后端到认证授权、从多租户到合规、从可观测性到工程基础设施。最新三期（v42 S3 执行层、v43 安全盲区、v44 系统性架构缺口）已触及了大量此前遗漏的执行层和连接层问题。
+
+然而，经过对代码库最后一遍穷举扫描，以下 **5 个方向** 依然未被任何一期分析实质性触及。它们的共同特征是：**不聚焦于"新功能"的添加，而是聚焦于已有功能之间的"交叉面"和"系统属性"**——即那些横跨多个模块、在接口处涌现出的架构缺口。
+
+```
+功能维度（前 43 期）：          ❌ 不支持 → ✅ 已实现
+执行层维度（v42/v43/v44）：     ✅ 有 CRUD → ✅ 运行时行为完整
+系统性交叉维度（本期 v45）：     ✅ 各功能独立正确 → ⚠️ 功能交叉面上行为不一致/安全隐患/缺口
+```
+
+---
+
+## 方向总览
+
+| # | 方向 | 类型 | 优先级 | 核心矛盾 | 锚定代码 | 44 期覆盖 |
+|---|------|------|--------|---------|---------|-----------|
+| 1 | **MCP 协议安全模型：跨租户数据访问漏洞与认证缺失** | 安全/架构 | **P0 — 安全漏洞** — MCP `readResource` 可通过 URI 构造访问任意租户数据；MCP stdio 模式无任何认证 | `internal/mcp/server.go:161`（`readResource` 直接使用 URI 中的 tenant）；`internal/mcp/transport.go:15`（`ServeStdio` 无 auth） | ❌ **零覆盖**（v24/v44 提及 MCP middleware 集成但未分析安全模型） |
+| 2 | **优雅关闭与后台工作负载排空（Graceful Shutdown）** | 可靠性/运维 | **P1** — 15+ goroutine 无协调关闭；in-flight 存储操作可被截断；SSE 客户端无通知断开 | `cmd/server/main.go:285`（仅 `bus.Close()` + `srv.Shutdown()`，不等待后台 worker）；`internal/events/bus.go:111-115`（`Close` 直接关闭所有 subscriber channel） | ⚠️ v10/v38/v39 方向表合计 3 行提及，**零实质性架构分析** |
+| 3 | **特性交互矩阵与跨特性一致性保障** | 工程质量/可靠性 | **P1** — 8+ 功能交叉组合（versioning+lock、SSE+replication、webhook+quota、MCP+auth 等）无测试覆盖、无契约文档 | `internal/service/file_crud.go`（versioning+lock 交叉在 `checkLockBeforeOverwrite` 有部分逻辑）；`internal/replication/replication.go`（SSE 加密对象的复制无特殊处理）；`internal/events/webhook.go`（无 quota 事件挂载） | ❌ **零覆盖** |
+| 4 | **控制面/数据面分离架构** | 架构/可运维性 | **P2** — Admin 操作与用户请求同进程混合，无法独立扩缩容、无法安全隔离、无法独立发布 | `cmd/server/main.go:buildRouter`（所有 admin 路由与数据路由同挂 chi）；`internal/api/rest/admin.go`（admin handler 与 rest handler 同包） | ❌ **零覆盖** |
+| 5 | **并发安全模型审查与数据竞态防护** | 可靠性/工程质量 | **P2** — 多 goroutine 共享可变状态（BM25 index、key cache、rate limiter、bus subscribers）且同步模式不一致，无系统性 race 检测 | `internal/ai/bm25.go:23`（RWMutex）；`internal/auth/key_cache.go:19`（Mutex）；`internal/events/bus.go:27`（RWMutex）；`internal/middleware/ratelimit.go:17`（Mutex）；`cmd/server/main.go`（15+ goroutine 无协调） | ❌ **零覆盖**（v38 方向表 1 行提及"并发安全"但聚焦 circuit breaker，非系统性竞态防护分析） |
+
+---
+
+## 方向一：MCP 协议安全模型——跨租户数据访问漏洞与认证缺失
+
+### 现状：一个具体的跨租户数据访问漏洞
+
+MCP `readResource` 函数直接从 URI 中提取 tenant，**不进行任何租户边界检查**：
+
+```go
+// internal/mcp/server.go:153-170
+func (s *Server) readResource(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
+    // ...
+    parts := strings.SplitN(rest, "/", 3)
+    if len(parts) < 3 {
+        return nil, &rpcError{Code: -32602, Message: "uri must be aero-vault://{tenant}/{bucket}/{key}"}
+    }
+    rc, obj, err := s.svc.Get(ctx, parts[0], parts[1], parts[2])  // ← parts[0] = tenant from URI!
+    // ...
+}
+```
+
+**攻击路径：** 任何能够访问 MCP 接口（HTTP POST `/mcp` 或 stdio `aero-vault mcp`）的客户端，可以构造 URI `aero-vault://other-tenant/bucket/key` 来读取任意租户下的任意对象。MCP 的 `tenantFor()` 方法仅在其他工具中使用，`readResource` 完全绕过了它。
+
+对比其他工具的租户处理：
+
+```go
+// internal/mcp/server.go:47-51 — tenantFor 被大部分工具使用
+func (s *Server) tenantFor(ctx context.Context) string {
+    if t := mw.TenantFrom(ctx); t != "" && t != "default" {
+        return t
+    }
+    return s.tenant  // 默认 "default"
+}
+
+// 但 readResource 完全不调用 tenantFor，直接使用 URI 中的 tenant
+rc, obj, err := s.svc.Get(ctx, parts[0], parts[1], parts[2])
+```
+
+### MCP 协议的安全鸿沟
+
+| 安全维度 | REST /v1 | S3 Compat | WebDAV | MCP (HTTP) | MCP (stdio) |
+|---------|---------|-----------|--------|------------|-------------|
+| Auth middleware | ✅ Bearer/APIKey/SigV4 | ✅ SigV4 | ✅ 通过 middleware 链 | ✅ 通过 middleware 链 | ❌ **无任何认证** |
+| Tenant 提取 | ✅ Tenenat middleware | ✅ Tenant middleware | ✅ Tenant middleware | ✅ Tenant middleware | ❌ **硬编码 default** |
+| Rate limiting | ✅ 全局 + AI 专用 | ✅ 全局 | ✅ 全局 | ✅ 全局 | ❌ **无限流** |
+| CORS 保护 | ✅ | ✅ | ✅ | ✅ | ❌ N/A |
+| Access logging | ✅ | ✅ | ✅ | ✅ | ❌ **无日志** |
+| 跨租户隔离 | ✅ 按 tenant 查询 | ✅ 按 tenant 查询 | ✅ 按 tenant 查询 | ⚠️ **readResource 绕过** | ❌ **全无** |
+
+### MCP stdio 模式：认证真空区
+
+`runMCP()` 函数完全不经过任何 HTTP middleware：
+
+```go
+// cmd/server/main.go:349-377
+func runMCP() error {
+    cfg, err := config.Load()
+    // ...
+    store, err := buildStorage(ctx, cfg)
+    repo, err := repository.Open(ctx, cfg.DB.Driver, cfg.DB.DSN)
+    // ...
+    svc := service.NewFileService(store, repo, logger)
+    // ... 构建 embedder, llm, search, chat ...
+    server := mcp.NewServer(svc, repo, search, "default", logger)
+    // ...
+    return mcp.ServeStdio(ctx, server, os.Stdin, os.Stdout)  // ← stdin/stdout，无 auth
+}
+```
+
+任何人能执行 `aero-vault mcp`，就可以：
+- 读取所有租户的所有对象（通过 `readResource` + 任意 URI）
+- 写入对象到 "default" 租户
+- 删除对象（无认证）
+- 绕过所有 rate limit 和 quota 限制
+
+### 为什么需要
+
+1. **MCP 是 Claude Desktop / AI Agent 的接入通道**——用户通过这些工具与数据交互，如果 MCP 存在跨租户漏洞，攻击者或恶意 Agent 可以访问不属于它的数据。这是一个 **数据泄露漏洞**，不是理论缺口。
+
+2. **MCP stdio 模式正在多个产品中普及**——Claude Code、Cursor、VS Code 扩展都使用 MCP stdio 协议。随着 AI 工具的普及，MCP 的攻击面正在快速增加。
+
+3. **MCP HTTP 模式注册在 chi router 中，获得了 middleware 防护**——但 `readResource` 中的跨租户访问逻辑是独立的安全 bug，不在 middleware 的防护范围内。
+
+### 缺失的能力
+
+1. **`readResource` 租户边界检查**——在所有资源访问路径上强制执行 `tenantFor()` 或更严格的 tenant 验证。
+
+2. **MCP stdio 模式的身份认证层**——支持可选的 API Key 验证（通过环境变量 `MCP_API_KEY` 配置，客户端在 `initialize` 时携带）：
+
+   ```go
+   // 伪代码：MCP auth 方案
+   type Server struct {
+       // ...
+       apiKey string  // 可选：MCP_STDIO_API_KEY
+   }
+   
+   func (s *Server) Handle(ctx context.Context, raw []byte) []byte {
+       // 如果配置了 apiKey，验证 initialize 请求中的认证信息
+       if s.apiKey != "" {
+           // ...
+       }
+   }
+   ```
+
+3. **MCP 租户隔离**——支持为不同 MCP 客户端分配不同的租户（通过 stdio 环境变量或 HTTP header）。
+
+4. **MCP 操作审计日志**——所有 MCP 工具调用记录到 audit_log，包含调用者身份、工具名、参数摘要。
+
+5. **MCP 操作限流**——支持 MCP 协议的独立 rate limit（防止 Agent 循环导致 TL;DR）。
+
+### 边界情况
+
+| 场景 | 处理方式 |
+|------|---------|
+| **MCP stdio 多租户场景** | 支持 `MCP_TENANT` 环境变量指定运行租户；或 `initialize` 时协商 |
+| **已有 MCP 客户端不兼容 auth** | 认证为可选项，不配置时保持向后兼容 |
+| **readResource 跨租户读取** | 严格执行 `tenantFor()` 检查，拒绝跨租户 URI |
+
+---
+
+## 方向二：优雅关闭与后台工作负载排空（Graceful Shutdown & Workload Drain）
+
+### 现状
+
+当前关闭序列（`cmd/server/main.go:256-288`）：
+
+```go
+func runServer(ctx context.Context, handler http.Handler, cfg *config.Config, logger *slog.Logger, bus *events.Bus, shutdownOtel func(context.Context) error) error {
+    // ... 等待 SIGINT/SIGTERM ...
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(shutdownCtx); err != nil {  // Step 1: 停 HTTP
+        return fmt.Errorf("shutdown: %w", err)
+    }
+    bus.Close()                                          // Step 2: 关 EventBus
+    _ = shutdownOtel(shutdownCtx)                        // Step 3: 停 OTel
+    return nil
+}
+```
+
+**未关闭的后台 goroutine（共 15+）：**
+
+| # | Goroutine | 启动位置 | 关闭状态 |
+|---|-----------|---------|---------|
+| 1 | SSE key rewrap | `main.go:265` (`go maybeRewrapSSE`) | ❌ 随 ctx 取消退出 |
+| 2 | Postgres transport | `main.go:312` (`go pt.Run`) | ❌ 随 ctx 取消退出 |
+| 3 | Indexer event loop | `main.go:626` (`go indexer.Run`) | ❌ channel 关闭后退出，但不等处理完成 |
+| 4 | BM25 warmup | `main.go:581` (`go func`) | ❌ 随 ctx 取消退出(?) |
+| 5 | Reindex stale | `main.go:654` (`go func`) | ❌ 随 ctx 取消退出(?) |
+| 6 | AV worker | `main.go:675` (`go avw.Run`) | ❌ channel 关闭后退出 |
+| 7 | Replication worker | `main.go:691` (`go rw.Run`) | ❌ channel 关闭后退出 |
+| 8 | Job pool | `main.go:695` (`go jobs.NewPool.Run`) | ❌ 随 ctx 取消退出 |
+| 9 | Webhook worker | `main.go:710` (`go wh.Run`) | ❌ channel 关闭后退出 |
+| 10 | Webhook retry loop | `main.go:711` (`go wh.RetryLoop`) | ❌ 随 ctx 取消退出 |
+| 11 | Reconcile | `main.go:738` (`go j.Run`) | ❌ 随 ctx 取消退出 |
+| 12 | Lifecycle | `main.go:739` (`go lf.Run`) | ❌ 随 ctx 取消退出 |
+| 13 | Retention (optional) | `main.go:741` (`go rg.Run`) | ❌ 随 ctx 取消退出 |
+| 14 | Rate limiter eviction | `main.go:118` (`rl.Start`) | ❌ 随 ctx 取消退出 |
+| 15 | AI rate limiter eviction | `main.go:119` (`aiRL.Start`) | ❌ 随 ctx 取消退出 |
+
+**关键问题：**
+
+1. **`srv.Shutdown()` 只拒绝新 HTTP 连接，但不等待后台 worker 排空。** 如果此时有正在执行的 index 作业（`indexer.Run` 正在处理一个事件）或复制作业（`rw.Run` 正在流式传输大文件），这些操作会被截断。
+
+2. **`bus.Close()` 直接关闭所有 subscriber channel，不等消费者处理完当前事件。** 如果 indexer 正在处理一个事件，channel 关闭后 `indexer.Run` 会在下次 `<-sub` 时收到零值并退出，但当前事件可能只处理了一半。
+
+3. **没有 pre-stop hook。** Kubernetes 的 preStop 钩子无法挂载——容器可能在后台操作完成前被 SIGKILL。
+
+4. **关闭超时仅 15 秒。** 对于大文件复制或大规模索引，可能不够。
+
+### 为什么需要
+
+1. **数据完整性风险。** 如果在复制过程中（`ReplicateObjectByID` 正在流式传输大文件）进程被 SIGKILL，副本可能只有部分数据。当前 `ReplicationJob` 不是幂等的（总是覆盖），但如果新副本损坏且旧副本已被部分覆盖，数据不可恢复。
+
+2. **Kubernetes 部署的标准期望。** K8s 的 `terminationGracePeriodSeconds` 默认 30s。当前关闭序列未完成排空前进程可能被强制杀死。运维人员无法配置排空超时。
+
+3. **SSE 客户端体验。** 关闭时 SSE 连接被直接切断，客户端收到连接重置而非 `event: shutdown` 通知。客户端无法优雅地重新连接。
+
+4. **审计日志完整性。** 如果关闭发生在写操作之后、审计日志刷新之前，操作可能丢失审计轨迹。
+
+### 缺失的能力
+
+1. **`ShutdownGroup`——goroutine 生命周期管理器：**
+
+   ```go
+   type ShutdownGroup struct {
+       wg      sync.WaitGroup
+       cleanup []func(context.Context) error
+   }
+   
+   func (sg *ShutdownGroup) Go(fn func(context.Context)) {
+       sg.wg.Add(1)
+       go func() {
+           defer sg.wg.Done()
+           fn(ctx)
+       }()
+   }
+   
+   func (sg *ShutdownGroup) Shutdown(ctx context.Context) error {
+       // 1. HTTP server drain（拒绝新请求，等待 in-flight 完成）
+       // 2. Bus drain（暂停新事件发布，等待消费者排空）
+       // 3. Worker drain（等待作业完成，可选 preStop hook）
+       // 4. 等待所有 goroutine 退出或超时
+   }
+   ```
+
+2. **关闭阶段化：**
+
+   ```
+   Phase 1: Shutdown HTTP server（停止接受新请求）
+   Phase 2: Shutdown bus（停止新事件发布，但允许消费者排空）
+   Phase 3: Signal workers to drain（worker 完成当前作业后退出）
+   Phase 4: Wait for all goroutines（带超时）
+   Phase 5: Shutdown OTel exporter
+   Phase 6: Close DB connections
+   ```
+
+3. **SSE 关闭通知：** 关闭时向所有 SSE 连接发送 `event: shutdown\ndata: {"reason":"server_restart"}\n\n`，让客户端可以自动重连。
+
+4. **可配置的关闭超时：** `SHUTDOWN_GRACE_SECONDS` 环境变量，默认 30s。
+
+5. **关闭进度日志：** 每个阶段记录日志，方便运维排障。
+
+### 边界情况
+
+| 场景 | 处理方式 |
+|------|---------|
+| **关闭超时** | 关闭超时后强制终止（`os.Exit(1)` + 日志告警） |
+| **关闭中收到新请求** | HTTP server 返回 `Connection: close` + Retry-After |
+| **正在执行的 index 作业** | `indexer.Run` 通过 ctx 感知关闭，完成当前 chunk 后退出 |
+| **正在复制的大文件** | 复制作业的 ctx 超时后放弃，标记为失败（下次 reconcile 修复） |
+| **SSE 客户端长连接** | 关闭前等待 `SSE_DRAIN_TIMEOUT`，然后发送 `event: shutdown` + 关闭连接 |
+
+---
+
+## 方向三：特性交互矩阵与跨特性一致性保障
+
+### 现状
+
+AeroVault 拥有 8+ 可以相互交互的核心特性。每个特性的独立行为有测试，但特性交互的交叉面既无文档也无测试覆盖：
+
+**已知的特性交互面：**
+
+| 特性 A | 特性 B | 交互面 | 当前代码处理 | 测试覆盖 |
+|--------|--------|--------|-------------|---------|
+| Versioning | Object Lock | 对旧版本设置 lock；lock 期间删除版本 | `checkLockBeforeOverwrite` 仅检查当前版本 | ❌ **无** |
+| SSE 加密 | Replication | 加密对象复制到目标后端后加密状态 | 副本存储为已加密 blob，无 re-wrap 逻辑 | ❌ **无** |
+| Webhook | Quota | 配额超限时触发 webhook 通知 | Quota 不产生事件，webhook 无法通知 | ❌ **无** |
+| MCP | Auth | MCP stdio 无 auth 绕过租户隔离 | `readResource` 可直接读取任意租户 | ❌ **无** |
+| Idempotency | Versioning | 幂等键对版本化 bucket 的语义 | 版本化 bucket 的幂等语义未定义 | ❌ **无** |
+| Lifecycle | Versioning | 生命周期在版本化 bucket 中的行为（删除标记 vs 旧版本） | `lifecycle.go` 无版本感知 | ❌ **无** |
+| StorageClass | Lifecycle Transition | StorageClass 迁移的交互 | 两者均无运行时行为 | ❌ **无** |
+| Rate Limiting | AI Budget | 限流与预算的优先级 | 独立作用，哪个先到算哪个 | ❌ **无** |
+| Cluster Singleton | Replication | 多副本时复制作业的去重 | 复制从事件驱动，集群 singleton 不能防止重复 | ❌ **无** |
+| Tenant Isolation | Search | 语义搜索是否需要跨租户或租户内 | Search 实现 `WHERE tenant=?` | ✅ 基本 |
+| SSE Events | Audit Log | 事件记录与审计日志的去重 | 某些操作既写事件又写审计 | ❌ **无** |
+
+**示例：Versioning + Object Lock 交互的具体问题**
+
+```go
+// internal/service/file_crud.go:78-88
+func (s *FileService) checkLockBeforeOverwrite(ctx context.Context, tenant, bucket, key string, versioning bool) error {
+    if !versioning {
+        if cur, err := s.repo.GetObject(ctx, tenant, bucket, key); err == nil {
+            if cur.LockedUntil != nil && cur.LockedUntil.After(time.Now()) {
+                return fmt.Errorf("%w: overwrite blocked until %s", ErrLocked, cur.LockedUntil.Format(time.RFC3339))
+            }
+        }
+    }
+    return nil
+}
+```
+
+当版本化启用时，`checkLockBeforeOverwrite` 直接返回 `nil`——**不检查现有版本的 lock**。这意味着：
+
+- 版本化 bucket 中，即使最新版本有 active lock，也可以 PUT 创建新版本
+- 旧版本上的 lock 会怎样？旧版本被保留（因为版本化），但 lock 状态是否随版本保留？
+
+### 为什么需要
+
+1. **特性交互是 bug 的主要来源。** 在复杂系统中，多数生产故障不是因为单一功能坏了，而是因为两个功能在组合时产生了意外的行为。当前 8+ 可交互特性意味着 28+ 对交互面——大部分无保护。
+
+2. **用户从 AWS S3 迁移的期望。** 在 AWS S3 中，versioning + lock、SSE + replication、lifecycle + versioning 都有明确的行为契约。AeroVault 的特色之一是多协议支持，如果交互行为与 AWS 不一致，用户在迁移时会产生"我的数据为什么会这样"的困惑。
+
+3. **测试覆盖的策略性缺口。** 当前测试（`service_test.go`、`handler_test.go` 等）均测试单一特性。没有交叉特性的组合测试。这意味着修改 versioning 逻辑时，无法通过 CI 发现是否破坏了 lock 行为。
+
+### 缺失的能力
+
+1. **特性交互矩阵文档：** 在 `docs/architecture.md` 中新增特性交互矩阵表格，列出每对特性的已知交互面和预期行为。
+
+2. **跨特性契约测试套件：** 新增 `internal/integration/feature_interaction_test.go`，覆盖关键交互面：
+
+   ```go
+   func TestVersioningAndLockInteraction(t *testing.T) {
+       // 1. 创建版本化 bucket + 开启对象锁
+       // 2. 写入对象 v1 → 自动锁定
+       // 3. 写入对象 v2 → 应成功（创建新版本）
+       // 4. 删除 v2 → 应成功（删除标记）
+       // 5. 尝试硬删除 v1 → 应失败（lock active）
+       // 6. 尝试覆盖 v1（非版本化路径）→ 应失败
+   }
+   ```
+
+3. **特性交互断路器：** 《一旦检测到两个特性同时启用，记录到 Prometheus 指标 `feature_interaction_active{features="versioning,lock"}`》，帮助运维了解哪些交互正在使用中。
+
+4. **Behavioral Contract Registry：** 在代码中注册每个特性的行为契约点，强制开发者在添加新功能时声明与已有功能的交互：
+
+   ```go
+   // registerBehavioralContract 在包 init() 或测试中注册
+   func registerBehavioralContract() {
+       RegisterInteraction("versioning", "lock", func(t *testing.T) {
+           // 版本化 + 锁的契约测试
+       })
+   }
+   ```
+
+### 边界情况
+
+| 交互面 | 当前行为风险 | 期望行为（对标 AWS S3） |
+|--------|------------|----------------------|
+| **Versioning + Lock** | `checkLockBeforeOverwrite` 忽略版本化 bucket 的 lock 检查 | 版本化 bucket 中，即使当前版本有 lock，也可以 PUT 创建新版本，但不能 DELETE 有 lock 的版本 |
+| **SSE + Replication** | 加密对象原样复制，目标端加密无特殊处理 | 副本解密后再加密（re-wrap），或维持相同的加密信封 |
+| **Webhook + Quota** | 配额超限不产生事件 | `object.quota.exceeded` 事件类型，可通过 webhook 通知运维 |
+| **Lifecycle + Versioning** | 生命周期仅处理当前版本 | 过期应创建删除标记（当前版本）或清除旧版本（NoncurrentVersionExpiration） |
+
+---
+
+## 方向四：控制面/数据面分离架构
+
+### 现状
+
+当前架构将控制面（admin）和数据面（用户操作）完全混合在同一个进程中：
+
+```go
+// cmd/server/main.go:buildRouter — 所有路由共用一个 chi Router
+func buildRouter(..., search, chat, agent, bus, authReg, promHandler, cfg, ...) http.Handler {
+    r := chi.NewRouter()
+    // ...
+    r.Mount("/v1", rest.NewRouter(...))  // 用户操作 + admin 操作全挂 /v1 下
+    // /v1/admin/tenants, /v1/admin/keys, /v1/admin/jwt, /v1/admin/jobs, /v1/admin/audit
+    // 和 /v1/files/*, /v1/search, /v1/chat 在同一个进程/同一个端口
+}
+```
+
+**混合架构的风险：**
+
+| 维度 | 当前状态 | 理想状态 |
+|------|---------|---------|
+| **扩缩容** | Admin 和 data 必须一起扩缩——admin 流量通常是 data 流量的 <1%，但只能整体扩容 | 数据面可以水平扩展，控制面保持小规模 |
+| **安全隔离** | 如果数据面有 RCE 漏洞，攻击者可以直接操控 admin 操作 | 数据面即使被攻破，控制面 API 仍受保护 |
+| **版本发布** | Admin API 和 Data API 一起发布——无法独立演进 | Admin API 可以独立于 Data API 进行版本更新 |
+| **故障域** | Admin 操作（如 list_tenants 遍历大表）可以拖慢数据操作（如 GET 对象） | Admin 操作不会影响数据面可用性 |
+| **运维** | 无法单独重启 admin 服务而不影响数据面 | 可独立重启 |
+
+**代码证据：混合在同一包中**
+
+```go
+// internal/api/rest/admin.go — Admin handler 与 REST handler 同包
+// internal/api/rest/handler.go — 用户操作 handler
+// internal/api/rest/router.go — 所有路由混在一起
+```
+
+### 为什么需要
+
+1. **企业 SaaS 的架构前提。** 任何多租户 SaaS 产品最终都需要将控制面和数据面分离，以实现独立扩缩容、安全隔离和运维独立性。当前架构是"单二进制单进程"的起点，但在进入生产环境前必须重构。
+
+2. **Kubernetes 的 HPA 困境。** 如果 admin 操作（如定时 reconcile）导致 CPU 升高，HPA 会错误地扩容数据面——即使数据面并不需要更多副本。
+
+3. **Admin 操作的故障域。** `DELETE /v1/admin/tenants/{tenant}` 有级联删除（遍历该租户的所有对象），如果租户有大量对象，这个操作可能阻塞数据面请求数秒。在混合架构中，整个服务都会受影响。
+
+4. **Admin API 的独立认证需求。** Admin 操作通常需要更强的认证（如 MFA、IP 白名单、独立 API Key 格式）。当前 admin 和 data 共享同一套 auth middleware，难以差异化。
+
+### 缺失的能力
+
+1. **Admin Router 独立端口/地址：** 新增配置 `ADMIN_ADDR`（默认禁用，复用 `APP_ADDR`），启用时 admin 路由监听独立端口：
+
+   ```
+   APP_ADDR=:8080          # 数据面
+   ADMIN_ADDR=:9090         # 控制面（可选，默认禁用）
+   ```
+
+2. **Admin 独立认证策略：** Admin 端口可配置独立的 auth 策略：
+
+   ```
+   ADMIN_AUTH_MODE=mfa            # 数据面可只用 API Key
+   ADMIN_TLS_CLIENT_CERT=true      # Admin 端口要求客户端证书
+   ADMIN_IP_WHITELIST=10.0.0.0/8   # Admin 仅内网可达
+   ```
+
+3. **Admin 请求优先级标记：** 在数据面中执行的 admin 操作（如 `GET /v1/admin/audit` 查询数据库）应标记为低优先级，在资源竞争时可被降级。
+
+4. **Admin 专用资源限制：** Admin 操作使用独立的数据库连接池（`ADMIN_DB_MAX_OPEN=5`），防止 admin 查询耗尽数据库连接。
+
+### 架构概要
+
+```
+当前（混合）:
+  :8080 → middleware → chi → REST(用户+admin混用) → FileService/Repo/Store
+
+改进（分离）:
+  :8080 (数据面)
+    → middleware(轻量) → chi → REST(仅用户操作) → FileService/Repo/Store
+  
+  :9090 (控制面，可选)
+    → middleware(强认证+TLS) → chi → REST(仅admin操作) → 独立DB连接池 → Repo/Store
+```
+
+### 边界情况
+
+| 场景 | 处理方式 |
+|------|---------|
+| **不配置 ADMIN_ADDR** | 保持向后兼容，admin 路由仍在数据面提供 |
+| **控制面与数据面同时修改同一资源** | 事务隔离级别保证一致性；控制面操作有独立事务 |
+| **控制面的 DB 查询拖慢数据面** | 独立连接池 + `context.Done` 超时 |
+
+---
+
+## 方向五：并发安全模型审查与数据竞态防护
+
+### 现状
+
+代码库中有多处共享可变状态，使用不同的同步原语，且没有系统性审查：
+
+**共享状态盘点：**
+
+| 共享状态 | 类型 | 同步原语 | 读路径 | 写路径 | 是否安全 |
+|---------|------|---------|-------|-------|---------|
+| `BM25.index` | `map[string]*termStats` | `sync.RWMutex` | Search 查询时读 | Indexer/Delete 时写 | ✅ 有锁 |
+| `BM25.objToChunks` | `map[int64][]int64` | 同上 | 同上 | 同上 | ✅ 有锁 |
+| `Auth.KeyCache.entries` | `map[string]*cacheEntry` | `sync.Mutex` | Auth middleware 每次请求读 | Admin API/Key change 时写 | ✅ 有锁 |
+| `Bus.subs` | `[]chan Event` | `sync.RWMutex` | `broadcast` 遍历读 | `Subscribe`/`Close` 写 | ✅ 有锁 |
+| `RateLimiter.buckets` | `map[string]*bucket` | `sync.Mutex` | 每个请求读+写（refill tokens） | 每个请求写 | ✅ 有锁 |
+| `PerTenantConcurrencyLimiter.inflight` | `map[string]int` | `sync.Mutex` | 每个请求检查+增减 | 每个请求增减 | ✅ 有锁 |
+| `LocalStorage.uploads` | `map[string]*localUpload` | `sync.RWMutex` | UploadPart/Complete 读 | InitMultipart/Abort 写 | ⚠️ 部分安全 |
+| `LocalStorage.mu` | `sync.RWMutex` | RWMutex | 各种操作 | 各种操作 | ✅ 有锁 |
+| `Registry.keys` | `map[string]Key` | `sync.RWMutex` | Auth middleware 读 | Parse/WithStore 写 | ✅ 有锁 |
+| `CachingEmbedder.cache` | `map[string][]float32` | `sync.Mutex` | Embed 时读 | Embed 时写 | ✅ 有锁 |
+| `ResultCache.entries` | `map[string]*cacheEntry` | `sync.Mutex` | Search 时读 | Search 时写 | ✅ 有锁 |
+| `CircuitBreaker.state` | 自定义状态机 | `sync.Mutex` | 每次存储调用 | 每次存储结果 | ✅ 有锁 |
+| `JobRegistry.handlers` | `map[string]Handler` | `sync.RWMutex` | Worker 查询 | main.go 注册 | ✅ 安全（启动后只读） |
+
+**虽然每处加锁了，但存在以下系统性风险：**
+
+| 风险 | 描述 | 代码证据 |
+|------|------|---------|
+| **锁顺序不一致** | 没有全局锁顺序约定，如果出现嵌套锁，可能死锁 | `LocalStorage.mu` 在多个方法中被获取；如果某个方法在持有 `mu` 时调用了需要另一个锁的函数... |
+| **goroutine 泄露** | `Bus.Subscribe()` 从不取消订阅；subscriber 退出后 channel 仍被 `broadcast` 写入 | `Bus.Close()` 关闭所有 channel，但如果有 subscriber 因其他原因退出但不关闭 channel... |
+| **BM25 的并发重建** | `BuildFromRepo` 在后台 goroutine 中重建 BM25 索引，期间 `Search` 可能同时查询 | `ai/bm25.go` `BuildFromRepo` 写 `mu.Lock()`；Search 读 `mu.RLock()` → 读会被写阻塞 |
+| **Indexer 与 Search 的并发** | Indexer 在后台更新 BM25 的同时，Search 在请求路径上查询 BM25 | 同上，RWMutex 保护 |
+| **KeyCache 的逐出与失效** | 缓存逐出和显式失效可能竞争 | `key_cache.go` 中 `Get` 和 `Invalidate` 无协调 |
+| **EventBus 关闭时广播** | `Close()` 关闭所有 channel，但关闭后 `broadcast` 可能仍在运行 | `broadcast` 在 `Close` 前已拿到 `RLock`，但 `Close` 等待 `Lock`... 有死锁风险？ |
+
+**检查 `broadcast` 的潜在死锁：**
+
+```go
+func (b *Bus) broadcast(e repository.Event) {
+    b.mu.RLock()       // 读锁
+    defer b.mu.RUnlock()
+    for _, ch := range b.subs {
+        select {
+        case ch <- e:
+        default:
+            // ...
+        }
+    }
+}
+
+func (b *Bus) Close() {
+    b.mu.Lock()        // 写锁，等待所有读锁释放
+    defer b.mu.Unlock()
+    for _, ch := range b.subs {
+        close(ch)
+    }
+    b.subs = nil
+}
+```
+
+这是安全的——`Close()` 等待所有正在进行的 `broadcast` 完成后再关闭 channels。但如果 `broadcast` 阻塞在 `ch <- e`（全 buffer 且 subscriber 不消费），`Close()` 也会阻塞。
+
+实际上 `select` 中的 `default` 分支防止了阻塞，所以 `broadcast` 不会卡住，`Close()` 也不会。
+
+### 为什么需要
+
+1. **竞态 bug 是生产故障中最难排查的类型。** Go 的 race detector 只在运行时启用 `-race` 编译时检测——CI 中未启用 `-race`。生产环境中的竞态 bug 可能数月不现，一旦出现就是间歇性数据损坏。
+
+2. **两个 goroutine 修改同一个 BM25 条目可能造成索引损坏。** 如果 `Indexer` 和 `ChunkCleaner` 同时更新同一个 term 的 `df`（文档频率），在无合适锁保护时可能导致计数偏差，影响搜索结果排序。
+
+3. **goroutine 泄露是运维噩梦。** 当前代码没有任何 goroutine 泄露防护。如果某个 subscriber 泄漏，`Bus.subs` 列表会无限制增长，最终每个事件广播都要遍历大量死 channel。
+
+4. **缺少系统性竞态测试。** Go 的标准 `testing` 包支持 `-race`，但当前 Makefile 没有 `make test-race` 目标，CI 中也没有运行 race 检测。
+
+### 缺失的能力
+
+1. **并发安全模型文档：** 在 `docs/architecture.md` 中新增并发模型章节，明确：
+   - 哪些数据是共享的
+   - 每个共享数据的同步策略
+   - 锁获取顺序约定
+   - 哪些 goroutine 是长期运行、哪些是按需创建
+
+2. **CI 中的竞态检测：** `Makefile` 新增 `make test-race` 目标：
+
+   ```makefile
+   test-race:
+       go test -race -count=1 -timeout 120s ./internal/...
+   ```
+
+   并作为 CI gate 的一部分运行（当前仅 `go test ./...` 无 `-race`）。
+
+3. **goroutine 泄露检测测试：** 对长期运行的 goroutine（indexer、webhook、reconcile 等）添加测试，验证启动和关闭后无 goroutine 残留：
+
+   ```go
+   func TestIndexerNoGoroutineLeak(t *testing.T) {
+       before := runtime.NumGoroutine()
+       idx := NewIndexer(...)
+       ctx, cancel := context.WithCancel(context.Background())
+       go idx.Run(ctx, bus.Subscribe())
+       cancel()
+       // 等待 goroutine 退出
+       time.Sleep(100 * time.Millisecond)
+       leaked := runtime.NumGoroutine() - before
+       if leaked > 2 {
+           t.Errorf("possible goroutine leak: %d goroutines remain", leaked)
+       }
+   }
+   ```
+
+4. **`Bus` 的 subscriber 生命周期管理：** 支持 `Unsubscribe(ch)` 方法，允许 subscriber 在退出时通知 Bus，避免 channel 泄漏：
+
+   ```go
+   func (b *Bus) Subscribe() (<-chan repository.Event, func()) {
+       ch := make(chan repository.Event, b.subBuffer)
+       b.mu.Lock()
+       b.subs = append(b.subs, ch)
+       b.mu.Unlock()
+       return ch, func() { b.unsubscribe(ch) }
+   }
+   ```
+
+5. **并发安全 lint 规则：** 在 `.golangci.yml` 中启用 `govet` 的 `atomic` 检查、`race` 检查 (`go vet -race` 子集)。
+
+### 边界情况
+
+| 场景 | 处理方式 |
+|------|---------|
+| **goroutine 泄露测试不稳定** | 允许小阈值（如 2-3 个额外 goroutine），仅告警不失败 |
+| **锁顺序不一致** | 文档约定：所有 `sync.Mutex` 按所在包名排序获取；违反用静态分析检查 |
+| **并发测试的 CI 时间** | `make test-race` 运行时间约为普通测试的 2-5 倍，作为 nightly CI 而非每次 commit |
+| **条件竞态（非确定性失败）** | 使用 `testing.Cleanup` + `runtime.Goexit` 模式，多次重试 |
+
+---
+
+## 综合优先级与建议实施顺序
+
+| 优先级 | 方向 | 影响面 | 前置依赖 | 涉及文件量 | 建议开始时间 |
+|--------|------|--------|---------|-----------|------------|
+| **P0** | MCP 安全模型：跨租户漏洞修复 | 安全——直接影响数据隔离 | 无 | `internal/mcp/server.go`（~10 行改动） | **立即** |
+| **P1** | 优雅关闭与工作负载排空 | 可靠性/数据完整性——影响所有部署 | 无 | `cmd/server/main.go` + 可能新增 `internal/shutdown/` 包（~300 行） | **当前 Sprint** |
+| **P1** | 特性交互矩阵与跨特性一致性 | 工程质量——长期防护 | 无 | 跨多个包的新增测试（~500 行测试代码） | **当前 Sprint** |
+| **P2** | 并发安全模型审查与竞态防护 | 可靠性——工程基础设施 | 无 | `Makefile`（~5 行）+ 新增测试（~200 行） | **下一 Sprint** |
+| **P3** | 控制面/数据面分离架构 | 架构——中期重构 | 需要清晰定义 admin API 边界 | `internal/api/rest/admin.go` 拆分 + `cmd/server/main.go` 调整（~500 行） | **下下 Sprint** |
+
+### 建议的 Sprint 计划
+
+```
+Sprint N（立即）:
+  └── 修复 MCP readResource 跨租户漏洞（方向一）— ~10 行改动，零风险
+
+Sprint N+1:
+  ├── 实现 ShutdownGroup + Bus drain（方向二）
+  └── 新增 Makefile test-race 目标 + goroutine 泄露测试（方向五）
+
+Sprint N+2:
+  ├── 新增特性交互契约测试（方向三）
+  └── 并发安全模型文档 + CI race 检测（方向五）
+
+Sprint N+3:
+  └── 控制面/数据面分离——ADMIN_ADDR + 独立 DB 连接池（方向四）
+
+Sprint N+4+:
+  └── 完整特性交互矩阵 + 跨特性断路器 + 行为契约注册（方向三持续）
+```
+
+### 与既有 44 期分析的去重关系
+
+| 方向 | 既有覆盖 | 本分析的新贡献 |
+|------|---------|-------------|
+| **MCP 安全模型** | v24: MCP HTTP middleware 集成（方向 1）；v44: MCP 幂等性（方向 2） | 发现 `readResource` 跨租户漏洞 + MCP stdio 认证真空区的安全架构分析 |
+| **优雅关闭** | v10/v38/v39 合计 3 行方向表提及 | 15+ goroutine 的完整排空策略 + ShutdownGroup 设计 + SSE 通知机制 |
+| **特性交互矩阵** | ❌ 零覆盖 | 首次识别 8+ 特性的 28+ 交互面 + 契约测试框架 + 行为契约注册模式 |
+| **控制面/数据面分离** | ❌ 零覆盖 | 首次提出 admin 端口独立 + 独立认证 + 独立连接池的分离架构 |
+| **并发安全模型** | v38 方向表 1 行提及"并发安全" | 首次系统性审查代码库中的 13 处共享状态 + CI race 检测 + goroutine 泄露防护 |

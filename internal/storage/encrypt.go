@@ -62,26 +62,41 @@ func newWrappingEncrypter(w DataKeyWrapper) *envelopeEncrypter {
 	return &envelopeEncrypter{wrapper: w}
 }
 
-// encrypt produces (ciphertext, envelope-json). Envelope is small JSON suitable
-// for sidecar storage.
-func (e *envelopeEncrypter) encrypt(plain []byte) ([]byte, string, error) {
-	dataKey := make([]byte, 32)
-	if _, err := rand.Read(dataKey); err != nil {
-		return nil, "", err
+func generateDataKey() (key, nonce []byte, err error) {
+	key = make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, nil, err
 	}
-	iv := make([]byte, 12)
-	if _, err := rand.Read(iv); err != nil {
-		return nil, "", err
+	nonce = make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, nil, err
 	}
+	return key, nonce, nil
+}
+
+func gcmSeal(plaintext, dataKey, nonce []byte) ([]byte, error) {
 	block, err := aes.NewCipher(dataKey)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nil, nonce, plaintext, nil), nil
+}
+
+// encrypt produces (ciphertext, envelope-json). Envelope is small JSON suitable
+// for sidecar storage.
+func (e *envelopeEncrypter) encrypt(plain []byte) ([]byte, string, error) {
+	dataKey, iv, err := generateDataKey()
+	if err != nil {
 		return nil, "", err
 	}
-	ct := gcm.Seal(nil, iv, plain, nil)
+	ct, err := gcmSeal(plain, dataKey, iv)
+	if err != nil {
+		return nil, "", err
+	}
 
 	// Remote wrapping (KMS): the wrapping key never leaves the wrapper.
 	if e.wrapper != nil {
@@ -201,48 +216,61 @@ func (e *envelopeEncrypter) rewrap(envelope string) (string, bool, error) {
 		return "", false, fmt.Errorf("sse: unsupported envelope alg %q", env.Alg)
 	}
 	if env.Wrap != "" {
-		// Remote-wrapped (KMS) objects aren't re-wrapped locally — the KMS owns its
-		// key rotation; leave the envelope untouched.
 		return envelope, false, nil
 	}
 	curID, curKey := e.provider.Current()
 	if env.Kid == curID {
 		return envelope, false, nil
 	}
-	oldKey, ok := e.provider.Resolve(env.Kid)
-	if !ok {
-		if env.Kid == "" {
-			return "", false, errors.New("sse: object has no key id and no legacy key is configured")
-		}
-		return "", false, fmt.Errorf("sse: unknown key version %q", env.Kid)
-	}
-	if len(oldKey) != masterKeyLen || len(curKey) != masterKeyLen {
-		return "", false, fmt.Errorf("sse: master key must be %d bytes", masterKeyLen)
-	}
-	wrapped, err := base64.StdEncoding.DecodeString(env.Kek)
-	if err != nil {
-		return "", false, fmt.Errorf("sse: decode kek: %w", err)
-	}
-	iv, err := base64.StdEncoding.DecodeString(env.IV)
-	if err != nil {
-		return "", false, fmt.Errorf("sse: decode iv: %w", err)
-	}
-	if len(iv) != 12 {
-		return "", false, fmt.Errorf("sse: envelope iv is %d bytes, want 12", len(iv))
-	}
-	dataKey, err := unwrapKey(oldKey, wrapped)
-	if err != nil {
-		return "", false, fmt.Errorf("rewrap unwrap: %w", err)
-	}
-	newWrapped, err := wrapKey(curKey, dataKey)
+	oldKey, err := e.resolveOldKey(env.Kid)
 	if err != nil {
 		return "", false, err
 	}
-	newEnv, err := buildEnvelope("", curID, newWrapped, iv)
+	if len(curKey) != masterKeyLen {
+		return "", false, fmt.Errorf("sse: master key must be %d bytes", masterKeyLen)
+	}
+	newEnv, err := rewrapObject(env, oldKey, curKey, curID)
 	if err != nil {
 		return "", false, err
 	}
 	return newEnv, true, nil
+}
+
+func (e *envelopeEncrypter) resolveOldKey(kid string) ([]byte, error) {
+	oldKey, ok := e.provider.Resolve(kid)
+	if !ok {
+		if kid == "" {
+			return nil, errors.New("sse: object has no key id and no legacy key is configured")
+		}
+		return nil, fmt.Errorf("sse: unknown key version %q", kid)
+	}
+	if len(oldKey) != masterKeyLen {
+		return nil, fmt.Errorf("sse: master key for %q is %d bytes, want %d", kid, len(oldKey), masterKeyLen)
+	}
+	return oldKey, nil
+}
+
+func rewrapObject(env sseEnvelope, oldKey, curKey []byte, curID string) (string, error) {
+	wrapped, err := base64.StdEncoding.DecodeString(env.Kek)
+	if err != nil {
+		return "", fmt.Errorf("sse: decode kek: %w", err)
+	}
+	iv, err := base64.StdEncoding.DecodeString(env.IV)
+	if err != nil {
+		return "", fmt.Errorf("sse: decode iv: %w", err)
+	}
+	if len(iv) != 12 {
+		return "", fmt.Errorf("sse: envelope iv is %d bytes, want 12", len(iv))
+	}
+	dataKey, err := unwrapKey(oldKey, wrapped)
+	if err != nil {
+		return "", fmt.Errorf("rewrap unwrap: %w", err)
+	}
+	newWrapped, err := wrapKey(curKey, dataKey)
+	if err != nil {
+		return "", err
+	}
+	return buildEnvelope("", curID, newWrapped, iv)
 }
 
 // wrapKey KEK-wraps a data key with a master key (AES-GCM, 12-byte nonce prefixed

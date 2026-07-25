@@ -4,7 +4,9 @@
 //   - stdio (one JSON object per line on os.Stdin / os.Stdout)
 //   - HTTP   (POST JSON-RPC requests to /mcp)
 //
-// Exposed tools: list_files, read_file, search.
+// Exposed tools: list_files, read_file, write_file, delete_file, and —
+// conditionally — search (requires an embedder) and chat (requires an
+// embedder + LLM).
 // Exposed resources: live objects in the active tenant.
 //
 // This is a hand-rolled MCP subset that talks to Claude Desktop, Claude Code,

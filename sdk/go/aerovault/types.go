@@ -94,6 +94,30 @@ type AgentResponse struct {
 	Model  string      `json:"model"`
 }
 
+// LineageEntry is one AI-consumption record for an object, mirroring the
+// server's lineageEntry DTO (GET /v1/lineage/objects/{id}).
+type LineageEntry struct {
+	UsageID          int64     `json:"usage_id"`
+	Caller           string    `json:"caller"`
+	Query            string    `json:"query,omitempty"`
+	ChunkIDs         []int64   `json:"chunk_ids"`
+	ObjectIDs        []int64   `json:"object_ids"`
+	RequestID        string    `json:"request_id,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	Model            string    `json:"model,omitempty"`
+	PromptTokens     int       `json:"prompt_tokens,omitempty"`
+	CompletionTokens int       `json:"completion_tokens,omitempty"`
+	TotalTokens      int       `json:"total_tokens,omitempty"`
+	LatencyMs        int64     `json:"latency_ms,omitempty"`
+	CostMicros       int64     `json:"cost_micros,omitempty"`
+}
+
+// LineageResponse is the envelope returned by GET /v1/lineage/objects/{id}.
+type LineageResponse struct {
+	ObjectID int64          `json:"object_id"`
+	Entries  []LineageEntry `json:"entries"`
+}
+
 // ObjectVersion is one historical revision of an object, from ListVersions.
 type ObjectVersion struct {
 	VersionID   string     `json:"version_id"`
