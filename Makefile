@@ -71,6 +71,11 @@ cli-invariants:
 cli-accept:
 	@$(ENGINE) accept
 
+# Run E2E tests against a real server (auto-starts binary)
+test-e2e:
+	@echo "=== E2E Tests ==="
+	@python3 tests/run_all.py --manage
+
 # Full acceptance: aligns with HARNESS.md
 accept: cli-accept
 
