@@ -261,21 +261,6 @@ type objectLockRetention struct {
 	Days int    `xml:"Days,omitempty"`
 }
 
-// objectLegalHold is the body of GET/PUT /{bucket}/{key}?legal-hold.
-type objectLegalHold struct {
-	XMLName xml.Name `xml:"LegalHold"`
-	Xmlns   string   `xml:"xmlns,attr,omitempty"`
-	Status  string   `xml:"Status"`
-}
-
-// objectRetention is the body of GET/PUT /{bucket}/{key}?retention.
-type objectRetention struct {
-	XMLName          xml.Name `xml:"Retention"`
-	Xmlns            string   `xml:"xmlns,attr,omitempty"`
-	Mode             string   `xml:"Mode"`
-	RetainUntilDate  string   `xml:"RetainUntilDate"`
-}
-
 // listVersionsResult is the body of GET /{bucket}?versions.
 type listVersionsResult struct {
 	XMLName             xml.Name       `xml:"ListVersionsResult"`
@@ -381,23 +366,6 @@ type locationConstraint struct {
 	Location string   `xml:",chardata"`
 }
 
-// ── Website Configuration ─────────────────────────────────────────────────────
-
-type websiteConfiguration struct {
-	XMLName       xml.Name         `xml:"WebsiteConfiguration"`
-	Xmlns         string           `xml:"xmlns,attr,omitempty"`
-	IndexDocument *websiteIndexDoc `xml:"IndexDocument,omitempty"`
-	ErrorDocument *websiteErrorDoc `xml:"ErrorDocument,omitempty"`
-}
-
-type websiteIndexDoc struct {
-	Suffix string `xml:"Suffix"`
-}
-
-type websiteErrorDoc struct {
-	Key string `xml:"Key"`
-}
-
 // --- Bucket CORS ---
 
 type corsRule struct {
@@ -483,23 +451,4 @@ type filterRule struct {
 
 type filterVal struct {
 	Value string `xml:",chardata"`
-}
-
-// ── SSE Encryption ────────────────────────────────────────────────────────────
-
-// serverSideEncryptionConfiguration is returned by GET /{bucket}?encryption
-// and accepted by PUT /{bucket}?encryption.
-type serverSideEncryptionConfiguration struct {
-	XMLName xml.Name                   `xml:"ServerSideEncryptionConfiguration"`
-	XMLNS   string                     `xml:"xmlns,attr,omitempty"`
-	Rules   []serverSideEncryptionRule `xml:"Rule"`
-}
-
-type serverSideEncryptionRule struct {
-	Apply serverSideEncryptionApply `xml:"ApplyServerSideEncryptionByDefault"`
-}
-
-type serverSideEncryptionApply struct {
-	SSEAlgorithm   string `xml:"SSEAlgorithm"`
-	KMSMasterKeyID string `xml:"KMSMasterKeyID,omitempty"`
 }
