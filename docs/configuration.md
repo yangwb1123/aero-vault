@@ -30,6 +30,9 @@ Validation (fails fast on startup): the storage backend must be one of
 | `APP_LOG_LEVEL` | `info` | Log level: `debug` \| `info` \| `warn`/`warning` \| `error`. Invalid values fail startup. |
 | `APP_WRITE_TIMEOUT` | `60` | HTTP write timeout in seconds. SSE streams exempt themselves via `SetWriteDeadline`. Set to `0` to disable. |
 | `APP_IDLE_TIMEOUT` | `120` | HTTP idle (keep-alive) timeout in seconds. Set to `0` to disable. |
+| `APP_TLS_ENABLED` | `false` | Enable TLS/HTTPS. Requires `APP_TLS_CERT_FILE` and `APP_TLS_KEY_FILE`. |
+| `APP_TLS_CERT_FILE` | _(empty)_ | Path to TLS certificate file (PEM). Required when `APP_TLS_ENABLED=true`. |
+| `APP_TLS_KEY_FILE` | _(empty)_ | Path to TLS private key file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`). Set to `0` to disable. |
 | `EVENTS_SUB_BUFFER` | `64` | Per-subscriber in-process event channel buffer depth. Increase if subscribers fall behind under high event throughput. Set to `0` to use the default. |
 | `CORS_EXPOSE_HEADERS` | _(empty)_ | Comma-separated extra response headers browsers may read. Default set: `ETag`, `Idempotency-Replayed`, `Retry-After`, `X-Request-ID`, `X-Version-Id`. |
@@ -156,6 +159,9 @@ Validation (fails fast on startup): the storage backend must be one of
 |----------|---------|-------------|
 | `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = operator (any tenant). Empty disables API-key auth (MVP/open mode). |
 | `AUTH_JWT_SECRET` | _(empty)_ | Secret enabling HS256 JWT verification and issuance (`POST /v1/admin/jwt`). |
+| `AUTH_JWKS_ENDPOINT` | _(empty)_ | JWKS endpoint URL for RS256 JWT verification (OIDC integration, e.g. `https://oidc.example.com/.well-known/jwks.json`). |
+| `AUTH_JWKS_KEY_TTL` | `3600` | JWKS key cache TTL in seconds. Keys are refreshed on cache miss; a stale cache is served when refresh fails. |
+| `AUTH_JWT_ISSUER` | _(empty)_ | When set, verifies the `iss` claim matches this value for both HS256 and RS256 JWTs. |
 | `AUTH_ANONYMOUS_PUBLIC_READ` | `false` | Allow unauthenticated `GET`/`HEAD` of public-read objects (the handler still enforces the object ACL). |
 | `AUTH_PERSIST_KEYS` | `false` | Back runtime API keys with the DB (`api_keys` table, tokens sha256-hashed). Keys survive restart and are shared across replicas. Also acts as an implicit auth switch: setting this without `AUTH_KEYS` still enables auth. |
 | `AUTH_KEY_CACHE_TTL_SECONDS` | `0` | `>0` adds a bounded TTL'd read-through cache in front of the DB key lookup, reducing per-request DB hits. Revokes are bounded by this TTL — keep short (e.g. 30). When `EVENTS_TRANSPORT_DSN` is set, add/revoke also broadcasts immediately via a dedicated Postgres LISTEN/NOTIFY channel (`aero_key_invalidate`) so other replicas drop the cache entry without waiting for TTL expiry. |

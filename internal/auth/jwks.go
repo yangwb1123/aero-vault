@@ -241,5 +241,3 @@ func (v *RS256Verifier) Verify(token string) (Key, error) {
 	}
 	return k, nil
 }
-
-
