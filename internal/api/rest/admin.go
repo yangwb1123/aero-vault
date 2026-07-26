@@ -200,26 +200,26 @@ func (h *AdminHandler) IssueJWT(w http.ResponseWriter, r *http.Request) {
 func (h *AdminHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Request) {
 	bucket := chiURLParam(r, "bucket")
 	var req struct {
-		Days                    int                       `json:"days"`
-		Action                  string                    `json:"action"`
-		NoncurrentDays          int                       `json:"noncurrent_days"`
-		NoncurrentCount         int                       `json:"noncurrent_count"`
-		TransitionRules         []repository.TransitionRule `json:"transition_rules,omitempty"`
-		NoncurrentTransDays     int                       `json:"noncurrent_transition_days"`
-		NoncurrentTransClass    string                    `json:"noncurrent_transition_storage_class"`
+		Days                 int                         `json:"days"`
+		Action               string                      `json:"action"`
+		NoncurrentDays       int                         `json:"noncurrent_days"`
+		NoncurrentCount      int                         `json:"noncurrent_count"`
+		TransitionRules      []repository.TransitionRule `json:"transition_rules,omitempty"`
+		NoncurrentTransDays  int                         `json:"noncurrent_transition_days"`
+		NoncurrentTransClass string                      `json:"noncurrent_transition_storage_class"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: err.Error()}})
 		return
 	}
 	lc := repository.LifecycleConfig{
-		ExpireAfterDays:   req.Days,
-		ExpireAction:      req.Action,
-		NoncurrentDays:    req.NoncurrentDays,
-		NoncurrentCount:   req.NoncurrentCount,
-		TransitionRules:   req.TransitionRules,
-		NoncurrentTransitionDays:          req.NoncurrentTransDays,
-		NoncurrentTransitionStorageClass:  req.NoncurrentTransClass,
+		ExpireAfterDays:                  req.Days,
+		ExpireAction:                     req.Action,
+		NoncurrentDays:                   req.NoncurrentDays,
+		NoncurrentCount:                  req.NoncurrentCount,
+		TransitionRules:                  req.TransitionRules,
+		NoncurrentTransitionDays:         req.NoncurrentTransDays,
+		NoncurrentTransitionStorageClass: req.NoncurrentTransClass,
 	}
 	if err := h.svc.SetBucketLifecycleFull(r.Context(), mw.TenantFrom(r.Context()), bucket, lc); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})

@@ -64,8 +64,10 @@ func (l *LifecycleJob) maybeSweep(ctx context.Context) {
 func (l *LifecycleJob) sweep(ctx context.Context) {
 	soft, hard := l.sweepExpired(ctx)
 	noncurrent := l.sweepNonCurrentVersions(ctx)
-	if soft > 0 || hard > 0 || noncurrent > 0 {
-		l.logger.Info("lifecycle sweep", "soft_deleted", soft, "hard_deleted", hard, "noncurrent_versions_purged", noncurrent)
+	transitions := l.sweepTransitions(ctx)
+	if soft > 0 || hard > 0 || noncurrent > 0 || transitions > 0 {
+		l.logger.Info("lifecycle sweep", "soft_deleted", soft, "hard_deleted", hard,
+			"noncurrent_versions_purged", noncurrent, "transitioned", transitions)
 	}
 }
 
@@ -138,4 +140,32 @@ func (l *LifecycleJob) sweepNonCurrentVersions(ctx context.Context) int {
 		l.logger.Info("lifecycle non-current versions purged", "count", purged)
 	}
 	return purged
+}
+
+// sweepTransitions finds objects whose bucket has transition rules and whose age
+// qualifies for a storage-class change, then updates the DB record. Returns the
+// number of objects transitioned.
+func (l *LifecycleJob) sweepTransitions(ctx context.Context) int {
+	objs, err := l.repo.ListTransitionable(ctx, 200)
+	if err != nil {
+		l.logger.Warn("lifecycle list transitionable", "err", err)
+		return 0
+	}
+	transitioned := 0
+	for _, obj := range objs {
+		targetClass, ok := obj.Metadata["__transition_to"]
+		if !ok || targetClass == "" || targetClass == obj.StorageClass {
+			continue
+		}
+		if err := l.repo.UpdateObjectStorageClass(ctx, obj.TenantID, obj.Bucket, obj.Key, targetClass); err != nil {
+			l.logger.Warn("lifecycle transition update", "key", obj.Key,
+				"from", obj.StorageClass, "to", targetClass, "err", err)
+			continue
+		}
+		transitioned++
+	}
+	if transitioned > 0 {
+		l.logger.Info("lifecycle transitions applied", "count", transitioned)
+	}
+	return transitioned
 }

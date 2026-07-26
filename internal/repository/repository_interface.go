@@ -34,6 +34,7 @@ type Repository interface {
 	SetObjectMetaKeys(ctx context.Context, tenant, bucket, key string, meta map[string]string) error
 	ReplaceObjectMetadata(ctx context.Context, tenant, bucket, key string, meta map[string]string) error
 	DeleteObjectMetaKey(ctx context.Context, tenant, bucket, key, metaKey string) error
+	UpdateObjectStorageClass(ctx context.Context, tenant, bucket, key, storageClass string) error
 	SetLockedUntil(ctx context.Context, tenant, bucket, key string, until time.Time) error
 	StorageKeyReferenced(ctx context.Context, storageKey string) (bool, error)
 	ListStorageKeys(ctx context.Context) ([]string, error)

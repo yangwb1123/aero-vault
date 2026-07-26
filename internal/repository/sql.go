@@ -32,8 +32,8 @@ type sqlStore struct {
 	db      *timedDB
 	dialect dialect
 }
-// ── this file is intentionally left for the instrumented-db wrapper ──
 
+// ── this file is intentionally left for the instrumented-db wrapper ──
 
 func (s *sqlStore) Close() error                   { return s.db.Close() }
 func (s *sqlStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }

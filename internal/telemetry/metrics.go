@@ -42,8 +42,8 @@ var (
 	mPresignGenerated       metric.Int64Counter
 	mPresignConsumed        metric.Int64Counter
 	mMiddlewareDuration     metric.Float64Histogram
-	mSQLQueryDuration      metric.Float64Histogram
-	mSQLQueryCount         metric.Int64Counter
+	mSQLQueryDuration       metric.Float64Histogram
+	mSQLQueryCount          metric.Int64Counter
 )
 
 func initDomain() {

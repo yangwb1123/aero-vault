@@ -45,25 +45,25 @@ type TransitionRule struct {
 // BucketConfig holds the full configuration state of a single bucket.
 // SSEAlgorithm and SSEKMSKeyId control per-bucket server-side encryption.
 type BucketConfig struct {
-	TenantID          string
-	Name              string
-	Versioning        bool
-	ObjectLockSeconds int
-	ExpireAfterDays   int
-	ExpireAction      string
-	NoncurrentDays    int
-	NoncurrentCount   int
-	ACL               string
-	Policy            string
-	CORSRules         []CORSRule
-	LoggingTarget     string
-	LoggingPrefix     string
-	NotificationRules []NotificationRule
-	SSEAlgorithm      string `json:"sse_algorithm,omitempty"` // "" | "AES256" | "aws:kms"
-	SSEKMSKeyId       string `json:"sse_kms_key_id,omitempty"`
-	TransitionRules   []TransitionRule `json:"transition_rules,omitempty"`
-	NoncurrentTransitionDays    int    `json:"noncurrent_transition_days,omitempty"`
-	NoncurrentTransitionStorageClass string `json:"noncurrent_transition_storage_class,omitempty"`
+	TenantID                         string
+	Name                             string
+	Versioning                       bool
+	ObjectLockSeconds                int
+	ExpireAfterDays                  int
+	ExpireAction                     string
+	NoncurrentDays                   int
+	NoncurrentCount                  int
+	ACL                              string
+	Policy                           string
+	CORSRules                        []CORSRule
+	LoggingTarget                    string
+	LoggingPrefix                    string
+	NotificationRules                []NotificationRule
+	SSEAlgorithm                     string           `json:"sse_algorithm,omitempty"` // "" | "AES256" | "aws:kms"
+	SSEKMSKeyId                      string           `json:"sse_kms_key_id,omitempty"`
+	TransitionRules                  []TransitionRule `json:"transition_rules,omitempty"`
+	NoncurrentTransitionDays         int              `json:"noncurrent_transition_days,omitempty"`
+	NoncurrentTransitionStorageClass string           `json:"noncurrent_transition_storage_class,omitempty"`
 }
 
 // NotificationRule maps S3 events to notification targets.

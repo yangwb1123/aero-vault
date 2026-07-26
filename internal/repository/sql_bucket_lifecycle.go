@@ -23,13 +23,13 @@ func (s *sqlStore) SetBucketLifecycle(ctx context.Context, tenant, bucket string
 // LifecycleConfig holds the complete lifecycle policy for a bucket, including
 // expiration and transition rules.
 type LifecycleConfig struct {
-	ExpireAfterDays   int              `json:"expire_after_days"`
-	ExpireAction      string           `json:"expire_action"`
-	NoncurrentDays    int              `json:"noncurrent_days"`
-	NoncurrentCount   int              `json:"noncurrent_count"`
-	TransitionRules   []TransitionRule `json:"transition_rules,omitempty"`
-	NoncurrentTransitionDays    int    `json:"noncurrent_transition_days"`
-	NoncurrentTransitionStorageClass string `json:"noncurrent_transition_storage_class"`
+	ExpireAfterDays                  int              `json:"expire_after_days"`
+	ExpireAction                     string           `json:"expire_action"`
+	NoncurrentDays                   int              `json:"noncurrent_days"`
+	NoncurrentCount                  int              `json:"noncurrent_count"`
+	TransitionRules                  []TransitionRule `json:"transition_rules,omitempty"`
+	NoncurrentTransitionDays         int              `json:"noncurrent_transition_days"`
+	NoncurrentTransitionStorageClass string           `json:"noncurrent_transition_storage_class"`
 }
 
 // SetBucketLifecycleFull stores a complete lifecycle configuration for a bucket,
@@ -86,14 +86,14 @@ LIMIT $1`), limit)
 	var out []Object
 	for rows.Next() {
 		var (
-			obj       Object
-			metaRaw   []byte
-			tagRaw    []byte
-			created   flexTime
-			updated   flexTime
-			deleted   flexNullTime
-			locked    flexNullTime
-			transRaw  string
+			obj      Object
+			metaRaw  []byte
+			tagRaw   []byte
+			created  flexTime
+			updated  flexTime
+			deleted  flexNullTime
+			locked   flexNullTime
+			transRaw string
 		)
 		if err := rows.Scan(&obj.ID, &obj.TenantID, &obj.Bucket, &obj.Key, &obj.VersionID, &obj.Backend, &obj.StorageKey,
 			&obj.Size, &obj.ETag, &obj.ContentType, &metaRaw, &tagRaw, &obj.StorageClass,
