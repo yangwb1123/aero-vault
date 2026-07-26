@@ -30,6 +30,13 @@ type ObjectInfo struct {
 type PutOptions struct {
 	ContentType string
 	Metadata    map[string]string
+	// SSECustomerKey is an AES-256 key for server-side encryption with
+	// customer-provided key (SSE-C). When set, the key is used to encrypt the
+	// object on write and MUST be provided on subsequent read/stat/delete.
+	// Length must be 32 bytes for AES-256.
+	SSECustomerKey []byte
+	// SSECustomerKeyMD5 is the MD5 of SSECustomerKey for integrity validation.
+	SSECustomerKeyMD5 []byte
 }
 
 // ListResult is one page of a List call.

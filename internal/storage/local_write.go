@@ -55,13 +55,18 @@ func (s *LocalStorage) writeObject(ctx context.Context, path, key string, r io.R
 	var (
 		reader   io.Reader = io.TeeReader(r, h)
 		envelope string
+		enc      = s.enc
 	)
-	if s.enc != nil {
+	// SSE-C: use customer-provided key instead of server-side encrypter.
+	if len(opts.SSECustomerKey) == 32 {
+		enc = newEnvelopeEncrypter(&ssecProvider{key: opts.SSECustomerKey})
+	}
+	if enc != nil {
 		plain, err := io.ReadAll(reader)
 		if err != nil {
 			return localMeta{}, err
 		}
-		ct, env, err := s.enc.encrypt(plain)
+		ct, env, err := enc.encrypt(plain)
 		if err != nil {
 			return localMeta{}, err
 		}

@@ -209,6 +209,21 @@ func newDataKeyWrapper(cfg LocalConfig) DataKeyWrapper {
 // Secrets provider (e.g. a custom KMS client) wins; else an HTTP secret store
 // (Vault KV); else a local keyfile; else a single env passphrase; else nil (SSE
 // disabled). The keyed providers take the env key as their legacy slot.
+// ssecProvider is a SecretProvider that returns a fixed key for SSE-C
+// (customer-provided encryption key). It always returns the same key ID
+// "__ssec__" so the envelope can distinguish SSE-C from server-side keys.
+type ssecProvider struct {
+	key []byte
+}
+
+func (p *ssecProvider) Current() (string, []byte) { return "__ssec__", p.key }
+func (p *ssecProvider) Resolve(id string) ([]byte, bool) {
+	if id == "__ssec__" {
+		return p.key, true
+	}
+	return nil, false
+}
+
 func newSecretProvider(cfg LocalConfig) (SecretProvider, error) {
 	switch {
 	case cfg.Secrets != nil:

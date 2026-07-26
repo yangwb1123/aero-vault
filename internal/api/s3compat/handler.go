@@ -1,6 +1,7 @@
 package s3compat
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -99,11 +100,13 @@ func (h *Handler) PutObject(w http.ResponseWriter, r *http.Request) {
 		h.restoreObject(w, r, bucket, key)
 		return
 	}
+	ssecKey := parseSSECKey(r.Header)
 	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), bucket, key, r.Body, r.ContentLength, service.PutOptions{
-		ContentType:  r.Header.Get("Content-Type"),
-		Metadata:     meta,
-		ContentMD5:   r.Header.Get("Content-MD5"),
-		StorageClass: r.Header.Get("x-amz-storage-class"),
+		ContentType:    r.Header.Get("Content-Type"),
+		Metadata:       meta,
+		ContentMD5:     r.Header.Get("Content-MD5"),
+		StorageClass:   r.Header.Get("x-amz-storage-class"),
+		SSECustomerKey: ssecKey,
 	})
 	if err != nil {
 		writeS3Error(w, r, err)
@@ -342,6 +345,24 @@ func writeObjectHeaders(w http.ResponseWriter, contentType string, size int64, e
 func keyFromURL(r *http.Request) string {
 	k := chi.URLParam(r, "*")
 	return strings.TrimPrefix(k, "/")
+}
+
+// parseSSECKey decodes the x-amz-server-side-encryption-customer-key header.
+// Returns nil when the header is absent or invalid.
+func parseSSECKey(h http.Header) []byte {
+	alg := h.Get("x-amz-server-side-encryption-customer-algorithm")
+	if alg == "" || strings.ToUpper(alg) != "AES256" {
+		return nil
+	}
+	keyB64 := h.Get("x-amz-server-side-encryption-customer-key")
+	if keyB64 == "" {
+		return nil
+	}
+	key, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil || len(key) != 32 {
+		return nil
+	}
+	return key
 }
 
 func s3PutMeta(h http.Header) map[string]string {

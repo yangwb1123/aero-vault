@@ -119,7 +119,11 @@ func (s *FileService) Put(ctx context.Context, tenant, bucket, key string, r io.
 	if opts.StorageClass == "" {
 		opts.StorageClass = DefaultStorageClass
 	}
-	storeOpts := storage.PutOptions{ContentType: opts.ContentType, Metadata: opts.Metadata}
+	storeOpts := storage.PutOptions{
+		ContentType:    opts.ContentType,
+		Metadata:       opts.Metadata,
+		SSECustomerKey: opts.SSECustomerKey,
+	}
 	versionID := repository.NewVersionID()
 	sk := storageKey(tenant, bucket, key)
 	if bcfg.Versioning {

@@ -177,11 +177,12 @@ func (s *FileService) Repo() repository.Repository { return s.repo }
 
 // PutOptions mirrors storage.PutOptions plus tags and optional Content-MD5.
 type PutOptions struct {
-	ContentType  string
-	Metadata     map[string]string
-	Tags         map[string]string
-	ContentMD5   string
-	StorageClass string
+	ContentType    string
+	Metadata       map[string]string
+	Tags           map[string]string
+	ContentMD5     string
+	StorageClass   string
+	SSECustomerKey []byte // AES-256 key for SSE-C (client-provided encryption)
 }
 
 // WithDefaultStorageClass overrides package-level DefaultStorageClass.
