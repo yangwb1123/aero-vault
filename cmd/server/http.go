@@ -131,9 +131,16 @@ func runServer(ctx context.Context, handler http.Handler, cfg *config.Config, lo
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", cfg.App.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+		if cfg.App.TLSEnabled {
+			logger.Info("listening (TLS)", "addr", cfg.App.Addr)
+			if err := srv.ListenAndServeTLS(cfg.App.TLSCertFile, cfg.App.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		} else {
+			logger.Info("listening", "addr", cfg.App.Addr)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
 		}
 		close(errCh)
 	}()

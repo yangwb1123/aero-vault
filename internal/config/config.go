@@ -33,12 +33,15 @@ type Config struct {
 type AppConfig struct {
 	Addr              string
 	LogLevel          slog.Level
-	WriteTimeoutSec   int // APP_WRITE_TIMEOUT; 0 = disabled
-	IdleTimeoutSec    int // APP_IDLE_TIMEOUT; 0 = disabled
-	RequestTimeoutSec int // REQUEST_TIMEOUT_SECONDS; 0 = disabled
-	MaxInFlight       int // MAX_INFLIGHT_REQUESTS; 0 = unlimited
-	PerTenantMax      int // PER_TENANT_CONCURRENCY_MAX; 0 = unlimited
-	MaxBodySize       int // APP_MAX_BODY_SIZE; max request body bytes (0 = unlimited)
+	TLSEnabled        bool   // APP_TLS_ENABLED
+	TLSCertFile       string // APP_TLS_CERT_FILE
+	TLSKeyFile        string // APP_TLS_KEY_FILE
+	WriteTimeoutSec   int    // APP_WRITE_TIMEOUT; 0 = disabled
+	IdleTimeoutSec    int    // APP_IDLE_TIMEOUT; 0 = disabled
+	RequestTimeoutSec int    // REQUEST_TIMEOUT_SECONDS; 0 = disabled
+	MaxInFlight       int    // MAX_INFLIGHT_REQUESTS; 0 = unlimited
+	PerTenantMax      int    // PER_TENANT_CONCURRENCY_MAX; 0 = unlimited
+	MaxBodySize       int    // APP_MAX_BODY_SIZE; max request body bytes (0 = unlimited)
 }
 
 func Load() (*Config, error) {
@@ -53,6 +56,9 @@ func Load() (*Config, error) {
 		App: AppConfig{
 			Addr:              getEnv("APP_ADDR", ":8080"),
 			LogLevel:          logLevel,
+			TLSEnabled:        getEnvBool("APP_TLS_ENABLED", false),
+			TLSCertFile:       getEnv("APP_TLS_CERT_FILE", ""),
+			TLSKeyFile:        getEnv("APP_TLS_KEY_FILE", ""),
 			WriteTimeoutSec:   getEnvInt("APP_WRITE_TIMEOUT", 60),
 			IdleTimeoutSec:    getEnvInt("APP_IDLE_TIMEOUT", 120),
 			RequestTimeoutSec: getEnvInt("REQUEST_TIMEOUT_SECONDS", 120),
@@ -299,6 +305,9 @@ func (c *Config) validateTimeouts() error {
 	}
 	if c.App.IdleTimeoutSec < 0 {
 		return errors.New("APP_IDLE_TIMEOUT must be >= 0 (0 = disabled)")
+	}
+	if c.App.TLSEnabled && (c.App.TLSCertFile == "" || c.App.TLSKeyFile == "") {
+		return errors.New("APP_TLS_CERT_FILE and APP_TLS_KEY_FILE are required when APP_TLS_ENABLED=true")
 	}
 	if c.App.RequestTimeoutSec < 0 {
 		return errors.New("REQUEST_TIMEOUT_SECONDS must be >= 0 (0 = disabled)")
