@@ -3,7 +3,6 @@ package repository
 import (
 	"context"
 	crand "crypto/rand"
-	"database/sql"
 	"embed"
 	"encoding/binary"
 	"fmt"
@@ -30,9 +29,11 @@ const (
 )
 
 type sqlStore struct {
-	db      *sql.DB
+	db      *timedDB
 	dialect dialect
 }
+// ── this file is intentionally left for the instrumented-db wrapper ──
+
 
 func (s *sqlStore) Close() error                   { return s.db.Close() }
 func (s *sqlStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }

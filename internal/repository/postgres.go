@@ -17,5 +17,5 @@ func openPostgres(ctx context.Context, dsn string) (Repository, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &sqlStore{db: db, dialect: dialectPostgres}, nil
+	return newSQLStore(db, dialectPostgres), nil
 }

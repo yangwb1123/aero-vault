@@ -42,6 +42,8 @@ var (
 	mPresignGenerated       metric.Int64Counter
 	mPresignConsumed        metric.Int64Counter
 	mMiddlewareDuration     metric.Float64Histogram
+	mSQLQueryDuration      metric.Float64Histogram
+	mSQLQueryCount         metric.Int64Counter
 )
 
 func initDomain() {
@@ -72,7 +74,18 @@ func initDomain() {
 		mPresignGenerated, _ = m.Int64Counter("presign.generated_total")
 		mPresignConsumed, _ = m.Int64Counter("presign.consumed_total")
 		mMiddlewareDuration, _ = m.Float64Histogram("middleware.duration_ms")
+		mSQLQueryDuration, _ = m.Float64Histogram("sql.query_duration_ms")
+		mSQLQueryCount, _ = m.Int64Counter("sql.query_total")
 	})
+}
+
+// RecordSQLQuery records the duration of a single SQL query, attributed by
+// the operation name so slow queries can be identified per-query-pattern.
+func RecordSQLQuery(ctx context.Context, op string, durMs float64) {
+	initDomain()
+	attrs := metric.WithAttributes(attribute.String("op", op))
+	mSQLQueryDuration.Record(ctx, durMs, attrs)
+	mSQLQueryCount.Add(ctx, 1, attrs)
 }
 
 // RecordAIUsage records token/cost domain metrics for one AI (chat) call,

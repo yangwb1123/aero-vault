@@ -32,7 +32,7 @@ func openSQLite(ctx context.Context, dsn string) (Repository, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("set sqlite pragmas: %w", err)
 	}
-	return &sqlStore{db: db, dialect: dialectSQLite}, nil
+	return newSQLStore(db, dialectSQLite), nil
 }
 
 // sqliteFilePath extracts the on-disk path from a "file:..." DSN, "" if not a file URL.
