@@ -220,14 +220,37 @@ func ossObjectInfo(key string, h http.Header) ObjectInfo {
 	return info
 }
 
-func (s *OSSStorage) CanCopy() bool { return false }
+func (s *OSSStorage) CanCopy() bool { return true }
 
 func (s *OSSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
-	// TODO: implement using OSS CopyObject API
-	return ObjectInfo{}, ErrUnsupported
+	// Use OSS CopyObject API (server-side copy, does not read body into memory).
+	hdrs := []oss.Option{}
+	if opts.MetadataDirective == "REPLACE" {
+		hdrs = append(hdrs, oss.MetadataDirective(oss.MetaReplace))
+		if opts.ContentType != "" {
+			hdrs = append(hdrs, oss.ContentType(opts.ContentType))
+		}
+		if len(opts.Metadata) > 0 {
+			for k, v := range opts.Metadata {
+				hdrs = append(hdrs, oss.Meta(k, v))
+			}
+		}
+	} else {
+		hdrs = append(hdrs, oss.MetadataDirective(oss.MetaCopy))
+	}
+	// oss.CopyObjectResult contains ETag and LastModified
+	result, err := s.bucket.CopyObject(srcKey, dstKey, hdrs...)
+	if err != nil {
+		return ObjectInfo{}, fmt.Errorf("oss copy: %w", err)
+	}
+	etag := strings.Trim(result.ETag, `"`)
+	return ObjectInfo{Key: dstKey, ETag: etag}, nil
 }
 
 func (s *OSSStorage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	// OSS SDK requires InitiateMultipartUploadResult which is not available at this
+	// abstraction level. Use Copy (which calls CopyObject server-side) for full
+	// objects, or fall back to the client-stream copy in the service layer.
 	return MultipartPart{}, ErrUnsupported
 }
 

@@ -225,14 +225,41 @@ func cosObjectInfo(key string, h http.Header) ObjectInfo {
 	return info
 }
 
-func (s *COSStorage) CanCopy() bool { return false }
+func (s *COSStorage) CanCopy() bool { return true }
 
 func (s *COSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
-	// TODO: implement using COS CopyObject API
-	return ObjectInfo{}, ErrUnsupported
+	sourceURL := fmt.Sprintf("%s/%s", s.cfg.BucketURL, srcKey)
+	hdr := &cos.ObjectCopyHeaderOptions{
+		XCosCopySource: sourceURL,
+	}
+	if opts.MetadataDirective == "REPLACE" {
+		hdr.XCosMetadataDirective = "Replaced"
+		if opts.ContentType != "" {
+			hdr.ContentType = opts.ContentType
+		}
+		if len(opts.Metadata) > 0 {
+			meta := http.Header{}
+			for k, v := range opts.Metadata {
+				meta.Set("x-cos-meta-"+k, v)
+			}
+			hdr.XCosMetaXXX = &meta
+		}
+	} else {
+		hdr.XCosMetadataDirective = "Copy"
+	}
+	src := &cos.ObjectCopyOptions{ObjectCopyHeaderOptions: hdr}
+	result, _, err := s.client.Object.Copy(ctx, dstKey, sourceURL, src)
+	if err != nil {
+		return ObjectInfo{}, fmt.Errorf("cos copy: %w", err)
+	}
+	etag := strings.Trim(result.ETag, `"`)
+	return ObjectInfo{Key: dstKey, ETag: etag}, nil
 }
 
 func (s *COSStorage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	// COS SDK does not provide a direct UploadPartCopy method on the ObjectService.
+	// Use Copy (which calls PutObjectCopy server-side) for full objects, or fall
+	// back to the client-stream copy in the service layer.
 	return MultipartPart{}, ErrUnsupported
 }
 
