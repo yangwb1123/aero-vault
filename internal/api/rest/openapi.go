@@ -1,24 +1,20 @@
 package rest
 
 import (
-	_ "embed"
 	"net/http"
 )
 
-//go:embed openapi.json
-var openapiJSON []byte
-
-// OpenAPISpecHandler serves /openapi.json.
+// OpenAPISpecHandler serves /openapi.json from the generated spec.
 func OpenAPISpecHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(openapiJSON)
+		data := globalSpec.JSON()
+		_, _ = w.Write(data)
 	}
 }
 
 // SwaggerUIHandler serves a minimal Swagger UI page at /docs that loads
-// /openapi.json from the same origin. No JS framework dependency — just the
-// CDN-hosted swagger-ui assets.
+// /openapi.json from the same origin.
 func SwaggerUIHandler() http.HandlerFunc {
 	html := `<!doctype html>
 <html><head><meta charset="utf-8"><title>aero-vault API</title>
