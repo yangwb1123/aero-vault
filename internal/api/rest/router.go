@@ -120,6 +120,7 @@ func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.
 
 	// Admin surfaces
 	r.Put("/admin/tenants/{tenant}/quota", adm.SetQuota)
+	r.Put("/admin/buckets/{bucket}/quota", adm.PutBucketQuota)
 	r.Put("/admin/tenants/{tenant}/budget", adm.SetBudget)
 	r.Get("/admin/keys", adm.ListKeys)
 	r.Post("/admin/keys", adm.AddKey)

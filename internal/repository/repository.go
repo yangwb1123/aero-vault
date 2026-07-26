@@ -79,6 +79,8 @@ type BucketConfig struct {
 	NoncurrentTransitionDays         int              `json:"noncurrent_transition_days,omitempty"`
 	NoncurrentTransitionStorageClass string           `json:"noncurrent_transition_storage_class,omitempty"`
 	WebsiteConfig                    WebsiteConfig    `json:"website_config,omitempty"`
+	BucketMaxBytes                   int64            `json:"bucket_max_bytes,omitempty"`
+	BucketMaxObjects                 int64            `json:"bucket_max_objects,omitempty"`
 }
 
 // NotificationRule maps S3 events to notification targets.

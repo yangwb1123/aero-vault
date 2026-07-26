@@ -35,6 +35,28 @@ func (s *FileService) preflightQuota(ctx context.Context, tenant string, size in
 	return checkObjectsQuota(q, objDelta)
 }
 
+// preflightBucketQuota checks per-bucket storage limits before a write.
+func (s *FileService) preflightBucketQuota(ctx context.Context, tenant, bucket string, size int64, deltaObjects int) error {
+	bcfg, err := s.repo.GetBucketConfig(ctx, tenant, bucket)
+	if err != nil {
+		return err
+	}
+	if bcfg.BucketMaxBytes <= 0 && bcfg.BucketMaxObjects <= 0 {
+		return nil // unlimited
+	}
+	usedBytes, usedObjects, err := s.repo.BucketUsage(ctx, tenant, bucket)
+	if err != nil {
+		return err
+	}
+	if bcfg.BucketMaxBytes > 0 && usedBytes+size > bcfg.BucketMaxBytes {
+		return fmt.Errorf("%w: bucket %s bytes %d/%d", ErrQuotaExceeded, bucket, usedBytes+size, bcfg.BucketMaxBytes)
+	}
+	if bcfg.BucketMaxObjects > 0 && usedObjects+int64(deltaObjects) > bcfg.BucketMaxObjects {
+		return fmt.Errorf("%w: bucket %s objects %d/%d", ErrQuotaExceeded, bucket, usedObjects+int64(deltaObjects), bcfg.BucketMaxObjects)
+	}
+	return nil
+}
+
 func checkBytesQuota(q repository.TenantQuota, size int64) error {
 	if size > 0 {
 		if q.MaxBytes > 0 && q.UsedBytes+size > q.MaxBytes {
@@ -88,6 +110,9 @@ func (s *FileService) Put(ctx context.Context, tenant, bucket, key string, r io.
 		return repository.Object{}, fmt.Errorf("get bucket config: %w", err)
 	}
 	if err := s.preflightQuota(ctx, tenant, size, 1); err != nil {
+		return repository.Object{}, err
+	}
+	if err := s.preflightBucketQuota(ctx, tenant, bucket, size, 1); err != nil {
 		return repository.Object{}, err
 	}
 

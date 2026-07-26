@@ -211,14 +211,14 @@ type s3NotificationEvent struct {
 }
 
 type s3EventRecord struct {
-	EventVersion string         `json:"eventVersion"`
-	EventSource  string         `json:"eventSource"`
-	AWSRegion    string         `json:"awsRegion"`
-	EventName    string         `json:"eventName"`
-	UserIdentity s3UserIdentity `json:"userIdentity"`
+	EventVersion      string            `json:"eventVersion"`
+	EventSource       string            `json:"eventSource"`
+	AWSRegion         string            `json:"awsRegion"`
+	EventName         string            `json:"eventName"`
+	UserIdentity      s3UserIdentity    `json:"userIdentity"`
 	RequestParameters map[string]string `json:"requestParameters"`
 	ResponseElements  map[string]string `json:"responseElements"`
-	S3              s3Entity     `json:"s3"`
+	S3                s3Entity          `json:"s3"`
 }
 
 type s3UserIdentity struct {
@@ -226,9 +226,9 @@ type s3UserIdentity struct {
 }
 
 type s3Entity struct {
-	SchemaVersion   string      `json:"s3SchemaVersion"`
-	Bucket          s3Bucket    `json:"bucket"`
-	Object          s3Object    `json:"object"`
+	SchemaVersion string   `json:"s3SchemaVersion"`
+	Bucket        s3Bucket `json:"bucket"`
+	Object        s3Object `json:"object"`
 }
 
 type s3Bucket struct {
@@ -246,11 +246,11 @@ type s3Object struct {
 func buildS3Event(e repository.Event, eventName string) s3NotificationEvent {
 	return s3NotificationEvent{
 		Records: []s3EventRecord{{
-			EventVersion: "2.1",
-			EventSource:  "aws:s3",
-			AWSRegion:    "us-east-1",
-			EventName:    eventName,
-			UserIdentity: s3UserIdentity{PrincipalID: e.TenantID},
+			EventVersion:      "2.1",
+			EventSource:       "aws:s3",
+			AWSRegion:         "us-east-1",
+			EventName:         eventName,
+			UserIdentity:      s3UserIdentity{PrincipalID: e.TenantID},
 			RequestParameters: map[string]string{"sourceIPAddress": "127.0.0.1"},
 			ResponseElements:  map[string]string{"x-amz-request-id": fmt.Sprintf("%d", e.ID)},
 			S3: s3Entity{

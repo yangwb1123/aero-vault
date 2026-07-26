@@ -228,6 +228,24 @@ func (h *AdminHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"days": req.Days, "action": req.Action})
 }
 
+// PUT /v1/admin/buckets/{bucket}/quota  {"max_bytes":N,"max_objects":N}
+func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
+	bucket := chiURLParam(r, "bucket")
+	var req struct {
+		MaxBytes   int64 `json:"max_bytes"`
+		MaxObjects int64 `json:"max_objects"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: err.Error()}})
+		return
+	}
+	if err := h.svc.SetBucketQuota(r.Context(), mw.TenantFrom(r.Context()), bucket, req.MaxBytes, req.MaxObjects); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"max_bytes": req.MaxBytes, "max_objects": req.MaxObjects})
+}
+
 // GET /v1/admin/webhook-failures
 func (h *AdminHandler) ListWebhookFailures(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(w, r) {

@@ -56,6 +56,8 @@ type Repository interface {
 	DeleteBucketEncryption(ctx context.Context, tenant, bucket string) error
 	SetBucketWebsite(ctx context.Context, tenant, bucket string, cfg WebsiteConfig) error
 	DeleteBucketWebsite(ctx context.Context, tenant, bucket string) error
+	SetBucketQuota(ctx context.Context, tenant, bucket string, maxBytes, maxObjects int64) error
+	BucketUsage(ctx context.Context, tenant, bucket string) (usedBytes, usedObjects int64, err error)
 	SetBucketACL(ctx context.Context, tenant, bucket, acl string) error
 	SetBucketPolicy(ctx context.Context, tenant, bucket, policy string) error
 	GetBucketCORS(ctx context.Context, tenant, bucket string) ([]CORSRule, error)

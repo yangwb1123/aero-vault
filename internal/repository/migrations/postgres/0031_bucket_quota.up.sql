@@ -1,0 +1,2 @@
+ALTER TABLE buckets ADD COLUMN bucket_max_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE buckets ADD COLUMN bucket_max_objects INTEGER NOT NULL DEFAULT 0;

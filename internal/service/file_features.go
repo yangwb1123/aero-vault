@@ -390,6 +390,12 @@ func (s *FileService) DeleteBucketWebsite(ctx context.Context, tenant, bucket st
 	return s.repo.DeleteBucketWebsite(ctx, tenant, bucket)
 }
 
+// SetBucketQuota sets per-bucket storage limits (0 = unlimited).
+func (s *FileService) SetBucketQuota(ctx context.Context, tenant, bucket string, maxBytes, maxObjects int64) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.SetBucketQuota(ctx, tenant, bucket, maxBytes, maxObjects)
+}
+
 // GetBucketLogging returns the access-logging config for a bucket.
 func (s *FileService) GetBucketLogging(ctx context.Context, tenant, bucket string) (repository.LoggingConfig, error) {
 	tenant, bucket = defaults(tenant, bucket)

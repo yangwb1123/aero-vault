@@ -233,6 +233,32 @@ def test_admin():
     print(f"  ✅ GET /v1/admin/config -> {status}")
 
 
+def test_bucket_quota():
+    """Bucket quota via admin API."""
+    # Set bucket quota
+    status, data = request("PUT", "/v1/admin/buckets/default/quota", body={
+        "max_bytes": 1073741824,  # 1GB
+        "max_objects": 10000,
+    })
+    assert status == 200, f"PutBucketQuota: {status} {data}"
+    print(f"  ✅ PUT /v1/admin/buckets/default/quota -> 200")
+
+    # Verify via bucket config
+    status, data = request("GET", "/v1/buckets/default/config")
+    assert status == 200
+    assert data.get("bucket_max_bytes") == 1073741824, f"expected max_bytes, got {data}"
+    assert data.get("bucket_max_objects") == 10000, f"expected max_objects, got {data}"
+    print(f"  ✅ GET /v1/buckets/default/config confirms quota")
+
+    # Reset to unlimited
+    status, _ = request("PUT", "/v1/admin/buckets/default/quota", body={
+        "max_bytes": 0,
+        "max_objects": 0,
+    })
+    assert status == 200
+    print(f"  ✅ Bucket quota reset -> unlimited")
+
+
 def test_bucket_policy():
     """Bucket policy CRUD."""
     key = "e2e-policy/doc.txt"
@@ -439,7 +465,7 @@ ALL_TESTS = [
                   test_edge_lifecycle_invalid, test_edge_encryption_roundtrip,
                   test_bucket_versioning_policy]),
     ("MCP", [test_mcp, test_mcp_tools_write_delete]),
-    ("Admin", [test_admin]),
+    ("Admin", [test_admin, test_bucket_quota]),
 ]
 
 

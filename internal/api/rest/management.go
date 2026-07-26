@@ -146,6 +146,7 @@ func (h *Handler) GetBucketConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, bucketConfigDTO{
 		Name: cfg.Name, Versioning: cfg.Versioning, ObjectLockSeconds: cfg.ObjectLockSeconds,
 		ExpireAfterDays: cfg.ExpireAfterDays, ExpireAction: cfg.ExpireAction,
+		BucketMaxBytes: cfg.BucketMaxBytes, BucketMaxObjects: cfg.BucketMaxObjects,
 	})
 }
 
@@ -203,6 +204,8 @@ type bucketConfigDTO struct {
 	ObjectLockSeconds int    `json:"object_lock_seconds"`
 	ExpireAfterDays   int    `json:"expire_after_days,omitempty"`
 	ExpireAction      string `json:"expire_action,omitempty"`
+	BucketMaxBytes    int64  `json:"bucket_max_bytes,omitempty"`
+	BucketMaxObjects  int64  `json:"bucket_max_objects,omitempty"`
 }
 
 func toVersionDTO(o repository.Object) versionDTO {

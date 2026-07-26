@@ -110,12 +110,12 @@ func (s *sqlStore) DeleteBucket(ctx context.Context, tenant, bucket string) erro
 
 func (s *sqlStore) GetBucketConfig(ctx context.Context, tenant, bucket string) (BucketConfig, error) {
 	tenant = defaultTenant(tenant)
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules, sse_algorithm, sse_kms_key_id, transition_rules, noncurrent_transition_days, noncurrent_transition_storage_class, website_config FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules, sse_algorithm, sse_kms_key_id, transition_rules, noncurrent_transition_days, noncurrent_transition_storage_class, website_config, bucket_max_bytes, bucket_max_objects FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
 	var cfg BucketConfig
 	var versioning sql.NullBool
 	var acl, policy, corsRaw, logTarget, logPrefix, notifRaw sql.NullString
 	var transRaw, webRaw sql.NullString
-	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw, &cfg.SSEAlgorithm, &cfg.SSEKMSKeyId, &transRaw, &cfg.NoncurrentTransitionDays, &cfg.NoncurrentTransitionStorageClass, &webRaw); err != nil {
+	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw, &cfg.SSEAlgorithm, &cfg.SSEKMSKeyId, &transRaw, &cfg.NoncurrentTransitionDays, &cfg.NoncurrentTransitionStorageClass, &webRaw, &cfg.BucketMaxBytes, &cfg.BucketMaxObjects); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return BucketConfig{TenantID: tenant, Name: bucket}, nil
 		}
@@ -173,6 +173,22 @@ func (s *sqlStore) DeleteBucketWebsite(ctx context.Context, tenant, bucket strin
 	tenant = defaultTenant(tenant)
 	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET website_config='' WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
 	return err
+}
+
+func (s *sqlStore) SetBucketQuota(ctx context.Context, tenant, bucket string, maxBytes, maxObjects int64) error {
+	tenant = defaultTenant(tenant)
+	if err := s.CreateBucket(ctx, tenant, bucket); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET bucket_max_bytes=$1, bucket_max_objects=$2 WHERE tenant_id=$3 AND name=$4`), maxBytes, maxObjects, tenant, bucket)
+	return err
+}
+
+func (s *sqlStore) BucketUsage(ctx context.Context, tenant, bucket string) (usedBytes, usedObjects int64, err error) {
+	tenant = defaultTenant(tenant)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT COALESCE(SUM(size),0), COUNT(1) FROM objects WHERE tenant_id=$1 AND bucket=$2 AND deleted_at IS NULL`), tenant, bucket)
+	err = row.Scan(&usedBytes, &usedObjects)
+	return
 }
 
 func (s *sqlStore) SetBucketPolicy(ctx context.Context, tenant, bucket, policy string) error {
