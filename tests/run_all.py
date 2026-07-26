@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""Run all E2E test suites against a server.
-
-Usage:
-    # Against an already running server:
-    python3 tests/run_all.py
-
-    # Start server automatically (requires binary path):
-    SERVER_BIN=./bin/aero-vault python3 tests/run_all.py --manage
-"""
+"""Run all E2E test suites against a server."""
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +29,19 @@ def wait_for_server(timeout=15):
     return False
 
 
+def run_suite(name, path):
+    result = subprocess.run([sys.executable, path], capture_output=True, text=True, timeout=120)
+    lines = [l.strip() for l in result.stdout.split("\n") if l.strip()]
+    summary = ""
+    for l in lines:
+        if "/" in l and "passed" in l:
+            summary = l
+            break
+    if not summary:
+        summary = f"exit={result.returncode}"
+    return result.returncode == 0, summary
+
+
 def main():
     manage = "--manage" in sys.argv
     server_proc = None
@@ -53,37 +59,36 @@ def main():
             server_proc.kill()
             return 1
 
-    tests_dir = os.path.dirname(os.path.abspath(__file__))
-    total = passed = failed = 0
+    # Also verify OpenAPI spec has >50 paths
+    try:
+        resp = urllib.request.urlopen(BASE_URL + "/openapi.json", timeout=5)
+        spec = json.loads(resp.read())
+        paths = len(spec.get("paths", {}))
+    except Exception:
+        paths = 0
 
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    all_ok = True
+    total_suites = 0
     for name, file in SUITES:
         path = os.path.join(tests_dir, file)
-        result = subprocess.run([sys.executable, path], capture_output=True, text=True)
-        output = result.stdout
-        # Count test results from output
-        for line in output.split("\n"):
-            if "✅" in line or "❌" in line:
-                if "✅" in line:
-                    passed += 1
-                else:
-                    failed += 1
-                total += 1
-
-        # Print suite results
-        last_lines = [l for l in output.split("\n") if l.strip()][-5:]
-        for l in last_lines:
-            if "/" in l and "passed" in l:
-                print(f"  {name}: {l.strip()}")
-                break
-        else:
-            print(f"  {name}: exit={result.returncode}")
+        ok, summary = run_suite(name, path)
+        if not ok:
+            all_ok = False
+        total_suites += 1
+        print(f"  {name}: {summary}")
 
     if server_proc:
         server_proc.terminate()
         server_proc.wait(timeout=5)
 
-    print(f"\n  Total: {total} tests, {passed} passed, {failed} failed")
-    return 1 if failed else 0
+    print(f"  OpenAPI: {paths} paths")
+    if paths < 50:
+        print(f"  ⚠️  OpenAPI has only {paths} paths (expected 50+)")
+        all_ok = False
+
+    print(f"\n  {'✅ ALL PASSED' if all_ok else '❌ SOME FAILED'}")
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
