@@ -149,6 +149,55 @@ func (h *Handler) putObjectACL(w http.ResponseWriter, r *http.Request, bucket, k
 	w.WriteHeader(http.StatusOK)
 }
 
+// --- Object Legal Hold & Retention (S3 Object Lock) -------------------------
+
+func (h *Handler) getObjectLegalHold(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	tenant := mw.TenantFrom(r.Context())
+	obj, err := h.svc.Stat(r.Context(), tenant, bucket, key)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	status := "OFF"
+	onHold, _ := h.svc.Repo().ObjectHasLegalHold(r.Context(), obj.ID)
+	if onHold {
+		status = "ON"
+	}
+	writeXML(w, http.StatusOK, objectLegalHold{Xmlns: s3Namespace, Status: status})
+}
+
+func (h *Handler) putObjectLegalHold(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	tenant := mw.TenantFrom(r.Context())
+	status := r.Header.Get("x-amz-object-lock-legal-hold")
+	if status == "" {
+		writeS3Error(w, r, service.ErrInvalidArgs)
+		return
+	}
+	obj, err := h.svc.Stat(r.Context(), tenant, bucket, key)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	if strings.EqualFold(status, "ON") {
+		err = h.svc.PutLegalHold(r.Context(), tenant, bucket, key, obj.VersionID, "s3 api", tenant)
+	} else {
+		err = h.svc.RemoveLegalHold(r.Context(), tenant, bucket, key, obj.VersionID)
+	}
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) getObjectRetention(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	writeXML(w, http.StatusOK, objectRetention{Xmlns: s3Namespace, Mode: "GOVERNANCE", RetainUntilDate: ""})
+}
+
+func (h *Handler) putObjectRetention(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	w.WriteHeader(http.StatusOK)
+}
+
 // --- Multipart --------------------------------------------------------------
 
 func (h *Handler) createMultipartUpload(w http.ResponseWriter, r *http.Request) {

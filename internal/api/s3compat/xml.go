@@ -261,6 +261,21 @@ type objectLockRetention struct {
 	Days int    `xml:"Days,omitempty"`
 }
 
+// objectLegalHold is the body of GET/PUT /{bucket}/{key}?legal-hold.
+type objectLegalHold struct {
+	XMLName xml.Name `xml:"LegalHold"`
+	Xmlns   string   `xml:"xmlns,attr,omitempty"`
+	Status  string   `xml:"Status"`
+}
+
+// objectRetention is the body of GET/PUT /{bucket}/{key}?retention.
+type objectRetention struct {
+	XMLName          xml.Name `xml:"Retention"`
+	Xmlns            string   `xml:"xmlns,attr,omitempty"`
+	Mode             string   `xml:"Mode"`
+	RetainUntilDate  string   `xml:"RetainUntilDate"`
+}
+
 // listVersionsResult is the body of GET /{bucket}?versions.
 type listVersionsResult struct {
 	XMLName             xml.Name       `xml:"ListVersionsResult"`

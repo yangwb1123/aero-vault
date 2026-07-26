@@ -87,6 +87,14 @@ func (h *Handler) PutObject(w http.ResponseWriter, r *http.Request) {
 		}
 		meta["_aero_legal_hold"] = "ON"
 	}
+	if r.URL.Query().Has("legal-hold") {
+		h.putObjectLegalHold(w, r, bucket, key)
+		return
+	}
+	if r.URL.Query().Has("retention") {
+		h.putObjectRetention(w, r, bucket, key)
+		return
+	}
 	if r.URL.Query().Has("restore") {
 		h.restoreObject(w, r, bucket, key)
 		return
@@ -124,6 +132,14 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Query().Has("acl") {
 		h.getObjectACL(w, r, bucket, key)
+		return
+	}
+	if r.URL.Query().Has("legal-hold") {
+		h.getObjectLegalHold(w, r, bucket, key)
+		return
+	}
+	if r.URL.Query().Has("retention") {
+		h.getObjectRetention(w, r, bucket, key)
 		return
 	}
 	tenant := mw.TenantFrom(r.Context())
