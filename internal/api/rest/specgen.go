@@ -43,6 +43,7 @@ func RegisterRoutes(rs []apiRoute) {
 	globalSpec.routes = append(globalSpec.routes, rs...)
 	globalSpec.cached = nil
 }
+
 // JSON returns the cached OpenAPI spec as JSON, rebuilding if routes changed.
 func (s *specBuilder) JSON() []byte {
 	s.mu.RLock()
@@ -71,11 +72,11 @@ func (s *specBuilder) build() map[string]any {
 		methods := paths[p].(map[string]any)
 
 		op := map[string]any{
-			"summary":     r.Summary,
-			"tags":        []string{r.Tag},
-			"security":    []map[string]any{{"bearer": []string{}, "apiKey": []string{}}},
-			"parameters":  s.parameters(r),
-			"responses":   s.responses(r, sch),
+			"summary":    r.Summary,
+			"tags":       []string{r.Tag},
+			"security":   []map[string]any{{"bearer": []string{}, "apiKey": []string{}}},
+			"parameters": s.parameters(r),
+			"responses":  s.responses(r, sch),
 		}
 		if r.Body != "" {
 			op["requestBody"] = map[string]any{
@@ -155,7 +156,7 @@ func (s *specBuilder) responses(r apiRoute, sch map[string]any) map[string]any {
 	if r.Response != "" {
 		resp["content"] = map[string]any{
 			"application/json": map[string]any{
-				"schema": map[string]any{"type": "object"},
+				"schema":  map[string]any{"type": "object"},
 				"example": json.RawMessage(r.Response),
 			},
 		}
@@ -190,25 +191,25 @@ func (s *specBuilder) schemas() map[string]any {
 		"Object": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"key": map[string]any{"type": "string"},
-				"size": map[string]any{"type": "integer"},
-				"etag": map[string]any{"type": "string"},
-				"content_type": map[string]any{"type": "string"},
-				"metadata": map[string]any{"type": "object"},
-				"tags": map[string]any{"type": "object"},
+				"key":           map[string]any{"type": "string"},
+				"size":          map[string]any{"type": "integer"},
+				"etag":          map[string]any{"type": "string"},
+				"content_type":  map[string]any{"type": "string"},
+				"metadata":      map[string]any{"type": "object"},
+				"tags":          map[string]any{"type": "object"},
 				"storage_class": map[string]any{"type": "string"},
-				"created_at": map[string]any{"type": "string", "format": "date-time"},
-				"updated_at": map[string]any{"type": "string", "format": "date-time"},
+				"created_at":    map[string]any{"type": "string", "format": "date-time"},
+				"updated_at":    map[string]any{"type": "string", "format": "date-time"},
 			},
 		},
 		"BucketConfig": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"name": map[string]any{"type": "string"},
-				"versioning": map[string]any{"type": "boolean"},
+				"name":                map[string]any{"type": "string"},
+				"versioning":          map[string]any{"type": "boolean"},
 				"object_lock_seconds": map[string]any{"type": "integer"},
-				"bucket_max_bytes": map[string]any{"type": "integer"},
-				"bucket_max_objects": map[string]any{"type": "integer"},
+				"bucket_max_bytes":    map[string]any{"type": "integer"},
+				"bucket_max_objects":  map[string]any{"type": "integer"},
 			},
 		},
 		"Error": map[string]any{
@@ -217,7 +218,7 @@ func (s *specBuilder) schemas() map[string]any {
 				"error": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"code": map[string]any{"type": "string"},
+						"code":    map[string]any{"type": "string"},
 						"message": map[string]any{"type": "string"},
 					},
 				},

@@ -56,6 +56,7 @@ type Registry struct {
 	jwt      *JWTVerifier
 	sigv4    *SigV4Verifier
 	store    PersistentStore // optional repo-backed store for runtime keys (hashed)
+	jwks     *RS256Verifier  // optional JWKS-based RS256 verifier
 	anonRead bool            // allow unauthenticated GET/HEAD on object paths (ACL-gated)
 	keyCache *keyCache       // optional bounded TTL cache for persisted-key lookups (nil = off)
 	// keyChangePublisher, when set, is invoked after a local persisted-key
@@ -167,6 +168,7 @@ func (r *Registry) Lookup(ctx context.Context, token string) (Key, bool) {
 	k, ok := r.keys[token]
 	store := r.store
 	jwt := r.jwt
+	jwks := r.jwks
 	r.mu.RUnlock()
 	if ok {
 		return k, true
@@ -180,6 +182,18 @@ func (r *Registry) Lookup(ctx context.Context, token string) (Key, bool) {
 		if resolved, ok := r.lookupJWT(ctx, token); ok {
 			return resolved, true
 		}
+	}
+	if jwks != nil {
+		if resolved, ok := r.lookupJWKS(ctx, token); ok {
+			return resolved, true
+		}
+	}
+	return Key{}, false
+}
+
+func (r *Registry) lookupJWKS(_ context.Context, token string) (Key, bool) {
+	if k, err := r.jwks.Verify(token); err == nil {
+		return k, true
 	}
 	return Key{}, false
 }
@@ -231,6 +245,14 @@ func (r *Registry) WithJWT(secret string) *Registry {
 
 // JWT returns the verifier (or nil) so /admin/keys can sign new tokens.
 func (r *Registry) JWT() *JWTVerifier { return r.jwt }
+
+// WithJWKS enables RS256 JWT verification via a JWKS endpoint.
+func (r *Registry) WithJWKS(jwksURL string, keyTTL time.Duration, issuer string) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.jwks = NewRS256Verifier(jwksURL, keyTTL, issuer)
+	return r
+}
 
 // WithAnonymousPublicRead allows unauthenticated GET/HEAD on object paths to
 // pass through (flagged anonymous); the handler then serves only public-read

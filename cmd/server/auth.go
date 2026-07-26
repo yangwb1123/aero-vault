@@ -32,6 +32,11 @@ func configureAuthSecrets(ctx context.Context, reg *auth.Registry, cfg *config.C
 			logger.Info("JWT issuer pinning enabled", "issuer", cfg.Auth.JWTIssuer)
 		}
 	}
+	if cfg.Auth.JWKSEndpoint != "" {
+		keyTTL := time.Duration(cfg.Auth.JWKSKeyTTLSeconds) * time.Second
+		reg.WithJWKS(cfg.Auth.JWKSEndpoint, keyTTL, cfg.Auth.JWTIssuer)
+		logger.Info("JWKS-based RS256 JWT verification enabled", "jwks_url", cfg.Auth.JWKSEndpoint, "issuer", cfg.Auth.JWTIssuer)
+	}
 	if cfg.Auth.AnonymousPublicRead {
 		reg.WithAnonymousPublicRead(true)
 		logger.Info("anonymous public-read enabled (ACL-gated object GET/HEAD)")

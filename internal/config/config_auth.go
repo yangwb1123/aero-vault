@@ -4,6 +4,8 @@ type AuthConfig struct {
 	Keys                string
 	JWTSecret           string
 	JWTIssuer           string // AUTH_JWT_ISSUER; when set, JWTs must carry a matching "iss" claim (and issued tokens are stamped with it)
+	JWKSEndpoint        string // AUTH_JWKS_ENDPOINT; OIDC JWKS URL for RS256 JWT verification
+	JWKSKeyTTLSeconds   int    // AUTH_JWKS_KEY_TTL; JWKS key cache TTL (default 3600)
 	AnonymousPublicRead bool
 	SigV4Credentials    string // accessKey:secretKey:tenant[:scope+scope],...
 	PersistKeys         bool   // back runtime API keys with the repository (hashed, survive restart)

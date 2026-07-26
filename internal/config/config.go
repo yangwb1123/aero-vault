@@ -177,6 +177,8 @@ func Load() (*Config, error) {
 			Keys:                getEnv("AUTH_KEYS", ""),
 			JWTSecret:           getEnv("AUTH_JWT_SECRET", ""),
 			JWTIssuer:           getEnv("AUTH_JWT_ISSUER", ""),
+			JWKSEndpoint:        getEnv("AUTH_JWKS_ENDPOINT", ""),
+			JWKSKeyTTLSeconds:   getEnvInt("AUTH_JWKS_KEY_TTL", 3600),
 			AnonymousPublicRead: getEnvBool("AUTH_ANONYMOUS_PUBLIC_READ", false),
 			SigV4Credentials:    getEnv("S3_SIGV4_CREDENTIALS", ""),
 			PersistKeys:         getEnvBool("AUTH_PERSIST_KEYS", false),
