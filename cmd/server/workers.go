@@ -55,6 +55,7 @@ func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slo
 		logger.Info("job pool started", "workers", cfg.Jobs.Workers)
 	}
 	startWebhook(ctx, cfg, logger, repo, bus)
+	startNotificationWorker(ctx, logger, repo, bus)
 	if cfg.Reconcile.IntervalMinutes > 0 {
 		startReconcile(ctx, cfg, logger, repo, store, cc)
 	}
@@ -123,4 +124,11 @@ func startReconcile(ctx context.Context, cfg *config.Config, logger *slog.Logger
 		"cluster_singleton", cfg.Reconcile.ClusterSingleton,
 		"retention_days", cfg.Reconcile.RetentionDays,
 		"upload_gc_ttl_hours", cfg.Reconcile.UploadGCHours)
+}
+
+func startNotificationWorker(ctx context.Context, logger *slog.Logger, repo repository.Repository, bus *events.Bus) {
+	notif := events.NewNotifier(repo, logger)
+	sub, _ := bus.Subscribe()
+	go notif.Run(ctx, sub)
+	logger.Info("bucket notification worker started")
 }

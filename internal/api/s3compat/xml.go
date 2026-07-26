@@ -369,10 +369,10 @@ type locationConstraint struct {
 // ── Website Configuration ─────────────────────────────────────────────────────
 
 type websiteConfiguration struct {
-	XMLName       xml.Name          `xml:"WebsiteConfiguration"`
-	Xmlns         string            `xml:"xmlns,attr,omitempty"`
-	IndexDocument *websiteIndexDoc  `xml:"IndexDocument,omitempty"`
-	ErrorDocument *websiteErrorDoc  `xml:"ErrorDocument,omitempty"`
+	XMLName       xml.Name         `xml:"WebsiteConfiguration"`
+	Xmlns         string           `xml:"xmlns,attr,omitempty"`
+	IndexDocument *websiteIndexDoc `xml:"IndexDocument,omitempty"`
+	ErrorDocument *websiteErrorDoc `xml:"ErrorDocument,omitempty"`
 }
 
 type websiteIndexDoc struct {

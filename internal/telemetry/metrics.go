@@ -44,6 +44,8 @@ var (
 	mMiddlewareDuration     metric.Float64Histogram
 	mSQLQueryDuration       metric.Float64Histogram
 	mSQLQueryCount          metric.Int64Counter
+	mNotifDelivered         metric.Int64Counter
+	mNotifFailed            metric.Int64Counter
 )
 
 func initDomain() {
@@ -76,6 +78,8 @@ func initDomain() {
 		mMiddlewareDuration, _ = m.Float64Histogram("middleware.duration_ms")
 		mSQLQueryDuration, _ = m.Float64Histogram("sql.query_duration_ms")
 		mSQLQueryCount, _ = m.Int64Counter("sql.query_total")
+		mNotifDelivered, _ = m.Int64Counter("notifications.delivered_total")
+		mNotifFailed, _ = m.Int64Counter("notifications.failed_total")
 	})
 }
 
@@ -86,6 +90,18 @@ func RecordSQLQuery(ctx context.Context, op string, durMs float64) {
 	attrs := metric.WithAttributes(attribute.String("op", op))
 	mSQLQueryDuration.Record(ctx, durMs, attrs)
 	mSQLQueryCount.Add(ctx, 1, attrs)
+}
+
+// IncNotificationDelivered counts one successful bucket notification delivery.
+func IncNotificationDelivered(ctx context.Context, target string) {
+	initDomain()
+	mNotifDelivered.Add(ctx, 1, metric.WithAttributes(attribute.String("target", target)))
+}
+
+// IncNotificationDeliveryFailed counts one failed bucket notification delivery.
+func IncNotificationDeliveryFailed(ctx context.Context, target string) {
+	initDomain()
+	mNotifFailed.Add(ctx, 1, metric.WithAttributes(attribute.String("target", target)))
 }
 
 // RecordAIUsage records token/cost domain metrics for one AI (chat) call,

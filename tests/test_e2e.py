@@ -295,6 +295,31 @@ def test_cors():
     print(f"  ✅ DELETE /v1/buckets/default/cors -> 200")
 
 
+def test_bucket_notifications():
+    """Bucket notification rule CRUD."""
+    # Set notification rule with EndpointURL
+    rules = [{
+        "Id": "test-notif",
+        "Events": ["s3:ObjectCreated:*"],
+        "EndpointUrl": "http://localhost:9999/notif",
+        "FilterKey": "",
+    }]
+    status, data = request("PUT", "/v1/buckets/default/notification", body={"rules": rules})
+    assert status == 200, f"PutNotification: {status} {data}"
+    print(f"  ✅ PUT /v1/buckets/default/notification -> 200")
+
+    # Read back
+    status, data = request("GET", "/v1/buckets/default/notification")
+    assert status == 200, f"GetNotification: {status}"
+    assert len(data.get("rules", [])) >= 1, f"expected rules, got {data}"
+    print(f"  ✅ GET /v1/buckets/default/notification -> {len(data['rules'])} rule(s)")
+
+    # Delete
+    status, _ = request("DELETE", "/v1/buckets/default/notification")
+    assert status == 200, f"DeleteNotification: {status}"
+    print(f"  ✅ DELETE /v1/buckets/default/notification -> 200")
+
+
 def test_mcp():
     """MCP protocol: tools/list and resources/list."""
     import json
@@ -410,6 +435,7 @@ ALL_TESTS = [
     ("Tags", [test_tags]),
     ("Multipart", [test_multipart]),
     ("Buckets", [test_bucket_crud, test_bucket_encryption, test_bucket_policy, test_cors,
+                  test_bucket_notifications,
                   test_edge_lifecycle_invalid, test_edge_encryption_roundtrip,
                   test_bucket_versioning_policy]),
     ("MCP", [test_mcp, test_mcp_tools_write_delete]),

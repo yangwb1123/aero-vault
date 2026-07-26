@@ -82,13 +82,15 @@ type BucketConfig struct {
 }
 
 // NotificationRule maps S3 events to notification targets.
+// At least one of QueueARN, TopicARN, LambdaARN, or EndpointURL must be set.
 type NotificationRule struct {
-	ID        string   `json:"Id"`
-	Events    []string `json:"Events"`
-	FilterKey string   `json:"FilterKey,omitempty"`
-	QueueARN  string   `json:"QueueArn,omitempty"`
-	TopicARN  string   `json:"TopicArn,omitempty"`
-	LambdaARN string   `json:"LambdaFunctionArn"`
+	ID          string   `json:"Id"`
+	Events      []string `json:"Events"`
+	FilterKey   string   `json:"FilterKey,omitempty"`
+	QueueARN    string   `json:"QueueArn,omitempty"`
+	TopicARN    string   `json:"TopicArn,omitempty"`
+	LambdaARN   string   `json:"LambdaFunctionArn"`
+	EndpointURL string   `json:"EndpointUrl,omitempty"` // direct HTTP endpoint (not S3 standard)
 }
 
 // CORSRule defines one CORS rule for a bucket.
