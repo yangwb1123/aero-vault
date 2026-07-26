@@ -54,6 +54,8 @@ type Repository interface {
 	ListTransitionable(ctx context.Context, limit int) ([]Object, error)
 	SetBucketEncryption(ctx context.Context, tenant, bucket, algorithm, kmsKeyID string) error
 	DeleteBucketEncryption(ctx context.Context, tenant, bucket string) error
+	SetBucketWebsite(ctx context.Context, tenant, bucket string, cfg WebsiteConfig) error
+	DeleteBucketWebsite(ctx context.Context, tenant, bucket string) error
 	SetBucketACL(ctx context.Context, tenant, bucket, acl string) error
 	SetBucketPolicy(ctx context.Context, tenant, bucket, policy string) error
 	GetBucketCORS(ctx context.Context, tenant, bucket string) ([]CORSRule, error)

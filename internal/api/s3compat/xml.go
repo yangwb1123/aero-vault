@@ -366,6 +366,23 @@ type locationConstraint struct {
 	Location string   `xml:",chardata"`
 }
 
+// ── Website Configuration ─────────────────────────────────────────────────────
+
+type websiteConfiguration struct {
+	XMLName       xml.Name          `xml:"WebsiteConfiguration"`
+	Xmlns         string            `xml:"xmlns,attr,omitempty"`
+	IndexDocument *websiteIndexDoc  `xml:"IndexDocument,omitempty"`
+	ErrorDocument *websiteErrorDoc  `xml:"ErrorDocument,omitempty"`
+}
+
+type websiteIndexDoc struct {
+	Suffix string `xml:"Suffix"`
+}
+
+type websiteErrorDoc struct {
+	Key string `xml:"Key"`
+}
+
 // --- Bucket CORS ---
 
 type corsRule struct {

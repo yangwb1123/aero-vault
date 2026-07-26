@@ -35,6 +35,20 @@ type Object struct {
 }
 
 // BucketConfig is the per-bucket policy bundle.
+// WebsiteConfig stores the static website hosting configuration for a bucket.
+type WebsiteConfig struct {
+	IndexDocument SuffixConfig `json:"index_document,omitempty"`
+	ErrorDocument ErrorConfig  `json:"error_document,omitempty"`
+}
+
+type SuffixConfig struct {
+	Suffix string `json:"suffix"`
+}
+
+type ErrorConfig struct {
+	Key string `json:"key"`
+}
+
 // TransitionRule defines a lifecycle transition: move to storage_class after
 // the specified number of days from object creation.
 type TransitionRule struct {
@@ -64,6 +78,7 @@ type BucketConfig struct {
 	TransitionRules                  []TransitionRule `json:"transition_rules,omitempty"`
 	NoncurrentTransitionDays         int              `json:"noncurrent_transition_days,omitempty"`
 	NoncurrentTransitionStorageClass string           `json:"noncurrent_transition_storage_class,omitempty"`
+	WebsiteConfig                    WebsiteConfig    `json:"website_config,omitempty"`
 }
 
 // NotificationRule maps S3 events to notification targets.

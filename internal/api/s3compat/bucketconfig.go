@@ -336,3 +336,56 @@ func (h *Handler) listObjectVersions(w http.ResponseWriter, r *http.Request, buc
 func writeMalformedXML(w http.ResponseWriter, r *http.Request) {
 	writeS3Error(w, r, errMalformedXML)
 }
+
+// --- Website (GET/PUT/DELETE ?website) ---------------------------------------
+
+func (h *Handler) getBucketWebsite(w http.ResponseWriter, r *http.Request, bucket string) {
+	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	wc := cfg.WebsiteConfig
+	if wc.IndexDocument.Suffix == "" && wc.ErrorDocument.Key == "" {
+		writeS3Error(w, r, errNoSuchWebsite)
+		return
+	}
+	out := websiteConfiguration{
+		Xmlns: s3Namespace,
+	}
+	if wc.IndexDocument.Suffix != "" {
+		out.IndexDocument = &websiteIndexDoc{Suffix: wc.IndexDocument.Suffix}
+	}
+	if wc.ErrorDocument.Key != "" {
+		out.ErrorDocument = &websiteErrorDoc{Key: wc.ErrorDocument.Key}
+	}
+	writeXML(w, http.StatusOK, out)
+}
+
+func (h *Handler) putBucketWebsite(w http.ResponseWriter, r *http.Request, bucket string) {
+	var in websiteConfiguration
+	if err := decodeBucketBody(r, &in); err != nil {
+		writeMalformedXML(w, r)
+		return
+	}
+	wc := repository.WebsiteConfig{}
+	if in.IndexDocument != nil {
+		wc.IndexDocument.Suffix = in.IndexDocument.Suffix
+	}
+	if in.ErrorDocument != nil {
+		wc.ErrorDocument.Key = in.ErrorDocument.Key
+	}
+	if err := h.svc.SetBucketWebsite(r.Context(), mw.TenantFrom(r.Context()), bucket, wc); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) deleteBucketWebsite(w http.ResponseWriter, r *http.Request, bucket string) {
+	if err := h.svc.DeleteBucketWebsite(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

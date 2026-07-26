@@ -31,6 +31,7 @@ var errNoSuchLifecycle = errors.New("the lifecycle configuration does not exist"
 // errNoSuchBucketPolicy signals that a bucket has no policy, which AWS reports
 // as a 404 NoSuchBucketPolicy rather than an empty body.
 var errNoSuchBucketPolicy = errors.New("the bucket policy does not exist")
+var errNoSuchWebsite = errors.New("the website configuration does not exist")
 
 // errMalformedXML signals an unparsable request body (400 MalformedXML).
 var errMalformedXML = errors.New("the XML you provided was not well-formed or did not validate")
@@ -45,6 +46,7 @@ var s3CodeStatus = map[string]int{
 	"NoSuchBucket":                 http.StatusNotFound,
 	"NoSuchBucketPolicy":           http.StatusNotFound,
 	"NoSuchLifecycleConfiguration": http.StatusNotFound,
+	"NoSuchWebsiteConfiguration": http.StatusNotFound,
 	"NoSuchKey":                    http.StatusNotFound,
 	"InvalidRange":                 http.StatusRequestedRangeNotSatisfiable,
 	"PreconditionFailed":           http.StatusPreconditionFailed,
@@ -61,6 +63,7 @@ var s3CodeMessage = map[string]string{
 	"NoSuchBucket":                 "The specified bucket does not exist.",
 	"NoSuchBucketPolicy":           "The bucket policy does not exist.",
 	"NoSuchLifecycleConfiguration": "The lifecycle configuration does not exist.",
+	"NoSuchWebsiteConfiguration": "The website configuration does not exist.",
 	"NoSuchKey":                    "The specified key does not exist.",
 	"InvalidRange":                 "The requested range is not satisfiable",
 	"PreconditionFailed":           "At least one of the preconditions you specified did not hold.",
@@ -80,6 +83,7 @@ var errToS3Code = []struct {
 	{errNoSuchBucket, "NoSuchBucket"},
 	{errNoSuchBucketPolicy, "NoSuchBucketPolicy"},
 	{errNoSuchLifecycle, "NoSuchLifecycleConfiguration"},
+	{errNoSuchWebsite, "NoSuchWebsiteConfiguration"},
 	{service.ErrNotFound, "NoSuchKey"},
 	{repository.ErrNotFound, "NoSuchKey"},
 	{service.ErrInvalidArgs, "InvalidArgument"},

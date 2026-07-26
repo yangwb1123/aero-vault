@@ -173,12 +173,42 @@ def test_upload_part_copy():
     print("  ✅ S3 UploadPartCopy")
 
 
+def test_bucket_website():
+    """Test S3 bucket website hosting configuration via XML API."""
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<WebsiteConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <IndexDocument><Suffix>index.html</Suffix></IndexDocument>
+  <ErrorDocument><Key>error.html</Key></ErrorDocument>
+</WebsiteConfiguration>"""
+    st, _ = s3_req("PUT", "/default/?website", body=xml, ct="application/xml")
+    assert st == 200, f"put website: {st}"
+
+    # Read back
+    st, body = s3_req("GET", "/default/?website")
+    assert st == 200, f"get website: {st}"
+    root = ET.fromstring(body.decode())
+    idx = root.find(".//{*}Suffix")
+    assert idx is not None and idx.text == "index.html", f"missing index config"
+    err = root.find(".//{*}Key")
+    assert err is not None and err.text == "error.html", f"missing error config"
+    print(f"  ✅ S3 bucket website hosting")
+
+    # Delete
+    st, _ = s3_req("DELETE", "/default/?website")
+    assert st == 204, f"delete website: {st}"
+
+    # Confirm gone
+    st, _ = s3_req("GET", "/default/?website")
+    assert st == 404, f"expected 404 after delete got {st}"
+
+
 ALL_TESTS = [
     ("S3 CRUD", [test_put_get_delete, test_head_etag]),
     ("S3 List", [test_list_v2]),
     ("S3 Multipart", [test_multipart]),
     ("S3 Encryption", [test_bucket_encryption_s3_api]),
     ("S3 UploadPartCopy", [test_upload_part_copy]),
+    ("S3 Website", [test_bucket_website]),
 ]
 
 

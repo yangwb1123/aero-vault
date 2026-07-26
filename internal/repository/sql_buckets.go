@@ -110,12 +110,12 @@ func (s *sqlStore) DeleteBucket(ctx context.Context, tenant, bucket string) erro
 
 func (s *sqlStore) GetBucketConfig(ctx context.Context, tenant, bucket string) (BucketConfig, error) {
 	tenant = defaultTenant(tenant)
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules, sse_algorithm, sse_kms_key_id, transition_rules, noncurrent_transition_days, noncurrent_transition_storage_class FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules, sse_algorithm, sse_kms_key_id, transition_rules, noncurrent_transition_days, noncurrent_transition_storage_class, website_config FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
 	var cfg BucketConfig
 	var versioning sql.NullBool
 	var acl, policy, corsRaw, logTarget, logPrefix, notifRaw sql.NullString
-	var transRaw sql.NullString
-	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw, &cfg.SSEAlgorithm, &cfg.SSEKMSKeyId, &transRaw, &cfg.NoncurrentTransitionDays, &cfg.NoncurrentTransitionStorageClass); err != nil {
+	var transRaw, webRaw sql.NullString
+	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw, &cfg.SSEAlgorithm, &cfg.SSEKMSKeyId, &transRaw, &cfg.NoncurrentTransitionDays, &cfg.NoncurrentTransitionStorageClass, &webRaw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return BucketConfig{TenantID: tenant, Name: bucket}, nil
 		}
@@ -135,6 +135,9 @@ func (s *sqlStore) GetBucketConfig(ctx context.Context, tenant, bucket string) (
 	if transRaw.Valid && transRaw.String != "" {
 		_ = json.Unmarshal([]byte(transRaw.String), &cfg.TransitionRules)
 	}
+	if webRaw.Valid && webRaw.String != "" {
+		_ = json.Unmarshal([]byte(webRaw.String), &cfg.WebsiteConfig)
+	}
 	return cfg, nil
 }
 
@@ -150,6 +153,25 @@ func (s *sqlStore) SetBucketEncryption(ctx context.Context, tenant, bucket, algo
 func (s *sqlStore) DeleteBucketEncryption(ctx context.Context, tenant, bucket string) error {
 	tenant = defaultTenant(tenant)
 	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET sse_algorithm='', sse_kms_key_id='' WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
+	return err
+}
+
+func (s *sqlStore) SetBucketWebsite(ctx context.Context, tenant, bucket string, cfg WebsiteConfig) error {
+	tenant = defaultTenant(tenant)
+	if err := s.CreateBucket(ctx, tenant, bucket); err != nil {
+		return err
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET website_config=$1 WHERE tenant_id=$2 AND name=$3`), string(b), tenant, bucket)
+	return err
+}
+
+func (s *sqlStore) DeleteBucketWebsite(ctx context.Context, tenant, bucket string) error {
+	tenant = defaultTenant(tenant)
+	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET website_config='' WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
 	return err
 }
 

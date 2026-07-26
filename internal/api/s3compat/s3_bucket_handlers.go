@@ -53,8 +53,24 @@ func (h *Handler) dispatchBucketSubresource(w http.ResponseWriter, r *http.Reque
 	case q.Has("encryption"):
 		h.dispatchBucketEncryption(w, r, bucket)
 		return true
+	case q.Has("website"):
+		h.dispatchBucketWebsite(w, r, bucket)
+		return true
 	}
 	return false
+}
+
+func (h *Handler) dispatchBucketWebsite(w http.ResponseWriter, r *http.Request, bucket string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.getBucketWebsite(w, r, bucket)
+	case http.MethodPut:
+		h.putBucketWebsite(w, r, bucket)
+	case http.MethodDelete:
+		h.deleteBucketWebsite(w, r, bucket)
+	default:
+		writeS3Error(w, r, service.ErrInvalidArgs)
+	}
 }
 
 func (h *Handler) dispatchBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {

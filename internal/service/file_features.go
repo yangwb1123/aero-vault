@@ -378,6 +378,18 @@ func (s *FileService) DeleteBucketEncryption(ctx context.Context, tenant, bucket
 	return s.repo.DeleteBucketEncryption(ctx, tenant, bucket)
 }
 
+// SetBucketWebsite configures static website hosting for a bucket.
+func (s *FileService) SetBucketWebsite(ctx context.Context, tenant, bucket string, cfg repository.WebsiteConfig) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.SetBucketWebsite(ctx, tenant, bucket, cfg)
+}
+
+// DeleteBucketWebsite removes the website configuration from a bucket.
+func (s *FileService) DeleteBucketWebsite(ctx context.Context, tenant, bucket string) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.DeleteBucketWebsite(ctx, tenant, bucket)
+}
+
 // GetBucketLogging returns the access-logging config for a bucket.
 func (s *FileService) GetBucketLogging(ctx context.Context, tenant, bucket string) (repository.LoggingConfig, error) {
 	tenant, bucket = defaults(tenant, bucket)
