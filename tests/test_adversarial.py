@@ -191,6 +191,109 @@ def test_legal_hold_flow():
     print(f"  ✅ Soft delete -> {status}")
 
 
+def test_concurrent_writes():
+    """Multiple concurrent writes to the same key — last write wins."""
+    import threading
+    key = f"adv/concurrent-{uuid.uuid4().hex[:8]}"
+    errors = []
+    def write(val):
+        try:
+            req("PUT", f"/v1/files/{key}", body=val)
+        except Exception as e:
+            errors.append(e)
+    threads = [threading.Thread(target=write, args=(f"data-{i}",)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(errors) == 0, f"concurrent writes had {len(errors)} errors"
+    status, data = req("GET", f"/v1/files/{key}")
+    assert status == 200, f"concurrent final read: {status}"
+    req("DELETE", f"/v1/files/{key}?hard=1")
+    print(f"  ✅ Concurrent writes (10 threads) -> OK")
+
+
+def test_very_long_key():
+    """Key at the max allowed length (200 chars) should succeed."""
+    long_key = "adv/" + "a" * 195  # 199 chars total
+    status, _ = req("PUT", f"/v1/files/{long_key}", body="x")
+    assert status == 201, f"long key put: {status}"
+    status, data = req("GET", f"/v1/files/{long_key}")
+    assert status == 200, f"long key get: {status}"
+    req("DELETE", f"/v1/files/{long_key}?hard=1")
+    print(f"  ✅ Max-length key (199 chars) -> OK")
+
+
+def test_lifecycle_with_transitions():
+    """Lifecycle with transition rules via S3 XML API."""
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <ID>expire-rule</ID>
+    <Status>Enabled</Status>
+    <Expiration><Days>365</Days></Expiration>
+  </Rule>
+  <Rule>
+    <ID>transition-ia</ID>
+    <Status>Enabled</Status>
+    <Transition><Days>30</Days><StorageClass>STANDARD_IA</StorageClass></Transition>
+  </Rule>
+  <Rule>
+    <ID>transition-glacier</ID>
+    <Status>Enabled</Status>
+    <Transition><Days>90</Days><StorageClass>GLACIER</StorageClass></Transition>
+  </Rule>
+</LifecycleConfiguration>"""
+    url = BASE_URL + "/s3/default/?lifecycle"
+    req = urllib.request.Request(url, data=xml, method="PUT")
+    req.add_header("Content-Type", "application/xml")
+    resp = urllib.request.urlopen(req, timeout=TIMEOUT)
+    assert resp.status == 200, f"S3 lifecycle PUT: {resp.status}"
+    resp.close()
+
+    # Read back and verify
+    resp2 = urllib.request.urlopen(url, timeout=TIMEOUT)
+    body = resp2.read()
+    resp2.close()
+    assert b"STANDARD_IA" in body, f"missing STANDARD_IA transition"
+    assert b"GLACIER" in body, f"missing GLACIER transition"
+    print(f"  ✅ Lifecycle transitions via S3 XML API -> OK")
+
+    req3 = urllib.request.Request(url, method="DELETE")
+    resp3 = urllib.request.urlopen(req3, timeout=TIMEOUT)
+    resp3.close()
+
+
+def test_version_multipart_combo():
+    """Create versioned bucket, upload file, then multipart upload same key."""
+    req("PUT", "/v1/buckets/default/versioning", body={"enabled": True})
+
+    key = f"adv/ver-mp-{uuid.uuid4().hex[:8]}"
+    req("PUT", f"/v1/files/{key}", body="version-1")
+
+    status, data = req("POST", "/v1/multipart", body={"bucket": "default", "key": key})
+    assert status == 201, f"init multipart: {status}"
+    uid = data["upload_id"]
+
+    part_url = f"/v1/multipart/{uid}/parts/1"
+    put_req = urllib.request.Request(BASE_URL + part_url, data=b"version-2", method="PUT")
+    put_req.add_header("Content-Type", "application/octet-stream")
+    put_resp = urllib.request.urlopen(put_req, timeout=TIMEOUT)
+    put_resp.close()
+
+    status, _ = req("POST", f"/v1/multipart/{uid}/complete")
+    assert status == 200, f"complete: {status}"
+
+    status, data = req("GET", f"/v1/files/{key}/versions")
+    assert status == 200
+    version_count = len(data.get("versions", []))
+    assert version_count >= 1, f"expected versions, got {data}"
+    print(f"  ✅ Versioned multipart combo ({version_count} versions) -> OK")
+
+    req("DELETE", f"/v1/files/{key}?hard=1")
+    req("PUT", "/v1/buckets/default/versioning", body={"enabled": False})
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 ALL_TESTS = [
@@ -200,6 +303,7 @@ ALL_TESTS = [
     ("Data Integrity", [test_overwrite_object, test_list_with_marker]),
     ("Streaming & Stats", [test_sse_stream_connection, test_bucket_stats]),
     ("Compliance", [test_legal_hold_flow]),
+    ("Edge Cases", [test_concurrent_writes, test_very_long_key, test_lifecycle_with_transitions, test_version_multipart_combo]),
 ]
 
 

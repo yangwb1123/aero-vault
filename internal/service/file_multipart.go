@@ -142,9 +142,11 @@ func (s *FileService) UploadPartCopy(ctx context.Context, uploadID string, partN
 	}
 
 	// Build the storage key for the upload's backend UID so UploadPartCopy knows
-	// where to place the part.
+	// where to place the part. Use the source object's stored StorageKey which
+	// already includes the correct version suffix (or not) based on whether
+	// versioning is enabled at the time of PUT.
 	sk := uploadStorageKey(u)
-	srcSK := storageKey(u.TenantID, u.Bucket, srcKey) + "@v" + srcObj.VersionID
+	srcSK := srcObj.StorageKey
 
 	part, err := s.store.UploadPartCopy(ctx, sk, u.BackendUID, partNumber, srcSK, srcOffset, length)
 	if err != nil {

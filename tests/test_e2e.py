@@ -319,13 +319,100 @@ def test_mcp():
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
+def test_edge_lifecycle_invalid():
+    """Edge case: lifecycle with missing fields."""
+    # Transition rule without required storage_class
+    status, data = request("PUT", "/v1/buckets/default/lifecycle", body={
+        "days": 0,
+        "transition_rules": [{"days": 30}],
+    })
+    assert status == 200, f"missing storage_class in transition: {status}"
+    print(f"  ✅ Lifecycle with incomplete transition rules accepted")
+
+    # Reset
+    request("PUT", "/v1/buckets/default/lifecycle", body={"days": 0})
+
+
+def test_edge_encryption_roundtrip():
+    """Edge case: AWS KMS-style encryption key."""
+    # Set aws:kms with a key ID
+    status, data = request("PUT", "/v1/buckets/default/encryption", body={
+        "sse_algorithm": "aws:kms",
+        "sse_kms_key_id": "arn:aws:kms:us-east-1:123456789012:key/abc123",
+    })
+    assert status == 200, f"PutEncryption kms: {status}"
+
+    # Read back
+    status, data = request("GET", "/v1/buckets/default/encryption")
+    assert status == 200
+    assert data.get("sse_algorithm") == "aws:kms", f"expected aws:kms got {data}"
+    assert "abc123" in data.get("sse_kms_key_id", ""), f"expected key id in {data}"
+    print(f"  ✅ KMS encryption roundtrip -> OK")
+
+    # Reset
+    request("DELETE", "/v1/buckets/default/encryption")
+
+
+def test_mcp_tools_write_delete():
+    """MCP write_file + delete_file tool integration."""
+    # write_file
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "write_file",
+            "arguments": {"key": "mcp-e2e-write.txt", "content": "MCP test content"},
+        },
+    }).encode()
+    req = urllib.request.Request(BASE_URL + "/mcp", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    resp = urllib.request.urlopen(req, timeout=5)
+    result = json.loads(resp.read())
+    assert "error" not in result, f"write_file failed: {result.get('error')}"
+    print(f"  ✅ MCP write_file -> OK")
+
+    # delete_file
+    body2 = json.dumps({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {
+            "name": "delete_file",
+            "arguments": {"key": "mcp-e2e-write.txt"},
+        },
+    }).encode()
+    req2 = urllib.request.Request(BASE_URL + "/mcp", data=body2, method="POST")
+    req2.add_header("Content-Type", "application/json")
+    resp2 = urllib.request.urlopen(req2, timeout=5)
+    result2 = json.loads(resp2.read())
+    assert "error" not in result2, f"delete_file failed: {result2.get('error')}"
+    print(f"  ✅ MCP delete_file -> OK")
+
+
+def test_bucket_versioning_policy():
+    """Versioning toggle and verify it persists."""
+    # Enable versioning
+    status, _ = request("PUT", "/v1/buckets/default/versioning", body={"enabled": True})
+    assert status == 200
+
+    # Verify via config
+    status, data = request("GET", "/v1/buckets/default/config")
+    assert status == 200
+    assert data.get("versioning") == True or data.get("versioning") == "true", f"versioning not enabled: {data}"
+    print(f"  ✅ Bucket versioning toggle -> OK")
+
+    # Disable versioning
+    status, _ = request("PUT", "/v1/buckets/default/versioning", body={"enabled": False})
+    assert status == 200
+    print(f"  ✅ Bucket versioning disable -> OK")
+
+
 ALL_TESTS = [
     ("Health", [test_healthz, test_readyz]),
     ("CRUD", [test_crud_roundtrip, test_list_objects]),
     ("Tags", [test_tags]),
     ("Multipart", [test_multipart]),
-    ("Buckets", [test_bucket_crud, test_bucket_encryption, test_bucket_policy, test_cors]),
-    ("MCP", [test_mcp]),
+    ("Buckets", [test_bucket_crud, test_bucket_encryption, test_bucket_policy, test_cors,
+                  test_edge_lifecycle_invalid, test_edge_encryption_roundtrip,
+                  test_bucket_versioning_policy]),
+    ("MCP", [test_mcp, test_mcp_tools_write_delete]),
     ("Admin", [test_admin]),
 ]
 
