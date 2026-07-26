@@ -110,11 +110,12 @@ func (s *sqlStore) DeleteBucket(ctx context.Context, tenant, bucket string) erro
 
 func (s *sqlStore) GetBucketConfig(ctx context.Context, tenant, bucket string) (BucketConfig, error) {
 	tenant = defaultTenant(tenant)
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules, sse_algorithm, sse_kms_key_id FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules, sse_algorithm, sse_kms_key_id, transition_rules, noncurrent_transition_days, noncurrent_transition_storage_class FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
 	var cfg BucketConfig
 	var versioning sql.NullBool
 	var acl, policy, corsRaw, logTarget, logPrefix, notifRaw sql.NullString
-	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw, &cfg.SSEAlgorithm, &cfg.SSEKMSKeyId); err != nil {
+	var transRaw sql.NullString
+	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw, &cfg.SSEAlgorithm, &cfg.SSEKMSKeyId, &transRaw, &cfg.NoncurrentTransitionDays, &cfg.NoncurrentTransitionStorageClass); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return BucketConfig{TenantID: tenant, Name: bucket}, nil
 		}
@@ -130,6 +131,9 @@ func (s *sqlStore) GetBucketConfig(ctx context.Context, tenant, bucket string) (
 	cfg.LoggingPrefix = logPrefix.String
 	if notifRaw.Valid && notifRaw.String != "" {
 		_ = json.Unmarshal([]byte(notifRaw.String), &cfg.NotificationRules)
+	}
+	if transRaw.Valid && transRaw.String != "" {
+		_ = json.Unmarshal([]byte(transRaw.String), &cfg.TransitionRules)
 	}
 	return cfg, nil
 }

@@ -49,6 +49,8 @@ type Repository interface {
 	SetBucketObjectLock(ctx context.Context, tenant, bucket string, seconds int) error
 	SetBucketLifecycle(ctx context.Context, tenant, bucket string, expireAfterDays int, expireAction string) error
 	SetBucketNoncurrentVersionLifecycle(ctx context.Context, tenant, bucket string, noncurrentDays, noncurrentCount int) error
+	SetBucketLifecycleFull(ctx context.Context, tenant, bucket string, lc LifecycleConfig) error
+	ListTransitionable(ctx context.Context, limit int) ([]Object, error)
 	SetBucketEncryption(ctx context.Context, tenant, bucket, algorithm, kmsKeyID string) error
 	DeleteBucketEncryption(ctx context.Context, tenant, bucket string) error
 	SetBucketACL(ctx context.Context, tenant, bucket, acl string) error

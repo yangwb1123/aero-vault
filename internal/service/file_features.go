@@ -408,6 +408,12 @@ func (s *FileService) SetBucketNotifications(ctx context.Context, tenant, bucket
 	return s.repo.SetBucketNotifications(ctx, tenant, bucket, rules)
 }
 
+// SetBucketLifecycleFull stores the complete lifecycle configuration.
+func (s *FileService) SetBucketLifecycleFull(ctx context.Context, tenant, bucket string, lc repository.LifecycleConfig) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.SetBucketLifecycleFull(ctx, tenant, bucket, lc)
+}
+
 // DeleteBucketNotifications removes notification rules for a bucket.
 func (s *FileService) DeleteBucketNotifications(ctx context.Context, tenant, bucket string) error {
 	tenant, bucket = defaults(tenant, bucket)

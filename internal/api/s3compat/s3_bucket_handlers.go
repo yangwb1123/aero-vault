@@ -85,7 +85,7 @@ func (h *Handler) getBucketEncryption(w http.ResponseWriter, r *http.Request, bu
 		XMLNS: s3Namespace,
 		Rules: []serverSideEncryptionRule{{
 			Apply: serverSideEncryptionApply{
-				SSEAlgorithm:  cfg.SSEAlgorithm,
+				SSEAlgorithm:   cfg.SSEAlgorithm,
 				KMSMasterKeyID: cfg.SSEKMSKeyId,
 			},
 		}},

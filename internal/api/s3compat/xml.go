@@ -210,8 +210,7 @@ type versioningConfiguration struct {
 	Status  string   `xml:"Status,omitempty"`
 }
 
-// lifecycleConfiguration is the body of GET/PUT /{bucket}?lifecycle. We model the
-// single expire-after-days rule the service supports.
+// lifecycleConfiguration is the body of GET/PUT /{bucket}?lifecycle.
 type lifecycleConfiguration struct {
 	XMLName xml.Name        `xml:"LifecycleConfiguration"`
 	Xmlns   string          `xml:"xmlns,attr,omitempty"`
@@ -219,13 +218,30 @@ type lifecycleConfiguration struct {
 }
 
 type lifecycleRule struct {
-	ID         string               `xml:"ID,omitempty"`
-	Status     string               `xml:"Status"`
-	Expiration *lifecycleExpiration `xml:"Expiration,omitempty"`
+	ID                          string                    `xml:"ID,omitempty"`
+	Status                      string                    `xml:"Status"`
+	Expiration                  *lifecycleExpiration      `xml:"Expiration,omitempty"`
+	Transition                  *lifecycleTransition      `xml:"Transition,omitempty"`
+	NoncurrentVersionExpiration *lifecycleNoncurrentExp   `xml:"NoncurrentVersionExpiration,omitempty"`
+	NoncurrentVersionTransition *lifecycleNoncurrentTrans `xml:"NoncurrentVersionTransition,omitempty"`
 }
 
 type lifecycleExpiration struct {
 	Days int `xml:"Days"`
+}
+
+type lifecycleTransition struct {
+	Days         int    `xml:"Days"`
+	StorageClass string `xml:"StorageClass"`
+}
+
+type lifecycleNoncurrentExp struct {
+	NoncurrentDays int `xml:"NoncurrentDays"`
+}
+
+type lifecycleNoncurrentTrans struct {
+	NoncurrentDays int    `xml:"NoncurrentDays"`
+	StorageClass   string `xml:"StorageClass"`
 }
 
 // objectLockConfiguration is the body of GET/PUT /{bucket}?object-lock.
@@ -442,9 +458,9 @@ type filterVal struct {
 // serverSideEncryptionConfiguration is returned by GET /{bucket}?encryption
 // and accepted by PUT /{bucket}?encryption.
 type serverSideEncryptionConfiguration struct {
-	XMLName  xml.Name                  `xml:"ServerSideEncryptionConfiguration"`
-	XMLNS    string                    `xml:"xmlns,attr,omitempty"`
-	Rules    []serverSideEncryptionRule `xml:"Rule"`
+	XMLName xml.Name                   `xml:"ServerSideEncryptionConfiguration"`
+	XMLNS   string                     `xml:"xmlns,attr,omitempty"`
+	Rules   []serverSideEncryptionRule `xml:"Rule"`
 }
 
 type serverSideEncryptionRule struct {
@@ -452,6 +468,6 @@ type serverSideEncryptionRule struct {
 }
 
 type serverSideEncryptionApply struct {
-	SSEAlgorithm string `xml:"SSEAlgorithm"`
+	SSEAlgorithm   string `xml:"SSEAlgorithm"`
 	KMSMasterKeyID string `xml:"KMSMasterKeyID,omitempty"`
 }

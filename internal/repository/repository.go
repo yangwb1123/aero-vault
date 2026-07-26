@@ -35,6 +35,13 @@ type Object struct {
 }
 
 // BucketConfig is the per-bucket policy bundle.
+// TransitionRule defines a lifecycle transition: move to storage_class after
+// the specified number of days from object creation.
+type TransitionRule struct {
+	Days         int    `json:"days"`
+	StorageClass string `json:"storage_class"`
+}
+
 // BucketConfig holds the full configuration state of a single bucket.
 // SSEAlgorithm and SSEKMSKeyId control per-bucket server-side encryption.
 type BucketConfig struct {
@@ -54,6 +61,9 @@ type BucketConfig struct {
 	NotificationRules []NotificationRule
 	SSEAlgorithm      string `json:"sse_algorithm,omitempty"` // "" | "AES256" | "aws:kms"
 	SSEKMSKeyId       string `json:"sse_kms_key_id,omitempty"`
+	TransitionRules   []TransitionRule `json:"transition_rules,omitempty"`
+	NoncurrentTransitionDays    int    `json:"noncurrent_transition_days,omitempty"`
+	NoncurrentTransitionStorageClass string `json:"noncurrent_transition_storage_class,omitempty"`
 }
 
 // NotificationRule maps S3 events to notification targets.

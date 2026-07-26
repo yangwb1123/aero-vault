@@ -202,6 +202,28 @@ def test_bucket_crud():
     assert status == 200
     print(f"  ✅ GET /v1/buckets/default/config -> 200")
 
+    # Set lifecycle with transitions
+    status, _ = request("PUT", "/v1/buckets/default/lifecycle", body={
+        "days": 365,
+        "action": "soft_delete",
+        "transition_rules": [
+            {"days": 30, "storage_class": "STANDARD_IA"},
+            {"days": 90, "storage_class": "GLACIER"},
+        ],
+    })
+    assert status == 200, f"lifecycle with transitions: {status}"
+    print(f"  ✅ PUT /v1/buckets/default/lifecycle (with transitions) -> 200")
+
+    # Read lifecycle back
+    status, data = request("GET", "/v1/buckets/default/lifecycle")
+    assert status == 200
+    assert len(data.get("transition_rules", [])) == 2, f"expected 2 transition rules, got {data}"
+    print(f"  ✅ GET /v1/buckets/default/lifecycle -> {len(data['transition_rules'])} transition rules")
+
+    # Reset to no lifecycle
+    status, _ = request("PUT", "/v1/buckets/default/lifecycle", body={"days": 0, "action": "soft_delete"})
+    assert status == 200
+
 
 def test_admin():
     """Admin API — config (read-only, no auth)."""

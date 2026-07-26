@@ -196,18 +196,32 @@ func (h *AdminHandler) IssueJWT(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"token": tok, "tenant": body.Tenant, "scopes": body.Scopes, "ttl_seconds": body.TTLSeconds})
 }
 
-// PUT /v1/buckets/{bucket}/lifecycle  {"days":30,"action":"soft_delete"}
+// PUT /v1/buckets/{bucket}/lifecycle  {"days":30,"action":"soft_delete","transition_rules":[...]}
 func (h *AdminHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Request) {
 	bucket := chiURLParam(r, "bucket")
 	var req struct {
-		Days   int    `json:"days"`
-		Action string `json:"action"`
+		Days                    int                       `json:"days"`
+		Action                  string                    `json:"action"`
+		NoncurrentDays          int                       `json:"noncurrent_days"`
+		NoncurrentCount         int                       `json:"noncurrent_count"`
+		TransitionRules         []repository.TransitionRule `json:"transition_rules,omitempty"`
+		NoncurrentTransDays     int                       `json:"noncurrent_transition_days"`
+		NoncurrentTransClass    string                    `json:"noncurrent_transition_storage_class"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: err.Error()}})
 		return
 	}
-	if err := h.svc.SetBucketLifecycle(r.Context(), mw.TenantFrom(r.Context()), bucket, req.Days, req.Action); err != nil {
+	lc := repository.LifecycleConfig{
+		ExpireAfterDays:   req.Days,
+		ExpireAction:      req.Action,
+		NoncurrentDays:    req.NoncurrentDays,
+		NoncurrentCount:   req.NoncurrentCount,
+		TransitionRules:   req.TransitionRules,
+		NoncurrentTransitionDays:          req.NoncurrentTransDays,
+		NoncurrentTransitionStorageClass:  req.NoncurrentTransClass,
+	}
+	if err := h.svc.SetBucketLifecycleFull(r.Context(), mw.TenantFrom(r.Context()), bucket, lc); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}

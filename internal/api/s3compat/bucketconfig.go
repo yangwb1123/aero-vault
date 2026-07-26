@@ -3,6 +3,7 @@ package s3compat
 import (
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -62,17 +63,50 @@ func (h *Handler) getBucketLifecycle(w http.ResponseWriter, r *http.Request, buc
 		writeS3Error(w, r, err)
 		return
 	}
-	if cfg.ExpireAfterDays <= 0 {
+	if cfg.ExpireAfterDays <= 0 && len(cfg.TransitionRules) == 0 {
 		writeS3Error(w, r, errNoSuchLifecycle)
 		return
 	}
-	writeXML(w, http.StatusOK, lifecycleConfiguration{
-		Xmlns: s3Namespace,
-		Rules: []lifecycleRule{{
+	// Build one rule per configuration type.
+	rules := []lifecycleRule{}
+	if cfg.ExpireAfterDays > 0 {
+		rules = append(rules, lifecycleRule{
+			ID:         "expire-all",
 			Status:     "Enabled",
 			Expiration: &lifecycleExpiration{Days: cfg.ExpireAfterDays},
-		}},
-	})
+		})
+	}
+	for i, tr := range cfg.TransitionRules {
+		rule := lifecycleRule{
+			ID:     fmt.Sprintf("transition-%d", i+1),
+			Status: "Enabled",
+			Transition: &lifecycleTransition{
+				Days:         tr.Days,
+				StorageClass: tr.StorageClass,
+			},
+		}
+		rules = append(rules, rule)
+	}
+	if cfg.NoncurrentDays > 0 {
+		rules = append(rules, lifecycleRule{
+			ID:     "noncurrent-expire",
+			Status: "Enabled",
+			NoncurrentVersionExpiration: &lifecycleNoncurrentExp{
+				NoncurrentDays: cfg.NoncurrentDays,
+			},
+		})
+	}
+	if cfg.NoncurrentTransitionDays > 0 && cfg.NoncurrentTransitionStorageClass != "" {
+		rules = append(rules, lifecycleRule{
+			ID:     "noncurrent-transition",
+			Status: "Enabled",
+			NoncurrentVersionTransition: &lifecycleNoncurrentTrans{
+				NoncurrentDays: cfg.NoncurrentTransitionDays,
+				StorageClass:   cfg.NoncurrentTransitionStorageClass,
+			},
+		})
+	}
+	writeXML(w, http.StatusOK, lifecycleConfiguration{Xmlns: s3Namespace, Rules: rules})
 }
 
 func (h *Handler) putBucketLifecycle(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -81,14 +115,30 @@ func (h *Handler) putBucketLifecycle(w http.ResponseWriter, r *http.Request, buc
 		writeMalformedXML(w, r)
 		return
 	}
-	days := 0
+	lc := repository.LifecycleConfig{}
 	for _, rule := range in.Rules {
+		if rule.Status == "Disabled" {
+			continue
+		}
 		if rule.Expiration != nil && rule.Expiration.Days > 0 {
-			days = rule.Expiration.Days
-			break
+			lc.ExpireAfterDays = rule.Expiration.Days
+			lc.ExpireAction = "soft_delete"
+		}
+		if rule.Transition != nil && rule.Transition.Days > 0 && rule.Transition.StorageClass != "" {
+			lc.TransitionRules = append(lc.TransitionRules, repository.TransitionRule{
+				Days:         rule.Transition.Days,
+				StorageClass: rule.Transition.StorageClass,
+			})
+		}
+		if rule.NoncurrentVersionExpiration != nil && rule.NoncurrentVersionExpiration.NoncurrentDays > 0 {
+			lc.NoncurrentDays = rule.NoncurrentVersionExpiration.NoncurrentDays
+		}
+		if rule.NoncurrentVersionTransition != nil && rule.NoncurrentVersionTransition.NoncurrentDays > 0 && rule.NoncurrentVersionTransition.StorageClass != "" {
+			lc.NoncurrentTransitionDays = rule.NoncurrentVersionTransition.NoncurrentDays
+			lc.NoncurrentTransitionStorageClass = rule.NoncurrentVersionTransition.StorageClass
 		}
 	}
-	if err := h.svc.SetBucketLifecycle(r.Context(), mw.TenantFrom(r.Context()), bucket, days, "soft_delete"); err != nil {
+	if err := h.svc.SetBucketLifecycleFull(r.Context(), mw.TenantFrom(r.Context()), bucket, lc); err != nil {
 		writeS3Error(w, r, err)
 		return
 	}

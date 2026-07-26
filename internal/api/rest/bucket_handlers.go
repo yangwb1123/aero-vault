@@ -291,8 +291,13 @@ func (h *Handler) GetBucketLifecycle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"expire_after_days": cfg.ExpireAfterDays,
-		"expire_action":     cfg.ExpireAction,
+		"expire_after_days":                cfg.ExpireAfterDays,
+		"expire_action":                    cfg.ExpireAction,
+		"noncurrent_days":                  cfg.NoncurrentDays,
+		"noncurrent_count":                 cfg.NoncurrentCount,
+		"transition_rules":                 cfg.TransitionRules,
+		"noncurrent_transition_days":       cfg.NoncurrentTransitionDays,
+		"noncurrent_transition_storage_class": cfg.NoncurrentTransitionStorageClass,
 	})
 }
 

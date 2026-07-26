@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -17,6 +18,115 @@ func (s *sqlStore) SetBucketLifecycle(ctx context.Context, tenant, bucket string
 	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET expire_after_days=$1, expire_action=$2 WHERE tenant_id=$3 AND name=$4`),
 		expireAfterDays, expireAction, tenant, bucket)
 	return err
+}
+
+// LifecycleConfig holds the complete lifecycle policy for a bucket, including
+// expiration and transition rules.
+type LifecycleConfig struct {
+	ExpireAfterDays   int              `json:"expire_after_days"`
+	ExpireAction      string           `json:"expire_action"`
+	NoncurrentDays    int              `json:"noncurrent_days"`
+	NoncurrentCount   int              `json:"noncurrent_count"`
+	TransitionRules   []TransitionRule `json:"transition_rules,omitempty"`
+	NoncurrentTransitionDays    int    `json:"noncurrent_transition_days"`
+	NoncurrentTransitionStorageClass string `json:"noncurrent_transition_storage_class"`
+}
+
+// SetBucketLifecycleFull stores a complete lifecycle configuration for a bucket,
+// including expiration, noncurrent version expiration, and transition rules.
+func (s *sqlStore) SetBucketLifecycleFull(ctx context.Context, tenant, bucket string, lc LifecycleConfig) error {
+	tenant = defaultTenant(tenant)
+	if err := s.CreateBucket(ctx, tenant, bucket); err != nil {
+		return err
+	}
+	transJSON := ""
+	if len(lc.TransitionRules) > 0 {
+		b, err := json.Marshal(lc.TransitionRules)
+		if err != nil {
+			return err
+		}
+		transJSON = string(b)
+	}
+	action := lc.ExpireAction
+	if action == "" && lc.ExpireAfterDays > 0 {
+		action = "soft_delete"
+	}
+	_, err := s.db.ExecContext(ctx, s.rebind(`
+UPDATE buckets SET expire_after_days=$1, expire_action=$2, noncurrent_days=$3, noncurrent_count=$4,
+    transition_rules=$5, noncurrent_transition_days=$6, noncurrent_transition_storage_class=$7
+WHERE tenant_id=$8 AND name=$9`),
+		lc.ExpireAfterDays, action, lc.NoncurrentDays, lc.NoncurrentCount,
+		transJSON, lc.NoncurrentTransitionDays, lc.NoncurrentTransitionStorageClass,
+		tenant, bucket)
+	return err
+}
+
+// ListTransitionable finds non-expired objects whose bucket has transition rules
+// and whose age qualifies for a storage-class change. Returns objects whose
+// updated_at is older than at least one transition rule's days threshold.
+func (s *sqlStore) ListTransitionable(ctx context.Context, limit int) ([]Object, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, s.rebind(`
+SELECT o.id, o.tenant_id, o.bucket, o.key, o.version_id, o.backend, o.storage_key,
+       o.size, o.etag, o.content_type, o.metadata, o.tags, o.storage_class,
+       o.created_at, o.updated_at, o.deleted_at, o.locked_until,
+       b.transition_rules
+FROM objects o
+JOIN buckets b ON o.tenant_id = b.tenant_id AND o.bucket = b.name
+WHERE o.deleted_at IS NULL
+  AND b.transition_rules != ''
+  AND b.transition_rules IS NOT NULL
+LIMIT $1`), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Object
+	for rows.Next() {
+		var (
+			obj       Object
+			metaRaw   []byte
+			tagRaw    []byte
+			created   flexTime
+			updated   flexTime
+			deleted   flexNullTime
+			locked    flexNullTime
+			transRaw  string
+		)
+		if err := rows.Scan(&obj.ID, &obj.TenantID, &obj.Bucket, &obj.Key, &obj.VersionID, &obj.Backend, &obj.StorageKey,
+			&obj.Size, &obj.ETag, &obj.ContentType, &metaRaw, &tagRaw, &obj.StorageClass,
+			&created, &updated, &deleted, &locked, &transRaw); err != nil {
+			return nil, err
+		}
+		obj.CreatedAt = created.Time
+		obj.UpdatedAt = updated.Time
+		obj.Metadata, _ = unmarshalKV(metaRaw)
+		obj.Tags, _ = unmarshalKV(tagRaw)
+		if locked.Valid {
+			t := locked.Time
+			obj.LockedUntil = &t
+		}
+		// Parse transition rules and find the applicable one.
+		if transRaw != "" {
+			var rules []TransitionRule
+			if err := json.Unmarshal([]byte(transRaw), &rules); err == nil {
+				age := time.Since(obj.UpdatedAt)
+				for _, rule := range rules {
+					if age >= time.Duration(rule.Days)*24*time.Hour && obj.StorageClass != rule.StorageClass {
+						if obj.Metadata == nil {
+							obj.Metadata = map[string]string{}
+						}
+						obj.Metadata["__transition_to"] = rule.StorageClass
+						out = append(out, obj)
+						break
+					}
+				}
+			}
+		}
+	}
+	return out, rows.Err()
 }
 
 func (s *sqlStore) SetBucketNoncurrentVersionLifecycle(ctx context.Context, tenant, bucket string, noncurrentDays, noncurrentCount int) error {
