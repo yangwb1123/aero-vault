@@ -225,6 +225,7 @@ func (h *AdminHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}
+	h.audit(r, "bucket.lifecycle.update", bucket, fmt.Sprintf("days=%d", req.Days))
 	writeJSON(w, http.StatusOK, map[string]any{"days": req.Days, "action": req.Action})
 }
 
@@ -243,6 +244,7 @@ func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}
+	h.audit(r, "bucket.quota.update", bucket, fmt.Sprintf("max_bytes=%d,max_objects=%d", req.MaxBytes, req.MaxObjects))
 	writeJSON(w, http.StatusOK, map[string]any{"max_bytes": req.MaxBytes, "max_objects": req.MaxObjects})
 }
 

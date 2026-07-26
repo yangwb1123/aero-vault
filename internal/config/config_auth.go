@@ -20,8 +20,10 @@ type CORSCfg struct {
 }
 
 type RateLimitCfg struct {
-	RPS     float64
-	Burst   float64
-	AIRPS   float64
-	AIBurst float64
+	RPS        float64
+	Burst      float64
+	AIRPS      float64
+	AIBurst    float64
+	AdminRPS   float64 // ADMIN_RATE_LIMIT_RPS; admin API rate limit (0 = unlimited)
+	AdminBurst float64 // ADMIN_RATE_LIMIT_BURST; admin API burst (0 = unlimited)
 }

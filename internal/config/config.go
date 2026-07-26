@@ -197,7 +197,9 @@ func Load() (*Config, error) {
 			RPS:     getEnvFloat("RATE_LIMIT_RPS", 0),
 			Burst:   getEnvFloat("RATE_LIMIT_BURST", 0),
 			AIRPS:   getEnvFloat("AI_RATE_LIMIT_RPS", 0),
-			AIBurst: getEnvFloat("AI_RATE_LIMIT_BURST", 0),
+			AIBurst:    getEnvFloat("AI_RATE_LIMIT_BURST", 0),
+			AdminRPS:   getEnvFloat("ADMIN_RATE_LIMIT_RPS", 0),
+			AdminBurst: getEnvFloat("ADMIN_RATE_LIMIT_BURST", 0),
 		},
 		Reconcile: ReconcileCfg{
 			IntervalMinutes:     getEnvInt("RECONCILE_INTERVAL_MINUTES", 0),
@@ -324,7 +326,10 @@ func (c *Config) validateRateLimits() error {
 	if (c.RateLimit.AIRPS > 0) != (c.RateLimit.AIBurst > 0) {
 		return errors.New("AI_RATE_LIMIT_RPS and AI_RATE_LIMIT_BURST must both be positive or both be zero")
 	}
-	if c.RateLimit.RPS < 0 || c.RateLimit.Burst < 0 || c.RateLimit.AIRPS < 0 || c.RateLimit.AIBurst < 0 {
+	if (c.RateLimit.AdminRPS > 0) != (c.RateLimit.AdminBurst > 0) {
+		return errors.New("ADMIN_RATE_LIMIT_RPS and ADMIN_RATE_LIMIT_BURST must both be positive or both be zero")
+	}
+	if c.RateLimit.RPS < 0 || c.RateLimit.Burst < 0 || c.RateLimit.AIRPS < 0 || c.RateLimit.AIBurst < 0 || c.RateLimit.AdminRPS < 0 || c.RateLimit.AdminBurst < 0 {
 		return errors.New("rate limit values must not be negative")
 	}
 	return nil
