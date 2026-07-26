@@ -81,6 +81,7 @@ type BucketConfig struct {
 	WebsiteConfig                    WebsiteConfig    `json:"website_config,omitempty"`
 	BucketMaxBytes                   int64            `json:"bucket_max_bytes,omitempty"`
 	BucketMaxObjects                 int64            `json:"bucket_max_objects,omitempty"`
+	Tags                             map[string]string `json:"tags,omitempty"`
 }
 
 // NotificationRule maps S3 events to notification targets.

@@ -194,9 +194,9 @@ func Load() (*Config, error) {
 			ExposeHeaders:  splitCSV(getEnv("CORS_EXPOSE_HEADERS", "")),
 		},
 		RateLimit: RateLimitCfg{
-			RPS:     getEnvFloat("RATE_LIMIT_RPS", 0),
-			Burst:   getEnvFloat("RATE_LIMIT_BURST", 0),
-			AIRPS:   getEnvFloat("AI_RATE_LIMIT_RPS", 0),
+			RPS:        getEnvFloat("RATE_LIMIT_RPS", 0),
+			Burst:      getEnvFloat("RATE_LIMIT_BURST", 0),
+			AIRPS:      getEnvFloat("AI_RATE_LIMIT_RPS", 0),
 			AIBurst:    getEnvFloat("AI_RATE_LIMIT_BURST", 0),
 			AdminRPS:   getEnvFloat("ADMIN_RATE_LIMIT_RPS", 0),
 			AdminBurst: getEnvFloat("ADMIN_RATE_LIMIT_BURST", 0),

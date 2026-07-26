@@ -389,3 +389,52 @@ func (h *Handler) deleteBucketWebsite(w http.ResponseWriter, r *http.Request, bu
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// --- Bucket Tagging (GET/PUT/DELETE ?tagging) ---------------------------------
+
+func (h *Handler) getBucketTagging(w http.ResponseWriter, r *http.Request, bucket string) {
+	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	tags := cfg.Tags
+	if tags == nil {
+		tags = map[string]string{}
+	}
+	// S3 returns 204 No Content when there are no tags (NoSuchTagSet).
+	if len(tags) == 0 {
+		writeS3Error(w, r, errNoSuchTagSet)
+		return
+	}
+	out := tagging{Xmlns: s3Namespace}
+	for k, v := range tags {
+		out.TagSet = append(out.TagSet, s3Tag{Key: k, Value: v})
+	}
+	writeXML(w, http.StatusOK, out)
+}
+
+func (h *Handler) putBucketTagging(w http.ResponseWriter, r *http.Request, bucket string) {
+	var in tagging
+	if err := decodeBucketBody(r, &in); err != nil {
+		writeMalformedXML(w, r)
+		return
+	}
+	tags := make(map[string]string, len(in.TagSet))
+	for _, t := range in.TagSet {
+		tags[t.Key] = t.Value
+	}
+	if err := h.svc.SetBucketTags(r.Context(), mw.TenantFrom(r.Context()), bucket, tags); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) deleteBucketTagging(w http.ResponseWriter, r *http.Request, bucket string) {
+	if err := h.svc.DeleteBucketTags(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

@@ -56,8 +56,24 @@ func (h *Handler) dispatchBucketSubresource(w http.ResponseWriter, r *http.Reque
 	case q.Has("website"):
 		h.dispatchBucketWebsite(w, r, bucket)
 		return true
+	case q.Has("tagging"):
+		h.dispatchBucketTagging(w, r, bucket)
+		return true
 	}
 	return false
+}
+
+func (h *Handler) dispatchBucketTagging(w http.ResponseWriter, r *http.Request, bucket string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.getBucketTagging(w, r, bucket)
+	case http.MethodPut:
+		h.putBucketTagging(w, r, bucket)
+	case http.MethodDelete:
+		h.deleteBucketTagging(w, r, bucket)
+	default:
+		writeS3Error(w, r, service.ErrInvalidArgs)
+	}
 }
 
 func (h *Handler) dispatchBucketWebsite(w http.ResponseWriter, r *http.Request, bucket string) {

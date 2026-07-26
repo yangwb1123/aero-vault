@@ -396,6 +396,18 @@ func (s *FileService) SetBucketQuota(ctx context.Context, tenant, bucket string,
 	return s.repo.SetBucketQuota(ctx, tenant, bucket, maxBytes, maxObjects)
 }
 
+// SetBucketTags sets key-value tags on a bucket.
+func (s *FileService) SetBucketTags(ctx context.Context, tenant, bucket string, tags map[string]string) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.SetBucketTags(ctx, tenant, bucket, tags)
+}
+
+// DeleteBucketTags removes all tags from a bucket.
+func (s *FileService) DeleteBucketTags(ctx context.Context, tenant, bucket string) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.DeleteBucketTags(ctx, tenant, bucket)
+}
+
 // GetBucketLogging returns the access-logging config for a bucket.
 func (s *FileService) GetBucketLogging(ctx context.Context, tenant, bucket string) (repository.LoggingConfig, error) {
 	tenant, bucket = defaults(tenant, bucket)
