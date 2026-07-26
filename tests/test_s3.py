@@ -202,6 +202,68 @@ def test_bucket_website():
     assert st == 404, f"expected 404 after delete got {st}"
 
 
+def test_legal_hold_s3():
+    """S3 per-object legal hold via ?legal-hold query API."""
+    key = f"s3test/legal-{uuid.uuid4().hex[:8]}.txt"
+    # Put object
+    s3_req("PUT", f"/default/{key}", body=b"legal hold test", ct="text/plain")
+
+    # Get legal hold (should be OFF)
+    st, body = s3_req("GET", f"/default/{key}?legal-hold")
+    assert st == 200, f"get legal-hold: {st}"
+    root = ET.fromstring(body.decode())
+    assert root.find(".//{*}Status").text == "OFF", f"expected OFF, got {body}"
+    print(f"  ✅ S3 Legal Hold GET -> OFF")
+
+    # Enable legal hold via PUT ?legal-hold
+    headers = {"x-amz-object-lock-legal-hold": "ON"}
+    st, _ = s3_req("PUT", f"/default/{key}?legal-hold", body=b"", headers=headers)
+    assert st == 200, f"put legal-hold ON: {st}"
+
+    # Verify it's ON
+    st, body = s3_req("GET", f"/default/{key}?legal-hold")
+    assert st == 200
+    root = ET.fromstring(body.decode())
+    assert root.find(".//{*}Status").text == "ON", f"expected ON, got {body}"
+    print(f"  ✅ S3 Legal Hold PUT -> ON")
+
+    # Hard delete should fail (legal hold blocks it). S3 returns 403 AccessDenied.
+    st, _ = s3_req("DELETE", f"/default/{key}")
+    assert st == 403, f"expected 403 for legal hold delete, got {st}"
+    print(f"  ✅ S3 Legal Hold blocks deletion -> 403")
+
+    # Disable
+    headers2 = {"x-amz-object-lock-legal-hold": "OFF"}
+    s3_req("PUT", f"/default/{key}?legal-hold", body=b"", headers=headers2)
+
+    # Now delete should work
+    st, _ = s3_req("DELETE", f"/default/{key}")
+    assert st == 204, f"expected 204 after removing hold, got {st}"
+    print(f"  ✅ S3 Legal Hold OFF + delete -> 204")
+
+
+def test_retention_s3():
+    """S3 per-object retention via ?retention query API (no-op test)."""
+    key = f"s3test/ret-{uuid.uuid4().hex[:8]}.txt"
+    s3_req("PUT", f"/default/{key}", body=b"retention test", ct="text/plain")
+
+    # Get retention (returns empty/default)
+    st, body = s3_req("GET", f"/default/{key}?retention")
+    assert st == 200, f"get retention: {st}"
+    root = ET.fromstring(body.decode())
+    assert root.find(".//{*}Mode") is not None, f"missing Mode in {body}"
+    print(f"  ✅ S3 Retention GET -> {body.decode()[:80]}")
+
+    # Put retention (no-op, just verifies the endpoint accepts)
+    st, _ = s3_req("PUT", f"/default/{key}?retention", body=b"",
+                   headers={"x-amz-object-lock-retain-until-date": "2027-01-01T00:00:00Z",
+                            "x-amz-object-lock-mode": "GOVERNANCE"})
+    assert st == 200, f"put retention: {st}"
+    print(f"  ✅ S3 Retention PUT -> 200")
+
+    s3_req("DELETE", f"/default/{key}")
+
+
 ALL_TESTS = [
     ("S3 CRUD", [test_put_get_delete, test_head_etag]),
     ("S3 List", [test_list_v2]),
@@ -209,6 +271,8 @@ ALL_TESTS = [
     ("S3 Encryption", [test_bucket_encryption_s3_api]),
     ("S3 UploadPartCopy", [test_upload_part_copy]),
     ("S3 Website", [test_bucket_website]),
+    ("S3 LegalHold", [test_legal_hold_s3]),
+    ("S3 Retention", [test_retention_s3]),
 ]
 
 
