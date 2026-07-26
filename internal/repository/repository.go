@@ -35,6 +35,8 @@ type Object struct {
 }
 
 // BucketConfig is the per-bucket policy bundle.
+// BucketConfig holds the full configuration state of a single bucket.
+// SSEAlgorithm and SSEKMSKeyId control per-bucket server-side encryption.
 type BucketConfig struct {
 	TenantID          string
 	Name              string
@@ -50,6 +52,8 @@ type BucketConfig struct {
 	LoggingTarget     string
 	LoggingPrefix     string
 	NotificationRules []NotificationRule
+	SSEAlgorithm      string `json:"sse_algorithm,omitempty"` // "" | "AES256" | "aws:kms"
+	SSEKMSKeyId       string `json:"sse_kms_key_id,omitempty"`
 }
 
 // NotificationRule maps S3 events to notification targets.

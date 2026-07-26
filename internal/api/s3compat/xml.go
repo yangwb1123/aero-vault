@@ -436,3 +436,22 @@ type filterRule struct {
 type filterVal struct {
 	Value string `xml:",chardata"`
 }
+
+// ── SSE Encryption ────────────────────────────────────────────────────────────
+
+// serverSideEncryptionConfiguration is returned by GET /{bucket}?encryption
+// and accepted by PUT /{bucket}?encryption.
+type serverSideEncryptionConfiguration struct {
+	XMLName  xml.Name                  `xml:"ServerSideEncryptionConfiguration"`
+	XMLNS    string                    `xml:"xmlns,attr,omitempty"`
+	Rules    []serverSideEncryptionRule `xml:"Rule"`
+}
+
+type serverSideEncryptionRule struct {
+	Apply serverSideEncryptionApply `xml:"ApplyServerSideEncryptionByDefault"`
+}
+
+type serverSideEncryptionApply struct {
+	SSEAlgorithm string `xml:"SSEAlgorithm"`
+	KMSMasterKeyID string `xml:"KMSMasterKeyID,omitempty"`
+}

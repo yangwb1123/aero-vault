@@ -110,11 +110,11 @@ func (s *sqlStore) DeleteBucket(ctx context.Context, tenant, bucket string) erro
 
 func (s *sqlStore) GetBucketConfig(ctx context.Context, tenant, bucket string) (BucketConfig, error) {
 	tenant = defaultTenant(tenant)
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT tenant_id, name, versioning, object_lock_seconds, expire_after_days, expire_action, noncurrent_days, noncurrent_count, acl, policy, cors_rules, logging_target, logging_prefix, notification_rules, sse_algorithm, sse_kms_key_id FROM buckets WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
 	var cfg BucketConfig
 	var versioning sql.NullBool
 	var acl, policy, corsRaw, logTarget, logPrefix, notifRaw sql.NullString
-	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw); err != nil {
+	if err := row.Scan(&cfg.TenantID, &cfg.Name, &versioning, &cfg.ObjectLockSeconds, &cfg.ExpireAfterDays, &cfg.ExpireAction, &cfg.NoncurrentDays, &cfg.NoncurrentCount, &acl, &policy, &corsRaw, &logTarget, &logPrefix, &notifRaw, &cfg.SSEAlgorithm, &cfg.SSEKMSKeyId); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return BucketConfig{TenantID: tenant, Name: bucket}, nil
 		}
@@ -132,6 +132,21 @@ func (s *sqlStore) GetBucketConfig(ctx context.Context, tenant, bucket string) (
 		_ = json.Unmarshal([]byte(notifRaw.String), &cfg.NotificationRules)
 	}
 	return cfg, nil
+}
+
+func (s *sqlStore) SetBucketEncryption(ctx context.Context, tenant, bucket, algorithm, kmsKeyID string) error {
+	tenant = defaultTenant(tenant)
+	if err := s.CreateBucket(ctx, tenant, bucket); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET sse_algorithm=$1, sse_kms_key_id=$2 WHERE tenant_id=$3 AND name=$4`), algorithm, kmsKeyID, tenant, bucket)
+	return err
+}
+
+func (s *sqlStore) DeleteBucketEncryption(ctx context.Context, tenant, bucket string) error {
+	tenant = defaultTenant(tenant)
+	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET sse_algorithm='', sse_kms_key_id='' WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
+	return err
 }
 
 func (s *sqlStore) SetBucketPolicy(ctx context.Context, tenant, bucket, policy string) error {

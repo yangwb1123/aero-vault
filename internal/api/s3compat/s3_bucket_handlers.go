@@ -50,8 +50,82 @@ func (h *Handler) dispatchBucketSubresource(w http.ResponseWriter, r *http.Reque
 	case q.Has("accelerate"):
 		h.getBucketAccelerate(w, r, bucket)
 		return true
+	case q.Has("encryption"):
+		h.dispatchBucketEncryption(w, r, bucket)
+		return true
 	}
 	return false
+}
+
+func (h *Handler) dispatchBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.getBucketEncryption(w, r, bucket)
+	case http.MethodPut:
+		h.putBucketEncryption(w, r, bucket)
+	case http.MethodDelete:
+		h.deleteBucketEncryption(w, r, bucket)
+	default:
+		writeS3Error(w, r, service.ErrInvalidArgs)
+	}
+}
+
+func (h *Handler) getBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {
+	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	if cfg.SSEAlgorithm == "" {
+		// No encryption configured → return ServerSideEncryptionConfigurationNotFoundError
+		writeS3Error(w, r, service.ErrNotFound)
+		return
+	}
+	out := serverSideEncryptionConfiguration{
+		XMLNS: s3Namespace,
+		Rules: []serverSideEncryptionRule{{
+			Apply: serverSideEncryptionApply{
+				SSEAlgorithm:  cfg.SSEAlgorithm,
+				KMSMasterKeyID: cfg.SSEKMSKeyId,
+			},
+		}},
+	}
+	writeXML(w, http.StatusOK, out)
+}
+
+func (h *Handler) putBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {
+	var in serverSideEncryptionConfiguration
+	if err := xml.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeS3Error(w, r, service.ErrInvalidArgs)
+		return
+	}
+	if len(in.Rules) == 0 {
+		writeS3Error(w, r, service.ErrInvalidArgs)
+		return
+	}
+	alg := in.Rules[0].Apply.SSEAlgorithm
+	kmsKey := in.Rules[0].Apply.KMSMasterKeyID
+	if alg != "AES256" && alg != "aws:kms" {
+		writeS3Error(w, r, service.ErrInvalidArgs)
+		return
+	}
+	if alg == "aws:kms" && kmsKey == "" {
+		writeS3Error(w, r, service.ErrInvalidArgs)
+		return
+	}
+	if err := h.svc.SetBucketEncryption(r.Context(), mw.TenantFrom(r.Context()), bucket, alg, kmsKey); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) deleteBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {
+	if err := h.svc.DeleteBucketEncryption(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) dispatchBucketLogging(w http.ResponseWriter, r *http.Request, bucket string) {

@@ -107,6 +107,61 @@ func (h *Handler) DeleteBucketCORS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// ── Bucket Encryption ──────────────────────────────────────────────────────────
+
+// GET /v1/buckets/{bucket}/encryption
+func (h *Handler) GetBucketEncryption(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sse_algorithm":  cfg.SSEAlgorithm,
+		"sse_kms_key_id": cfg.SSEKMSKeyId,
+	})
+}
+
+// PUT /v1/buckets/{bucket}/encryption
+func (h *Handler) PutBucketEncryption(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	var body struct {
+		Algorithm string `json:"sse_algorithm"`
+		KMSKeyID  string `json:"sse_kms_key_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		h.writeError(w, r, errInvalidJSON(err))
+		return
+	}
+	if body.Algorithm != "" && body.Algorithm != "AES256" && body.Algorithm != "aws:kms" {
+		h.writeError(w, r, errInvalidJSON(nil))
+		return
+	}
+	if body.Algorithm == "aws:kms" && body.KMSKeyID == "" {
+		h.writeError(w, r, errInvalidJSON(nil))
+		return
+	}
+	if err := h.svc.SetBucketEncryption(r.Context(), mw.TenantFrom(r.Context()), bucket, body.Algorithm, body.KMSKeyID); err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sse_algorithm":  body.Algorithm,
+		"sse_kms_key_id": body.KMSKeyID,
+	})
+}
+
+// DELETE /v1/buckets/{bucket}/encryption
+func (h *Handler) DeleteBucketEncryption(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	if err := h.svc.DeleteBucketEncryption(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // ── Bucket CRUD ────────────────────────────────────────────────────────────────
 
 // GET /v1/buckets — list all buckets for the current tenant.

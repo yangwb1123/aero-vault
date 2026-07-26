@@ -364,6 +364,20 @@ func (s *FileService) DeleteBucketCORS(ctx context.Context, tenant, bucket strin
 	return s.repo.DeleteBucketCORS(ctx, tenant, bucket)
 }
 
+// SetBucketEncryption configures per-bucket SSE. algorithm must be "",
+// "AES256", or "aws:kms". Empty clears encryption.
+func (s *FileService) SetBucketEncryption(ctx context.Context, tenant, bucket, algorithm, kmsKeyID string) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.SetBucketEncryption(ctx, tenant, bucket, algorithm, kmsKeyID)
+}
+
+// DeleteBucketEncryption removes per-bucket SSE config, reverting to global
+// storage-level encryption (if any).
+func (s *FileService) DeleteBucketEncryption(ctx context.Context, tenant, bucket string) error {
+	tenant, bucket = defaults(tenant, bucket)
+	return s.repo.DeleteBucketEncryption(ctx, tenant, bucket)
+}
+
 // GetBucketLogging returns the access-logging config for a bucket.
 func (s *FileService) GetBucketLogging(ctx context.Context, tenant, bucket string) (repository.LoggingConfig, error) {
 	tenant, bucket = defaults(tenant, bucket)

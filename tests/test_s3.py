@@ -80,10 +80,48 @@ def test_multipart():
     print("  ✅ S3 multipart")
 
 
+def test_bucket_encryption_s3_api():
+    key = "s3enc/test-enc.txt"
+    # Put object then set encryption via S3-syntax PUT /{bucket}?encryption
+    s3_req("PUT", f"/default/{key}", body=b"encryptable data", ct="text/plain")
+
+    # Set AES256 encryption
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <ApplyServerSideEncryptionByDefault>
+      <SSEAlgorithm>AES256</SSEAlgorithm>
+    </ApplyServerSideEncryptionByDefault>
+  </Rule>
+</ServerSideEncryptionConfiguration>"""
+    st, _ = s3_req("PUT", "/default/?encryption", body=xml, ct="application/xml")
+    assert st == 200, f"put encryption: {st}"
+
+    # Read it back
+    st, body = s3_req("GET", "/default/?encryption")
+    assert st == 200, f"get encryption: {st}"
+    root = ET.fromstring(body.decode())
+    alg = root.find(".//{*}SSEAlgorithm").text
+    assert alg == "AES256", f"expected AES256 got {alg}"
+
+    # Delete encryption
+    st, _ = s3_req("DELETE", "/default/?encryption")
+    assert st == 204, f"delete encryption: {st}"
+
+    # Confirm gone
+    st, _ = s3_req("GET", "/default/?encryption")
+    assert st == 404, f"expected 404 after delete got {st}"
+
+    # Cleanup
+    s3_req("DELETE", f"/default/{key}")
+    print("  ✅ S3 bucket encryption")
+
+
 ALL_TESTS = [
     ("S3 CRUD", [test_put_get_delete, test_head_etag]),
     ("S3 List", [test_list_v2]),
     ("S3 Multipart", [test_multipart]),
+    ("S3 Encryption", [test_bucket_encryption_s3_api]),
 ]
 
 

@@ -228,6 +228,31 @@ def test_bucket_policy():
     request("DELETE", f"/v1/files/{key}?hard=1")
 
 
+def test_bucket_encryption():
+    """Bucket encryption CRUD via REST API."""
+    # Set AES256
+    status, data = request("PUT", "/v1/buckets/default/encryption", body={"sse_algorithm": "AES256"})
+    assert status == 200, f"PutEncryption: got {status}"
+    print(f"  ✅ PUT /v1/buckets/default/encryption -> 200")
+
+    # Read back
+    status, data = request("GET", "/v1/buckets/default/encryption")
+    assert status == 200
+    assert data.get("sse_algorithm") == "AES256", f"expected AES256 got {data}"
+    print(f"  ✅ GET /v1/buckets/default/encryption -> AES256")
+
+    # Delete
+    status, _ = request("DELETE", "/v1/buckets/default/encryption")
+    assert status == 200, f"DeleteEncryption: got {status}"
+    print(f"  ✅ DELETE /v1/buckets/default/encryption -> 200")
+
+    # Confirm gone
+    status, data = request("GET", "/v1/buckets/default/encryption")
+    assert status == 200
+    assert data.get("sse_algorithm") == "", f"expected empty got {data}"
+    print(f"  ✅ GET /v1/buckets/default/encryption -> empty")
+
+
 def test_cors():
     """Bucket CORS CRUD."""
     # Set CORS
@@ -277,7 +302,7 @@ ALL_TESTS = [
     ("CRUD", [test_crud_roundtrip, test_list_objects]),
     ("Tags", [test_tags]),
     ("Multipart", [test_multipart]),
-    ("Buckets", [test_bucket_crud, test_bucket_policy, test_cors]),
+    ("Buckets", [test_bucket_crud, test_bucket_encryption, test_bucket_policy, test_cors]),
     ("MCP", [test_mcp]),
     ("Admin", [test_admin]),
 ]
