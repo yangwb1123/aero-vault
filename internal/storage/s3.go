@@ -298,6 +298,28 @@ func (s *S3Storage) CleanupParts(ctx context.Context, key, uploadID string) erro
 	return err
 }
 
+func (s *S3Storage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	input := &s3.UploadPartCopyInput{
+		Bucket:     aws.String(s.cfg.Bucket),
+		Key:        aws.String(dstKey),
+		UploadId:   aws.String(uploadID),
+		PartNumber: aws.Int32(partNumber),
+		CopySource: aws.String(s.cfg.Bucket + "/" + srcKey),
+	}
+	if srcOffset >= 0 {
+		input.CopySourceRange = aws.String(fmt.Sprintf("bytes=%d-%d", srcOffset, srcOffset+length-1))
+	}
+	out, err := s.client.UploadPartCopy(ctx, input)
+	if err != nil {
+		return MultipartPart{}, fmt.Errorf("s3 upload-part-copy: %w", err)
+	}
+	etag := ""
+	if out.CopyPartResult != nil && out.CopyPartResult.ETag != nil {
+		etag = strings.Trim(aws.ToString(out.CopyPartResult.ETag), `"`)
+	}
+	return MultipartPart{PartNumber: partNumber, ETag: etag}, nil
+}
+
 func (s *S3Storage) CanCopy() bool { return true }
 
 func (s *S3Storage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {

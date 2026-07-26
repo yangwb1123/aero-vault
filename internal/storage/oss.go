@@ -227,6 +227,10 @@ func (s *OSSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyO
 	return ObjectInfo{}, ErrUnsupported
 }
 
+func (s *OSSStorage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	return MultipartPart{}, ErrUnsupported
+}
+
 func isOSSNotFound(err error) bool {
 	var se oss.ServiceError
 	if errors.As(err, &se) {

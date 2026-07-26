@@ -124,6 +124,59 @@ func (s *LocalStorage) AbortMultipart(ctx context.Context, key, uploadID string)
 	return nil
 }
 
+func (s *LocalStorage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	s.mu.RLock()
+	up, ok := s.uploads[uploadID]
+	s.mu.RUnlock()
+	if !ok || up.key != dstKey {
+		return MultipartPart{}, fmt.Errorf("unknown upload %s", uploadID)
+	}
+
+	srcPath, err := s.objectPath(srcKey)
+	if err != nil {
+		return MultipartPart{}, err
+	}
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return MultipartPart{}, fmt.Errorf("%w: source %s not found", os.ErrNotExist, srcKey)
+		}
+		return MultipartPart{}, err
+	}
+	defer srcFile.Close()
+
+	var srcReader io.Reader
+	if srcOffset >= 0 {
+		if _, err := srcFile.Seek(srcOffset, io.SeekStart); err != nil {
+			return MultipartPart{}, err
+		}
+		srcReader = io.LimitReader(srcFile, length)
+	} else {
+		// Whole file copy — need to figure out the actual length for the copy.
+		fi, err := srcFile.Stat()
+		if err != nil {
+			return MultipartPart{}, err
+		}
+		length = fi.Size()
+		srcReader = srcFile
+	}
+
+	partPath := filepath.Join(up.dir, fmt.Sprintf("part-%05d", partNumber))
+	dst, err := os.Create(partPath)
+	if err != nil {
+		return MultipartPart{}, err
+	}
+	h := md5.New()
+	if _, err := io.Copy(io.MultiWriter(dst, h), srcReader); err != nil {
+		_ = dst.Close()
+		return MultipartPart{}, err
+	}
+	if err := dst.Close(); err != nil {
+		return MultipartPart{}, err
+	}
+	return MultipartPart{PartNumber: partNumber, ETag: hex.EncodeToString(h.Sum(nil))}, nil
+}
+
 func (s *LocalStorage) CleanupParts(ctx context.Context, key, uploadID string) error {
 	// Remove the .multipart/<uploadID>/ directory if it exists.
 	dir := filepath.Join(s.cfg.Root, ".multipart", uploadID)

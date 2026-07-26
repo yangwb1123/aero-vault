@@ -193,6 +193,52 @@ func (h *Handler) uploadPart(w http.ResponseWriter, r *http.Request, uploadID st
 	w.WriteHeader(http.StatusOK)
 }
 
+func (h *Handler) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, dstKey, copySource, uploadID string, partNumber int) {
+	if partNumber < 1 || partNumber > 10000 {
+		writeS3Error(w, r, fmt.Errorf("%w: partNumber must be between 1 and 10000", service.ErrInvalidArgs))
+		return
+	}
+	srcBucket, srcKey, ok := parseCopySource(copySource)
+	if !ok {
+		writeS3Error(w, r, fmt.Errorf("%w: invalid x-amz-copy-source", service.ErrInvalidArgs))
+		return
+	}
+	_ = bucket // dst bucket, same as src for now
+	tenant := mw.TenantFrom(r.Context())
+
+	// Parse optional byte range from x-amz-copy-source-range.
+	rangeHeader := r.Header.Get("x-amz-copy-source-range")
+	var srcOffset, length int64 = -1, 0
+	if rangeHeader != "" {
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &srcOffset, &length); err != nil {
+			writeS3Error(w, r, fmt.Errorf("%w: invalid x-amz-copy-source-range", service.ErrInvalidArgs))
+			return
+		}
+		length = length - srcOffset + 1
+	}
+
+	// If no range specified, get source object size to know the part length.
+	if rangeHeader == "" {
+		src, err := h.svc.Stat(r.Context(), tenant, srcBucket, srcKey)
+		if err != nil {
+			writeS3Error(w, r, err)
+			return
+		}
+		length = src.Size
+	}
+
+	part, err := h.svc.UploadPartCopy(r.Context(), uploadID, int32(partNumber), srcKey, srcOffset, length)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", `"`+part.ETag+`"`)
+	writeXML(w, http.StatusOK, copyObjectResult{
+		Xmlns: s3Namespace,
+		ETag:  part.ETag,
+	})
+}
+
 func (h *Handler) completeMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)

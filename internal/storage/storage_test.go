@@ -855,6 +855,10 @@ func (n *nonRewrapStore) CleanupParts(ctx context.Context, key, uploadID string)
 	return n.inner.CleanupParts(ctx, key, uploadID)
 }
 
+func (n *nonRewrapStore) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	return n.inner.UploadPartCopy(ctx, dstKey, uploadID, partNumber, srcKey, srcOffset, length)
+}
+
 func TestNewLocalWithKMSURL(t *testing.T) {
 	s, err := NewLocal(LocalConfig{
 		Root:        t.TempDir(),

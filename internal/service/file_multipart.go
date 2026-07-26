@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -110,6 +111,87 @@ func (s *FileService) UploadPart(ctx context.Context, uploadID string, partNumbe
 	body, _ := json.Marshal(pr)
 	_ = s.repo.CompleteIdempotencyKey(ctx, u.TenantID, idemKey, http.StatusOK, body, "application/json", nil)
 	return pr, nil
+}
+
+// UploadPartCopy copies a range from srcKey into the multipart upload as a single
+// part, using server-side transfer when the storage backend supports it.
+func (s *FileService) UploadPartCopy(ctx context.Context, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (repository.PartRecord, error) {
+	u, err := s.repo.GetUpload(ctx, uploadID)
+	if err != nil {
+		if errors.Is(err, repository.ErrUploadNotFound) {
+			return repository.PartRecord{}, ErrUploadNotFound
+		}
+		return repository.PartRecord{}, err
+	}
+
+	// Verify the source exists and belongs to the same tenant.
+	srcObj, err := s.repo.GetObject(ctx, u.TenantID, u.Bucket, srcKey)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return repository.PartRecord{}, fmt.Errorf("%w: source %s not found", ErrNotFound, srcKey)
+		}
+		return repository.PartRecord{}, err
+	}
+	// Validate bucket config for source (WORM check is done at write time).
+	bcfg, err := s.repo.GetBucketConfig(ctx, u.TenantID, u.Bucket)
+	if err != nil {
+		return repository.PartRecord{}, err
+	}
+	if err := s.checkMultipartLock(ctx, u, bcfg); err != nil {
+		return repository.PartRecord{}, err
+	}
+
+	// Build the storage key for the upload's backend UID so UploadPartCopy knows
+	// where to place the part.
+	sk := uploadStorageKey(u)
+	srcSK := storageKey(u.TenantID, u.Bucket, srcKey) + "@v" + srcObj.VersionID
+
+	part, err := s.store.UploadPartCopy(ctx, sk, u.BackendUID, partNumber, srcSK, srcOffset, length)
+	if err != nil {
+		if errors.Is(err, storage.ErrUnsupported) {
+			// Backend doesn't support server-side part copy; fall through to
+			// client-stream copy via Get+UploadPart.
+			return s.uploadPartCopyStream(ctx, uploadID, partNumber, srcObj, srcSK, srcOffset, length)
+		}
+		return repository.PartRecord{}, fmt.Errorf("storage upload part copy: %w", err)
+	}
+
+	pr := repository.PartRecord{
+		UploadID:   uploadID,
+		PartNumber: partNumber,
+		ETag:       part.ETag,
+		Size:       length,
+	}
+	if err := s.repo.RecordPart(ctx, pr); err != nil {
+		return repository.PartRecord{}, fmt.Errorf("repo record part: %w", err)
+	}
+	return pr, nil
+}
+
+func (s *FileService) uploadPartCopyStream(ctx context.Context, uploadID string, partNumber int32, srcObj repository.Object, srcSK string, srcOffset, length int64) (repository.PartRecord, error) {
+	rc, _, err := s.store.Get(ctx, srcSK)
+	if err != nil {
+		return repository.PartRecord{}, err
+	}
+	defer rc.Close()
+
+	var r io.Reader = rc
+	var actualSize int64 = srcObj.Size
+	if srcOffset >= 0 {
+		// Seek not possible on stream; drain to memory for the range.
+		buf := make([]byte, length)
+		// Skip srcOffset bytes first.
+		if _, err := io.CopyN(io.Discard, r, srcOffset); err != nil {
+			return repository.PartRecord{}, err
+		}
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return repository.PartRecord{}, err
+		}
+		r = bytes.NewReader(buf)
+		actualSize = length
+	}
+
+	return s.UploadPart(ctx, uploadID, partNumber, r, actualSize)
 }
 
 // CompleteMultipartWithParts completes a multipart upload, verifying that the

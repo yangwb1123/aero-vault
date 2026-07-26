@@ -117,11 +117,68 @@ def test_bucket_encryption_s3_api():
     print("  ✅ S3 bucket encryption")
 
 
+def test_upload_part_copy():
+    """Test UploadPartCopy via S3 API."""
+    src_key = f"s3test/upc-src-{uuid.uuid4().hex[:8]}.bin"
+    dst_key = f"s3test/upc-dst-{uuid.uuid4().hex[:8]}.bin"
+
+    # Put a 500-byte source object
+    body = b"x" * 500
+    st, _ = s3_req("PUT", f"/default/{src_key}", body=body, ct="application/octet-stream")
+    assert st in (200, 201), f"put src: {st}"
+
+    # Initiate multipart upload
+    st, body = s3_req("POST", f"/default/{dst_key}?uploads")
+    assert st == 200, f"init multipart: {st}"
+    root = ET.fromstring(body.decode())
+    uid = root.find(".//{*}UploadId").text
+
+    # UploadPartCopy: copy first 200 bytes from source
+    copy_src = f"/default/{src_key}"
+    headers = {
+        "x-amz-copy-source": copy_src,
+        "x-amz-copy-source-range": "bytes=0-199",
+    }
+    st, body = s3_req("PUT", f"/default/{dst_key}?partNumber=1&uploadId={uid}",
+                       body=b"", headers=headers)
+    assert st == 200, f"upload part copy: {st}"
+    root2 = ET.fromstring(body.decode())
+    etag1 = root2.find(".//{*}ETag").text.strip('"')
+
+    # UploadPartCopy: copy bytes 200-499
+    headers["x-amz-copy-source-range"] = "bytes=200-499"
+    st, body = s3_req("PUT", f"/default/{dst_key}?partNumber=2&uploadId={uid}",
+                       body=b"", headers=headers)
+    assert st == 200, f"upload part copy 2: {st}"
+    root3 = ET.fromstring(body.decode())
+    etag2 = root3.find(".//{*}ETag").text.strip('"')
+
+    # Complete multipart
+    xml = f"""<CompleteMultipartUpload>
+  <Part><PartNumber>1</PartNumber><ETag>"{etag1}"</ETag></Part>
+  <Part><PartNumber>2</PartNumber><ETag>"{etag2}"</ETag></Part>
+</CompleteMultipartUpload>"""
+    st, body = s3_req("POST", f"/default/{dst_key}?uploadId={uid}",
+                      body=xml.encode(), ct="application/xml")
+    assert st == 200, f"complete: {st} {body[:200]}"
+
+    # Verify destination size
+    st, body = s3_req("GET", f"/default/{dst_key}")
+    assert st == 200, f"get dst: {st}"
+    assert len(body) == 500, f"expected 500 bytes got {len(body)}"
+
+    # Cleanup
+    s3_req("DELETE", f"/default/{src_key}")
+    s3_req("DELETE", f"/default/{dst_key}")
+    print("  ✅ S3 UploadPartCopy")
+
+
 ALL_TESTS = [
     ("S3 CRUD", [test_put_get_delete, test_head_etag]),
     ("S3 List", [test_list_v2]),
     ("S3 Multipart", [test_multipart]),
     ("S3 Encryption", [test_bucket_encryption_s3_api]),
+    ("S3 UploadPartCopy", [test_upload_part_copy]),
 ]
 
 

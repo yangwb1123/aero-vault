@@ -61,6 +61,10 @@ func (h *Handler) PutObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if src := r.Header.Get("x-amz-copy-source"); src != "" {
+		if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+			h.uploadPartCopy(w, r, bucket, key, src, uploadID, partNumberOf(r))
+			return
+		}
 		h.copyObject(w, r, bucket, key, src)
 		return
 	}

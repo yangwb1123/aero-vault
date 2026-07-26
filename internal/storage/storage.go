@@ -148,6 +148,12 @@ type Storage interface {
 	// CompleteMultipart finalizes the upload by stitching parts together.
 	CompleteMultipart(ctx context.Context, key, uploadID string, parts []MultipartPart) (ObjectInfo, error)
 
+	// UploadPartCopy copies a range of bytes from srcKey into partNumber of the
+	// multipart upload identified by uploadID. srcOffset and length control the
+	// byte range; if srcOffset < 0 the entire source is used.
+	// Returns ErrUnsupported when the backend cannot perform server-side copy.
+	UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error)
+
 	// AbortMultipart cancels a multipart upload and discards its parts.
 	AbortMultipart(ctx context.Context, key, uploadID string) error
 

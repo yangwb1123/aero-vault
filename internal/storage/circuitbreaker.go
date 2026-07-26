@@ -333,6 +333,15 @@ func (cb *circuitBreaker) CleanupParts(ctx context.Context, key, uploadID string
 	return err
 }
 
+func (cb *circuitBreaker) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	if err := cb.beforeRequest(); err != nil {
+		return MultipartPart{}, err
+	}
+	part, err := cb.Storage.UploadPartCopy(ctx, dstKey, uploadID, partNumber, srcKey, srcOffset, length)
+	cb.recordOutcome(err)
+	return part, err
+}
+
 // Backend returns the underlying backend name with a "(cb)" suffix.
 func (cb *circuitBreaker) Backend() string {
 	return cb.Storage.Backend() + "(cb)"

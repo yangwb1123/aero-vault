@@ -232,6 +232,10 @@ func (s *COSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyO
 	return ObjectInfo{}, ErrUnsupported
 }
 
+func (s *COSStorage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	return MultipartPart{}, ErrUnsupported
+}
+
 func isCOSNotFound(err error) bool {
 	var e *cos.ErrorResponse
 	if errors.As(err, &e) && e.Response != nil {
