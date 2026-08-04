@@ -61,6 +61,10 @@ S3-compatible store (AWS S3, MinIO, Alibaba OSS, Tencent COS).
   toggles plus per-object retention locks and canned ACLs.
 - **Events & webhooks** — an in-process event bus persists object-lifecycle
   events, streams them over SSE, and POSTs HMAC-signed webhooks with retry.
+- **Streaming without a second stateful transport** — SSE powers event and
+  chat streams; gRPC and WebSocket endpoints are intentionally not exposed in
+  v0.4 because the REST/SDK surface covers the current public and browser use
+  cases.
 - **Durable background job queue** — a worker pool runs indexing, antivirus, and
   replication jobs with retry, backed by a jobs table.
 - **RAG pipeline** — automatic text extraction, chunking, and embedding;
@@ -148,9 +152,16 @@ production-shaped configuration.
 | **S3-compatible** | Disabled by default; set `S3_COMPAT_PREFIX` (for example `/s3`) | Path-style `GET/PUT/HEAD/DELETE` objects, `ListObjectsV2`, multipart, tagging, ACL, copy, batch delete. Auth via AWS SigV4 or `X-Api-Key`. |
 | **WebDAV** | `/webdav` (set `WEBDAV_PREFIX`; empty disables) | Mountable from Finder, Explorer, rclone, Cyberduck. `PROPFIND`/`MKCOL` supported. |
 | **MCP** | `POST /mcp` (HTTP) or `aero-vault mcp` (stdio) | Model Context Protocol server exposing `list_files`, `read_file`, and `search` tools plus object resources (`aero-vault://{tenant}/{bucket}/{key}`). |
+| **SSE** | `/v1/events/stream`, `/v1/chat/stream` | One-way event and token streams; uses the same authentication, tenant, rate-limit, and FileService boundaries as REST. |
 
 All enabled protocols share one `FileService` core, so an object written through
 any protocol is visible through every other enabled protocol.
+
+REST/OpenAPI plus the language SDKs is the canonical integration surface. A
+future gRPC adapter would be appropriate for internal, strongly typed
+service-to-service traffic, while WebSocket would be appropriate for
+bidirectional collaboration or presence. Neither should bypass `FileService`
+or duplicate authorization rules.
 
 See [`docs/api.md`](docs/api.md) for the full REST reference and S3-compatibility
 matrix.
