@@ -29,6 +29,9 @@ if [[ ! -s "${operator_file}" ]]; then
 fi
 operator_token="$(<"${operator_file}")"
 
+# Reconcile bounds storage-only upload failures after a grace period far longer
+# than the request/write timeouts. Extend its tenant list before provisioning a
+# new Vault tenant.
 exec env \
   APP_ADDR=127.0.0.1:18081 \
   APP_LOG_LEVEL=info \
@@ -80,5 +83,10 @@ exec env \
   AI_VECTOR_DSN="${runtime_dsn}" \
   EVENTS_TRANSPORT=postgres \
   EVENTS_TRANSPORT_DSN="${runtime_dsn}" \
+  RECONCILE_INTERVAL_MINUTES=15 \
+  RECONCILE_DELETE_ORPHAN_BLOBS=true \
+  RECONCILE_ORPHAN_GRACE_MINUTES=60 \
+  RECONCILE_TENANTS="default,admin,aero-im" \
+  RECONCILE_CLUSTER_SINGLETON=true \
   JOBS_WORKERS=2 \
   /home/u1/aero-vault/bin/aero-vault
