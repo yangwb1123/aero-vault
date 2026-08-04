@@ -114,8 +114,9 @@ keeping it backend-agnostic.
 
 `internal/access` is an independent policy-decision domain. Authentication
 adapters normalize API keys and local JWTs directly. Snaplink's
-`interfaces/ssoclient/remote.TokenClient` owns authorization URL construction,
-PKCE, and OAuth token exchange;
+`interfaces/ssoclient/remote.BrowserFlow` and `TokenClient` own bounded
+one-time state, secure cookies, authorization URL construction, PKCE, and OAuth
+token exchange;
 access tokens pass through `interfaces/ssoclient/rs` and then a thin identity
 mapper. FileService sends `{action, tenant, bucket, key, owner}` to
 the authorizer before every object operation. REST, S3, WebDAV, MCP, multipart,

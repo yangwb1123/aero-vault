@@ -184,7 +184,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `AUTH_JWKS_TENANT_CLAIM` | `ten` | External JWT claim mapped to the Aero tenant: `ten`, `tenant_id`, or `sub`. |
 | `AUTH_JWKS_CLIENT_TENANTS` | _(empty)_ | Optional `client_id:tenant` pairs. Use this for Snaplink tenant-bound clients because Snaplink access tokens intentionally omit `tenant_id`; an unmapped client fails closed when this map is configured. |
 | `AUTH_JWKS_DEFAULT_SCOPES` | _(empty)_ | Comma-separated Aero scopes used only when a verified external token has no recognized `read`/`write`/`admin` scope. Use only with issuer and audience/client pinning. |
-| `AUTH_OIDC_ISSUER` | _(empty)_ | Enables browser Authorization Code + PKCE login through Snaplink's `remote.TokenClient` when supplied with client ID and redirect URI. |
+| `AUTH_OIDC_ISSUER` | _(empty)_ | Enables browser Authorization Code + PKCE login through Snaplink's `remote.BrowserFlow` and `TokenClient` when supplied with client ID and redirect URI. |
 | `AUTH_OIDC_CLIENT_ID` | _(empty)_ | Public OIDC client ID; must equal `AUTH_JWKS_AUDIENCE`. |
 | `AUTH_OIDC_REDIRECT_URI` | _(empty)_ | Exact registered callback, e.g. `https://vault.example.com/auth/oidc/callback`. |
 | `AUTH_OIDC_AUTHORIZATION_ENDPOINT` | `<issuer>/auth/login` | Snaplink browser-hosted login endpoint. |
@@ -209,9 +209,9 @@ authentication source (API key, JWT/JWKS, SigV4, or persistent API-key store).
 | `ACCESS_PUBLIC_BASE_URL` | _(empty)_ | Canonical external base URL placed in returned share/asset URLs, e.g. `https://source.ywbsd.site`. Empty derives it from the request. |
 
 For Snaplink, configure a tenant-bound `aero-vault` OAuth client, pin issuer and
-audience, and map that trusted client to the Aero tenant. Authorization URL
-construction, PKCE, and code exchange use Snaplink's
-`interfaces/ssoclient/remote.TokenClient`; validation calls
+audience, and map that trusted client to the Aero tenant. State/cookie handling,
+authorization URL construction, PKCE, and code exchange use Snaplink's
+`interfaces/ssoclient/remote.BrowserFlow` and `TokenClient`; validation calls
 `interfaces/ssoclient/rs` directly. Only the mapping below is application-specific:
 
 ```dotenv

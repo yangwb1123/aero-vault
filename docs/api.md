@@ -40,10 +40,10 @@ When `AUTH_OIDC_*` is configured, the embedded UI exposes a provider login:
 | `GET` | `/auth/oidc/logout` | Clear the UI token and end the provider session. |
 
 The callback returns tokens to `/ui` in the URL fragment, which the UI removes
-from browser history before making API requests. Snaplink's SDK builds the
-authorization redirect, generates PKCE, exchanges the code, and verifies access
-tokens with issuer and client/audience pinning; Aero only keeps login state and
-maps validated claims to its Principal.
+from browser history before making API requests. Snaplink's SDK owns one-time
+state, the HttpOnly cookie, authorization redirect, PKCE, code exchange, and
+access-token verification with issuer and client/audience pinning; Aero only
+maps the successful result to its UI and Principal.
 
 ## Errors
 

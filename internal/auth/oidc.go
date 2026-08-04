@@ -1,14 +1,11 @@
 package auth
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yangwb1123/snaplink/interfaces/ssoclient"
@@ -30,18 +27,11 @@ type OIDCConfig struct {
 	Scopes                []string
 }
 
-type pendingOIDCFlow struct {
-	verifier string
-	expires  time.Time
-}
-
 // OIDCHandler starts a browser login and exchanges the callback code. Tokens
 // are returned in a URL fragment so they never enter access logs or referrers.
 type OIDCHandler struct {
-	cfg     OIDCConfig
-	tokens  *remote.TokenClient
-	mu      sync.Mutex
-	pending map[string]pendingOIDCFlow
+	cfg  OIDCConfig
+	flow *remote.BrowserFlow
 }
 
 func NewOIDCHandler(cfg OIDCConfig) (*OIDCHandler, error) {
@@ -65,7 +55,14 @@ func NewOIDCHandler(cfg OIDCConfig) (*OIDCHandler, error) {
 		remote.WithAuthorizationEndpoint(cfg.AuthorizationEndpoint),
 		remote.WithClientID(cfg.ClientID), remote.WithRedirectURI(cfg.RedirectURI),
 		remote.WithPKCE(true), remote.WithHTTPClient(&http.Client{Timeout: 15 * time.Second}))
-	return &OIDCHandler{cfg: cfg, tokens: tokens, pending: map[string]pendingOIDCFlow{}}, nil
+	flow, err := remote.NewBrowserFlow(tokens,
+		remote.WithBrowserScopes(cfg.Scopes...),
+		remote.WithBrowserCookie(oidcStateCookie, "/auth/oidc"),
+		remote.WithBrowserFlowTTL(oidcFlowTTL))
+	if err != nil {
+		return nil, err
+	}
+	return &OIDCHandler{cfg: cfg, flow: flow}, nil
 }
 
 func validateOIDCEndpoints(cfg OIDCConfig) error {
@@ -85,36 +82,21 @@ func validateOIDCEndpoints(cfg OIDCConfig) error {
 }
 
 func (h *OIDCHandler) Login(w http.ResponseWriter, r *http.Request) {
-	state, err := randomURLToken(32)
-	if err != nil {
+	if err := h.flow.Begin(w, r); err != nil {
 		http.Error(w, "could not start login", http.StatusInternalServerError)
-		return
 	}
-	target, verifier, err := h.tokens.AuthorizationCodeURL(state, h.cfg.Scopes...)
-	if err != nil {
-		http.Error(w, "could not start login", http.StatusInternalServerError)
-		return
-	}
-	h.storePending(state, verifier)
-	h.setStateCookie(w, state, int(oidcFlowTTL.Seconds()))
-	http.Redirect(w, r, target, http.StatusFound)
 }
 
 func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
-	h.noStore(w)
-	if oidcErr := r.URL.Query().Get("error"); oidcErr != "" {
+	token, err := h.flow.Callback(w, r)
+	if errors.Is(err, ssoclient.ErrAuthorizationRejected) {
 		http.Error(w, "identity provider rejected login", http.StatusUnauthorized)
 		return
 	}
-	state, code := r.URL.Query().Get("state"), r.URL.Query().Get("code")
-	cookie, _ := r.Cookie(oidcStateCookie)
-	verifier, ok := h.consumePending(state, cookie)
-	h.clearStateCookie(w)
-	if !ok || code == "" {
+	if errors.Is(err, ssoclient.ErrInvalidAuthorizationFlow) {
 		http.Error(w, "invalid or expired login state", http.StatusBadRequest)
 		return
 	}
-	token, err := h.tokens.ExchangeCode(r.Context(), code, verifier)
 	if err != nil {
 		http.Error(w, "OIDC token exchange failed", http.StatusBadGateway)
 		return
@@ -144,55 +126,8 @@ func (h *OIDCHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, target, http.StatusFound)
 }
 
-func (h *OIDCHandler) storePending(state, verifier string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	now := time.Now()
-	for key, flow := range h.pending {
-		if now.After(flow.expires) {
-			delete(h.pending, key)
-		}
-	}
-	h.pending[state] = pendingOIDCFlow{verifier: verifier, expires: now.Add(oidcFlowTTL)}
-}
-
-func (h *OIDCHandler) consumePending(state string, cookie *http.Cookie) (string, bool) {
-	if state == "" || cookie == nil || cookie.Value != state {
-		return "", false
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	flow, ok := h.pending[state]
-	delete(h.pending, state)
-	if !ok || time.Now().After(flow.expires) {
-		return "", false
-	}
-	return flow.verifier, true
-}
-
-func (h *OIDCHandler) setStateCookie(w http.ResponseWriter, value string, maxAge int) {
-	redirect, _ := url.Parse(h.cfg.RedirectURI)
-	http.SetCookie(w, &http.Cookie{
-		Name: oidcStateCookie, Value: value, Path: "/auth/oidc",
-		HttpOnly: true, Secure: redirect.Scheme == "https",
-		SameSite: http.SameSiteLaxMode, MaxAge: maxAge,
-	})
-}
-
-func (h *OIDCHandler) clearStateCookie(w http.ResponseWriter) {
-	h.setStateCookie(w, "", -1)
-}
-
 func (h *OIDCHandler) noStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-}
-
-func randomURLToken(bytes int) (string, error) {
-	raw := make([]byte, bytes)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(raw), nil
 }

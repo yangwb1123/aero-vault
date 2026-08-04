@@ -50,7 +50,7 @@ S3-compatible store (AWS S3, MinIO, Alibaba OSS, Tencent COS).
 - **Multi-tenancy** — tenant isolation via the `X-Aero-Tenant` header and a
   `tenant/bucket/key` storage-key scheme.
 - **Enterprise identity & authorization** — API keys, local JWT, Snaplink's Go
-  resource-server verifier and OAuth token-client SDKs,
+  browser-flow, token-client, and resource-server SDKs,
   SigV4, normalized principals, object ownership, nested departments, and
   inheritable user/group/role/department allow/deny ACLs enforced in FileService.
 - **File operations & distribution** — revocable/password/expiry/use-limited
