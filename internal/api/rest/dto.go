@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"strings"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -40,11 +41,24 @@ func toObjectDTO(o repository.Object) objectDTO {
 		ContentType:  o.ContentType,
 		Backend:      o.Backend,
 		StorageClass: o.StorageClass,
-		Metadata:     o.Metadata,
+		Metadata:     userVisibleMetadata(o.Metadata),
 		Tags:         o.Tags,
 		CreatedAt:    o.CreatedAt,
 		UpdatedAt:    o.UpdatedAt,
 	}
+}
+
+func userVisibleMetadata(metadata map[string]string) map[string]string {
+	visible := make(map[string]string)
+	for key, value := range metadata {
+		if !strings.HasPrefix(strings.ToLower(key), "_aero_") {
+			visible[key] = value
+		}
+	}
+	if len(visible) == 0 {
+		return nil
+	}
+	return visible
 }
 
 type listResponse struct {

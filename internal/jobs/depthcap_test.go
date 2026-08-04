@@ -4,10 +4,19 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
+
+type countFailureRepository struct {
+	repository.Repository
+}
+
+func (r countFailureRepository) CountJobsByStatus(context.Context, string) (int, error) {
+	return 0, errors.New("count unavailable")
+}
 
 // TestQueue_MaxDepthBackpressure verifies Enqueue returns ErrQueueFull once the
 // pending backlog reaches the configured cap, and accepts again after drain.
@@ -38,5 +47,23 @@ func TestQueue_MaxDepthBackpressure(t *testing.T) {
 	qu := NewQueue(repo)
 	if _, _, err := qu.Enqueue(ctx, repository.Job{Type: "t", Payload: "{}"}); err != nil {
 		t.Fatalf("unbounded enqueue should succeed: %v", err)
+	}
+}
+
+func TestQueue_MaxDepthFailsClosedWhenCountFails(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepo(t)
+	q := NewQueue(countFailureRepository{Repository: repo}).WithMaxDepth(2)
+
+	if _, _, err := q.Enqueue(ctx, repository.Job{Type: "t"}); err == nil ||
+		!strings.Contains(err.Error(), "count unavailable") {
+		t.Fatalf("expected count error, got %v", err)
+	}
+	all, err := repo.ListJobs(ctx, "", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("depth check failure still enqueued %d jobs", len(all))
 	}
 }

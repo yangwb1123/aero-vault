@@ -48,6 +48,29 @@ for (const c of reply.citations) console.log(" -", c.object_key);
 for await (const token of av.chatStream("summarize everything")) {
   process.stdout.write(token);                      // streamed tokens (SSE)
 }
+
+// --- public blog image, protected share, portable backup ---
+await av.upload("blog/hero.jpg", imageBytes, { contentType: "image/jpeg" });
+const published = await av.publishAsset("blog/hero.jpg", "blog/hero.jpg");
+document.querySelector("img").src = published.url;
+const share = await av.createShare("blog/hero.jpg", {
+  allowDownload: true, ttlSeconds: 3600,
+});
+const backup = await av.exportArchive({ prefix: "blog/" });
+```
+
+Operational lifecycle methods complete the same management surface:
+
+```js
+const shares = await av.listShares("blog/hero.jpg");
+await av.revokeShare(shares[0].id);
+const assets = await av.listAssets();
+await av.unpublishAsset(assets[0].slug);
+const acl = await av.listResourceACL("blog/", { resourceKind: "folder" });
+await av.deleteResourceACL(acl[0].id);
+const departments = await av.listDepartments();
+const details = await av.getDepartment(departments[0].id);
+await av.deleteDepartmentMember(details.department.id, details.members[0].subject_id);
 ```
 
 ## Upload & download
@@ -233,7 +256,11 @@ const reply: ChatResponse = await av.chat("question");
 `iterObjects` · `delete` · `presign` · `thumbnail` · `getTags` · `putTags` ·
 `deleteTags` · `listVersions` · `getAcl` · `setAcl` · `createMultipartUpload` ·
 `uploadPart` · `completeMultipartUpload` · `abortMultipartUpload` · `search` ·
-`chat` · `chatStream` · `agent` · `usage` · `health`.
+`chat` · `chatStream` · `agent` · `usage` · `health` · `createShare` ·
+`listShares` · `revokeShare` · `publishAsset` · `listAssets` · `unpublishAsset` ·
+`putResourceACL` · `listResourceACL` · `deleteResourceACL` ·
+`createDepartment` · `listDepartments` · `getDepartment` · `deleteDepartment` ·
+`putDepartmentMember` · `deleteDepartmentMember` · `exportArchive`.
 
 ## License
 

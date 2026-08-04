@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
@@ -136,6 +137,7 @@ func (w *Webhook) postOne(ctx context.Context, eventID int64, url string, body [
 		return
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	telemetry.RecordWebhookDelivery(ctx, url, resp.StatusCode)
 	telemetry.RecordWebhookDeliveryLatency(ctx, url, latency)
 	if resp.StatusCode >= 300 {
@@ -199,8 +201,7 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL, bytes.NewReader(body))
 	if err != nil {
-		// A malformed URL must not panic the retry loop; record the failed attempt.
-		w.persistFailure(ctx, f.EventID, f.URL, body, "bad url: "+err.Error(), 0, f.Attempts+1)
+		w.handleRetryFailure(ctx, f, "bad url: "+err.Error(), 0)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -210,27 +211,35 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 		req.Header.Set("X-Aero-Retry-Attempt", fmtInt(int64(f.Attempts+1)))
 	}
 	resp, err := w.client.Do(req)
-	attempts := f.Attempts + 1
 	telemetry.IncWebhookRetry(ctx, f.URL)
 	if err == nil {
 		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
 		if resp.StatusCode < 300 {
 			_ = w.repo.MarkWebhookSucceeded(ctx, f.ID)
 			return
 		}
-		err = fmt.Errorf("non-2xx: %d", resp.StatusCode)
+		w.handleRetryFailure(ctx, f, fmt.Sprintf("non-2xx: %d", resp.StatusCode), resp.StatusCode)
+		return
 	}
-	// give up after 10 attempts: record the final failure detail, then retire the
-	// row so it is no longer re-selected by NextPendingFailures. The schema only
-	// has a binary `succeeded` flag (no dedicated dead-letter state), so we reuse
-	// MarkWebhookSucceeded as the terminal transition — this intentionally
-	// conflates "permanently dead" with "succeeded" to stop perpetual retries and
-	// unbounded table growth. ListWebhookFailures still surfaces the last_error
-	// for operators to inspect.
+	w.handleRetryFailure(ctx, f, err.Error(), 0)
+}
+
+func (w *Webhook) handleRetryFailure(
+	ctx context.Context, failure repository.WebhookFailure, lastErr string, lastStatus int,
+) {
+	if w.repo == nil {
+		return
+	}
+	attempts := failure.Attempts + 1
 	if attempts >= 10 {
-		telemetry.IncWebhookDeadLetter(ctx, f.URL)
-		_ = w.repo.UpdateWebhookFailure(ctx, f.ID, "dead-lettered after "+fmtInt(int64(attempts))+" attempts: "+err.Error(), 0, time.Now(), attempts)
-		_ = w.repo.MarkWebhookSucceeded(ctx, f.ID)
+		telemetry.IncWebhookDeadLetter(ctx, failure.URL)
+		message := "dead-lettered after " + fmtInt(int64(attempts)) + " attempts: " + lastErr
+		if err := w.repo.MarkWebhookDeadLettered(
+			ctx, failure.ID, message, lastStatus, attempts,
+		); err != nil {
+			w.logger.Warn("mark webhook dead-lettered", "id", failure.ID, "err", err)
+		}
 		return
 	}
 	backoff := time.Duration(30) * time.Second
@@ -238,7 +247,11 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 		backoff *= 2
 	}
 	backoff = jitter(backoff)
-	_ = w.repo.UpdateWebhookFailure(ctx, f.ID, err.Error(), 0, time.Now().Add(backoff), attempts)
+	if err := w.repo.UpdateWebhookFailure(
+		ctx, failure.ID, lastErr, lastStatus, time.Now().Add(backoff), attempts,
+	); err != nil {
+		w.logger.Warn("update webhook retry", "id", failure.ID, "err", err)
+	}
 }
 
 func fmtInt(n int64) string {

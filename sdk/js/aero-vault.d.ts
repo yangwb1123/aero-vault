@@ -205,6 +205,37 @@ export interface CreateMultipartOptions {
   contentType?: string;
 }
 
+export interface ShareOptions {
+  bucket?: string;
+  name?: string;
+  password?: string;
+  allowPreview?: boolean;
+  allowDownload?: boolean;
+  maxUses?: number;
+  ttlSeconds?: number;
+}
+
+export interface PublishAssetOptions {
+  bucket?: string;
+  cacheControl?: string;
+}
+
+export interface ResourceACLInput {
+  bucket?: string;
+  key?: string;
+  resource_kind: "bucket" | "folder" | "object";
+  principal_type: "user" | "department" | "group" | "role" | "authenticated" | "everyone";
+  principal_id?: string;
+  actions: string[];
+  effect: "allow" | "deny";
+  inherit?: boolean;
+}
+
+export interface ResourceACLQuery {
+  bucket?: string;
+  resourceKind?: "object" | "folder" | "bucket";
+}
+
 /**
  * Raised when the server returns a non-2xx response.
  * Carries the platform error envelope fields when present.
@@ -275,6 +306,24 @@ export declare class Client {
   // ---- ops ----
   usage(): Promise<Usage>;
   health(): Promise<boolean>;
+
+  // ---- enterprise access / sharing / publishing ----
+  createShare(key: string, opts?: ShareOptions): Promise<Record<string, any>>;
+  listShares(key: string, bucket?: string): Promise<any[]>;
+  revokeShare(id: string): Promise<void>;
+  publishAsset(key: string, slug: string, opts?: PublishAssetOptions): Promise<Record<string, any>>;
+  unpublishAsset(slug: string): Promise<void>;
+  listAssets(): Promise<any[]>;
+  putResourceACL(input: ResourceACLInput): Promise<Record<string, any>>;
+  listResourceACL(key?: string, opts?: ResourceACLQuery): Promise<any[]>;
+  deleteResourceACL(id: string): Promise<void>;
+  createDepartment(name: string, parentId?: string): Promise<Record<string, any>>;
+  listDepartments(): Promise<any[]>;
+  getDepartment(id: string): Promise<Record<string, any>>;
+  deleteDepartment(id: string): Promise<void>;
+  putDepartmentMember(departmentId: string, subjectId: string, role?: "member" | "manager"): Promise<void>;
+  deleteDepartmentMember(departmentId: string, subjectId: string): Promise<void>;
+  exportArchive(opts?: { bucket?: string; prefix?: string }): Promise<Uint8Array>;
 }
 
 /** Percent-encode a key's path segments while preserving `/` separators. */

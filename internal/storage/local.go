@@ -82,8 +82,25 @@ func NewLocal(cfg LocalConfig) (*LocalStorage, error) {
 
 func (s *LocalStorage) Backend() string { return "local" }
 
+func (s *LocalStorage) SupportsServerSideEncryption(algorithm, keyID string) bool {
+	if s.enc == nil {
+		return false
+	}
+	switch algorithm {
+	case "AES256":
+		return keyID == "" && s.enc.provider != nil
+	case "aws:kms":
+		if s.enc.wrapper == nil {
+			return false
+		}
+		return keyID == "" || s.cfg.SSEKMSKeyID == "" || keyID == s.cfg.SSEKMSKeyID
+	default:
+		return false
+	}
+}
+
 func (s *LocalStorage) objectPath(key string) (string, error) {
-	if key == "" || strings.HasPrefix(key, "/") || strings.Contains(key, "..") {
+	if err := validateObjectKey(key); err != nil {
 		return "", ErrInvalidKey
 	}
 	clean := filepath.Clean(filepath.FromSlash(key))

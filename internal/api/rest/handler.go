@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -21,9 +21,24 @@ import (
 
 // Handler binds REST routes to the FileService.
 type Handler struct {
-	svc          *service.FileService
-	logger       *slog.Logger
-	corsProvider mw.BucketCORSProvider
+	svc           *service.FileService
+	logger        *slog.Logger
+	corsProvider  mw.BucketCORSProvider
+	putPresigner  *auth.PutPresigner
+	access        *access.Manager
+	publicBaseURL string
+}
+
+func (h *Handler) WithAccessManager(manager *access.Manager, publicBaseURL string) *Handler {
+	h.access = manager
+	h.publicBaseURL = strings.TrimRight(publicBaseURL, "/")
+	return h
+}
+
+// WithPutPresigner routes presigned transfers back through REST/FileService.
+func (h *Handler) WithPutPresigner(p *auth.PutPresigner) *Handler {
+	h.putPresigner = p
+	return h
 }
 
 func NewHandler(svc *service.FileService, logger *slog.Logger) *Handler {
@@ -49,13 +64,19 @@ func keyFromPath(r *http.Request) string {
 // action is not allowed. Returns true when the request may proceed.
 func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, action string) bool {
 	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket)
-	if err != nil || cfg.Policy == "" {
+	if err != nil {
+		h.logger.Warn("bucket policy lookup failed; denying request", "bucket", service.DefaultBucket, "err", err)
+		h.writeError(w, r, service.ErrForbidden)
+		return false
+	}
+	if cfg.Policy == "" {
 		return true
 	}
 	p, perr := auth.ParsePolicy(cfg.Policy)
-	if perr != nil {
-		h.logger.Warn("bucket policy parse error, skipping enforcement", "bucket", service.DefaultBucket, "err", perr)
-		return true
+	if perr != nil || p == nil {
+		h.logger.Warn("bucket policy parse failed; denying request", "bucket", service.DefaultBucket, "err", perr)
+		h.writeError(w, r, service.ErrForbidden)
+		return false
 	}
 	host, _, splitErr := net.SplitHostPort(r.RemoteAddr)
 	if splitErr != nil {
@@ -85,12 +106,13 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	size := r.ContentLength
 	ct := r.Header.Get("Content-Type")
 	meta := extractMetadataHeaders(r.Header)
-	meta = addContentHeaders(meta, r.Header)
 	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, r.Body, size, service.PutOptions{
-		ContentType:  ct,
-		Metadata:     meta,
-		ContentMD5:   r.Header.Get("Content-MD5"),
-		StorageClass: r.Header.Get("x-amz-storage-class"),
+		ContentType:        ct,
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		Metadata:           meta,
+		ContentMD5:         r.Header.Get("Content-MD5"),
+		StorageClass:       r.Header.Get("x-amz-storage-class"),
 	})
 	if err != nil {
 		h.writeError(w, r, err)
@@ -131,10 +153,12 @@ func (h *Handler) PostForm(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, file, header.Size, service.PutOptions{
-		ContentType:  ct,
-		Metadata:     addContentHeaders(metadata, r.Header),
-		ContentMD5:   r.Header.Get("Content-MD5"),
-		StorageClass: r.Header.Get("x-amz-storage-class"),
+		ContentType:        ct,
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		Metadata:           metadata,
+		ContentMD5:         r.Header.Get("Content-MD5"),
+		StorageClass:       r.Header.Get("x-amz-storage-class"),
 	})
 	if err != nil {
 		h.writeError(w, r, err)
@@ -185,6 +209,10 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	obj, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key)
 	if err != nil {
 		h.writeError(w, r, err)
+		return
+	}
+	if readPreconditionFailed(r, obj) {
+		h.writeError(w, r, service.ErrPreconditionFailed)
 		return
 	}
 	if notModified(r, obj) {
@@ -248,41 +276,6 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// ── Presign & Multipart ────────────────────────────────────────────────────────
-
-// POST /v1/files/*key/presign?op=get|put&expires=<seconds>
-func (h *Handler) Presign(w http.ResponseWriter, r *http.Request) {
-	key := keyFromPath(r)
-	key = strings.TrimSuffix(key, "/presign")
-	op := r.URL.Query().Get("op")
-	if op == "" {
-		op = "get"
-	}
-	secs, _ := strconv.Atoi(r.URL.Query().Get("expires"))
-	if secs <= 0 {
-		secs = 300
-	}
-	expiry := time.Duration(secs) * time.Second
-	var (
-		url string
-		err error
-	)
-	switch op {
-	case "get":
-		url, err = h.svc.PresignGet(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, expiry)
-	case "put":
-		url, err = h.svc.PresignPut(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, expiry)
-	default:
-		h.writeError(w, r, fmt.Errorf("%w: op must be get|put", service.ErrInvalidArgs))
-		return
-	}
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, presignResponse{URL: url, Expires: time.Now().Add(expiry)})
-}
-
 // POST /v1/multipart
 func (h *Handler) InitMultipart(w http.ResponseWriter, r *http.Request) {
 	var req initMultipartRequest
@@ -309,7 +302,11 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, fmt.Errorf("%w: part number must be a positive integer", service.ErrInvalidArgs))
 		return
 	}
-	rec, err := h.svc.UploadPart(r.Context(), uploadID, int32(n), r.Body, r.ContentLength)
+	rec, err := h.svc.UploadPartFor(
+		r.Context(),
+		service.MultipartScope{TenantID: mw.TenantFrom(r.Context())},
+		uploadID, int32(n), r.Body, r.ContentLength, service.ReadOptions{},
+	)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -320,7 +317,11 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 // POST /v1/multipart/{uploadID}/complete
 func (h *Handler) CompleteMultipart(w http.ResponseWriter, r *http.Request) {
 	uploadID := chi.URLParam(r, "uploadID")
-	obj, err := h.svc.CompleteMultipart(r.Context(), uploadID)
+	obj, err := h.svc.CompleteMultipartFor(
+		r.Context(),
+		service.MultipartScope{TenantID: mw.TenantFrom(r.Context())},
+		uploadID, service.ReadOptions{},
+	)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -331,7 +332,11 @@ func (h *Handler) CompleteMultipart(w http.ResponseWriter, r *http.Request) {
 // DELETE /v1/multipart/{uploadID}
 func (h *Handler) AbortMultipart(w http.ResponseWriter, r *http.Request) {
 	uploadID := chi.URLParam(r, "uploadID")
-	if err := h.svc.AbortMultipart(r.Context(), uploadID); err != nil {
+	if err := h.svc.AbortMultipartFor(
+		r.Context(),
+		service.MultipartScope{TenantID: mw.TenantFrom(r.Context())},
+		uploadID,
+	); err != nil {
 		h.writeError(w, r, err)
 		return
 	}

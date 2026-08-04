@@ -250,6 +250,29 @@ func TestBatchDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteBucketRequiresEmptyBucket(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL
+	resp, _ := do(t, "PUT", base+"/bucket-delete", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create bucket status = %d", resp.StatusCode)
+	}
+	do(t, "PUT", base+"/bucket-delete/object.txt", []byte("x"), nil)
+	resp, body := do(t, "DELETE", base+"/bucket-delete", nil, nil)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "BucketNotEmpty") {
+		t.Fatalf("non-empty bucket delete status=%d body=%s", resp.StatusCode, body)
+	}
+	do(t, "DELETE", base+"/bucket-delete/object.txt", nil, nil)
+	resp, body = do(t, "DELETE", base+"/bucket-delete", nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("empty bucket delete status=%d body=%s", resp.StatusCode, body)
+	}
+	resp, body = do(t, "DELETE", base+"/bucket-delete", nil, nil)
+	if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(body), "NoSuchBucket") {
+		t.Fatalf("missing bucket delete status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
 func TestObjectACL(t *testing.T) {
 	s := newTestServer(t)
 	base := s.URL
@@ -286,6 +309,17 @@ func TestObjectACL(t *testing.T) {
 		if g.Grantee.URI == allUsersURI {
 			t.Fatalf("expected no public grant after private, got %+v", p2.Grants)
 		}
+	}
+
+	// AccessControlPolicy XML bodies are accepted without a canned header.
+	policyBody, _ := xml.Marshal(cannedToPolicy("public-read"))
+	resp, body = do(t, "PUT", base+"/b/pub.txt?acl", policyBody, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put XML acl status=%d body=%s", resp.StatusCode, body)
+	}
+	_, body = do(t, "GET", base+"/b/pub.txt?acl", nil, nil)
+	if !strings.Contains(string(body), allUsersURI) {
+		t.Fatalf("XML ACL was not persisted: %s", body)
 	}
 }
 
@@ -342,6 +376,55 @@ func TestS3ContentMD5RoundTrip(t *testing.T) {
 	// System _aero_ prefix should not leak into x-amz-meta-* headers.
 	if v := resp.Header.Get("x-amz-meta-_aero-content-md5"); v != "" {
 		t.Errorf("system metadata should not be leaked: x-amz-meta-_aero-content-md5=%q", v)
+	}
+}
+
+func TestS3ContentMD5MismatchReturnsBadDigest(t *testing.T) {
+	s := newTestServer(t)
+	resp, body := do(
+		t, http.MethodPut, s.URL+"/bucket/bad-md5.txt", []byte("content"),
+		map[string]string{"Content-MD5": "AAAAAAAAAAAAAAAAAAAAAA=="},
+	)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT status=%d, want 400; body=%s", resp.StatusCode, body)
+	}
+	var got s3Error
+	if err := xml.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Code != "BadDigest" {
+		t.Fatalf("error code=%q, want BadDigest", got.Code)
+	}
+}
+
+func TestS3ObjectMetaHidesInternalFields(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeS3ObjectMeta(w, map[string]string{
+		"author":       "Ada",
+		"_aero_owner":  "subject-1",
+		"_AeRo_secret": "hidden",
+	})
+
+	if got := w.Header().Get("x-amz-meta-author"); got != "Ada" {
+		t.Fatalf("x-amz-meta-author = %q, want Ada", got)
+	}
+	for _, key := range []string{"x-amz-meta-_aero_owner", "x-amz-meta-_AeRo_secret"} {
+		if got := w.Header().Get(key); got != "" {
+			t.Errorf("internal metadata leaked through %s: %q", key, got)
+		}
+	}
+}
+
+func TestS3MetadataLimitErrorsAreInvalidArguments(t *testing.T) {
+	for _, err := range []error{
+		service.ErrMetadataTooLarge,
+		service.ErrMetadataKeyTooLong,
+		service.ErrMetadataValueTooLong,
+	} {
+		code, _, status := classify(err)
+		if status != http.StatusBadRequest || code != "InvalidArgument" {
+			t.Fatalf("classify(%v)=(%q,%d), want InvalidArgument,400", err, code, status)
+		}
 	}
 }
 
@@ -669,7 +752,8 @@ func TestListObjectVersionsPagination(t *testing.T) {
 	}
 	do(t, "PUT", base+"/b/a.txt", []byte("x2"), nil) // a.txt now has 2 versions
 
-	// First page of 2 keys → truncated with a NextKeyMarker.
+	// max-keys bounds the combined number of versions and delete markers, not
+	// the number of distinct object keys.
 	resp, body := do(t, "GET", base+"/b?versions&max-keys=2", nil, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("versions page1 status=%d body=%s", resp.StatusCode, body)
@@ -678,12 +762,12 @@ func TestListObjectVersionsPagination(t *testing.T) {
 	if err := xml.Unmarshal(body, &p1); err != nil {
 		t.Fatalf("parse page1: %v body=%s", err, body)
 	}
-	if !p1.IsTruncated || p1.NextKeyMarker == "" {
-		t.Fatalf("expected truncated page1 with NextKeyMarker, got truncated=%v marker=%q body=%s", p1.IsTruncated, p1.NextKeyMarker, body)
+	if !p1.IsTruncated || p1.NextKeyMarker == "" || p1.NextVersionIdMarker == "" {
+		t.Fatalf("expected version continuation on page1, got truncated=%v key=%q version=%q body=%s",
+			p1.IsTruncated, p1.NextKeyMarker, p1.NextVersionIdMarker, body)
 	}
-	// Page 1 = keys a.txt (2 versions) + b.txt (1 version) = 3 version rows.
-	if len(p1.Versions) != 3 {
-		t.Fatalf("expected 3 version rows on page1 (a.txt x2 + b.txt), got %d: %s", len(p1.Versions), body)
+	if len(p1.Versions)+len(p1.DeleteMarkers) != 2 {
+		t.Fatalf("page1 entries=%d, want max-keys=2: %s", len(p1.Versions)+len(p1.DeleteMarkers), body)
 	}
 	aLatest := 0
 	for _, v := range p1.Versions {
@@ -695,12 +779,19 @@ func TestListObjectVersionsPagination(t *testing.T) {
 		t.Fatalf("expected exactly one IsLatest among a.txt's versions, got %d: %s", aLatest, body)
 	}
 
-	// Second page via key-marker → remaining key, not truncated.
-	resp, body = do(t, "GET", base+"/b?versions&max-keys=2&key-marker="+p1.NextKeyMarker, nil, nil)
+	// Resume with both markers. The final page contains b.txt and c.txt and
+	// must not repeat either a.txt version.
+	resp, body = do(t, "GET", base+"/b?versions&max-keys=2&key-marker="+
+		p1.NextKeyMarker+"&version-id-marker="+p1.NextVersionIdMarker, nil, nil)
 	var p2 listVersionsResult
 	_ = xml.Unmarshal(body, &p2)
-	if resp.StatusCode != 200 || p2.IsTruncated || len(p2.Versions) != 1 {
-		t.Fatalf("expected final page with 1 version, got status=%d truncated=%v n=%d body=%s", resp.StatusCode, p2.IsTruncated, len(p2.Versions), body)
+	if resp.StatusCode != 200 || p2.IsTruncated || len(p2.Versions) != 2 {
+		t.Fatalf("expected final page with 2 versions, got status=%d truncated=%v n=%d body=%s", resp.StatusCode, p2.IsTruncated, len(p2.Versions), body)
+	}
+	for _, version := range p2.Versions {
+		if version.Key == "a.txt" {
+			t.Fatalf("continued page repeated completed key a.txt: %s", body)
+		}
 	}
 }
 

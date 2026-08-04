@@ -44,7 +44,9 @@ func (s *sqlStore) SetBucketCORS(ctx context.Context, tenant, bucket string, rul
 
 func (s *sqlStore) DeleteBucketCORS(ctx context.Context, tenant, bucket string) error {
 	tenant = defaultTenant(tenant)
-	_, err := s.db.ExecContext(ctx, s.rebind(`UPDATE buckets SET cors_rules='' WHERE tenant_id=$1 AND name=$2`), tenant, bucket)
+	_, err := s.db.ExecContext(ctx, s.rebind(
+		`UPDATE buckets SET cors_rules=$1 WHERE tenant_id=$2 AND name=$3`,
+	), "[]", tenant, bucket)
 	return err
 }
 

@@ -157,7 +157,9 @@ func (c *Chat) AnswerStream(ctx context.Context, req ChatReq, onChunk func(strin
 	if c.llm == nil {
 		return ChatResp{}, fmt.Errorf("chat disabled: no LLM configured")
 	}
-	req.Caller = "rest:chat-stream"
+	if req.Caller == "" {
+		req.Caller = "rest:chat-stream"
+	}
 	messages, hits, err := c.buildChatPrompt(ctx, req)
 	if err != nil {
 		return ChatResp{}, err
@@ -198,7 +200,9 @@ func (c *Chat) Answer(ctx context.Context, req ChatReq) (ChatResp, error) {
 	if c.llm == nil {
 		return ChatResp{}, fmt.Errorf("chat disabled: no LLM configured")
 	}
-	req.Caller = "rest:chat"
+	if req.Caller == "" {
+		req.Caller = "rest:chat"
+	}
 	messages, hits, err := c.buildChatPrompt(ctx, req)
 	if err != nil {
 		return ChatResp{}, err

@@ -2,6 +2,7 @@ package rest
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 )
 
@@ -11,11 +12,19 @@ type apiRoute struct {
 	Path        string
 	Summary     string
 	Tag         string
+	Query       []apiQueryParameter
 	Body        string // example JSON body for request, or "" for no body
 	Status      int    // success HTTP status
 	Response    string // example JSON response, or "" for empty
 	Response200 string // example 200 response when Status != 200
 	AdminOnly   bool
+	Public      bool
+}
+
+type apiQueryParameter struct {
+	Name        string
+	Description string
+	Type        string
 }
 
 // specBuilder constructs the full OpenAPI 3.1.0 document from a route table.
@@ -74,9 +83,13 @@ func (s *specBuilder) build() map[string]any {
 		op := map[string]any{
 			"summary":    r.Summary,
 			"tags":       []string{r.Tag},
-			"security":   []map[string]any{{"bearer": []string{}, "apiKey": []string{}}},
 			"parameters": s.parameters(r),
 			"responses":  s.responses(r, sch),
+		}
+		if r.Public {
+			op["security"] = []map[string]any{}
+		} else {
+			op["security"] = []map[string]any{{"bearer": []string{}, "apiKey": []string{}}}
 		}
 		if r.Body != "" {
 			op["requestBody"] = map[string]any{
@@ -113,6 +126,11 @@ func (s *specBuilder) build() map[string]any {
 			{"name": "admin", "description": "Operator surfaces (admin scope)"},
 			{"name": "legal-hold", "description": "Compliance holds"},
 			{"name": "multipart", "description": "Multipart uploads"},
+			{"name": "auth", "description": "OIDC browser login"},
+			{"name": "access", "description": "Resource and department authorization"},
+			{"name": "sharing", "description": "Revocable capability links"},
+			{"name": "assets", "description": "Stable public image publishing"},
+			{"name": "backup", "description": "Portable authorized exports"},
 		},
 		"components": map[string]any{
 			"securitySchemes": map[string]any{
@@ -129,7 +147,7 @@ func (s *specBuilder) build() map[string]any {
 					"schema": map[string]any{"type": "string"},
 				},
 				"key": map[string]any{
-					"name": "key", "in": "path",
+					"name": "key", "in": "path", "required": true,
 					"schema": map[string]any{"type": "string"},
 				},
 			},
@@ -140,8 +158,53 @@ func (s *specBuilder) build() map[string]any {
 }
 
 func (s *specBuilder) parameters(r apiRoute) []map[string]any {
-	return []map[string]any{
-		{"$ref": "#/components/parameters/tenant"},
+	var params []map[string]any
+	if !r.Public {
+		params = append(params, map[string]any{"$ref": "#/components/parameters/tenant"})
+	}
+	for _, name := range pathParameterNames(r.Path) {
+		ref := "#/components/parameters/" + name
+		if name == "bucket" || name == "key" {
+			params = append(params, map[string]any{"$ref": ref})
+			continue
+		}
+		schemaType := "string"
+		if name == "n" {
+			schemaType = "integer"
+		}
+		params = append(params, map[string]any{
+			"name": name, "in": "path", "required": true,
+			"schema": map[string]any{"type": schemaType},
+		})
+	}
+	for _, query := range r.Query {
+		schemaType := query.Type
+		if schemaType == "" {
+			schemaType = "string"
+		}
+		params = append(params, map[string]any{
+			"name": query.Name, "in": "query",
+			"description": query.Description,
+			"schema":      map[string]any{"type": schemaType},
+		})
+	}
+	return params
+}
+
+func pathParameterNames(path string) []string {
+	var names []string
+	for {
+		start := strings.IndexByte(path, '{')
+		if start < 0 {
+			return names
+		}
+		path = path[start+1:]
+		end := strings.IndexByte(path, '}')
+		if end < 0 {
+			return names
+		}
+		names = append(names, path[:end])
+		path = path[end+1:]
 	}
 }
 

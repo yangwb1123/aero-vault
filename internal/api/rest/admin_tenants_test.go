@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -17,7 +18,7 @@ import (
 // newAdminTenantTest mounts the tenant admin routes with a disabled (no-auth)
 // registry, so requireAdmin passes through and we exercise the handlers
 // directly over HTTP.
-func newAdminTenantTest(t *testing.T) *httptest.Server {
+func newAdminTenantTest(t *testing.T) (*httptest.Server, repository.Repository) {
 	t.Helper()
 	dir := t.TempDir()
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "tenants.db"))
@@ -40,7 +41,7 @@ func newAdminTenantTest(t *testing.T) *httptest.Server {
 	r.Put("/v1/admin/tenants/{tenant}/status", adm.SetTenantStatus)
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
-	return srv
+	return srv, repo
 }
 
 // TestAdminSetBudget exercises the per-tenant AI budget endpoint end-to-end:
@@ -80,7 +81,7 @@ func TestAdminSetBudget(t *testing.T) {
 }
 
 func TestAdminTenantCRUD(t *testing.T) {
-	s := newAdminTenantTest(t)
+	s, repo := newAdminTenantTest(t)
 	base := s.URL + "/v1/admin/tenants"
 
 	// Create.
@@ -139,7 +140,22 @@ func TestAdminTenantCRUD(t *testing.T) {
 		t.Fatalf("status unknown: status=%d want 404", resp.StatusCode)
 	}
 
-	// Delete → 204.
+	// A tenant with data must be cleaned through FileService first.
+	if _, err := repo.UpsertObject(context.Background(), repository.Object{
+		TenantID: "acme", Bucket: "default", Key: "report.txt",
+		StorageKey: "acme/default/report.txt", Size: 1, ETag: "etag",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp, body = req(t, "DELETE", base+"/acme", nil, nil)
+	if resp.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte(`"code":"TenantNotEmpty"`)) {
+		t.Fatalf("delete non-empty: status=%d body=%s", resp.StatusCode, body)
+	}
+	if err := repo.HardDeleteObject(context.Background(), "acme", "default", "report.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete → 204 once data resources are gone.
 	if resp, _ := req(t, "DELETE", base+"/acme", nil, nil); resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete: status=%d want 204", resp.StatusCode)
 	}

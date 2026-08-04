@@ -2,6 +2,7 @@ package aerovault
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -41,8 +42,12 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, opts Uploa
 func guessContentType(key string) string {
 	ext := strings.ToLower(filepath.Ext(key))
 	switch ext {
-	case ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log":
+	case ".txt", ".md", ".csv", ".yaml", ".yml", ".log":
 		return "text/plain"
+	case ".json":
+		return "application/json"
+	case ".xml":
+		return "application/xml"
 	case ".html", ".htm":
 		return "text/html"
 	case ".jpg", ".jpeg":
@@ -92,13 +97,17 @@ func (c *Client) GetRange(ctx context.Context, key string, offset, length int64)
 	if err != nil {
 		return nil, nil, err
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	rangeValue := fmt.Sprintf("bytes=%d-", offset)
+	if length > 0 {
+		rangeValue = fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	}
+	req.Header.Set("Range", rangeValue)
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, nil, err
 	}
 	obj := objectFromHeaders(key, resp)
-	if resp.StatusCode == http.StatusPartialContent {
+	if resp.StatusCode == http.StatusPartialContent && length > 0 {
 		obj.Size = length
 	}
 	return resp.Body, obj, nil
@@ -127,7 +136,9 @@ func objectFromHeaders(key string, resp *http.Response) *Object {
 		obj.ETag = v[1 : len(v)-1]
 	}
 	if v := resp.Header.Get("Last-Modified"); v != "" {
-		// Use UpdatedAt for last-modified semantics
+		if parsed, err := http.ParseTime(v); err == nil {
+			obj.UpdatedAt = parsed
+		}
 	}
 	obj.Metadata = map[string]string{}
 	for k, v := range resp.Header {
@@ -158,7 +169,7 @@ func (c *Client) Exists(ctx context.Context, key string) (bool, error) {
 	obj, err := c.Stat(ctx, key)
 	if err != nil {
 		var e *Error
-		if AsError(err, &e) && e.Code == "NotFound" {
+		if AsError(err, &e) && (e.Status == http.StatusNotFound || e.Code == "NotFound") {
 			return false, nil
 		}
 		return false, err
@@ -245,7 +256,11 @@ func (c *Client) doObject(req *http.Request) (*Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	var obj Object
+	if err := json.NewDecoder(resp.Body).Decode(&obj); err == nil {
+		return &obj, nil
+	}
 	// Extract the object key from the URL path (/v1/files/<key>).
 	path := strings.TrimPrefix(req.URL.Path, "/v1/files/")
 	return objectFromHeaders(path, resp), nil

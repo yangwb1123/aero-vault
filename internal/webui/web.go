@@ -12,6 +12,12 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
+// Favicon serves the public browser icon from the embedded UI assets.
+func Favicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	http.ServeFileFS(w, r, staticFS, "static/favicon.svg")
+}
+
 // Handler returns an http.Handler that serves the static UI under /ui/* and
 // redirects /ui → /ui/.
 func Handler() http.Handler {

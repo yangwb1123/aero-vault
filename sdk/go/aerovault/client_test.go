@@ -981,6 +981,102 @@ func TestErrorString(t *testing.T) {
 	}
 }
 
+func TestEnterpriseSharePublishAndExport(t *testing.T) {
+	c, rec := newStub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/shares":
+			writeJSON(w, http.StatusCreated, map[string]any{
+				"share": map[string]any{"id": "share-1", "key": "blog/hero.jpg"},
+				"token": "raw-token", "url": "https://source.example/share/raw-token",
+			})
+		case "/v1/assets":
+			writeJSON(w, http.StatusCreated, map[string]any{
+				"asset": map[string]any{"id": "asset-1", "key": "blog/hero.jpg", "slug": "blog/hero.jpg"},
+				"url":   "https://source.example/public/assets/blog/hero.jpg",
+			})
+		case "/v1/exports/archive":
+			_, _ = io.WriteString(w, "archive")
+		}
+	})
+	share, err := c.CreateShare(context.Background(), ShareRequest{
+		Key: "blog/hero.jpg", AllowPreview: true, TTLSeconds: 60,
+	})
+	if err != nil || share.Token != "raw-token" {
+		t.Fatalf("CreateShare=%+v err=%v", share, err)
+	}
+	if rec.method != http.MethodPost || rec.path != "/v1/shares" {
+		t.Fatalf("share request=%s %s", rec.method, rec.path)
+	}
+	published, err := c.PublishAsset(context.Background(), PublishAssetRequest{
+		Key: "blog/hero.jpg", Slug: "blog/hero.jpg",
+	})
+	if err != nil || published.Asset.ID != "asset-1" {
+		t.Fatalf("PublishAsset=%+v err=%v", published, err)
+	}
+	archive, err := c.ExportArchive(context.Background(), "default", "blog/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := io.ReadAll(archive)
+	_ = archive.Close()
+	if err != nil || string(payload) != "archive" {
+		t.Fatalf("archive=%q err=%v", payload, err)
+	}
+	query := parseQuery(rec.rawQ)
+	if query["bucket"] != "default" || query["prefix"] != "blog/" {
+		t.Fatalf("export query=%v", query)
+	}
+}
+
+func TestEnterpriseLifecycleManagement(t *testing.T) {
+	c, rec := newStub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/assets":
+			writeJSON(w, http.StatusOK, map[string]any{"assets": []map[string]any{{"id": "asset-1"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/access/acl":
+			writeJSON(w, http.StatusOK, map[string]any{"entries": []map[string]any{{"id": "acl-1"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/departments":
+			writeJSON(w, http.StatusOK, map[string]any{"departments": []map[string]any{{"id": "dept-1"}}})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/admin/departments/"):
+			writeJSON(w, http.StatusOK, map[string]any{
+				"department": map[string]any{"id": "dept-1"}, "members": []any{},
+			})
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+	ctx := context.Background()
+	assets, err := c.ListAssets(ctx)
+	if err != nil || len(assets) != 1 || assets[0].ID != "asset-1" {
+		t.Fatalf("ListAssets=%+v err=%v", assets, err)
+	}
+	entries, err := c.ListResourceACL(ctx, "default", "team/", "folder")
+	if err != nil || len(entries) != 1 || entries[0].ID != "acl-1" {
+		t.Fatalf("ListResourceACL=%+v err=%v", entries, err)
+	}
+	if query := parseQuery(rec.rawQ); query["kind"] != "folder" || query["key"] != "team/" {
+		t.Fatalf("ACL query=%v", query)
+	}
+	if err := c.DeleteResourceACL(ctx, "acl/id"); err != nil || rec.escPath != "/v1/access/acl/acl%2Fid" {
+		t.Fatalf("DeleteResourceACL path=%q err=%v", rec.escPath, err)
+	}
+	departments, err := c.ListDepartments(ctx)
+	if err != nil || len(departments) != 1 || departments[0].ID != "dept-1" {
+		t.Fatalf("ListDepartments=%+v err=%v", departments, err)
+	}
+	details, err := c.GetDepartment(ctx, "dept/id")
+	if err != nil || details.Department.ID != "dept-1" || rec.escPath != "/v1/admin/departments/dept%2Fid" {
+		t.Fatalf("GetDepartment=%+v path=%q err=%v", details, rec.escPath, err)
+	}
+	if err := c.DeleteDepartment(ctx, "dept/id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteDepartmentMember(ctx, "dept/id", "user one"); err != nil ||
+		rec.escPath != "/v1/admin/departments/dept%2Fid/members/user%20one" {
+		t.Fatalf("DeleteDepartmentMember path=%q err=%v", rec.escPath, err)
+	}
+}
+
 // ---- helpers --------------------------------------------------------------
 
 func errEnvelope(code, message, reqID string) map[string]any {

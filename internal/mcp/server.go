@@ -45,7 +45,7 @@ func (s *Server) WithChat(c *ai.Chat) *Server {
 // tenantFor returns the request-scoped tenant from ctx if present (set by the
 // HTTP middleware), falling back to the server's default tenant (stdio mode).
 func (s *Server) tenantFor(ctx context.Context) string {
-	if t := mw.TenantFrom(ctx); t != "" && t != "default" {
+	if t, ok := mw.TenantFromContext(ctx); ok {
 		return t
 	}
 	return s.tenant
@@ -246,7 +246,7 @@ func (s *Server) toolReadFile(ctx context.Context, args map[string]any) (any, *r
 		return errResult(err), nil
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(io.LimitReader(rc, 4<<20))
+	body, err := readTextObject(rc)
 	if err != nil {
 		return errResult(err), nil
 	}
@@ -291,8 +291,8 @@ func (s *Server) toolWriteFile(ctx context.Context, args map[string]any) (any, *
 	if key == "" {
 		return errResult(errors.New("key required")), nil
 	}
-	content := stringArg(args, "content", "")
-	if content == "" {
+	content, ok := args["content"].(string)
+	if !ok {
 		return errResult(errors.New("content required")), nil
 	}
 	ct := stringArg(args, "content_type", "text/plain")
@@ -377,13 +377,25 @@ func (s *Server) readResource(ctx context.Context, raw json.RawMessage) (any, *r
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(io.LimitReader(rc, 4<<20))
+	body, err := readTextObject(rc)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: "read object: " + err.Error()}
 	}
 	return readResourceResult{Contents: []resourceContent{{
 		URI: p.URI, MimeType: obj.ContentType, Text: string(body),
 	}}}, nil
+}
+
+func readTextObject(reader io.Reader) ([]byte, error) {
+	const maxTextBytes = 4 << 20
+	body, err := io.ReadAll(io.LimitReader(reader, maxTextBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxTextBytes {
+		return nil, errors.New("object exceeds 4 MiB MCP text limit")
+	}
+	return body, nil
 }
 
 func errResult(err error) toolResult {

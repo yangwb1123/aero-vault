@@ -202,6 +202,28 @@ func TestReapStuckJobs(t *testing.T) {
 	}
 }
 
+func TestReapStuckJobAtMaxAttemptsFailsPermanently(t *testing.T) {
+	repo := testRepo(t)
+	ctx := context.Background()
+	id, _, err := repo.EnqueueJob(ctx, repository.Job{Type: "crashes", MaxAttempts: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := repo.ClaimJob(ctx, "dead-worker"); err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	if n, err := repo.ReapStuckJobs(ctx, -time.Second); err != nil || n != 0 {
+		t.Fatalf("reap requeued=%d err=%v, want 0", n, err)
+	}
+	failed, err := repo.ListJobs(ctx, repository.JobFailed, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 1 || failed[0].ID != id || failed[0].LastError == "" {
+		t.Fatalf("exhausted stuck job was not failed: %+v", failed)
+	}
+}
+
 func TestJobStats(t *testing.T) {
 	repo := testRepo(t)
 	ctx := context.Background()

@@ -192,3 +192,26 @@ func TestMarkWebhookSucceeded(t *testing.T) {
 		t.Fatalf("expected 0 pending, got %d", len(pending))
 	}
 }
+
+func TestMarkWebhookDeadLettered(t *testing.T) {
+	repo, ctx := openWebhookRepo(t)
+	id := recordWebhook(t, repo, ctx, 1, "https://example.com/dead", time.Now().Add(-time.Minute))
+	if err := repo.MarkWebhookDeadLettered(ctx, id, "terminal", 503, 10); err != nil {
+		t.Fatalf("MarkWebhookDeadLettered: %v", err)
+	}
+	pending, err := repo.NextPendingFailures(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("dead-lettered row remained retryable: %+v", pending)
+	}
+	rows, err := repo.ListWebhookFailures(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].DeadLettered || rows[0].Succeeded ||
+		rows[0].Attempts != 10 || rows[0].LastStatus != 503 {
+		t.Fatalf("unexpected DLQ row: %+v", rows)
+	}
+}

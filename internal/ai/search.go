@@ -22,6 +22,11 @@ type Search struct {
 	lexical  LexicalIndex
 	results  *resultCache
 	logger   *slog.Logger
+	hitAuth  HitAuthorizer
+}
+
+type HitAuthorizer interface {
+	CanReadObject(context.Context, string, string, string) error
 }
 
 func NewSearch(repo repository.Repository, emb Embedder, logger *slog.Logger) *Search {
@@ -69,6 +74,13 @@ func (s *Search) WithBM25(b *BM25) *Search {
 // WithReranker installs a cross-encoder reranker (called after retrieval).
 func (s *Search) WithReranker(r Reranker) *Search {
 	s.rerank = r
+	return s
+}
+
+// WithHitAuthorizer filters every candidate before it reaches search, chat, or
+// agent callers. Result caching is bypassed because decisions are subject-specific.
+func (s *Search) WithHitAuthorizer(authorizer HitAuthorizer) *Search {
+	s.hitAuth = authorizer
 	return s
 }
 
@@ -168,7 +180,7 @@ func (s *Search) searchVector(ctx context.Context, req Request) ([]ranked, error
 	queryModel := s.embedder.Name()
 	var vecHits []ranked
 	for _, h := range hits {
-		if queryModel != "" && h.Chunk.EmbedModel != "" && h.Chunk.EmbedModel != queryModel {
+		if !matchesEmbedModel(queryModel, h.Chunk.EmbedModel) {
 			continue
 		}
 		vecHits = append(vecHits, ranked{chunkID: h.Chunk.ID, score: h.Score, chunk: h.Chunk})
@@ -178,30 +190,43 @@ func (s *Search) searchVector(ctx context.Context, req Request) ([]ranked, error
 
 func (s *Search) searchLexical(ctx context.Context, req Request) ([]ranked, error) {
 	var bm25Hits []ranked
+	queryModel := ""
+	if s.embedder != nil {
+		queryModel = s.embedder.Name()
+	}
 	if s.lexical != nil {
 		hits, err := s.lexical.SearchLexical(ctx, req.Tenant, req.Bucket, req.Query, req.K*2)
 		if err != nil {
 			return nil, fmt.Errorf("lexical search: %w", err)
 		}
 		for _, h := range hits {
+			if !matchesEmbedModel(queryModel, h.Chunk.EmbedModel) {
+				continue
+			}
 			bm25Hits = append(bm25Hits, ranked{chunkID: h.Chunk.ID, score: h.Score, chunk: h.Chunk})
 		}
 	} else {
-		raw := s.bm25.Search(req.Query, req.Bucket, req.K*2)
+		raw := s.bm25.Search(req.Tenant, req.Query, req.Bucket, req.K*2)
 		for _, h := range raw {
-			ch, _ := s.repo.GetObjectByID(ctx, h.Doc.objectID)
+			if !matchesEmbedModel(queryModel, h.Doc.embedModel) {
+				continue
+			}
 			bm25Hits = append(bm25Hits, ranked{
 				chunkID: h.ChunkID,
 				score:   float32(h.Score),
 				chunk: repository.Chunk{
 					ID: h.ChunkID, ObjectID: h.Doc.objectID, TenantID: h.Doc.tenant, Bucket: h.Doc.bucket,
-					ObjectKey: h.Doc.objectKey, Seq: h.Doc.seq, Content: h.Doc.content, EmbedModel: "bm25",
+					ObjectKey: h.Doc.objectKey, Seq: h.Doc.seq, Content: h.Doc.content,
+					EmbedModel: h.Doc.embedModel,
 				},
 			})
-			_ = ch
 		}
 	}
 	return bm25Hits, nil
+}
+
+func matchesEmbedModel(current, chunk string) bool {
+	return current == "" || chunk == current
 }
 
 func rrfMerge(vecHits, bm25Hits []ranked) []ranked {
@@ -314,9 +339,10 @@ func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
 	// Hot-result cache: identical normalized queries short-circuit the embed +
 	// retrieval + rerank work. Returns a copy so callers can't mutate the entry.
 	var cacheKey string
-	if s.results != nil {
+	if s.results != nil && s.hitAuth == nil {
 		cacheKey = resultCacheKey(req)
 		if hits, ok := s.results.get(cacheKey); ok {
+			s.recordUsage(ctx, req, hits)
 			return hits, nil
 		}
 	}
@@ -329,13 +355,40 @@ func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
 		return nil, err
 	}
 	out := hitsFromRanked(merged)
+	out, err = s.filterAuthorizedHits(ctx, req, out)
+	if err != nil {
+		return nil, err
+	}
 
 	out = s.applyRerankOrTrim(ctx, req.Query, out, req.K)
 
-	chunkIDs := make([]int64, 0, len(out))
+	s.recordUsage(ctx, req, out)
+	telemetry.RecordSearchLatency(ctx, mode, float64(time.Since(start).Milliseconds()))
+	if s.results != nil && s.hitAuth == nil {
+		s.results.put(cacheKey, out)
+	}
+	return out, nil
+}
+
+func (s *Search) filterAuthorizedHits(ctx context.Context, req Request, hits []Hit) ([]Hit, error) {
+	if s.hitAuth == nil {
+		return hits, nil
+	}
+	out := make([]Hit, 0, len(hits))
+	for _, hit := range hits {
+		if err := s.hitAuth.CanReadObject(ctx, req.Tenant, hit.Bucket, hit.ObjectKey); err != nil {
+			continue
+		}
+		out = append(out, hit)
+	}
+	return out, nil
+}
+
+func (s *Search) recordUsage(ctx context.Context, req Request, hits []Hit) {
+	chunkIDs := make([]int64, 0, len(hits))
 	objSeen := map[int64]struct{}{}
-	objIDs := make([]int64, 0, len(out))
-	for _, h := range out {
+	objIDs := make([]int64, 0, len(hits))
+	for _, h := range hits {
 		chunkIDs = append(chunkIDs, h.ChunkID)
 		if _, ok := objSeen[h.ObjectID]; !ok {
 			objSeen[h.ObjectID] = struct{}{}
@@ -349,9 +402,4 @@ func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
 	}); err != nil {
 		s.logger.Warn("audit usage failed", "err", err)
 	}
-	telemetry.RecordSearchLatency(ctx, mode, float64(time.Since(start).Milliseconds()))
-	if s.results != nil {
-		s.results.put(cacheKey, out)
-	}
-	return out, nil
 }

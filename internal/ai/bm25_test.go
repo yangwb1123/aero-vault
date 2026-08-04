@@ -9,18 +9,20 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
-// fakeChunkRepo serves a fixed set of chunks for BuildFromRepo. It embeds the
-// Repository interface so only the two methods BuildFromRepo exercises are
-// implemented; any other call panics (none are expected).
+// fakeChunkRepo serves a fixed set of chunks for BuildFromRepo and the BM25
+// Search service tests.
 type fakeChunkRepo struct {
 	repository.Repository
 	chunks []repository.Chunk
 }
 
-func (f *fakeChunkRepo) ListBuckets(_ context.Context, _ string) ([]string, error) {
+func (f *fakeChunkRepo) ListBuckets(_ context.Context, tenant string) ([]string, error) {
 	seen := map[string]bool{}
 	var buckets []string
 	for _, c := range f.chunks {
+		if c.TenantID != tenant {
+			continue
+		}
 		if !seen[c.Bucket] {
 			seen[c.Bucket] = true
 			buckets = append(buckets, c.Bucket)
@@ -32,11 +34,11 @@ func (f *fakeChunkRepo) ListBuckets(_ context.Context, _ string) ([]string, erro
 	return buckets, nil
 }
 
-func (f *fakeChunkRepo) ListObjects(_ context.Context, _, bucket, _, _ string, _ int) (repository.ListPage, error) {
+func (f *fakeChunkRepo) ListObjects(_ context.Context, tenant, bucket, _, _ string, _ int) (repository.ListPage, error) {
 	seen := map[int64]bool{}
 	var objs []repository.Object
 	for _, c := range f.chunks {
-		if c.Bucket != bucket {
+		if c.TenantID != tenant || c.Bucket != bucket {
 			continue
 		}
 		if !seen[c.ObjectID] {
@@ -57,11 +59,23 @@ func (f *fakeChunkRepo) ListChunksForObject(_ context.Context, objectID int64) (
 	return out, nil
 }
 
+func (f *fakeChunkRepo) GetObjectByID(_ context.Context, _ int64) (repository.Object, error) {
+	return repository.Object{}, repository.ErrNotFound
+}
+
+func (f *fakeChunkRepo) RecordUsage(_ context.Context, _ repository.Usage) error {
+	return nil
+}
+
 // chunk is a small helper to build a repository.Chunk for the in-memory BM25
 // index without a repository.
 func chunk(id, objID int64, bucket, content string, seq int) repository.Chunk {
+	return tenantChunk(testTenant, id, objID, bucket, content, seq)
+}
+
+func tenantChunk(tenant string, id, objID int64, bucket, content string, seq int) repository.Chunk {
 	return repository.Chunk{
-		ID: id, ObjectID: objID, TenantID: testTenant,
+		ID: id, ObjectID: objID, TenantID: tenant,
 		Bucket: bucket, ObjectKey: "obj.txt", Seq: seq, Content: content,
 	}
 }
@@ -107,15 +121,15 @@ func TestBM25UpsertMakesTermsSearchable(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	hits := b.Search("quokka", "", 10)
+	hits := b.Search(testTenant, "quokka", "", 10)
 	if len(hits) != 1 || hits[0].ChunkID != 10 {
 		t.Fatalf("expected chunk 10 for 'quokka', got %+v", hits)
 	}
 	// Correct bucket scoping.
-	if got := b.Search("quokka", "alpha", 10); len(got) != 1 {
+	if got := b.Search(testTenant, "quokka", "alpha", 10); len(got) != 1 {
 		t.Fatalf("bucket 'alpha' should match, got %d", len(got))
 	}
-	if got := b.Search("quokka", "beta", 10); len(got) != 0 {
+	if got := b.Search(testTenant, "quokka", "beta", 10); len(got) != 0 {
 		t.Fatalf("bucket 'beta' should not match, got %d", len(got))
 	}
 }
@@ -135,14 +149,14 @@ func TestBM25DeleteRemovesUniqueTermFromDF(t *testing.T) {
 		t.Fatalf("upsert B: %v", err)
 	}
 
-	if got := b.Search("zorptastic", "", 10); len(got) == 0 {
+	if got := b.Search(testTenant, "zorptastic", "", 10); len(got) == 0 {
 		t.Fatal("zorptastic should be searchable before delete")
 	}
 
 	if err := b.DeleteObjectChunks(ctx, 1); err != nil {
 		t.Fatalf("delete A: %v", err)
 	}
-	if got := b.Search("zorptastic", "", 10); len(got) != 0 {
+	if got := b.Search(testTenant, "zorptastic", "", 10); len(got) != 0 {
 		t.Fatalf("zorptastic must be gone after delete, got %d hits", len(got))
 	}
 	if _, ok := b.df["zorptastic"]; ok {
@@ -154,7 +168,7 @@ func TestBM25DeleteRemovesUniqueTermFromDF(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert C: %v", err)
 	}
-	if got := b.Search("shared", "", 10); len(got) != 2 {
+	if got := b.Search(testTenant, "shared", "", 10); len(got) != 2 {
 		t.Fatalf("'shared' should now match objects B and C, got %d", len(got))
 	}
 
@@ -173,7 +187,7 @@ func TestBM25ReUpsertReplacesContent(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert v1: %v", err)
 	}
-	if got := b.Search("penguin", "", 10); len(got) == 0 {
+	if got := b.Search(testTenant, "penguin", "", 10); len(got) == 0 {
 		t.Fatal("penguin should be searchable in v1")
 	}
 
@@ -187,10 +201,10 @@ func TestBM25ReUpsertReplacesContent(t *testing.T) {
 		}
 	}
 
-	if got := b.Search("penguin", "", 10); len(got) != 0 {
+	if got := b.Search(testTenant, "penguin", "", 10); len(got) != 0 {
 		t.Fatalf("obsolete 'penguin' must be gone after replace, got %d", len(got))
 	}
-	if got := b.Search("narwhal", "", 10); len(got) != 1 || got[0].ChunkID != 12 {
+	if got := b.Search(testTenant, "narwhal", "", 10); len(got) != 1 || got[0].ChunkID != 12 {
 		t.Fatalf("new 'narwhal' should be found as chunk 12, got %+v", got)
 	}
 	if b.totalDoc != 1 {
@@ -236,6 +250,81 @@ func TestBM25IncrementalMatchesFreshBuild(t *testing.T) {
 	assertSameState(t, b, buildReference(t, surviving))
 }
 
+func TestSearchBM25TenantIsolationSameBucket(t *testing.T) {
+	const (
+		tenantA = "tenant-a"
+		tenantB = "tenant-b"
+		bucket  = "shared"
+	)
+	b := NewBM25()
+	ctx := context.Background()
+	if err := b.UpsertObjectChunks(ctx, 101, []repository.Chunk{
+		tenantChunk(tenantA, 1001, 101, bucket, "confidential alpha", 0),
+	}); err != nil {
+		t.Fatalf("upsert tenant A: %v", err)
+	}
+	if err := b.UpsertObjectChunks(ctx, 202, []repository.Chunk{
+		tenantChunk(tenantB, 2002, 202, bucket, "confidential beta", 0),
+	}); err != nil {
+		t.Fatalf("upsert tenant B: %v", err)
+	}
+
+	search := NewSearch(&fakeChunkRepo{}, nil, nil).WithBM25(b)
+	hits, err := search.Query(ctx, Request{
+		Tenant: tenantA,
+		Bucket: bucket,
+		Query:  "confidential",
+		K:      10,
+		Mode:   "bm25",
+	})
+	if err != nil {
+		t.Fatalf("tenant A search: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ObjectID != 101 {
+		t.Fatalf("tenant A must see only its object, got %+v", hits)
+	}
+}
+
+func TestBM25BuildFromRepoPreservesOtherTenants(t *testing.T) {
+	const (
+		tenantA = "tenant-a"
+		tenantB = "tenant-b"
+		bucket  = "shared"
+	)
+	ctx := context.Background()
+	repo := &fakeChunkRepo{chunks: []repository.Chunk{
+		tenantChunk(tenantA, 10, 1, bucket, "alphaonly original", 0),
+		tenantChunk(tenantB, 20, 2, bucket, "betaonly original", 0),
+	}}
+	b := NewBM25()
+	if err := b.BuildFromRepo(ctx, repo, tenantA); err != nil {
+		t.Fatalf("warm tenant A: %v", err)
+	}
+	if err := b.BuildFromRepo(ctx, repo, tenantB); err != nil {
+		t.Fatalf("warm tenant B: %v", err)
+	}
+	if got := b.Search(tenantA, "alphaonly", bucket, 10); len(got) != 1 {
+		t.Fatalf("tenant A warm was overwritten, got %d hits", len(got))
+	}
+	if got := b.Search(tenantB, "betaonly", bucket, 10); len(got) != 1 {
+		t.Fatalf("tenant B warm missing, got %d hits", len(got))
+	}
+
+	repo.chunks = []repository.Chunk{
+		tenantChunk(tenantA, 11, 1, bucket, "alphaonly replaced", 0),
+		tenantChunk(tenantB, 20, 2, bucket, "betaonly original", 0),
+	}
+	if err := b.BuildFromRepo(ctx, repo, tenantA); err != nil {
+		t.Fatalf("rewarm tenant A: %v", err)
+	}
+	if got := b.Search(tenantA, "replaced", bucket, 10); len(got) != 1 || got[0].ChunkID != 11 {
+		t.Fatalf("tenant A was not replaced cleanly, got %+v", got)
+	}
+	if got := b.Search(tenantB, "betaonly", bucket, 10); len(got) != 1 {
+		t.Fatalf("rewarming tenant A removed tenant B, got %d hits", len(got))
+	}
+}
+
 func TestBM25ConcurrentSearchAndMutate(t *testing.T) {
 	b := NewBM25()
 	ctx := context.Background()
@@ -258,7 +347,7 @@ func TestBM25ConcurrentSearchAndMutate(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					_ = b.Search("concurrent content", "", 5)
+					_ = b.Search(testTenant, "concurrent content", "", 5)
 				}
 			}
 		}()

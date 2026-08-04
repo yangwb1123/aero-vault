@@ -2,6 +2,7 @@ package rest
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -26,6 +27,24 @@ func TestMetadataRoundTripsThroughGetHead(t *testing.T) {
 		}
 		if got := r.Header.Get("X-Meta-Shape"); got != "round" {
 			t.Fatalf("%s X-Meta-Shape = %q, want round (from x-amz-meta-)", m, got)
+		}
+	}
+}
+
+func TestMetadataHeadersHideInternalFields(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeMetadataHeaders(w, map[string]string{
+		"author":       "Ada",
+		"_aero_owner":  "subject-1",
+		"_AeRo_secret": "hidden",
+	})
+
+	if got := w.Header().Get("X-Meta-Author"); got != "Ada" {
+		t.Fatalf("X-Meta-Author = %q, want Ada", got)
+	}
+	for _, key := range []string{"X-Meta-_aero_owner", "X-Meta-_AeRo_secret"} {
+		if got := w.Header().Get(key); got != "" {
+			t.Errorf("internal metadata leaked through %s: %q", key, got)
 		}
 	}
 }

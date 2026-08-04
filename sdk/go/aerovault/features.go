@@ -13,6 +13,7 @@ func (c *Client) Thumbnail(ctx context.Context, key string, w, h int) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Accept", "image/jpeg")
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err

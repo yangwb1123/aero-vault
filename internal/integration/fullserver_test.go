@@ -51,6 +51,7 @@ func startFullServer(t *testing.T) *httptest.Server {
 	svc := service.NewFileService(store, repo, logger)
 
 	authReg, _ := auth.Parse("")
+	authReg.WithPutPresigner(auth.NewPutPresigner("integration-presign-secret-32-bytes"))
 	var rl, aiRL *middleware.RateLimiter
 
 	r := chi.NewRouter()
@@ -68,7 +69,7 @@ func startFullServer(t *testing.T) *httptest.Server {
 	})
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
-	r.Mount("/v1", rest.NewRouter(svc, repo, nil, nil, nil, nil, authReg, logger, false, aiRL, 0, false))
+	r.Mount("/v1", rest.NewRouter(svc, repo, nil, nil, nil, nil, authReg, logger, false, aiRL, nil, 0, false))
 	r.Mount("/s3", s3compat.NewRouter(svc, logger))
 
 	mcpServer := mcp.NewServer(svc, repo, nil, "default", logger)
@@ -311,8 +312,8 @@ func TestFullServer_SearchDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("search disabled: got %d, want 503 or 501", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("search disabled: got %d, want 503", resp.StatusCode)
 	}
 }
 
@@ -466,15 +467,15 @@ func TestFullServer_AdminEndpoints(t *testing.T) {
 	ts := startFullServer(t)
 	base := ts.URL + "/v1/admin"
 
-	// List keys (enabled only with AUTH_PERSIST_KEYS, expect empty or 501)
+	// The registry exists even with no configured credentials, so the list is
+	// available and empty in the unauthenticated baseline.
 	resp, err := http.Get(base + "/keys")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	// Without auth, admin endpoints may return 404 or 200
-	if resp.StatusCode == http.StatusInternalServerError {
-		t.Fatalf("admin/keys: got 500")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin/keys: got %d, want 200", resp.StatusCode)
 	}
 }
 

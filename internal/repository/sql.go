@@ -114,11 +114,19 @@ func (s *sqlStore) applyMigration(ctx context.Context, f migrationFile) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", f.path, err)
 	}
-	if _, err := s.db.ExecContext(ctx, string(body)); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin %s: %w", f.version, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, string(body)); err != nil {
 		return fmt.Errorf("apply %s: %w", f.version, err)
 	}
-	if _, err := s.db.ExecContext(ctx, s.rebind(`INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)`), f.version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)`), f.version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("record %s: %w", f.version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s: %w", f.version, err)
 	}
 	return nil
 }

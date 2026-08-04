@@ -56,7 +56,7 @@ func (s *sqlStore) ListObjectIDsToReindex(ctx context.Context, tenant, currentMo
 		limit = 1000
 	}
 	rows, err := s.db.QueryContext(ctx, s.rebind(
-		`SELECT DISTINCT object_id FROM chunks WHERE tenant_id=$1 AND embed_model <> '' AND embed_model <> $2 LIMIT $3`),
+		`SELECT DISTINCT object_id FROM chunks WHERE tenant_id=$1 AND (embed_model = '' OR embed_model <> $2) LIMIT $3`),
 		tenant, currentModel, limit)
 	if err != nil {
 		return nil, err

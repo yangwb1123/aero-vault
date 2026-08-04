@@ -43,6 +43,31 @@ FROM object_events WHERE consumed_at IS NULL ORDER BY id ASC LIMIT $1`
 	if err != nil {
 		return nil, err
 	}
+	return scanEvents(rows)
+}
+
+// ListEventsAfter returns the durable event history for one tenant regardless
+// of worker consumption state. It is used by resumable client streams.
+func (s *sqlStore) ListEventsAfter(ctx context.Context, tenant string, afterID int64, limit int) ([]Event, error) {
+	tenant = defaultTenant(tenant)
+	if afterID < 0 {
+		afterID = 0
+	}
+	if limit <= 0 {
+		limit = 200
+	} else if limit > 1000 {
+		limit = 1000
+	}
+	q := `SELECT id, tenant_id, bucket, key, type, object_id, request_id, payload, created_at
+FROM object_events WHERE tenant_id=$1 AND id>$2 ORDER BY id ASC LIMIT $3`
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), tenant, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanEvents(rows)
+}
+
+func scanEvents(rows *sql.Rows) ([]Event, error) {
 	defer rows.Close()
 	var out []Event
 	for rows.Next() {

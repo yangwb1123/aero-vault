@@ -35,8 +35,8 @@ func NewSSEHandler(bus *events.Bus, repo repository.Repository, logger *slog.Log
 //	# (or in a browser EventSource)
 //
 // Supports `Last-Event-ID` for replay on reconnect: missed events between the
-// reported id and the current head are flushed from the DB before the live
-// subscription starts.
+// reported id and the current head are flushed from the DB before queued live
+// events are consumed.
 func parseLastEventID(r *http.Request) int64 {
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -46,27 +46,38 @@ func parseLastEventID(r *http.Request) int64 {
 	return 0
 }
 
-func (h *SSEHandler) replayMissed(w http.ResponseWriter, flusher http.Flusher, r *http.Request, tenant string, lastID int64) {
+func (h *SSEHandler) replayMissed(w http.ResponseWriter, flusher http.Flusher, r *http.Request, tenant string, lastID int64) int64 {
 	if lastID <= 0 {
-		return
+		return lastID
 	}
-	backlog, err := h.repo.NextUnconsumedEvents(r.Context(), 200)
-	if err != nil {
-		return
-	}
-	for _, e := range backlog {
-		if e.ID <= lastID || e.TenantID != tenant {
-			continue
+	const pageSize = 200
+	afterID := lastID
+	for {
+		backlog, err := h.repo.ListEventsAfter(r.Context(), tenant, afterID, pageSize)
+		if err != nil {
+			h.logger.Warn("event replay failed", "tenant", tenant, "after_id", afterID, "err", err)
+			return afterID
 		}
-		if !writeEvent(w, flusher, e) {
-			return
+		for _, e := range backlog {
+			if !writeEvent(w, flusher, e) {
+				return afterID
+			}
+			afterID = e.ID
+		}
+		if len(backlog) < pageSize {
+			return afterID
 		}
 	}
 }
 
-func (h *SSEHandler) liveStream(w http.ResponseWriter, r *http.Request, flusher http.Flusher, tenant string) {
-	sub, cancel := h.bus.Subscribe()
-	defer cancel()
+func (h *SSEHandler) liveStream(
+	w http.ResponseWriter,
+	r *http.Request,
+	flusher http.Flusher,
+	tenant string,
+	sub <-chan repository.Event,
+	lastSentID int64,
+) {
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
 	for {
@@ -77,12 +88,13 @@ func (h *SSEHandler) liveStream(w http.ResponseWriter, r *http.Request, flusher 
 			if !ok {
 				return
 			}
-			if e.TenantID != tenant {
+			if e.TenantID != tenant || e.ID <= lastSentID {
 				continue
 			}
 			if !writeEvent(w, flusher, e) {
 				return
 			}
+			lastSentID = e.ID
 		case <-keepalive.C:
 			if _, err := fmt.Fprintf(w, ": keepalive %d\n\n", time.Now().Unix()); err != nil {
 				return
@@ -111,9 +123,11 @@ func (h *SSEHandler) Stream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 
+	sub, cancel := h.bus.Subscribe()
+	defer cancel()
 	lastID := parseLastEventID(r)
-	h.replayMissed(w, flusher, r, tenant, lastID)
-	h.liveStream(w, r, flusher, tenant)
+	lastSentID := h.replayMissed(w, flusher, r, tenant, lastID)
+	h.liveStream(w, r, flusher, tenant, sub, lastSentID)
 }
 
 func writeEvent(w http.ResponseWriter, flusher http.Flusher, e repository.Event) bool {

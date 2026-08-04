@@ -117,6 +117,8 @@ commands:
   tag <key> k1=v1 k2=v2     overwrite tags
   versions <key>            list versions
   lineage <objectID>        show AI consumption history
+  lsbuckets                  list buckets
+  bucket-rm <bucket>         delete a bucket and its objects
   snapshot create <out.tgz> [--db file:./var/aero.db] [--objects ./var/objects]
   snapshot restore <in.tgz> [--db file:./var/aero.db] [--objects ./var/objects]
   admin keys list                list API keys

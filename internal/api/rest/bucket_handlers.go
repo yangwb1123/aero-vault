@@ -3,8 +3,6 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
-	"strconv"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -112,7 +110,7 @@ func (h *Handler) DeleteBucketCORS(w http.ResponseWriter, r *http.Request) {
 // GET /v1/buckets/{bucket}/encryption
 func (h *Handler) GetBucketEncryption(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	cfg, err := h.svc.GetBucketConfigAuthorized(r.Context(), mw.TenantFrom(r.Context()), bucket)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -160,6 +158,52 @@ func (h *Handler) DeleteBucketEncryption(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ── Bucket Website ─────────────────────────────────────────────────────────────
+
+// GET /v1/buckets/{bucket}/website
+func (h *Handler) GetBucketWebsite(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	cfg, err := h.svc.GetBucketConfigAuthorized(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg.WebsiteConfig)
+}
+
+// PUT /v1/buckets/{bucket}/website
+func (h *Handler) PutBucketWebsite(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	var cfg repository.WebsiteConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		h.writeError(w, r, errInvalidJSON(err))
+		return
+	}
+	if cfg.IndexDocument.Suffix == "" {
+		h.writeError(w, r, errInvalidJSON(nil))
+		return
+	}
+	if err := h.svc.SetBucketWebsite(
+		r.Context(), mw.TenantFrom(r.Context()), bucket, cfg,
+	); err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+// DELETE /v1/buckets/{bucket}/website
+func (h *Handler) DeleteBucketWebsite(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	if err := h.svc.DeleteBucketWebsite(
+		r.Context(), mw.TenantFrom(r.Context()), bucket,
+	); err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── Bucket CRUD ────────────────────────────────────────────────────────────────
@@ -285,7 +329,7 @@ func (h *Handler) DeleteBucketNotifications(w http.ResponseWriter, r *http.Reque
 // GET /v1/buckets/{bucket}/lifecycle
 func (h *Handler) GetBucketLifecycle(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	cfg, err := h.svc.GetBucketConfigAuthorized(r.Context(), mw.TenantFrom(r.Context()), bucket)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -310,40 +354,4 @@ func (h *Handler) GetBucketStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, stats)
-}
-
-// ── Bucket Versions ────────────────────────────────────────────────────────────
-
-// GET /v1/buckets/{bucket}/versions
-func (h *Handler) ListBucketVersions(w http.ResponseWriter, r *http.Request) {
-	bucket := chi.URLParam(r, "bucket")
-	q := r.URL.Query()
-	prefix := q.Get("prefix")
-	marker := q.Get("key-marker")
-	limit, _ := strconv.Atoi(q.Get("max-keys"))
-	page, err := h.svc.List(r.Context(), mw.TenantFrom(r.Context()), bucket, prefix, marker, limit)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	type versionEntry struct {
-		Key       string `json:"key"`
-		VersionID string `json:"version_id"`
-		Size      int64  `json:"size"`
-		ETag      string `json:"etag"`
-		IsLatest  bool   `json:"is_latest"`
-		UpdatedAt string `json:"updated_at"`
-	}
-	var entries []versionEntry
-	for _, obj := range page.Objects {
-		entries = append(entries, versionEntry{
-			Key: obj.Key, VersionID: obj.VersionID,
-			Size: obj.Size, ETag: obj.ETag,
-			IsLatest: true, UpdatedAt: obj.UpdatedAt.Format(time.RFC3339),
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"versions": entries, "has_more": page.HasMore,
-		"next_key_marker": page.NextMarker,
-	})
 }

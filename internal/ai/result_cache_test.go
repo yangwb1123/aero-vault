@@ -61,6 +61,13 @@ func TestSearchResultCache_ShortCircuitsRepeatQuery(t *testing.T) {
 	if emb.embedded != 1 {
 		t.Fatalf("expected embedder invoked once across two identical queries, got %d", emb.embedded)
 	}
+	usages, err := env.repo.ListUsageForObject(context.Background(), testTenant, o.ID, 10)
+	if err != nil {
+		t.Fatalf("list usage: %v", err)
+	}
+	if len(usages) != 2 {
+		t.Fatalf("cached queries recorded %d usage rows, want 2", len(usages))
+	}
 }
 
 // TestResultCache_EvictsExpiredBeforeLive verifies that when the cache is at

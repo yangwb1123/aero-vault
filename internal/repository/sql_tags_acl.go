@@ -36,6 +36,30 @@ func (s *sqlStore) UpdateTags(ctx context.Context, tenant, bucket, key string, t
 	return nil
 }
 
+// UpdateObjectTagsByID updates one exact version instead of whichever row is
+// currently active for a key. Background jobs use this because a newer version
+// may be uploaded between event publication and job execution.
+func (s *sqlStore) UpdateObjectTagsByID(ctx context.Context, id int64, tags map[string]string) error {
+	tagBytes, err := jsonOrEmpty(tags)
+	if err != nil {
+		return err
+	}
+	query := `UPDATE objects SET tags=$1, updated_at=$2 WHERE id=$3`
+	args := []any{string(tagBytes), time.Now().UTC().Format(time.RFC3339Nano), id}
+	if s.dialect == dialectPostgres {
+		query = `UPDATE objects SET tags=$1::jsonb, updated_at=now() WHERE id=$2`
+		args = []any{string(tagBytes), id}
+	}
+	result, err := s.db.ExecContext(ctx, s.rebind(query), args...)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *sqlStore) SetLockedUntil(ctx context.Context, tenant, bucket, key string, until time.Time) error {
 	tenant = defaultTenant(tenant)
 	var q string
@@ -50,6 +74,30 @@ func (s *sqlStore) SetLockedUntil(ctx context.Context, tenant, bucket, key strin
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetObjectRetention updates one exact object version. Object IDs are used
+// because historical versions share tenant/bucket/key with the current row.
+func (s *sqlStore) SetObjectRetention(ctx context.Context, objectID int64, until time.Time, metadata map[string]string) error {
+	metaBytes, err := jsonOrEmpty(metadata)
+	if err != nil {
+		return err
+	}
+	query := `UPDATE objects SET locked_until=$1, metadata=$2 WHERE id=$3`
+	if s.dialect == dialectPostgres {
+		query = `UPDATE objects SET locked_until=$1, metadata=$2::jsonb WHERE id=$3`
+	}
+	result, err := s.db.ExecContext(
+		ctx, s.rebind(query),
+		until.UTC().Format(time.RFC3339Nano), string(metaBytes), objectID,
+	)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -73,7 +121,7 @@ func (s *sqlStore) StorageKeyReferenced(ctx context.Context, storageKey string) 
 // ListStorageKeys returns every distinct storage_key in the objects table,
 // including soft-deleted rows (they still pin their blob).
 func (s *sqlStore) ListStorageKeys(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT DISTINCT storage_key FROM objects`))
+	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT DISTINCT storage_key FROM objects WHERE storage_key <> ''`))
 	if err != nil {
 		return nil, err
 	}

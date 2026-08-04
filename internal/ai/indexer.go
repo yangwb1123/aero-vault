@@ -69,9 +69,15 @@ type Indexer struct {
 	logger    *slog.Logger
 	queue     Enqueuer
 	sinks     []ChunkSink
+	tagger    ObjectTagger
 
 	pollEvery time.Duration
 	batch     int
+}
+
+// ObjectTagger is the FileService slice used for exact-version PII tags.
+type ObjectTagger interface {
+	SetObjectTagsByID(ctx context.Context, objectID int64, tags map[string]string) error
 }
 
 // WithQueue makes the indexer a thin event→job bridge: instead of extracting
@@ -88,6 +94,12 @@ func (ix *Indexer) WithQueue(q Enqueuer) *Indexer {
 // registered sink receives every upsert/delete.
 func (ix *Indexer) WithChunkSink(s ChunkSink) *Indexer {
 	ix.sinks = append(ix.sinks, s)
+	return ix
+}
+
+// WithObjectTagger routes PII tag updates through FileService.
+func (ix *Indexer) WithObjectTagger(tagger ObjectTagger) *Indexer {
+	ix.tagger = tagger
 	return ix
 }
 
@@ -160,38 +172,46 @@ func (ix *Indexer) drainBacklog(ctx context.Context) {
 }
 
 func (ix *Indexer) handle(ctx context.Context, e repository.Event) {
-	defer func() {
-		if err := ix.repo.MarkEventConsumed(ctx, e.ID); err != nil {
-			ix.logger.Warn("mark consumed", "id", e.ID, "err", err)
-		}
-	}()
+	if err := ix.processEvent(ctx, e); err != nil {
+		ix.logger.Warn("indexer: event processing failed", "id", e.ID, "err", err)
+		return
+	}
+	if err := ix.repo.MarkEventConsumed(ctx, e.ID); err != nil {
+		ix.logger.Warn("mark consumed", "id", e.ID, "err", err)
+	}
+}
+
+func (ix *Indexer) processEvent(ctx context.Context, e repository.Event) error {
 	switch e.Type {
 	case repository.EventCreated:
 		if e.ObjectID == nil {
-			return
+			return nil
 		}
-		ix.dispatch(ctx, JobIndexObject, e.TenantID, *e.ObjectID,
+		return ix.dispatch(ctx, JobIndexObject, e.TenantID, *e.ObjectID,
 			func() error { return ix.IndexObjectByID(ctx, *e.ObjectID) })
 	case repository.EventDeleted:
 		if e.ObjectID == nil {
-			return
+			return nil
 		}
-		ix.dispatch(ctx, JobDeleteChunks, e.TenantID, *e.ObjectID,
+		return ix.dispatch(ctx, JobDeleteChunks, e.TenantID, *e.ObjectID,
 			func() error { return ix.DeleteObjectChunks(ctx, *e.ObjectID) })
 	case repository.EventAccessed:
 		// no-op (used only for audit)
 	}
+	return nil
 }
 
 // dispatch enqueues a job for the worker pool when a queue is configured,
 // otherwise runs the work inline (original behavior). The dedupe key collapses
 // repeated events for the same object into a single live job.
-func (ix *Indexer) dispatch(ctx context.Context, jobType, tenant string, objectID int64, inline func() error) {
+func (ix *Indexer) dispatch(
+	ctx context.Context,
+	jobType, tenant string,
+	objectID int64,
+	inline func() error,
+) error {
 	if ix.queue == nil {
-		if err := inline(); err != nil {
-			ix.logger.Warn("indexer: inline "+jobType, "object_id", objectID, "err", err)
-		}
-		return
+		return inline()
 	}
 	job := repository.Job{
 		TenantID:  tenant,
@@ -200,8 +220,9 @@ func (ix *Indexer) dispatch(ctx context.Context, jobType, tenant string, objectI
 		DedupeKey: fmt.Sprintf("%s:%d", jobType, objectID),
 	}
 	if _, _, err := ix.queue.Enqueue(ctx, job); err != nil {
-		ix.logger.Warn("indexer: enqueue "+jobType, "object_id", objectID, "err", err)
+		return fmt.Errorf("enqueue %s for object %d: %w", jobType, objectID, err)
 	}
+	return nil
 }
 
 // DeleteObjectChunks removes all chunks for an object. Used as the
@@ -254,10 +275,25 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 	}
 	obj, err := ix.repo.GetObjectByID(ctx, objectID)
 	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil
+		}
 		return fmt.Errorf("get object %d: %w", objectID, err)
+	}
+	current, err := ix.prepareCurrentObject(ctx, obj)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return nil
 	}
 	rc, _, err := ix.store.Get(ctx, obj.StorageKey)
 	if err != nil {
+		if errors.Is(err, storage.ErrSSECustomerKeyRequired) {
+			telemetry.IncIndexerSkip(ctx, "unsupported")
+			ix.logger.Info("indexer: skipping SSE-C object", "key", obj.Key)
+			return nil
+		}
 		return fmt.Errorf("storage get %q: %w", obj.StorageKey, err)
 	}
 	defer rc.Close()
@@ -290,6 +326,31 @@ func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
 	return nil
 }
 
+func (ix *Indexer) prepareCurrentObject(ctx context.Context, obj repository.Object) (bool, error) {
+	current, err := ix.repo.GetObject(ctx, obj.TenantID, obj.Bucket, obj.Key)
+	if errors.Is(err, repository.ErrNotFound) {
+		return false, ix.DeleteObjectChunks(ctx, obj.ID)
+	}
+	if err != nil {
+		return false, err
+	}
+	if current.ID != obj.ID {
+		return false, ix.DeleteObjectChunks(ctx, obj.ID)
+	}
+	versions, err := ix.repo.ListObjectVersions(ctx, obj.TenantID, obj.Bucket, obj.Key)
+	if err != nil {
+		return false, err
+	}
+	for _, version := range versions {
+		if version.ID != current.ID {
+			if err := ix.DeleteObjectChunks(ctx, version.ID); err != nil {
+				return false, err
+			}
+		}
+	}
+	return true, nil
+}
+
 func (ix *Indexer) applyPII(ctx context.Context, obj repository.Object, text string, err error) (string, error) {
 	if err == nil && ix.pii != nil {
 		if hits := ix.pii.Scan(text); len(hits) > 0 {
@@ -298,7 +359,11 @@ func (ix *Indexer) applyPII(ctx context.Context, obj repository.Object, text str
 				tags[k] = v
 			}
 			tags["pii_scan"] = MapPII(hits)
-			_ = ix.repo.UpdateTags(ctx, obj.TenantID, obj.Bucket, obj.Key, tags)
+			if ix.tagger == nil {
+				ix.logger.Warn("indexer: PII tagger unavailable", "object_id", obj.ID)
+			} else if err := ix.tagger.SetObjectTagsByID(ctx, obj.ID, tags); err != nil {
+				ix.logger.Warn("indexer: write PII tags", "object_id", obj.ID, "err", err)
+			}
 		}
 		if ix.redact {
 			text = ix.pii.Redact(text, nil)

@@ -80,10 +80,14 @@ func (c *Client) adminKeysList() int {
 		return 1
 	}
 	defer resp.Body.Close()
+	body, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
 	var env struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+	if err := json.Unmarshal(body, &env); err != nil {
 		fmt.Fprintln(os.Stderr, "decode:", err)
 		return 1
 	}
@@ -128,8 +132,11 @@ func (c *Client) adminKeysAdd(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }
 
@@ -144,6 +151,9 @@ func (c *Client) adminKeysRevoke(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
+	if _, ok := readSuccessfulResponse(resp); !ok {
+		return 1
+	}
 	fmt.Println("revoked")
 	return 0
 }
@@ -175,10 +185,14 @@ func (c *Client) adminTenantList() int {
 		return 1
 	}
 	defer resp.Body.Close()
+	body, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
 	var env struct {
 		Tenants []json.RawMessage `json:"tenants"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+	if err := json.Unmarshal(body, &env); err != nil {
 		fmt.Fprintln(os.Stderr, "decode:", err)
 		return 1
 	}
@@ -212,8 +226,11 @@ func (c *Client) adminTenantCreate(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }
 
@@ -228,6 +245,9 @@ func (c *Client) adminTenantDelete(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
+	if _, ok := readSuccessfulResponse(resp); !ok {
+		return 1
+	}
 	fmt.Println("deleted")
 	return 0
 }
@@ -245,6 +265,9 @@ func (c *Client) adminTenantStatus(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
+	if _, ok := readSuccessfulResponse(resp); !ok {
+		return 1
+	}
 	fmt.Println("updated")
 	return 0
 }
@@ -265,8 +288,11 @@ func (c *Client) adminTenantQuota(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }
 
@@ -285,8 +311,11 @@ func (c *Client) adminTenantBudget(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }
 

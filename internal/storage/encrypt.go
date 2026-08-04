@@ -163,6 +163,22 @@ func (e *envelopeEncrypter) decrypt(ct []byte, envelope string) ([]byte, error) 
 	return gcm.Open(nil, iv, ct, nil)
 }
 
+func (e *envelopeEncrypter) validateEnvelope(envelope string) error {
+	env, err := parseEnvelope(envelope)
+	if err != nil {
+		return err
+	}
+	if env.Alg != sseAlg {
+		return fmt.Errorf("sse: unsupported envelope alg %q", env.Alg)
+	}
+	wrapped, err := base64.StdEncoding.DecodeString(env.Kek)
+	if err != nil {
+		return fmt.Errorf("sse: decode kek: %w", err)
+	}
+	_, err = e.unwrapDataKey(env, wrapped)
+	return err
+}
+
 // unwrapDataKey recovers the per-object data key from an envelope, dispatching on
 // the wrap mode: remote (KMS) via the wrapper, or local via the master-key
 // provider. Each path guards that the matching mechanism is configured, so a

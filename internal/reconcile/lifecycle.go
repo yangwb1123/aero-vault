@@ -19,9 +19,15 @@ const leaseLifecycleSweep = "lifecycle-sweep"
 type LifecycleJob struct {
 	repo      repository.Repository
 	store     storage.Storage
+	cleaner   ChunkCleaner
 	interval  time.Duration
 	singleton *cluster.Singleton
 	logger    *slog.Logger
+}
+
+func (l *LifecycleJob) WithChunkCleaner(cleaner ChunkCleaner) *LifecycleJob {
+	l.cleaner = cleaner
+	return l
 }
 
 func NewLifecycle(repo repository.Repository, store storage.Storage, interval time.Duration, logger *slog.Logger) *LifecycleJob {
@@ -92,16 +98,25 @@ func (l *LifecycleJob) sweepExpired(ctx context.Context) (soft, hard int) {
 
 func (l *LifecycleJob) handleExpiredObject(ctx context.Context, obj repository.Object, action string) bool {
 	if action == "hard_delete" {
-		if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
+		protected, err := objectKeyDeletionProtected(ctx, l.repo, obj)
+		if err != nil {
+			l.logger.Warn("lifecycle protection check", "key", obj.Key, "err", err)
 			return false
 		}
-		if err := l.store.Delete(ctx, obj.StorageKey); err != nil {
-			l.logger.Warn("lifecycle storage delete", "key", obj.Key, "err", err)
+		if protected {
 			return false
 		}
-		return l.repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key) == nil
+		if err := hardDeleteKey(ctx, l.repo, l.store, l.cleaner, obj, l.logger); err != nil {
+			l.logger.Warn("lifecycle hard delete", "key", obj.Key, "err", err)
+			return false
+		}
+		return true
 	}
-	return l.repo.SoftDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key) == nil
+	if err := softDeleteKey(ctx, l.repo, l.cleaner, obj, l.logger); err != nil {
+		l.logger.Warn("lifecycle soft delete", "key", obj.Key, "err", err)
+		return false
+	}
+	return true
 }
 
 // sweepNonCurrentVersions permanently removes version tombstones (old versions
@@ -115,18 +130,15 @@ func (l *LifecycleJob) sweepNonCurrentVersions(ctx context.Context) int {
 	}
 	purged := 0
 	for _, v := range versions {
-		// Double-check that this is not protected by an object lock.
-		if v.LockedUntil != nil && v.LockedUntil.After(time.Now()) {
+		protected, pErr := objectDeletionProtected(ctx, l.repo, v)
+		if pErr != nil {
+			l.logger.Warn("lifecycle non-current protection check", "key", v.Key, "version", v.VersionID, "err", pErr)
 			continue
 		}
-		// Delete the backing blob.
-		if err := l.store.Delete(ctx, v.StorageKey); err != nil {
-			l.logger.Warn("lifecycle non-current storage delete", "key", v.Key, "version", v.VersionID, "err", err)
+		if protected {
 			continue
 		}
-		// Hard delete the row. The repository method checks for legal holds
-		// (the SQL query already excluded legal holds, but this is a safety net).
-		if err := l.repo.HardDeleteObjectByID(ctx, v.ID); err != nil {
+		if err := hardDeleteVersion(ctx, l.repo, l.store, l.cleaner, v, l.logger); err != nil {
 			if errors.Is(err, repository.ErrLegalHoldActive) {
 				l.logger.Warn("lifecycle non-current version skipped: legal hold", "key", v.Key, "version", v.VersionID)
 			} else {

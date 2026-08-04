@@ -57,6 +57,8 @@ type jwtClaims struct {
 	Ten    string   `json:"ten,omitempty"`
 	Iss    string   `json:"iss,omitempty"`
 	Scopes []string `json:"scopes,omitempty"`
+	Roles  []string `json:"roles,omitempty"`
+	Groups []string `json:"groups,omitempty"`
 	Exp    int64    `json:"exp,omitempty"`
 	Nbf    int64    `json:"nbf,omitempty"`
 }
@@ -123,7 +125,11 @@ func (v *JWTVerifier) decodeValidateClaims(token string, parts []string) (jwtCla
 }
 
 func claimsToKey(token string, c jwtClaims) (Key, error) {
-	k := Key{Token: token, Tenant: c.Ten, Scopes: map[Scope]bool{}}
+	k := Key{
+		Token: token, Tenant: c.Ten, SubjectID: c.Sub,
+		Roles: append([]string(nil), c.Roles...), Groups: append([]string(nil), c.Groups...),
+		Scopes: map[Scope]bool{},
+	}
 	for _, s := range c.Scopes {
 		k.Scopes[Scope(s)] = true
 	}
@@ -161,13 +167,33 @@ func (v *JWTVerifier) Sign(c struct {
 	Scopes []string
 	TTL    time.Duration
 }) (string, error) {
+	return v.SignWithPrincipal(JWTSignClaims{
+		Sub: c.Sub, Tenant: c.Tenant, Scopes: c.Scopes, TTL: c.TTL,
+	})
+}
+
+type JWTSignClaims struct {
+	Sub    string
+	Tenant string
+	Scopes []string
+	Roles  []string
+	Groups []string
+	TTL    time.Duration
+}
+
+// SignWithPrincipal issues a local token carrying Aero's normalized role and
+// group claims in addition to the legacy subject, tenant, and scope claims.
+func (v *JWTVerifier) SignWithPrincipal(c JWTSignClaims) (string, error) {
 	if v == nil {
 		return "", errors.New("jwt verifier not configured")
 	}
 	header := jwtHeader{Alg: "HS256", Typ: "JWT"}
 	hb, _ := json.Marshal(header)
 	now := time.Now().Unix()
-	claims := jwtClaims{Sub: c.Sub, Ten: c.Tenant, Iss: v.expectedIssuer, Scopes: c.Scopes, Nbf: now}
+	claims := jwtClaims{
+		Sub: c.Sub, Ten: c.Tenant, Iss: v.expectedIssuer, Scopes: c.Scopes,
+		Roles: c.Roles, Groups: c.Groups, Nbf: now,
+	}
 	if c.TTL > 0 {
 		claims.Exp = now + int64(c.TTL/time.Second)
 	}

@@ -61,6 +61,13 @@ type copyObjectResult struct {
 	ETag         string    `xml:"ETag"`
 }
 
+type copyPartResult struct {
+	XMLName      xml.Name  `xml:"CopyPartResult"`
+	Xmlns        string    `xml:"xmlns,attr"`
+	LastModified time.Time `xml:"LastModified"`
+	ETag         string    `xml:"ETag"`
+}
+
 // --- Tagging (GET/PUT ?tagging) ---
 
 type s3Tag struct {
@@ -155,7 +162,8 @@ type deleteRequest struct {
 }
 
 type deleteRequestObject struct {
-	Key string `xml:"Key"`
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId,omitempty"`
 }
 
 type deleteResult struct {
@@ -166,13 +174,16 @@ type deleteResult struct {
 }
 
 type deletedItem struct {
-	Key string `xml:"Key"`
+	Key          string `xml:"Key"`
+	VersionID    string `xml:"VersionId,omitempty"`
+	DeleteMarker bool   `xml:"DeleteMarker,omitempty"`
 }
 
 type deleteErrItem struct {
-	Key     string `xml:"Key"`
-	Code    string `xml:"Code"`
-	Message string `xml:"Message"`
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId,omitempty"`
+	Code      string `xml:"Code"`
+	Message   string `xml:"Message"`
 }
 
 // --- ACL (GET ?acl) ---
@@ -263,18 +274,18 @@ type objectLockRetention struct {
 
 // listVersionsResult is the body of GET /{bucket}?versions.
 type listVersionsResult struct {
-	XMLName             xml.Name       `xml:"ListVersionsResult"`
-	Xmlns               string         `xml:"xmlns,attr"`
-	Name                string         `xml:"Name"`
-	Prefix              string         `xml:"Prefix"`
-	KeyMarker           string         `xml:"KeyMarker"`
-	VersionIdMarker     string         `xml:"VersionIdMarker,omitempty"`
-	NextKeyMarker       string         `xml:"NextKeyMarker,omitempty"`
-	NextVersionIdMarker string         `xml:"NextVersionIdMarker,omitempty"`
-	MaxKeys             int            `xml:"MaxKeys"`
-	IsTruncated         bool           `xml:"IsTruncated"`
-	Versions            []versionEntry `xml:"Version"`
-	DeleteMarkers       []versionEntry `xml:"DeleteMarker,omitempty"`
+	XMLName             xml.Name            `xml:"ListVersionsResult"`
+	Xmlns               string              `xml:"xmlns,attr"`
+	Name                string              `xml:"Name"`
+	Prefix              string              `xml:"Prefix"`
+	KeyMarker           string              `xml:"KeyMarker"`
+	VersionIdMarker     string              `xml:"VersionIdMarker,omitempty"`
+	NextKeyMarker       string              `xml:"NextKeyMarker,omitempty"`
+	NextVersionIdMarker string              `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int                 `xml:"MaxKeys"`
+	IsTruncated         bool                `xml:"IsTruncated"`
+	Versions            []versionEntry      `xml:"Version"`
+	DeleteMarkers       []deleteMarkerEntry `xml:"DeleteMarker,omitempty"`
 }
 
 type versionEntry struct {
@@ -285,6 +296,13 @@ type versionEntry struct {
 	ETag         string    `xml:"ETag"`
 	Size         int64     `xml:"Size"`
 	StorageClass string    `xml:"StorageClass"`
+}
+
+type deleteMarkerEntry struct {
+	Key          string    `xml:"Key"`
+	VersionID    string    `xml:"VersionId"`
+	IsLatest     bool      `xml:"IsLatest"`
+	LastModified time.Time `xml:"LastModified"`
 }
 
 const allUsersURI = "http://acs.amazonaws.com/groups/global/AllUsers"

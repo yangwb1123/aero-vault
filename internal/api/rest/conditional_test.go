@@ -114,6 +114,56 @@ func TestConditionalGetIfModifiedSince(t *testing.T) {
 	}
 }
 
+func TestConditionalGetIfMatch(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/doc.txt"
+	req(t, "PUT", u, []byte("hello"), nil)
+
+	resp, _ := req(t, "GET", u, nil, nil)
+	etag := resp.Header.Get("ETag")
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		resp, body := req(t, method, u, nil, map[string]string{
+			"If-Match": `"definitely-wrong"`,
+		})
+		if resp.StatusCode != http.StatusPreconditionFailed {
+			t.Fatalf("%s wrong If-Match: status=%d want 412", method, resp.StatusCode)
+		}
+		if method == http.MethodGet && len(body) == 0 {
+			t.Fatalf("%s 412 should include the REST error body", method)
+		}
+
+		resp, body = req(t, method, u, nil, map[string]string{"If-Match": etag})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s matching If-Match: status=%d want 200", method, resp.StatusCode)
+		}
+		if method == http.MethodGet && string(body) != "hello" {
+			t.Fatalf("%s matching body=%q", method, body)
+		}
+	}
+}
+
+func TestConditionalGetIfUnmodifiedSince(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/doc.txt"
+	req(t, "PUT", u, []byte("hello"), nil)
+
+	past := time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
+	resp, _ := req(t, "GET", u, nil, map[string]string{
+		"If-Unmodified-Since": past,
+	})
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("past If-Unmodified-Since: status=%d want 412", resp.StatusCode)
+	}
+
+	future := time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)
+	resp, body := req(t, "GET", u, nil, map[string]string{
+		"If-Unmodified-Since": future,
+	})
+	if resp.StatusCode != http.StatusOK || string(body) != "hello" {
+		t.Fatalf("future If-Unmodified-Since: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
 func TestPutIfNoneMatchStar(t *testing.T) {
 	s := newRESTTest(t)
 	u := s.URL + "/v1/files/new.txt"

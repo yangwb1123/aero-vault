@@ -114,10 +114,34 @@ func clampRange(start, end, size int64) (offset, length int64, err error) {
 // It works across every storage backend by slicing the (already-decrypted)
 // stream from Get, so SSE-encrypted and remote objects are handled correctly.
 func (s *FileService) GetRange(ctx context.Context, tenant, bucket, key string, offset, length int64) (io.ReadCloser, repository.Object, error) {
-	rc, obj, err := s.Get(ctx, tenant, bucket, key)
+	return s.GetRangeWithOptions(ctx, tenant, bucket, key, offset, length, ReadOptions{})
+}
+
+func (s *FileService) GetRangeWithOptions(ctx context.Context, tenant, bucket, key string, offset, length int64, opts ReadOptions) (io.ReadCloser, repository.Object, error) {
+	rc, obj, err := s.GetWithOptions(ctx, tenant, bucket, key, opts)
 	if err != nil {
 		return nil, obj, err
 	}
+	return sliceReadCloser(rc, obj, offset, length)
+}
+
+// GetVersionRangeWithOptions streams a byte range from one exact version.
+func (s *FileService) GetVersionRangeWithOptions(
+	ctx context.Context,
+	tenant, bucket, key, versionID string,
+	offset, length int64,
+	opts ReadOptions,
+) (io.ReadCloser, repository.Object, error) {
+	rc, obj, err := s.GetVersionWithOptions(ctx, tenant, bucket, key, versionID, opts)
+	if err != nil {
+		return nil, obj, err
+	}
+	return sliceReadCloser(rc, obj, offset, length)
+}
+
+func sliceReadCloser(
+	rc io.ReadCloser, obj repository.Object, offset, length int64,
+) (io.ReadCloser, repository.Object, error) {
 	if offset > 0 {
 		if _, err := io.CopyN(io.Discard, rc, offset); err != nil {
 			_ = rc.Close()

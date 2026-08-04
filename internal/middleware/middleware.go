@@ -16,6 +16,7 @@ type ctxKey int
 const (
 	ctxRequestID ctxKey = iota
 	ctxTenantID
+	ctxTenantStatusVerified
 )
 
 // TenantHeader is read by the Tenant middleware. Both REST and S3-compatible
@@ -43,22 +44,29 @@ func RequestIDFrom(ctx context.Context) string {
 
 // Tenant extracts X-Aero-Tenant and stashes it on context.
 func Tenant(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t := r.Header.Get(TenantHeader)
-		if t == "" {
-			t = "default"
-		}
-		ctx := context.WithValue(r.Context(), ctxTenantID, t)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+	return TenantWithStatus(nil)(next)
 }
 
 func TenantFrom(ctx context.Context) string {
-	v, _ := ctx.Value(ctxTenantID).(string)
-	if v == "" {
+	v, ok := TenantFromContext(ctx)
+	if !ok {
 		return "default"
 	}
 	return v
+}
+
+// TenantFromContext distinguishes an explicit "default" tenant from a context
+// where the Tenant middleware has not run.
+func TenantFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(ctxTenantID).(string)
+	return v, ok && v != ""
+}
+
+// TenantStatusVerified reports whether the Tenant middleware admitted this
+// exact tenant after consulting the configured status lookup.
+func TenantStatusVerified(ctx context.Context, tenant string) bool {
+	verified, _ := ctx.Value(ctxTenantStatusVerified).(string)
+	return verified != "" && verified == tenant
 }
 
 // Recoverer turns panics into 500s and logs the stack.
@@ -209,60 +217,82 @@ func NewPerTenantConcurrencyLimiter(globalMax, perTenantMax int) *PerTenantConcu
 
 // Middleware returns an HTTP middleware that enforces both limits.
 func (pt *PerTenantConcurrencyLimiter) Middleware() func(http.Handler) http.Handler {
-	if pt.global == nil || pt.global.sem == nil {
+	var globalSem chan struct{}
+	if pt.global != nil {
+		globalSem = pt.global.sem
+	}
+	if globalSem == nil && pt.perTenant <= 0 {
 		return func(next http.Handler) http.Handler { return next }
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cost := reqWeight(r.Method)
 			tenant := TenantFrom(r.Context())
-
-			// Acquire global slot(s) first.
-			acquired := 0
-			for i := 0; i < cost; i++ {
-				select {
-				case pt.global.sem <- struct{}{}:
-					acquired++
-				default:
-					for j := 0; j < acquired; j++ {
-						<-pt.global.sem
-					}
-					w.Header().Set("Retry-After", "1")
-					http.Error(w, "too many concurrent requests", http.StatusTooManyRequests)
-					return
-				}
+			if !acquireSlots(globalSem, cost) {
+				rejectConcurrency(w, "too many concurrent requests")
+				return
 			}
-
-			// Check per-tenant budget.
-			if pt.perTenant > 0 {
-				pt.mu.Lock()
-				if pt.inflight[tenant] >= pt.perTenant {
-					pt.mu.Unlock()
-					for i := 0; i < cost; i++ {
-						<-pt.global.sem
-					}
-					w.Header().Set("Retry-After", "1")
-					http.Error(w, "tenant has too many concurrent requests", http.StatusTooManyRequests)
-					return
-				}
-				pt.inflight[tenant] += cost
-				pt.mu.Unlock()
+			if !pt.acquireTenant(tenant, cost) {
+				releaseSlots(globalSem, cost)
+				rejectConcurrency(w, "tenant has too many concurrent requests")
+				return
 			}
-
 			defer func() {
-				for i := 0; i < cost; i++ {
-					<-pt.global.sem
-				}
-				if pt.perTenant > 0 {
-					pt.mu.Lock()
-					pt.inflight[tenant] -= cost
-					if pt.inflight[tenant] <= 0 {
-						delete(pt.inflight, tenant)
-					}
-					pt.mu.Unlock()
-				}
+				releaseSlots(globalSem, cost)
+				pt.releaseTenant(tenant, cost)
 			}()
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func acquireSlots(sem chan struct{}, cost int) bool {
+	if sem == nil {
+		return true
+	}
+	for acquired := 0; acquired < cost; acquired++ {
+		select {
+		case sem <- struct{}{}:
+		default:
+			releaseSlots(sem, acquired)
+			return false
+		}
+	}
+	return true
+}
+
+func releaseSlots(sem chan struct{}, cost int) {
+	for i := 0; i < cost && sem != nil; i++ {
+		<-sem
+	}
+}
+
+func (pt *PerTenantConcurrencyLimiter) acquireTenant(tenant string, cost int) bool {
+	if pt.perTenant <= 0 {
+		return true
+	}
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	if pt.inflight[tenant]+cost > pt.perTenant {
+		return false
+	}
+	pt.inflight[tenant] += cost
+	return true
+}
+
+func (pt *PerTenantConcurrencyLimiter) releaseTenant(tenant string, cost int) {
+	if pt.perTenant <= 0 {
+		return
+	}
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.inflight[tenant] -= cost
+	if pt.inflight[tenant] <= 0 {
+		delete(pt.inflight, tenant)
+	}
+}
+
+func rejectConcurrency(w http.ResponseWriter, message string) {
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, message, http.StatusTooManyRequests)
 }

@@ -26,6 +26,12 @@ type Enqueuer interface {
 	Enqueue(ctx context.Context, j repository.Job) (int64, bool, error)
 }
 
+// ObjectController is the FileService slice needed by antivirus jobs.
+type ObjectController interface {
+	SetObjectTagsByID(ctx context.Context, objectID int64, tags map[string]string) error
+	QuarantineObjectByID(ctx context.Context, objectID int64) error
+}
+
 type scanPayload struct {
 	ObjectID int64 `json:"object_id"`
 }
@@ -55,6 +61,7 @@ type Worker struct {
 	store      storage.Storage
 	scanner    Scanner
 	queue      Enqueuer
+	objects    ObjectController
 	quarantine bool
 	logger     *slog.Logger
 }
@@ -64,6 +71,12 @@ func NewWorker(repo repository.Repository, store storage.Storage, scanner Scanne
 		logger = slog.Default()
 	}
 	return &Worker{repo: repo, store: store, scanner: scanner, queue: queue, quarantine: quarantine, logger: logger}
+}
+
+// WithObjectController routes worker mutations through FileService.
+func (w *Worker) WithObjectController(objects ObjectController) *Worker {
+	w.objects = objects
+	return w
 }
 
 // Run drains created events from sub and enqueues a virus_scan job per object.
@@ -96,6 +109,9 @@ func (w *Worker) Run(ctx context.Context, sub <-chan repository.Event) {
 // (when quarantine is enabled) soft-deletes infected objects. Used as the
 // virus_scan job handler.
 func (w *Worker) ScanObjectByID(ctx context.Context, objectID int64) error {
+	if w.objects == nil {
+		return errors.New("antivirus: object controller is required")
+	}
 	obj, err := w.repo.GetObjectByID(ctx, objectID)
 	if err != nil {
 		return fmt.Errorf("get object %d: %w", objectID, err)
@@ -123,14 +139,14 @@ func (w *Worker) ScanObjectByID(ctx context.Context, objectID int64) error {
 		tags[TagStatus] = "infected"
 		tags[TagSignature] = res.Signature
 	}
-	if err := w.repo.UpdateTags(ctx, obj.TenantID, obj.Bucket, obj.Key, tags); err != nil {
+	if err := w.objects.SetObjectTagsByID(ctx, objectID, tags); err != nil {
 		return fmt.Errorf("tag object %d: %w", objectID, err)
 	}
 
 	if !res.Clean {
 		w.logger.Warn("antivirus: infected object", "tenant", obj.TenantID, "key", obj.Key, "signature", res.Signature, "quarantined", w.quarantine)
 		if w.quarantine {
-			if err := w.repo.SoftDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err != nil {
+			if err := w.objects.QuarantineObjectByID(ctx, objectID); err != nil {
 				return fmt.Errorf("quarantine %q: %w", obj.Key, err)
 			}
 		}

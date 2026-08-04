@@ -166,11 +166,18 @@ func (f *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	}
 	// Carry the source object's ContentType, user metadata, and tags across the
 	// move; copy the maps so the new object never aliases the source's.
-	opts := service.PutOptions{ContentType: src.ContentType}
+	opts := service.PutOptions{
+		ContentType:        src.ContentType,
+		ContentDisposition: src.Metadata["_aero_content_disposition"],
+		ContentEncoding:    src.Metadata["_aero_content_encoding"],
+		ContentMD5:         src.Metadata["_aero_content_md5"],
+	}
 	if len(src.Metadata) > 0 {
 		opts.Metadata = make(map[string]string, len(src.Metadata))
 		for k, v := range src.Metadata {
-			opts.Metadata[k] = v
+			if !strings.HasPrefix(strings.ToLower(k), "_aero_") {
+				opts.Metadata[k] = v
+			}
 		}
 	}
 	if len(src.Tags) > 0 {

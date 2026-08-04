@@ -77,64 +77,69 @@ func (j *UploadGCJob) maybeSweep(ctx context.Context) {
 }
 
 func (j *UploadGCJob) sweep(ctx context.Context) {
-	expired, zombies := j.collectStale(ctx)
-	if expired+zombies == 0 {
+	before := time.Now().Add(-j.ttl).UTC().Format(time.RFC3339Nano)
+	expired := j.listExpiredUploads(ctx, before)
+	zombies := j.listZombieUploads(ctx, before)
+	candidates := mergeUploadCandidates(expired, zombies)
+	if len(candidates) == 0 {
 		return
 	}
-	purged := j.cleanup(ctx)
-	if purged > 0 || expired > 0 || zombies > 0 {
-		j.logger.Info("upload gc sweep",
-			"expired_candidates", expired,
-			"zombie_candidates", zombies,
-			"purged", purged,
-		)
-	}
+	purged := j.purgeUploads(ctx, candidates)
+	j.logger.Info("upload gc sweep",
+		"expired_candidates", len(expired),
+		"zombie_candidates", len(zombies),
+		"unique_candidates", len(candidates),
+		"purged", purged,
+	)
 }
 
-// collectStale finds stale uploads: expired (time-based) and zombie (parts
-// exist but never completed). Returns counts for logging.
-func (j *UploadGCJob) collectStale(ctx context.Context) (expired, zombies int) {
-	before := time.Now().Add(-j.ttl).UTC().Format(time.RFC3339Nano)
-
-	// 1. Time-based: uploads older than TTL.
-	staleUploads, err := j.repo.ListExpiredUploads(ctx, before, 200)
+func (j *UploadGCJob) listExpiredUploads(ctx context.Context, before string) []repository.Upload {
+	uploads, err := j.repo.ListExpiredUploads(ctx, before, 200)
 	if err != nil {
 		j.logger.Warn("upload gc list expired", "err", err)
-	} else {
-		expired = len(staleUploads)
-		j.purgeUploads(ctx, staleUploads)
+		return nil
 	}
+	return uploads
+}
 
-	// 2. Zombie: uploads with parts but not completed.
-	zombieUploads, err := j.repo.ListZombieUploads(ctx, before, 200)
+func (j *UploadGCJob) listZombieUploads(ctx context.Context, before string) []repository.Upload {
+	uploads, err := j.repo.ListZombieUploads(ctx, before, 200)
 	if err != nil {
 		j.logger.Warn("upload gc list zombies", "err", err)
-	} else {
-		zombies = len(zombieUploads)
-		j.purgeUploads(ctx, zombieUploads)
+		return nil
 	}
-
-	return expired, zombies
+	return uploads
 }
 
-// purgeUploads iterates over stale uploads, cleans storage parts, and removes
-// DB records.
-func (j *UploadGCJob) purgeUploads(ctx context.Context, uploads []repository.Upload) {
+func mergeUploadCandidates(groups ...[]repository.Upload) []repository.Upload {
+	seen := make(map[string]struct{})
+	var merged []repository.Upload
+	for _, uploads := range groups {
+		for _, upload := range uploads {
+			if _, exists := seen[upload.ID]; exists {
+				continue
+			}
+			seen[upload.ID] = struct{}{}
+			merged = append(merged, upload)
+		}
+	}
+	return merged
+}
+
+// purgeUploads removes the DB record only after storage cleanup succeeds, so a
+// transient backend failure remains retryable on the next sweep.
+func (j *UploadGCJob) purgeUploads(ctx context.Context, uploads []repository.Upload) int {
+	purged := 0
 	for _, u := range uploads {
-		// Clean up storage-level parts.
 		if err := j.store.CleanupParts(ctx, u.StorageKey, u.BackendUID); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			j.logger.Warn("upload gc storage cleanup", "upload_id", u.ID, "err", err)
-			// Continue to delete the DB record even if storage cleanup fails.
+			continue
 		}
-		// Remove the DB record (cascading to parts).
 		if err := j.repo.DeleteUploadCascade(ctx, u.ID); err != nil && !errors.Is(err, repository.ErrUploadNotFound) {
 			j.logger.Warn("upload gc db delete", "upload_id", u.ID, "err", err)
+			continue
 		}
+		purged++
 	}
-}
-
-// cleanup is a no-op placeholder; actual cleanup happens in collectStale/purgeUploads.
-// Returns the number of uploads purged in this cycle (approximate).
-func (j *UploadGCJob) cleanup(ctx context.Context) int {
-	return 0 // actual count is tracked in collectStale
+	return purged
 }

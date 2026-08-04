@@ -315,11 +315,15 @@ func TestListObjectIDsToReindex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListObjectIDsToReindex: %v", err)
 	}
-	if len(ids) != 1 {
-		t.Fatalf("got %d ids, want 1", len(ids))
+	if len(ids) != 2 {
+		t.Fatalf("got %d ids, want 2", len(ids))
 	}
-	if ids[0] != obj1.ID {
-		t.Errorf("reindex id=%d, want %d", ids[0], obj1.ID)
+	got := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !got[obj1.ID] || !got[obj3.ID] {
+		t.Errorf("reindex ids=%v, want stale=%d and unknown=%d", ids, obj1.ID, obj3.ID)
 	}
 }
 
@@ -525,6 +529,48 @@ func TestMarkEventConsumed(t *testing.T) {
 		if ev.ID == id {
 			t.Fatalf("consumed event %d still returned", id)
 		}
+	}
+}
+
+func TestListEventsAfterIncludesConsumedTenantHistory(t *testing.T) {
+	ctx := context.Background()
+	repo := openCebTestRepo(t)
+
+	firstID, err := repo.InsertEvent(ctx, repository.Event{
+		TenantID: "history", Bucket: "b", Key: "first", Type: repository.EventCreated,
+	})
+	if err != nil {
+		t.Fatalf("InsertEvent first: %v", err)
+	}
+	if _, err := repo.InsertEvent(ctx, repository.Event{
+		TenantID: "other", Bucket: "b", Key: "hidden", Type: repository.EventCreated,
+	}); err != nil {
+		t.Fatalf("InsertEvent other tenant: %v", err)
+	}
+	lastID, err := repo.InsertEvent(ctx, repository.Event{
+		TenantID: "history", Bucket: "b", Key: "last", Type: repository.EventDeleted,
+	})
+	if err != nil {
+		t.Fatalf("InsertEvent last: %v", err)
+	}
+	if err := repo.MarkEventConsumed(ctx, firstID); err != nil {
+		t.Fatalf("MarkEventConsumed: %v", err)
+	}
+
+	got, err := repo.ListEventsAfter(ctx, "history", 0, 10)
+	if err != nil {
+		t.Fatalf("ListEventsAfter: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != firstID || got[1].ID != lastID {
+		t.Fatalf("events = %+v, want ordered tenant history [%d %d]", got, firstID, lastID)
+	}
+
+	got, err = repo.ListEventsAfter(ctx, "history", firstID, 1)
+	if err != nil {
+		t.Fatalf("ListEventsAfter page: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != lastID {
+		t.Fatalf("page = %+v, want event %d", got, lastID)
 	}
 }
 
@@ -738,6 +784,74 @@ func TestListObjects(t *testing.T) {
 	if page.NextMarker == "" {
 		t.Errorf("expected NextMarker")
 	}
+}
+
+func TestListObjectPrefixesTreatSQLWildcardsLiterally(t *testing.T) {
+	ctx := context.Background()
+	repo := openCebTestRepo(t)
+	const tenant, bucket = "literal-prefix", "objects"
+	for _, key := range []string{
+		"under_score.txt", "underXscore.txt",
+		"percent%value.txt", "percentXvalue.txt",
+		"bang!value.txt",
+	} {
+		upsertObj(t, repo, tenant, bucket, key)
+	}
+
+	assertListedKeys(t, repo, tenant, bucket, "under_", []string{"under_score.txt"})
+	assertListedKeys(t, repo, tenant, bucket, "percent%", []string{"percent%value.txt"})
+	assertListedKeys(t, repo, tenant, bucket, "bang!", []string{"bang!value.txt"})
+
+	if err := repo.SoftDeleteObject(ctx, tenant, bucket, "percent%value.txt"); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := repo.ListDeletedObjects(ctx, tenant, bucket, "percent%", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted.Objects) != 1 || deleted.Objects[0].Key != "percent%value.txt" {
+		t.Fatalf("deleted prefix result=%v, want percent%%value.txt", objectKeys(deleted.Objects))
+	}
+
+	versionKeys, _, _, err := repo.ListObjectVersionKeys(
+		ctx, tenant, bucket, "under_", "", 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versionKeys) != 1 || versionKeys[0] != "under_score.txt" {
+		t.Fatalf("version prefix result=%v, want under_score.txt", versionKeys)
+	}
+}
+
+func assertListedKeys(
+	t *testing.T,
+	repo repository.Repository,
+	tenant, bucket, prefix string,
+	want []string,
+) {
+	t.Helper()
+	page, err := repo.ListObjects(context.Background(), tenant, bucket, prefix, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := objectKeys(page.Objects)
+	if len(got) != len(want) {
+		t.Fatalf("prefix %q result=%v, want %v", prefix, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("prefix %q result=%v, want %v", prefix, got, want)
+		}
+	}
+}
+
+func objectKeys(objects []repository.Object) []string {
+	keys := make([]string, 0, len(objects))
+	for _, object := range objects {
+		keys = append(keys, object.Key)
+	}
+	return keys
 }
 
 func TestListObjects_softDeletedExcluded(t *testing.T) {

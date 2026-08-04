@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -75,11 +77,35 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3Storage, error) {
 
 func (s *S3Storage) Backend() string { return "s3" }
 
+func (s *S3Storage) SupportsServerSideEncryption(algorithm, keyID string) bool {
+	switch algorithm {
+	case "AES256":
+		return keyID == ""
+	case "aws:kms":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *S3Storage) Put(ctx context.Context, key string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
+	if opts.SSEAlgorithm != "" &&
+		(!s.SupportsServerSideEncryption(opts.SSEAlgorithm, opts.SSEKMSKeyID) ||
+			len(opts.SSECustomerKey) != 0) {
+		return ObjectInfo{}, ErrUnsupported
+	}
+	body, cleanup, err := replayableS3Body(ctx, r)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer cleanup()
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
-		Body:   r,
+		Body:   body,
 	}
 	if opts.ContentType != "" {
 		input.ContentType = aws.String(opts.ContentType)
@@ -90,7 +116,18 @@ func (s *S3Storage) Put(ctx context.Context, key string, r io.Reader, size int64
 	if size > 0 {
 		input.ContentLength = aws.Int64(size)
 	}
-	out, err := s.client.PutObject(ctx, input)
+	if len(opts.SSECustomerKey) > 0 {
+		input.SSECustomerAlgorithm = aws.String("AES256")
+		input.SSECustomerKey = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKey))
+		input.SSECustomerKeyMD5 = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKeyMD5))
+	}
+	if opts.SSEAlgorithm != "" {
+		input.ServerSideEncryption = s3types.ServerSideEncryption(opts.SSEAlgorithm)
+		if opts.SSEKMSKeyID != "" {
+			input.SSEKMSKeyId = aws.String(opts.SSEKMSKeyID)
+		}
+	}
+	out, err := s.client.PutObject(ctx, input, s3BodyOptions(r)...)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -105,10 +142,19 @@ func (s *S3Storage) Put(ctx context.Context, key string, r io.Reader, size int64
 }
 
 func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+	return s.GetWithOptions(ctx, key, GetOptions{})
+}
+
+func (s *S3Storage) GetWithOptions(ctx context.Context, key string, opts GetOptions) (io.ReadCloser, ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
-	})
+	}
+	applySSECGetInput(input, opts)
+	out, err := s.client.GetObject(ctx, input)
 	if err != nil {
 		if isS3NotFound(err) {
 			return nil, ObjectInfo{}, ErrNotFound
@@ -127,10 +173,23 @@ func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, ObjectI
 }
 
 func (s *S3Storage) Stat(ctx context.Context, key string) (ObjectInfo, error) {
-	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+	return s.StatWithOptions(ctx, key, GetOptions{})
+}
+
+func (s *S3Storage) StatWithOptions(ctx context.Context, key string, opts GetOptions) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
+	input := &s3.HeadObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
-	})
+	}
+	if len(opts.SSECustomerKey) > 0 {
+		input.SSECustomerAlgorithm = aws.String("AES256")
+		input.SSECustomerKey = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKey))
+		input.SSECustomerKeyMD5 = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKeyMD5))
+	}
+	out, err := s.client.HeadObject(ctx, input)
 	if err != nil {
 		if isS3NotFound(err) {
 			return ObjectInfo{}, ErrNotFound
@@ -148,6 +207,9 @@ func (s *S3Storage) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 }
 
 func (s *S3Storage) Delete(ctx context.Context, key string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
@@ -156,6 +218,9 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 }
 
 func (s *S3Storage) List(ctx context.Context, prefix, marker string, limit int) (ListResult, error) {
+	if err := validateListPrefix(prefix); err != nil {
+		return ListResult{}, err
+	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
@@ -191,6 +256,9 @@ func (s *S3Storage) List(ctx context.Context, prefix, marker string, limit int) 
 }
 
 func (s *S3Storage) PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	if err := validateObjectKey(key); err != nil {
+		return "", err
+	}
 	req, err := s.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
@@ -202,6 +270,9 @@ func (s *S3Storage) PresignGet(ctx context.Context, key string, expiry time.Dura
 }
 
 func (s *S3Storage) PresignPut(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	if err := validateObjectKey(key); err != nil {
+		return "", err
+	}
 	req, err := s.presigner.PresignPutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
@@ -213,6 +284,14 @@ func (s *S3Storage) PresignPut(ctx context.Context, key string, expiry time.Dura
 }
 
 func (s *S3Storage) InitMultipart(ctx context.Context, key string, opts PutOptions) (MultipartInit, error) {
+	if err := validateObjectKey(key); err != nil {
+		return MultipartInit{}, err
+	}
+	if opts.SSEAlgorithm != "" &&
+		(!s.SupportsServerSideEncryption(opts.SSEAlgorithm, opts.SSEKMSKeyID) ||
+			len(opts.SSECustomerKey) != 0) {
+		return MultipartInit{}, ErrUnsupported
+	}
 	input := &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
@@ -223,6 +302,17 @@ func (s *S3Storage) InitMultipart(ctx context.Context, key string, opts PutOptio
 	if len(opts.Metadata) > 0 {
 		input.Metadata = opts.Metadata
 	}
+	if len(opts.SSECustomerKey) > 0 {
+		input.SSECustomerAlgorithm = aws.String("AES256")
+		input.SSECustomerKey = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKey))
+		input.SSECustomerKeyMD5 = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKeyMD5))
+	}
+	if opts.SSEAlgorithm != "" {
+		input.ServerSideEncryption = s3types.ServerSideEncryption(opts.SSEAlgorithm)
+		if opts.SSEKMSKeyID != "" {
+			input.SSEKMSKeyId = aws.String(opts.SSEKMSKeyID)
+		}
+	}
 	out, err := s.client.CreateMultipartUpload(ctx, input)
 	if err != nil {
 		return MultipartInit{}, err
@@ -231,24 +321,62 @@ func (s *S3Storage) InitMultipart(ctx context.Context, key string, opts PutOptio
 }
 
 func (s *S3Storage) UploadPart(ctx context.Context, key, uploadID string, partNumber int32, r io.Reader, size int64) (MultipartPart, error) {
+	return s.UploadPartWithOptions(ctx, key, uploadID, partNumber, r, size, PutOptions{})
+}
+
+func (s *S3Storage) UploadPartWithOptions(ctx context.Context, key, uploadID string, partNumber int32, r io.Reader, size int64, opts PutOptions) (MultipartPart, error) {
+	if err := validateObjectKey(key); err != nil {
+		return MultipartPart{}, err
+	}
+	body, cleanup, err := replayableS3Body(ctx, r)
+	if err != nil {
+		return MultipartPart{}, err
+	}
+	defer cleanup()
 	input := &s3.UploadPartInput{
 		Bucket:     aws.String(s.cfg.Bucket),
 		Key:        aws.String(key),
 		UploadId:   aws.String(uploadID),
 		PartNumber: aws.Int32(partNumber),
-		Body:       r,
+		Body:       body,
 	}
 	if size > 0 {
 		input.ContentLength = aws.Int64(size)
 	}
-	out, err := s.client.UploadPart(ctx, input)
+	if len(opts.SSECustomerKey) > 0 {
+		input.SSECustomerAlgorithm = aws.String("AES256")
+		input.SSECustomerKey = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKey))
+		input.SSECustomerKeyMD5 = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKeyMD5))
+	}
+	out, err := s.client.UploadPart(ctx, input, s3BodyOptions(r)...)
 	if err != nil {
 		return MultipartPart{}, err
 	}
 	return MultipartPart{PartNumber: partNumber, ETag: strings.Trim(aws.ToString(out.ETag), `"`)}, nil
 }
 
+func s3BodyOptions(body io.Reader) []func(*s3.Options) {
+	if _, ok := body.(io.Seeker); ok {
+		return nil
+	}
+	return []func(*s3.Options){
+		func(opts *s3.Options) {
+			opts.APIOptions = append(
+				opts.APIOptions,
+				awsv4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
+			)
+		},
+	}
+}
+
 func (s *S3Storage) CompleteMultipart(ctx context.Context, key, uploadID string, parts []MultipartPart) (ObjectInfo, error) {
+	return s.CompleteMultipartWithOptions(ctx, key, uploadID, parts, PutOptions{})
+}
+
+func (s *S3Storage) CompleteMultipartWithOptions(ctx context.Context, key, uploadID string, parts []MultipartPart, opts PutOptions) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
 	completed := make([]s3types.CompletedPart, 0, len(parts))
 	for _, p := range parts {
 		completed = append(completed, s3types.CompletedPart{
@@ -256,12 +384,18 @@ func (s *S3Storage) CompleteMultipart(ctx context.Context, key, uploadID string,
 			PartNumber: aws.Int32(p.PartNumber),
 		})
 	}
-	out, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	input := &s3.CompleteMultipartUploadInput{
 		Bucket:          aws.String(s.cfg.Bucket),
 		Key:             aws.String(key),
 		UploadId:        aws.String(uploadID),
 		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completed},
-	})
+	}
+	if len(opts.SSECustomerKey) > 0 {
+		input.SSECustomerAlgorithm = aws.String("AES256")
+		input.SSECustomerKey = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKey))
+		input.SSECustomerKeyMD5 = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKeyMD5))
+	}
+	out, err := s.client.CompleteMultipartUpload(ctx, input)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -272,7 +406,21 @@ func (s *S3Storage) CompleteMultipart(ctx context.Context, key, uploadID string,
 	}, nil
 }
 
+func (s *S3Storage) SupportsSSEC() bool { return true }
+
+func applySSECGetInput(input *s3.GetObjectInput, opts GetOptions) {
+	if len(opts.SSECustomerKey) == 0 {
+		return
+	}
+	input.SSECustomerAlgorithm = aws.String("AES256")
+	input.SSECustomerKey = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKey))
+	input.SSECustomerKeyMD5 = aws.String(base64.StdEncoding.EncodeToString(opts.SSECustomerKeyMD5))
+}
+
 func (s *S3Storage) AbortMultipart(ctx context.Context, key, uploadID string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(s.cfg.Bucket),
 		Key:      aws.String(key),
@@ -282,6 +430,9 @@ func (s *S3Storage) AbortMultipart(ctx context.Context, key, uploadID string) er
 }
 
 func (s *S3Storage) CleanupParts(ctx context.Context, key, uploadID string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	// S3 storage-level cleanup is the same as aborting the multipart upload.
 	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(s.cfg.Bucket),
@@ -296,69 +447,6 @@ func (s *S3Storage) CleanupParts(ctx context.Context, key, uploadID string) erro
 		}
 	}
 	return err
-}
-
-func (s *S3Storage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
-	input := &s3.UploadPartCopyInput{
-		Bucket:     aws.String(s.cfg.Bucket),
-		Key:        aws.String(dstKey),
-		UploadId:   aws.String(uploadID),
-		PartNumber: aws.Int32(partNumber),
-		CopySource: aws.String(s.cfg.Bucket + "/" + srcKey),
-	}
-	if srcOffset >= 0 {
-		input.CopySourceRange = aws.String(fmt.Sprintf("bytes=%d-%d", srcOffset, srcOffset+length-1))
-	}
-	out, err := s.client.UploadPartCopy(ctx, input)
-	if err != nil {
-		return MultipartPart{}, fmt.Errorf("s3 upload-part-copy: %w", err)
-	}
-	etag := ""
-	if out.CopyPartResult != nil && out.CopyPartResult.ETag != nil {
-		etag = strings.Trim(aws.ToString(out.CopyPartResult.ETag), `"`)
-	}
-	return MultipartPart{PartNumber: partNumber, ETag: etag}, nil
-}
-
-func (s *S3Storage) CanCopy() bool { return true }
-
-func (s *S3Storage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
-	input := &s3.CopyObjectInput{
-		Bucket:     aws.String(s.cfg.Bucket),
-		CopySource: aws.String(s.cfg.Bucket + "/" + srcKey),
-		Key:        aws.String(dstKey),
-	}
-	if opts.MetadataDirective == "REPLACE" {
-		input.MetadataDirective = s3types.MetadataDirectiveReplace
-		if opts.ContentType != "" {
-			input.ContentType = aws.String(opts.ContentType)
-		}
-		if len(opts.Metadata) > 0 {
-			input.Metadata = opts.Metadata
-		}
-	} else {
-		input.MetadataDirective = s3types.MetadataDirectiveCopy
-	}
-
-	out, err := s.client.CopyObject(ctx, input)
-	if err != nil {
-		return ObjectInfo{}, fmt.Errorf("s3 copy: %w", err)
-	}
-
-	info := ObjectInfo{
-		Key:  dstKey,
-		Size: -1, // S3 CopyObject response does not include content length
-	}
-	if out.CopyObjectResult != nil && out.CopyObjectResult.ETag != nil {
-		info.ETag = *out.CopyObjectResult.ETag
-	}
-	// Stat the destination to get accurate size.
-	st, err := s.Stat(ctx, dstKey)
-	if err == nil {
-		info.Size = st.Size
-		info.LastModified = st.LastModified
-	}
-	return info, nil
 }
 
 func isS3NotFound(err error) bool {

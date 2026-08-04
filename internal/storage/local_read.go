@@ -26,12 +26,16 @@ var storeTracer = telemetry.Tracer("aero-vault/storage")
 func (s *LocalStorage) metaPath(p string) string { return p + localMetaSuffix }
 
 func (s *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
+	return s.GetWithOptions(ctx, key, GetOptions{})
+}
+
+func (s *LocalStorage) GetWithOptions(ctx context.Context, key string, opts GetOptions) (io.ReadCloser, ObjectInfo, error) {
 	ctx, span := storeTracer.Start(ctx, "LocalStorage.Get",
 		trace.WithAttributes(attribute.String("key", key)),
 	)
 	defer span.End()
 
-	info, err := s.Stat(ctx, key)
+	info, err := s.StatWithOptions(ctx, key, opts)
 	if err != nil {
 		return nil, ObjectInfo{}, err
 	}
@@ -43,22 +47,32 @@ func (s *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, Obje
 		}
 		return nil, ObjectInfo{}, err
 	}
-	// Decrypt on the fly if the object has an SSE envelope.
-	if s.enc != nil {
-		meta, mErr := readMeta(s.metaPath(path))
-		if mErr == nil && meta.Envelope != "" {
-			rc, err := decryptReader(f, meta.Envelope, s.enc)
+	meta, mErr := readMeta(s.metaPath(path))
+	if mErr == nil && meta.Envelope != "" {
+		enc, err := s.readEncrypter(meta.Envelope, opts)
+		if err != nil {
 			_ = f.Close()
-			if err != nil {
-				return nil, ObjectInfo{}, fmt.Errorf("sse decrypt: %w", err)
-			}
-			return rc, info, nil
+			return nil, ObjectInfo{}, err
 		}
+		rc, err := decryptReader(f, meta.Envelope, enc)
+		_ = f.Close()
+		if err != nil {
+			return nil, ObjectInfo{}, fmt.Errorf("sse decrypt: %w", err)
+		}
+		return rc, info, nil
 	}
 	return f, info, nil
 }
 
 func (s *LocalStorage) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	return s.statObject(key, nil)
+}
+
+func (s *LocalStorage) StatWithOptions(ctx context.Context, key string, opts GetOptions) (ObjectInfo, error) {
+	return s.statObject(key, &opts)
+}
+
+func (s *LocalStorage) statObject(key string, opts *GetOptions) (ObjectInfo, error) {
 	path, err := s.objectPath(key)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -79,8 +93,42 @@ func (s *LocalStorage) Stat(ctx context.Context, key string) (ObjectInfo, error)
 		}
 		return ObjectInfo{}, err
 	}
+	if meta.Envelope != "" && opts != nil {
+		if _, err := s.readEncrypter(meta.Envelope, *opts); err != nil {
+			return ObjectInfo{}, err
+		}
+	}
 	return meta.toInfo(), nil
 }
+
+func (s *LocalStorage) readEncrypter(envelope string, opts GetOptions) (*envelopeEncrypter, error) {
+	env, err := parseEnvelope(envelope)
+	if err != nil {
+		return nil, err
+	}
+	if env.Kid == ssecKeyID {
+		if len(opts.SSECustomerKey) != masterKeyLen {
+			return nil, ErrSSECustomerKeyRequired
+		}
+		enc := newEnvelopeEncrypter(newSSECProvider(opts.SSECustomerKey))
+		if err := enc.validateEnvelope(envelope); err != nil {
+			return nil, ErrInvalidSSECustomerKey
+		}
+		return enc, nil
+	}
+	if len(opts.SSECustomerKey) != 0 {
+		return nil, ErrInvalidSSECustomerKey
+	}
+	if s.enc == nil {
+		return nil, errors.New("sse: encrypted object but no server-side key is configured")
+	}
+	if err := s.enc.validateEnvelope(envelope); err != nil {
+		return nil, err
+	}
+	return s.enc, nil
+}
+
+func (s *LocalStorage) SupportsSSEC() bool { return true }
 
 func (s *LocalStorage) PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error) {
 	return s.presign(key, "GET", expiry)

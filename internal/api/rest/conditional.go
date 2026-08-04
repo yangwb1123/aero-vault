@@ -52,11 +52,29 @@ func notModified(r *http.Request, obj repository.Object) bool {
 	return false
 }
 
+// readPreconditionFailed evaluates preconditions that fail with 412 for
+// GET/HEAD. If-Match takes precedence over If-Unmodified-Since.
+func readPreconditionFailed(r *http.Request, obj repository.Object) bool {
+	if match := r.Header.Get("If-Match"); match != "" {
+		return !etagListMatches(match, obj.ETag)
+	}
+	if unmodified := r.Header.Get("If-Unmodified-Since"); unmodified != "" {
+		if t, err := http.ParseTime(unmodified); err == nil {
+			return obj.UpdatedAt.Truncate(time.Second).After(t)
+		}
+	}
+	return false
+}
+
 // hasConditional reports whether the request carries any precondition or range
 // header that requires a Stat before serving.
 func hasConditional(r *http.Request) bool {
 	h := r.Header
-	return h.Get("If-None-Match") != "" || h.Get("If-Modified-Since") != "" || h.Get("Range") != ""
+	return h.Get("If-Match") != "" ||
+		h.Get("If-Unmodified-Since") != "" ||
+		h.Get("If-None-Match") != "" ||
+		h.Get("If-Modified-Since") != "" ||
+		h.Get("Range") != ""
 }
 
 // checkWritePreconditions enforces If-Match / If-None-Match on writes (optimistic

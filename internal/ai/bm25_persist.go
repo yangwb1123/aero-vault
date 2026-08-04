@@ -52,15 +52,16 @@ type bm25Snapshot struct {
 
 // bm25SnapshotDoc is the serialisable form of one indexed document.
 type bm25SnapshotDoc struct {
-	ID        int64          `json:"id"`
-	Tenant    string         `json:"tenant"`
-	Bucket    string         `json:"bucket"`
-	ObjectKey string         `json:"object_key"`
-	ObjectID  int64          `json:"object_id"`
-	Seq       int            `json:"seq"`
-	Content   string         `json:"content"`
-	Length    int            `json:"length"`
-	Tokens    map[string]int `json:"tokens"`
+	ID         int64          `json:"id"`
+	Tenant     string         `json:"tenant"`
+	Bucket     string         `json:"bucket"`
+	ObjectKey  string         `json:"object_key"`
+	ObjectID   int64          `json:"object_id"`
+	Seq        int            `json:"seq"`
+	Content    string         `json:"content"`
+	EmbedModel string         `json:"embed_model,omitempty"`
+	Length     int            `json:"length"`
+	Tokens     map[string]int `json:"tokens"`
 }
 
 // toSnapshot builds a serialisable snapshot of the current index state.
@@ -78,15 +79,16 @@ func (b *BM25) toSnapshot() bm25Snapshot {
 		s.Docs = make([]bm25SnapshotDoc, 0, len(b.docs))
 		for id, d := range b.docs {
 			s.Docs = append(s.Docs, bm25SnapshotDoc{
-				ID:        id,
-				Tenant:    d.tenant,
-				Bucket:    d.bucket,
-				ObjectKey: d.objectKey,
-				ObjectID:  d.objectID,
-				Seq:       d.seq,
-				Content:   d.content,
-				Length:    d.length,
-				Tokens:    d.tokens,
+				ID:         id,
+				Tenant:     d.tenant,
+				Bucket:     d.bucket,
+				ObjectKey:  d.objectKey,
+				ObjectID:   d.objectID,
+				Seq:        d.seq,
+				Content:    d.content,
+				EmbedModel: d.embedModel,
+				Length:     d.length,
+				Tokens:     d.tokens,
 			})
 		}
 	}
@@ -119,14 +121,15 @@ func (b *BM25) fromSnapshot(s bm25Snapshot) {
 	b.docs = make(map[int64]bm25Doc, len(s.Docs))
 	for _, sd := range s.Docs {
 		b.docs[sd.ID] = bm25Doc{
-			tenant:    sd.Tenant,
-			bucket:    sd.Bucket,
-			objectKey: sd.ObjectKey,
-			objectID:  sd.ObjectID,
-			seq:       sd.Seq,
-			content:   sd.Content,
-			length:    sd.Length,
-			tokens:    sd.Tokens,
+			tenant:     sd.Tenant,
+			bucket:     sd.Bucket,
+			objectKey:  sd.ObjectKey,
+			objectID:   sd.ObjectID,
+			seq:        sd.Seq,
+			content:    sd.Content,
+			embedModel: sd.EmbedModel,
+			length:     sd.Length,
+			tokens:     sd.Tokens,
 		}
 	}
 

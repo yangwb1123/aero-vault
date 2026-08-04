@@ -205,9 +205,9 @@ func (s *sqlStore) ListSoftDeletedBefore(ctx context.Context, before string, lim
 	rows, err := s.db.QueryContext(ctx, s.rebind(`
 SELECT id, tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at, locked_until, version_tombstone
 FROM objects
-WHERE deleted_at IS NOT NULL AND deleted_at < $1 AND version_tombstone = 0
+WHERE deleted_at IS NOT NULL AND deleted_at < $1 AND version_tombstone = $2
 ORDER BY deleted_at
-LIMIT $2`), before, limit)
+LIMIT $3`), before, false, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -236,10 +236,10 @@ SELECT o.id, o.tenant_id, o.bucket, o.key, o.version_id, o.backend, o.storage_ke
        b.noncurrent_days
 FROM objects o
 JOIN buckets b ON o.tenant_id = b.tenant_id AND o.bucket = b.name
-WHERE o.version_tombstone = 1
+WHERE o.version_tombstone = $1
   AND b.noncurrent_days > 0
   AND NOT EXISTS (SELECT 1 FROM legal_holds lh WHERE lh.object_id = o.id)
-LIMIT $1`), limit)
+LIMIT $2`), true, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -479,6 +479,49 @@ await test("multipart init/part/complete hit the right routes", async () => {
   assert.equal(fetch.calls[2].url, "http://test/v1/multipart/U1/complete");
 });
 
+await test("enterprise share, ACL, department member, and export requests", async () => {
+  const { client, fetch } = newClient((call) => {
+    if (call.url.includes("/v1/exports/archive")) return { body: "archive" };
+    return { body: JSON.stringify({ token: "raw", url: "https://source/share/raw" }) };
+  });
+  const share = await client.createShare("blog/hero.jpg", { allowDownload: true, ttlSeconds: 60 });
+  assert.equal(share.token, "raw");
+  assert.equal(JSON.parse(fetch.calls[0].init.body).allow_download, true);
+  await client.putResourceACL({ key: "blog/", resource_kind: "folder", principal_type: "department",
+    principal_id: "dept-1", actions: ["object:read"], effect: "allow", inherit: true });
+  assert.equal(fetch.calls[1].init.method, "PUT");
+  await client.putDepartmentMember("dept/id", "user one");
+  assert.match(fetch.calls[2].url, /departments\/dept%2Fid\/members\/user%20one$/);
+  const archive = await client.exportArchive({ prefix: "blog/" });
+  assert.equal(new TextDecoder().decode(archive), "archive");
+  assert.match(fetch.calls[3].url, /prefix=blog%2F/);
+});
+
+await test("enterprise management lifecycle requests", async () => {
+  const { client, fetch } = newClient((call) => {
+    if (call.url.endsWith("/v1/assets")) return { body: '{"assets":[{"id":"asset-1"}]}' };
+    if (call.url.includes("/v1/access/acl?") && call.init.method === "GET") {
+      return { body: '{"entries":[{"id":"acl-1"}]}' };
+    }
+    if (call.url.endsWith("/v1/admin/departments")) {
+      return { body: '{"departments":[{"id":"dept-1"}]}' };
+    }
+    if (call.init.method === "GET") {
+      return { body: '{"department":{"id":"dept-1"},"members":[]}' };
+    }
+    return { status: 204 };
+  });
+  assert.equal((await client.listAssets())[0].id, "asset-1");
+  assert.equal((await client.listResourceACL("team/", { resourceKind: "folder" }))[0].id, "acl-1");
+  await client.deleteResourceACL("acl/id");
+  assert.match(fetch.calls[2].url, /access\/acl\/acl%2Fid$/);
+  assert.equal((await client.listDepartments())[0].id, "dept-1");
+  assert.equal((await client.getDepartment("dept/id")).department.id, "dept-1");
+  await client.deleteDepartment("dept/id");
+  await client.deleteDepartmentMember("dept/id", "user one");
+  assert.match(fetch.calls[6].url, /departments\/dept%2Fid\/members\/user%20one$/);
+});
+
 // ---- summary ------------------------------------------------------------
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

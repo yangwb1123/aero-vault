@@ -28,6 +28,8 @@ func classify(err error) (string, string, int) {
 		return code, msg, status
 	}
 	switch {
+	case errors.Is(err, service.ErrTenantDisabled):
+		return "TenantDisabled", service.ErrTenantDisabled.Error(), http.StatusForbidden
 	case errors.Is(err, service.ErrQuotaExceeded):
 		return "QuotaExceeded", err.Error(), http.StatusInsufficientStorage
 	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):
@@ -36,6 +38,14 @@ func classify(err error) (string, string, int) {
 		return "NoSuchUpload", "upload not found", http.StatusNotFound
 	case errors.Is(err, service.ErrInvalidArgs):
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
+	case errors.Is(err, service.ErrBadDigest):
+		return "BadDigest", err.Error(), http.StatusBadRequest
+	case errors.Is(err, service.ErrMetadataTooLarge),
+		errors.Is(err, service.ErrMetadataKeyTooLong),
+		errors.Is(err, service.ErrMetadataValueTooLong):
+		return "InvalidArgument", err.Error(), http.StatusBadRequest
+	case errors.Is(err, service.ErrSizeMismatch):
+		return "SizeMismatch", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrRangeNotSatisfiable):
 		return "InvalidRange", "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable
 	case errors.Is(err, service.ErrPreconditionFailed):
@@ -51,10 +61,13 @@ func classify(err error) (string, string, int) {
 
 // ── Conditional & Range handling ───────────────────────────────────────────────
 
-// handleConditional checks If-None-Match/If-Modified-Since and Range headers
-// against the stat'd object. Returns true when the request was fully handled
-// (304 Not Modified or 206 Partial Content).
+// handleConditional checks read preconditions, cache validators, and Range
+// against the stat'd object. It returns true when the request was fully handled.
 func (h *Handler) handleConditional(w http.ResponseWriter, r *http.Request, obj repository.Object) bool {
+	if readPreconditionFailed(r, obj) {
+		h.writeError(w, r, service.ErrPreconditionFailed)
+		return true
+	}
 	if notModified(r, obj) {
 		w.Header().Set("ETag", `"`+obj.ETag+`"`)
 		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
@@ -133,7 +146,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeMetadataHeaders(w http.ResponseWriter, meta map[string]string) {
 	for k, v := range meta {
-		if strings.HasPrefix(k, "_aero_") {
+		if strings.HasPrefix(strings.ToLower(k), "_aero_") {
 			continue
 		}
 		w.Header().Set("X-Meta-"+k, v)
@@ -150,22 +163,6 @@ func writeContentMD5(w http.ResponseWriter, meta map[string]string) {
 	if v, ok := meta["_aero_content_md5"]; ok && v != "" {
 		w.Header().Set("X-Content-MD5", v)
 	}
-}
-
-func addContentHeaders(meta map[string]string, h http.Header) map[string]string {
-	if v := h.Get("Content-Disposition"); v != "" {
-		if meta == nil {
-			meta = map[string]string{}
-		}
-		meta["_aero_content_disposition"] = v
-	}
-	if v := h.Get("Content-Encoding"); v != "" {
-		if meta == nil {
-			meta = map[string]string{}
-		}
-		meta["_aero_content_encoding"] = v
-	}
-	return meta
 }
 
 func writeContentResponseHeaders(w http.ResponseWriter, meta map[string]string) {

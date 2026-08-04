@@ -2,8 +2,11 @@ package auth
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A record with an empty (or whitespace-only) scope segment yields a key with
@@ -81,5 +84,57 @@ func TestParse_EmptyScopeErrorNamesRecord(t *testing.T) {
 	_, err := Parse("tok:acme:")
 	if err == nil || !strings.Contains(err.Error(), "tok:acme:") {
 		t.Fatalf("error should name the offending record, got %v", err)
+	}
+}
+
+func TestParse_MalformedConfigReturnsFailClosedRegistry(t *testing.T) {
+	reg, err := Parse("valid:acme:read,malformed")
+	if err == nil {
+		t.Fatal("malformed AUTH_KEYS must return an error")
+	}
+	if reg == nil {
+		t.Fatal("malformed AUTH_KEYS must return a non-nil registry")
+	}
+	if !reg.Enabled() {
+		t.Fatal("malformed AUTH_KEYS registry must remain enabled")
+	}
+	if _, ok := reg.Lookup(context.Background(), "valid"); ok {
+		t.Fatal("partially parsed credentials must be discarded")
+	}
+
+	called := false
+	protected := reg.Middleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/v1/files/secret.txt", nil)
+	req.Header.Set("Authorization", "Bearer valid")
+	rec := httptest.NewRecorder()
+	protected.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("malformed config request status=%d want %d", rec.Code, http.StatusUnauthorized)
+	}
+	if called {
+		t.Fatal("fail-closed registry must not invoke the protected handler")
+	}
+}
+
+func TestParse_NonEmptyConfigWithoutRecordsFailsClosed(t *testing.T) {
+	reg, err := Parse(",,,")
+	if err == nil {
+		t.Fatal("non-empty AUTH_KEYS without records must return an error")
+	}
+	if reg == nil || !reg.Enabled() {
+		t.Fatalf("registry must be non-nil and enabled, got %#v", reg)
+	}
+}
+
+func TestRegistryEnabledWithJWKSOnly(t *testing.T) {
+	reg, err := Parse("")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	reg.WithJWKS("https://issuer.example/.well-known/jwks.json", time.Minute, "issuer")
+	if !reg.Enabled() {
+		t.Fatal("JWKS-only authentication must enable the registry")
 	}
 }

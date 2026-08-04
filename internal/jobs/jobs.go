@@ -68,6 +68,7 @@ var ErrQueueFull = errors.New("job queue full")
 // Queue is the enqueue side — a thin, dependency-light wrapper so callers don't
 // need the whole repository surface.
 type Queue struct {
+	mu       sync.Mutex
 	repo     repository.Repository
 	maxDepth int // 0 = unbounded
 }
@@ -77,6 +78,8 @@ func NewQueue(repo repository.Repository) *Queue { return &Queue{repo: repo} }
 // WithMaxDepth caps the number of pending jobs; Enqueue returns ErrQueueFull
 // once the cap is reached. Zero (default) is unbounded.
 func (q *Queue) WithMaxDepth(n int) *Queue {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.maxDepth = n
 	return q
 }
@@ -85,8 +88,14 @@ func (q *Queue) WithMaxDepth(n int) *Queue {
 // matching a live job, deduped is true and id is the existing job. When a depth
 // cap is set and the pending backlog has reached it, returns ErrQueueFull.
 func (q *Queue) Enqueue(ctx context.Context, j repository.Job) (int64, bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	if q.maxDepth > 0 {
-		if n, err := q.repo.CountJobsByStatus(ctx, "pending"); err == nil && n >= q.maxDepth {
+		n, err := q.repo.CountJobsByStatus(ctx, "pending")
+		if err != nil {
+			return 0, false, fmt.Errorf("count pending jobs: %w", err)
+		}
+		if n >= q.maxDepth {
 			return 0, false, ErrQueueFull
 		}
 	}
@@ -233,7 +242,7 @@ func (p *Pool) reaper(ctx context.Context) {
 				continue
 			}
 			if n > 0 {
-				p.logger.Info("requeued stuck jobs", "count", n)
+				p.logger.Info("reaped stuck jobs", "requeued", n)
 			}
 		}
 	}

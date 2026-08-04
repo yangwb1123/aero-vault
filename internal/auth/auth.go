@@ -35,9 +35,12 @@ const (
 
 // Key is a parsed API-key record.
 type Key struct {
-	Token  string
-	Tenant string
-	Scopes map[Scope]bool
+	Token     string
+	Tenant    string
+	SubjectID string
+	Roles     []string
+	Groups    []string
+	Scopes    map[Scope]bool
 }
 
 func (k Key) Has(s Scope) bool {
@@ -50,23 +53,43 @@ func (k Key) Has(s Scope) bool {
 // Registry holds the in-memory map of token -> Key. It is read-only after
 // construction so callers can share one instance across goroutines.
 type Registry struct {
-	mu       sync.RWMutex
-	keys     map[string]Key
-	enabled  bool
-	jwt      *JWTVerifier
-	sigv4    *SigV4Verifier
-	store    PersistentStore // optional repo-backed store for runtime keys (hashed)
-	jwks     *RS256Verifier  // optional JWKS-based RS256 verifier
-	anonRead bool            // allow unauthenticated GET/HEAD on object paths (ACL-gated)
-	keyCache *keyCache       // optional bounded TTL cache for persisted-key lookups (nil = off)
+	mu        sync.RWMutex
+	keys      map[string]Key
+	enabled   bool
+	jwt       *JWTVerifier
+	sigv4     *SigV4Verifier
+	store     PersistentStore // optional repo-backed store for runtime keys (hashed)
+	jwks      *JWKSVerifier   // optional JWKS-based RS256/EdDSA verifier
+	anonRead  bool            // allow unauthenticated GET/HEAD on object paths (ACL-gated)
+	keyCache  *keyCache       // optional bounded TTL cache for persisted-key lookups (nil = off)
+	putSigner *PutPresigner   // REST PUT capabilities; does not enable global auth by itself
 	// keyChangePublisher, when set, is invoked after a local persisted-key
 	// add/revoke with the affected token hash, so other replicas can drop it from
 	// their caches immediately. nil = single-instance (local invalidation only).
 	keyChangePublisher func(ctx context.Context, tokenHash string)
 }
 
+// WithPutPresigner enables validation of REST PUT capability URLs. It does not
+// enable authentication for ordinary requests when all credential sources are
+// otherwise disabled.
+func (r *Registry) WithPutPresigner(p *PutPresigner) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.putSigner = p
+	return r
+}
+
+// PutPresigner returns the signer shared by REST URL generation and auth.
+func (r *Registry) PutPresigner() *PutPresigner {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.putSigner
+}
+
 // Parse turns the AUTH_KEYS env string into a Registry. An empty string
-// returns a disabled (pass-through) registry.
+// returns a disabled (pass-through) registry. Malformed non-empty input returns
+// an enabled registry with no credentials alongside the parse error so callers
+// that log and continue still fail closed.
 func Parse(raw string) (*Registry, error) {
 	reg := &Registry{keys: map[string]Key{}}
 	raw = strings.TrimSpace(raw)
@@ -80,7 +103,10 @@ func Parse(raw string) (*Registry, error) {
 		}
 		parts := strings.SplitN(rec, ":", 3)
 		if len(parts) != 3 {
-			return nil, errors.New("AUTH_KEYS: bad record, want token:tenant:scope+scope")
+			return failClosedRegistry(errors.New("AUTH_KEYS: bad record, want token:tenant:scope+scope"))
+		}
+		if parts[0] == "" || parts[1] == "" {
+			return failClosedRegistry(errors.New("AUTH_KEYS: token and tenant are required"))
 		}
 		k := Key{Token: parts[0], Tenant: parts[1], Scopes: map[Scope]bool{}}
 		for _, sc := range strings.Split(parts[2], "+") {
@@ -88,21 +114,36 @@ func Parse(raw string) (*Registry, error) {
 			if sc == "" {
 				continue
 			}
-			k.Scopes[Scope(sc)] = true
+			scope := Scope(sc)
+			if !knownScope(scope) {
+				return failClosedRegistry(errors.New("AUTH_KEYS: " + rec + ": unknown scope " + sc))
+			}
+			k.Scopes[scope] = true
 		}
 		if len(k.Scopes) == 0 {
-			return nil, errors.New("AUTH_KEYS: " + rec + ": must have at least one scope")
+			return failClosedRegistry(errors.New("AUTH_KEYS: " + rec + ": must have at least one scope"))
 		}
 		reg.keys[k.Token] = k
 	}
-	reg.enabled = len(reg.keys) > 0
+	if len(reg.keys) == 0 {
+		return failClosedRegistry(errors.New("AUTH_KEYS: no valid records"))
+	}
+	reg.enabled = true
 	return reg, nil
+}
+
+func failClosedRegistry(err error) (*Registry, error) {
+	return &Registry{keys: map[string]Key{}, enabled: true}, err
+}
+
+func knownScope(scope Scope) bool {
+	return scope == ScopeRead || scope == ScopeWrite || scope == ScopeAdmin
 }
 
 func (r *Registry) Enabled() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.enabled || r.jwt != nil || r.sigv4 != nil || r.store != nil
+	return r.enabled || r.jwt != nil || r.jwks != nil || r.sigv4 != nil || r.store != nil
 }
 
 // WithStore attaches an optional persistent store so runtime API keys survive
@@ -152,6 +193,21 @@ func (r *Registry) InvalidateCachedKey(tokenHash string) {
 	r.mu.RUnlock()
 	if cache != nil {
 		cache.delete(tokenHash)
+	}
+}
+
+// InvalidatePersistedKey drops a key deleted outside Registry.RevokeKey and
+// publishes the invalidation so peer replicas discard positive cache entries.
+func (r *Registry) InvalidatePersistedKey(ctx context.Context, tokenHash string) {
+	r.mu.RLock()
+	cache := r.keyCache
+	publish := r.keyChangePublisher
+	r.mu.RUnlock()
+	if cache != nil {
+		cache.delete(tokenHash)
+	}
+	if publish != nil {
+		publish(ctx, tokenHash)
 	}
 }
 
@@ -246,13 +302,16 @@ func (r *Registry) WithJWT(secret string) *Registry {
 // JWT returns the verifier (or nil) so /admin/keys can sign new tokens.
 func (r *Registry) JWT() *JWTVerifier { return r.jwt }
 
-// WithJWKS enables RS256 JWT verification via a JWKS endpoint.
+// WithJWKS enables RS256/EdDSA JWT verification via a JWKS endpoint.
 func (r *Registry) WithJWKS(jwksURL string, keyTTL time.Duration, issuer string) *Registry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.jwks = NewRS256Verifier(jwksURL, keyTTL, issuer)
+	r.jwks = NewJWKSVerifier(jwksURL, keyTTL, issuer)
 	return r
 }
+
+// JWKS returns the external-token verifier for startup-only configuration.
+func (r *Registry) JWKS() *JWKSVerifier { return r.jwks }
 
 // WithAnonymousPublicRead allows unauthenticated GET/HEAD on object paths to
 // pass through (flagged anonymous); the handler then serves only public-read
@@ -283,7 +342,17 @@ func isObjectReadPath(method, path string) bool {
 		return false
 	}
 	const prefix = "/v1/files/"
-	return strings.HasPrefix(path, prefix) && len(path) > len(prefix)
+	if !strings.HasPrefix(path, prefix) || len(path) <= len(prefix) {
+		return false
+	}
+	if method == http.MethodGet {
+		for _, suffix := range []string{"/tags", "/versions", "/acl", "/metadata"} {
+			if strings.HasSuffix(path, suffix) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // AddKey registers an API key at runtime — used by the Admin API. When a

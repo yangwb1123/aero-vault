@@ -23,6 +23,8 @@ const (
 	sigV4Algorithm  = "AWS4-HMAC-SHA256"
 	sigV4Service    = "s3"
 	unsignedPayload = "UNSIGNED-PAYLOAD"
+	maxHeaderSkew   = 15 * time.Minute
+	maxPresignTTL   = 7 * 24 * time.Hour
 )
 
 type sigV4Cred struct {
@@ -50,24 +52,37 @@ func ParseSigV4Credentials(raw string) (*SigV4Verifier, error) {
 		}
 		parts := strings.SplitN(rec, ":", 4)
 		if len(parts) < 3 {
-			return nil, errors.New("S3_SIGV4_CREDENTIALS: want accessKey:secretKey:tenant[:scope+scope]")
+			return v, errors.New("S3_SIGV4_CREDENTIALS: want accessKey:secretKey:tenant[:scope+scope]")
+		}
+		if parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return v, errors.New("S3_SIGV4_CREDENTIALS: access key, secret and tenant are required")
+		}
+		if _, duplicate := v.creds[parts[0]]; duplicate {
+			return v, errors.New("S3_SIGV4_CREDENTIALS: duplicate access key " + parts[0])
 		}
 		k := Key{Token: parts[0], Tenant: parts[2], Scopes: map[Scope]bool{ScopeRead: true, ScopeWrite: true}}
 		if len(parts) == 4 && parts[3] != "" {
 			k.Scopes = map[Scope]bool{}
 			for _, sc := range strings.Split(parts[3], "+") {
 				if sc = strings.TrimSpace(sc); sc != "" {
-					k.Scopes[Scope(sc)] = true
+					scope := Scope(sc)
+					if !knownScope(scope) {
+						return v, errors.New("S3_SIGV4_CREDENTIALS: " + rec + ": unknown scope " + sc)
+					}
+					k.Scopes[scope] = true
 				}
 			}
 			// An explicit scope segment that parses to nothing (e.g. "+" or
 			// whitespace) would silently drop all permissions — reject it rather
 			// than leave the credential with no scopes.
 			if len(k.Scopes) == 0 {
-				return nil, errors.New("S3_SIGV4_CREDENTIALS: " + rec + ": scope segment has no valid scope")
+				return v, errors.New("S3_SIGV4_CREDENTIALS: " + rec + ": scope segment has no valid scope")
 			}
 		}
 		v.creds[parts[0]] = sigV4Cred{secret: parts[1], key: k}
+	}
+	if len(v.creds) == 0 {
+		return v, errors.New("S3_SIGV4_CREDENTIALS: no valid records")
 	}
 	return v, nil
 }
@@ -111,9 +126,21 @@ func (v *SigV4Verifier) verifyHeader(r *http.Request) (Key, error) {
 	if amzDate == "" {
 		return Key{}, errors.New("sigv4: missing X-Amz-Date")
 	}
+	if err := validateCredentialScope(scope, amzDate); err != nil {
+		return Key{}, err
+	}
+	if err := validateHeaderTime(amzDate, time.Now().UTC()); err != nil {
+		return Key{}, err
+	}
+	if err := validateSignedHeaders(signedHeaders); err != nil {
+		return Key{}, err
+	}
 	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
 	if payloadHash == "" {
 		payloadHash = unsignedPayload
+	}
+	if err := validatePayloadHash(payloadHash); err != nil {
+		return Key{}, err
 	}
 	sig := v.sign(r, scope, signedHeaders, payloadHash, amzDate, c.secret)
 	if !hmac.Equal([]byte(sig), []byte(providedSig)) {
@@ -142,7 +169,7 @@ func parsePresignedURL(r *http.Request) (url.Values, string, error) {
 	if q.Get("X-Amz-Algorithm") != sigV4Algorithm {
 		return nil, "", errors.New("sigv4: bad presign algorithm")
 	}
-	accessKey, _, err := splitCredential(q.Get("X-Amz-Credential"))
+	accessKey, scope, err := splitCredential(q.Get("X-Amz-Credential"))
 	if err != nil {
 		return nil, "", err
 	}
@@ -154,14 +181,22 @@ func parsePresignedURL(r *http.Request) (url.Values, string, error) {
 	if err != nil {
 		return nil, "", errors.New("sigv4: invalid X-Amz-Date")
 	}
-	if exp := q.Get("X-Amz-Expires"); exp != "" {
-		secs, err := strconv.Atoi(exp)
-		if err != nil || secs <= 0 {
-			return nil, "", errors.New("sigv4: invalid X-Amz-Expires")
-		}
-		if time.Now().UTC().After(signedAt.Add(time.Duration(secs) * time.Second)) {
-			return nil, "", errors.New("sigv4: presigned URL expired")
-		}
+	if err := validateCredentialScope(scope, amzDate); err != nil {
+		return nil, "", err
+	}
+	if err := validateSignedHeaders(strings.Split(q.Get("X-Amz-SignedHeaders"), ";")); err != nil {
+		return nil, "", err
+	}
+	secs, err := strconv.Atoi(q.Get("X-Amz-Expires"))
+	if err != nil || secs <= 0 || time.Duration(secs)*time.Second > maxPresignTTL {
+		return nil, "", errors.New("sigv4: invalid X-Amz-Expires")
+	}
+	now := time.Now().UTC()
+	if signedAt.After(now.Add(maxHeaderSkew)) {
+		return nil, "", errors.New("sigv4: request date is in the future")
+	}
+	if now.After(signedAt.Add(time.Duration(secs) * time.Second)) {
+		return nil, "", errors.New("sigv4: presigned URL expired")
 	}
 	return q, accessKey, nil
 }
@@ -228,10 +263,11 @@ func canonicalHeaderValue(r *http.Request, name string) string {
 		return "0"
 	}
 	vals := r.Header[http.CanonicalHeaderKey(name)]
+	trimmed := make([]string, len(vals))
 	for i := range vals {
-		vals[i] = strings.TrimSpace(vals[i])
+		trimmed[i] = strings.Join(strings.Fields(vals[i]), " ")
 	}
-	return strings.Join(vals, ",")
+	return strings.Join(trimmed, ",")
 }
 
 // deriveSigningKey runs the SigV4 HMAC chain: secret→date→region→s3→aws4_request.
@@ -256,6 +292,9 @@ func hexSHA256(b []byte) string {
 // parseAuthHeader extracts Credential, SignedHeaders, Signature from an
 // "AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=..." header.
 func parseAuthHeader(h string) (credential string, signedHeaders []string, signature string, err error) {
+	if !strings.HasPrefix(h, sigV4Algorithm+" ") {
+		return "", nil, "", errors.New("sigv4: malformed Authorization header")
+	}
 	h = strings.TrimSpace(strings.TrimPrefix(h, sigV4Algorithm))
 	for _, part := range strings.Split(h, ",") {
 		part = strings.TrimSpace(part)
@@ -277,11 +316,16 @@ func parseAuthHeader(h string) (credential string, signedHeaders []string, signa
 // splitCredential splits "AK/date/region/s3/aws4_request" into the access key
 // and the credential scope "date/region/s3/aws4_request".
 func splitCredential(cred string) (accessKey, scope string, err error) {
-	i := strings.IndexByte(cred, '/')
-	if i < 0 {
+	parts := strings.Split(cred, "/")
+	if len(parts) != 5 {
 		return "", "", errors.New("sigv4: malformed credential")
 	}
-	return cred[:i], cred[i+1:], nil
+	for _, part := range parts {
+		if part == "" {
+			return "", "", errors.New("sigv4: malformed credential")
+		}
+	}
+	return parts[0], strings.Join(parts[1:], "/"), nil
 }
 
 // encodeQuery builds the SigV4 canonical query string: params sorted by key,

@@ -10,7 +10,6 @@ import (
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
-
 func (h *Handler) deleteBucketLogging(w http.ResponseWriter, r *http.Request, bucket string) {
 	if err := h.svc.DeleteBucketLogging(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
 		writeS3Error(w, r, err)
@@ -115,7 +114,7 @@ func filterKey(f *filter) string {
 	return f.S3Key.Value.Value
 }
 
-// ── Bucket accelerate (stub) ────────────────────────────────────────────────
+// ── Bucket accelerate ───────────────────────────────────────────────────────
 
 type accelerateConfig struct {
 	XMLNs  string `xml:"xmlns,attr"`
@@ -123,10 +122,41 @@ type accelerateConfig struct {
 }
 
 func (h *Handler) getBucketAccelerate(w http.ResponseWriter, r *http.Request, bucket string) {
-	_ = bucket
+	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	status := cfg.AccelerateStatus
+	if status == "" {
+		status = "Suspended"
+	}
 	writeXML(w, http.StatusOK, accelerateConfig{
-		XMLNs: s3Namespace, Status: "Suspended",
+		XMLNs: s3Namespace, Status: status,
 	})
+}
+
+func (h *Handler) putBucketAccelerate(w http.ResponseWriter, r *http.Request, bucket string) {
+	var config accelerateConfig
+	if err := decodeXMLBody(r.Body, DefaultXMLMaxBytes, &config); err != nil {
+		writeS3Error(w, r, errMalformedXML)
+		return
+	}
+	if err := h.svc.SetBucketAccelerate(
+		r.Context(), mw.TenantFrom(r.Context()), bucket, config.Status,
+	); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) dispatchBucketAccelerate(w http.ResponseWriter, r *http.Request, bucket string) {
+	if r.Method == http.MethodPut {
+		h.putBucketAccelerate(w, r, bucket)
+		return
+	}
+	h.getBucketAccelerate(w, r, bucket)
 }
 
 // ── Restore Object ──────────────────────────────────────────────────────────

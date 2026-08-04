@@ -94,6 +94,7 @@ func (j *Job) scrubObject(ctx context.Context, obj repository.Object) error {
 	if err := j.repo.SetObjectMetaKey(ctx, obj.TenantID, obj.Bucket, obj.Key, "_aero_scrub_status", "corrupt"); err != nil {
 		j.logger.Warn("scrub: failed to mark corrupt", "key", obj.Key, "err", err)
 	}
+	cleanObjectChunks(ctx, j.chunkCleaner, obj, j.logger)
 	j.logger.Warn("scrub: CORRUPT object detected",
 		"tenant", obj.TenantID, "bucket", obj.Bucket, "key", obj.Key, "storage_key", obj.StorageKey)
 	return errors.New("corrupt")

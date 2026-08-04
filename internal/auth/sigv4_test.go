@@ -14,6 +14,10 @@ import (
 )
 
 func signedReq(t *testing.T, method, url, body, ak, sk string) *http.Request {
+	return signedReqAt(t, method, url, body, ak, sk, time.Now().UTC())
+}
+
+func signedReqAt(t *testing.T, method, url, body, ak, sk string, signedAt time.Time) *http.Request {
 	t.Helper()
 	var r *strings.Reader
 	if body != "" {
@@ -30,7 +34,7 @@ func signedReq(t *testing.T, method, url, body, ak, sk string) *http.Request {
 	signer := v4.NewSigner()
 	if err := signer.SignHTTP(context.Background(),
 		aws.Credentials{AccessKeyID: ak, SecretAccessKey: sk},
-		req, payloadHash, "s3", "us-east-1", time.Now().UTC()); err != nil {
+		req, payloadHash, "s3", "us-east-1", signedAt); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	return req
@@ -82,6 +86,9 @@ func TestSigV4UnknownKey(t *testing.T) {
 func TestSigV4Presigned(t *testing.T) {
 	v, _ := ParseSigV4Credentials("AKIDEXAMPLE:secretkey123:acme:read")
 	req, _ := http.NewRequest("GET", "http://vault.example.com/s3/bucket/key.txt", nil)
+	query := req.URL.Query()
+	query.Set("X-Amz-Expires", "900")
+	req.URL.RawQuery = query.Encode()
 	signer := v4.NewSigner()
 	// PresignHTTP signs the URL with UNSIGNED-PAYLOAD and returns a signed URL.
 	signedURL, _, err := signer.PresignHTTP(context.Background(),
@@ -97,15 +104,29 @@ func TestSigV4Presigned(t *testing.T) {
 	}
 }
 
-func TestDecodeStreamingBody(t *testing.T) {
-	// Two data chunks ("Hello" + " world") then the zero terminator.
-	wire := "5;chunk-signature=aaaa\r\nHello\r\n" +
-		"6;chunk-signature=bbbb\r\n world\r\n" +
-		"0;chunk-signature=cccc\r\n\r\n"
-	req, _ := http.NewRequest("PUT", "http://h/s3/b/k", io.NopCloser(strings.NewReader(wire)))
+func TestVerifiedStreamingBody(t *testing.T) {
+	const (
+		amzDate = "20260728T120000Z"
+		scope   = "20260728/us-east-1/s3/aws4_request"
+		seed    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+	key := deriveSigningKey("secretkey123", "20260728", "us-east-1")
+	first := streamingChunkSignature(key, amzDate, scope, seed, []byte("Hello"))
+	second := streamingChunkSignature(key, amzDate, scope, first, []byte(" world"))
+	final := streamingChunkSignature(key, amzDate, scope, second, nil)
+	wire := "5;chunk-signature=" + first + "\r\nHello\r\n" +
+		"6;chunk-signature=" + second + "\r\n world\r\n" +
+		"0;chunk-signature=" + final + "\r\n\r\n"
+	req, _ := http.NewRequest("PUT", "http://h/s3/b/k", strings.NewReader(wire))
 	req.Header.Set("X-Amz-Content-Sha256", streamingPayload)
 	req.Header.Set("X-Amz-Decoded-Content-Length", "11")
-	decodeStreamingBody(req)
+	req.Header.Set("X-Amz-Date", amzDate)
+	req.Header.Set("Authorization", sigV4Algorithm+" Credential=AKIDEXAMPLE/"+scope+
+		", SignedHeaders=host;x-amz-date, Signature="+seed)
+	verifier, _ := ParseSigV4Credentials("AKIDEXAMPLE:secretkey123:acme")
+	if err := verifier.PrepareBody(req); err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
 	got, err := io.ReadAll(req.Body)
 	if err != nil {
 		t.Fatalf("read decoded body: %v", err)
@@ -115,6 +136,45 @@ func TestDecodeStreamingBody(t *testing.T) {
 	}
 	if req.ContentLength != 11 {
 		t.Fatalf("content-length=%d want 11", req.ContentLength)
+	}
+}
+
+func TestSigV4PayloadTamperDetectedWhileReading(t *testing.T) {
+	verifier, _ := ParseSigV4Credentials("AKIDEXAMPLE:secretkey123:acme")
+	req := signedReq(t, "PUT", "http://h/s3/b/k", "original", "AKIDEXAMPLE", "secretkey123")
+	req.Body = io.NopCloser(strings.NewReader("tampered"))
+	req.ContentLength = int64(len("tampered"))
+	if _, err := verifier.Verify(req); err != nil {
+		t.Fatalf("seed signature should still verify: %v", err)
+	}
+	if err := verifier.PrepareBody(req); err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
+	if _, err := io.ReadAll(req.Body); err == nil || !strings.Contains(err.Error(), "payload hash mismatch") {
+		t.Fatalf("expected payload mismatch, got %v", err)
+	}
+}
+
+func TestSigV4RejectsStaleHeader(t *testing.T) {
+	verifier, _ := ParseSigV4Credentials("AKIDEXAMPLE:secretkey123:acme")
+	req := signedReqAt(
+		t, "GET", "http://h/s3/b/k", "", "AKIDEXAMPLE", "secretkey123",
+		time.Now().UTC().Add(-time.Hour),
+	)
+	if _, err := verifier.Verify(req); err == nil || !strings.Contains(err.Error(), "allowed skew") {
+		t.Fatalf("expected stale request rejection, got %v", err)
+	}
+}
+
+func TestSigV4RejectsMalformedCredentialWithoutPanic(t *testing.T) {
+	verifier, _ := ParseSigV4Credentials("AKIDEXAMPLE:secretkey123:acme")
+	req := signedReq(t, "GET", "http://h/s3/b/k", "", "AKIDEXAMPLE", "secretkey123")
+	authHeader := req.Header.Get("Authorization")
+	start := strings.Index(authHeader, "Credential=")
+	end := strings.Index(authHeader[start:], ",")
+	req.Header.Set("Authorization", authHeader[:start]+"Credential=AKIDEXAMPLE/bad"+authHeader[start+end:])
+	if _, err := verifier.Verify(req); err == nil {
+		t.Fatal("malformed credential must be rejected")
 	}
 }
 
@@ -155,6 +215,15 @@ func TestSigV4Middleware(t *testing.T) {
 	h.ServeHTTP(rr3, req3)
 	if rr3.Code != http.StatusForbidden {
 		t.Fatalf("tampered: code=%d want 403", rr3.Code)
+	}
+
+	// A tenant-bound SigV4 credential cannot override a conflicting tenant.
+	req4 := signedReq(t, "GET", "http://h/s3/b/k.txt", "", "AKIDEXAMPLE", "secretkey123")
+	req4.Header.Set("X-Aero-Tenant", "other")
+	rr4 := httptest.NewRecorder()
+	h.ServeHTTP(rr4, req4)
+	if rr4.Code != http.StatusForbidden {
+		t.Fatalf("tenant mismatch: code=%d want 403", rr4.Code)
 	}
 }
 

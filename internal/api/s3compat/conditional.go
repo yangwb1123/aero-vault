@@ -1,11 +1,14 @@
 package s3compat
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
+	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 )
 
 func s3ETagEquals(token, etag string) bool {
@@ -35,6 +38,37 @@ func hasS3GetConditional(r *http.Request) bool {
 	h := r.Header
 	return h.Get("If-Match") != "" || h.Get("If-None-Match") != "" ||
 		h.Get("If-Modified-Since") != "" || h.Get("If-Unmodified-Since") != ""
+}
+
+func hasS3WriteConditional(r *http.Request) bool {
+	return r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
+}
+
+func (h *Handler) checkS3WritePreconditions(
+	w http.ResponseWriter, r *http.Request, bucket, key string,
+) bool {
+	if !hasS3WriteConditional(r) {
+		return true
+	}
+	obj, err := h.svc.Stat(
+		r.Context(), mw.TenantFrom(r.Context()), bucket, key,
+	)
+	exists := err == nil
+	if err != nil && !errors.Is(err, service.ErrNotFound) {
+		writeS3Error(w, r, err)
+		return false
+	}
+	if match := r.Header.Get("If-Match"); match != "" &&
+		(!exists || !s3ETagListMatches(match, obj.ETag)) {
+		writeS3Error(w, r, service.ErrPreconditionFailed)
+		return false
+	}
+	if none := r.Header.Get("If-None-Match"); none != "" && exists &&
+		s3ETagListMatches(none, obj.ETag) {
+		writeS3Error(w, r, service.ErrPreconditionFailed)
+		return false
+	}
+	return true
 }
 
 func evalIfMatch(etag, header string) bool {

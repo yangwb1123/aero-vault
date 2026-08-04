@@ -22,7 +22,7 @@ func (c *Client) GetTags(ctx context.Context, key string) (map[string]string, er
 }
 
 func (c *Client) PutTags(ctx context.Context, key string, tags map[string]string) (map[string]string, error) {
-	body, jOpt, err := jsonBody(tagsEnvelope{Tags: tags})
+	body, jOpt, err := jsonBody(tags)
 	if err != nil {
 		return nil, err
 	}

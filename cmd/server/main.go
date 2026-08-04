@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/cli"
 	"github.com/aero-vault/aero-vault/internal/config"
@@ -55,6 +56,10 @@ func run() error {
 		return err
 	}
 	defer repo.Close()
+	accessManager, err := buildAccessManager(cfg, repo)
+	if err != nil {
+		return fmt.Errorf("configure enterprise access: %w", err)
+	}
 
 	embedder := buildEmbedder(cfg, logger)
 	if cfg.AI.EmbedCacheSize > 0 {
@@ -65,6 +70,8 @@ func run() error {
 
 	svc := service.NewFileService(store, repo, logger).
 		WithEventSink(bus).
+		WithAuthorizer(accessManager).
+		WithTenantStatusEnforcement().
 		WithReadVerification(service.ReadVerificationConfig{
 			Enabled: cfg.Storage.VerifyOnRead,
 			MaxSize: cfg.Storage.VerifyMaxSize,
@@ -100,22 +107,28 @@ func run() error {
 		search, chat, agent = buildAIComponents(ctx, cfg, logger, repo, store, bus, svc, embedder, llm, reranker, jobReg, jobQueue)
 	}
 
-	if err := buildBackgroundWorkers(ctx, cfg, logger, repo, store, bus, jobReg, jobQueue, svc.ChunkCleaner()); err != nil {
+	if err := buildBackgroundWorkers(ctx, cfg, logger, repo, store, bus, jobReg, jobQueue, svc); err != nil {
 		return err
 	}
 
 	authReg := buildAuthRegistry(ctx, cfg, logger, repo)
+	oidcHandler, err := buildOIDCHandler(cfg)
+	if err != nil {
+		return fmt.Errorf("configure OIDC: %w", err)
+	}
 
 	rl := middleware.NewRateLimiter(cfg.RateLimit.RPS, cfg.RateLimit.Burst)
 	aiRL := middleware.NewRateLimiter(cfg.RateLimit.AIRPS, cfg.RateLimit.AIBurst)
+	adminRL := middleware.NewRateLimiter(cfg.RateLimit.AdminRPS, cfg.RateLimit.AdminBurst)
 	rl.Start(ctx)
 	aiRL.Start(ctx)
+	adminRL.Start(ctx)
 
 	promHandler := buildPrometheus(cfg, logger)
 	registerGauges(repo)
 
 	aiTimeout := time.Duration(cfg.App.RequestTimeoutSec) * time.Second
-	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, promHandler, cfg, aiTimeout, aiRL, logger, corsProvider)
+	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, accessManager, oidcHandler, promHandler, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider)
 	cl := middleware.NewConcurrencyLimiter(cfg.App.MaxInFlight)
 	var concurrencyMW func(http.Handler) http.Handler
 	if cfg.App.PerTenantMax > 0 {
@@ -124,7 +137,7 @@ func run() error {
 	} else {
 		concurrencyMW = cl.Middleware()
 	}
-	finalHandler := applyMiddleware(dispatcher, authReg, rl, cfg, logger, concurrencyMW, corsProvider)
+	finalHandler := applyMiddleware(dispatcher, repo, authReg, rl, cfg, logger, concurrencyMW, corsProvider)
 
 	return runServer(ctx, finalHandler, cfg, logger, bus, shutdownOtel)
 }
@@ -150,12 +163,20 @@ func runMCP() error {
 	if err := repo.Migrate(ctx); err != nil {
 		return err
 	}
-	svc := service.NewFileService(store, repo, logger)
+	accessManager, err := buildAccessManager(cfg, repo)
+	if err != nil {
+		return fmt.Errorf("configure enterprise access: %w", err)
+	}
+	ctx = access.SystemContext(ctx, "default")
+	svc := service.NewFileService(store, repo, logger).WithAuthorizer(accessManager)
 	embedder := buildEmbedder(cfg, logger)
 	llm := buildLLM(cfg, logger)
 	var search *ai.Search
 	if embedder != nil {
 		search = ai.NewSearch(repo, embedder, logger)
+		if accessManager != nil {
+			search.WithHitAuthorizer(svc)
+		}
 		if reranker := buildReranker(cfg, logger); reranker != nil {
 			search.WithReranker(reranker)
 		}
@@ -165,6 +186,9 @@ func runMCP() error {
 		chat = ai.NewChat(search, llm, repo, logger).
 			WithPricing(cfg.AI.ChatCostPromptPer1K, cfg.AI.ChatCostCompletionPer1K).
 			WithBudget(cfg.AI.TenantDailyBudgetUSD)
+		if cfg.AI.PerTenantBudgets {
+			chat.WithPerTenantBudgets()
+		}
 	}
 	server := mcp.NewServer(svc, repo, search, "default", logger)
 	if chat != nil {

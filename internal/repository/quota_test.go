@@ -97,4 +97,12 @@ func TestAddTenantUsageCreatesThenIncrements(t *testing.T) {
 	if q.UpdatedAt.IsZero() {
 		t.Fatalf("updated_at is zero after AddTenantUsage")
 	}
+
+	q, err = repo.AddTenantUsage(ctx, "acme", -5_000, -30)
+	if err != nil {
+		t.Fatalf("add usage (clamp): %v", err)
+	}
+	if q.UsedBytes != 0 || q.UsedObjects != 0 {
+		t.Fatalf("usage must not become negative: %+v", q)
+	}
 }

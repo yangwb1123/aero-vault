@@ -579,6 +579,17 @@ func TestPut_withBucketObjectLock(t *testing.T) {
 	if obj.LockedUntil == nil {
 		t.Fatal("expected LockedUntil to be set by bucket object lock")
 	}
+	persisted, err := svc.GetObjectRetention(
+		ctx, "", "", obj.Key, obj.VersionID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.LockedUntil == nil ||
+		!persisted.LockedUntil.Equal(*obj.LockedUntil) {
+		t.Fatalf("persisted lock=%v, returned lock=%v",
+			persisted.LockedUntil, obj.LockedUntil)
+	}
 }
 
 func TestHardDelete_emitEvent(t *testing.T) {

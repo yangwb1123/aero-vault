@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/api/rest"
 	"github.com/aero-vault/aero-vault/internal/api/s3compat"
@@ -55,7 +56,7 @@ func buildDispatcher(r *chi.Mux, davH http.Handler, cfg *config.Config) http.Han
 	})
 }
 
-func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, promHandler http.Handler, cfg *config.Config, aiTimeout time.Duration, aiRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider) http.Handler {
+func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -72,8 +73,25 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 	}
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
-	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, aiTimeout, cfg.AI.DegradedMode,
-		func(h *rest.Handler) { h.WithCORSProvider(corsProvider) }))
+	if oidc != nil {
+		r.Get("/auth/oidc/login", oidc.Login)
+		r.Get("/auth/oidc/callback", oidc.Callback)
+		r.Get("/auth/oidc/logout", oidc.Logout)
+	}
+	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode,
+		func(h *rest.Handler) {
+			h.WithCORSProvider(corsProvider)
+			if accessManager != nil {
+				h.WithAccessManager(accessManager, cfg.Access.PublicBaseURL)
+			}
+		}))
+	if accessManager != nil {
+		publicAccess := rest.NewPublicAccessHandler(svc, accessManager, logger)
+		r.Get("/share/{token}", publicAccess.Share)
+		r.Head("/share/{token}", publicAccess.Share)
+		r.Get("/public/assets/*", publicAccess.Asset)
+		r.Head("/public/assets/*", publicAccess.Asset)
+	}
 	if cfg.S3Compat.Prefix != "" {
 		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger))
 	}
@@ -83,6 +101,8 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 	}
 	r.Method(http.MethodPost, "/mcp", mcp.HTTPHandler(mcpServer))
 	if cfg.WebUI.Enabled {
+		r.Get("/", redirectWebUI)
+		r.Get("/favicon.ico", webui.Favicon)
 		r.Mount("/ui", webui.Handler())
 	}
 	var davH http.Handler
@@ -92,7 +112,15 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 	return buildDispatcher(r, davH, cfg)
 }
 
-func applyMiddleware(handler http.Handler, authReg *auth.Registry, rl *middleware.RateLimiter, cfg *config.Config, logger *slog.Logger, concurrencyMW func(http.Handler) http.Handler, corsProvider middleware.BucketCORSProvider) http.Handler {
+func redirectWebUI(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/ui/", http.StatusFound)
+}
+
+func applyMiddleware(handler http.Handler, repo repository.Repository, authReg *auth.Registry, rl *middleware.RateLimiter, cfg *config.Config, logger *slog.Logger, concurrencyMW func(http.Handler) http.Handler, corsProvider middleware.BucketCORSProvider) http.Handler {
+	tenantMW := middleware.TenantWithStatus(func(ctx context.Context, tenant string) (string, bool, error) {
+		record, found, err := repo.GetTenant(ctx, tenant)
+		return record.Status, found, err
+	})
 	chain := []struct {
 		name string
 		mw   func(http.Handler) http.Handler
@@ -102,7 +130,7 @@ func applyMiddleware(handler http.Handler, authReg *auth.Registry, rl *middlewar
 		{"recoverer", middleware.Recoverer(logger)},
 		{"otel", telemetry.HTTPMiddleware("aero-vault")},
 		{"rate_limit", rl.Middleware()},
-		{"tenant", middleware.Tenant},
+		{"tenant", tenantMW},
 		{"auth", authReg.Middleware()},
 		{"max_body", middleware.MaxBodySize(int64(cfg.App.MaxBodySize))},
 		{"secure_headers", middleware.SecureHeaders()},

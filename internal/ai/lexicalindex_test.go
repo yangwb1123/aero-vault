@@ -21,10 +21,22 @@ func TestSearch_UsesInjectedLexicalIndex(t *testing.T) {
 	ctx := context.Background()
 	env := newTestEnv(t)
 
-	fake := &fakeLexical{hits: []repository.SearchHit{{
-		Score: 0.5,
-		Chunk: repository.Chunk{ID: 9, ObjectID: 1, Bucket: testBucket, ObjectKey: "k.txt", Content: "x", EmbedModel: "fts"},
-	}}}
+	fake := &fakeLexical{hits: []repository.SearchHit{
+		{
+			Score: 0.5,
+			Chunk: repository.Chunk{
+				ID: 9, ObjectID: 1, Bucket: testBucket, ObjectKey: "k.txt",
+				Content: "x", EmbedModel: "hash-64",
+			},
+		},
+		{
+			Score: 0.9,
+			Chunk: repository.Chunk{
+				ID: 10, ObjectID: 2, Bucket: testBucket, ObjectKey: "stale.txt",
+				Content: "x", EmbedModel: "stale-model",
+			},
+		},
+	}}
 
 	s := NewSearch(env.repo, NewHashEmbedder(64), nil).WithLexicalIndex(fake)
 	hits, err := s.Query(ctx, Request{Tenant: testTenant, Bucket: testBucket, Query: "hi", K: 5, Mode: "bm25"})
@@ -35,7 +47,7 @@ func TestSearch_UsesInjectedLexicalIndex(t *testing.T) {
 		t.Fatal("bm25 mode should route through the injected LexicalIndex")
 	}
 	if len(hits) != 1 || hits[0].ChunkID != 9 {
-		t.Fatalf("expected the injected lexical hit (chunk 9), got %+v", hits)
+		t.Fatalf("expected only current-model lexical hit (chunk 9), got %+v", hits)
 	}
 }
 

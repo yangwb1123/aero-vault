@@ -137,6 +137,35 @@ event. `SearchRequest.Mode` is one of `vector`, `bm25`, or `hybrid`.
 | `Usage(ctx) (*Usage, error)` | `GET /v1/usage` |
 | `Health(ctx) (bool, error)` | `GET /healthz` |
 
+### Enterprise files and distribution
+
+```go
+published, _ := c.PublishAsset(ctx, aerovault.PublishAssetRequest{
+	Key: "blog/hero.jpg", Slug: "blog/hero.jpg",
+	CacheControl: "public, max-age=86400",
+})
+fmt.Println(published.URL)
+
+share, _ := c.CreateShare(ctx, aerovault.ShareRequest{
+	Key: "review/design.png", AllowPreview: true,
+	AllowDownload: true, TTLSeconds: 3600,
+})
+fmt.Println(share.URL) // raw token appears only here
+
+backup, _ := c.ExportArchive(ctx, "default", "blog/")
+defer backup.Close()
+io.Copy(backupFile, backup)
+```
+
+`PutACL`, `CreateDepartment`, and `PutDepartmentMember` expose the enterprise
+authorization surface. The same decisions apply to REST, S3, WebDAV, MCP, and
+AI retrieval because enforcement is inside FileService.
+
+Management code can complete each lifecycle with `ListShares`/`RevokeShare`,
+`ListAssets`/`UnpublishAsset`, `ListResourceACL`/`DeleteResourceACL`, and
+`ListDepartments`/`GetDepartment`/`DeleteDepartment`/
+`DeleteDepartmentMember`.
+
 ## Error handling
 
 Any non-2xx response is returned as `*aerovault.Error`, which carries the HTTP

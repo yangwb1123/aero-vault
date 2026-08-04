@@ -2,92 +2,163 @@ package auth
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 )
 
-const streamingPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+const (
+	streamingPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	chunkAlgorithm   = "AWS4-HMAC-SHA256-PAYLOAD"
+	maxChunkSize     = 16 << 20
+)
 
-// decodeStreamingBody rewrites the request body in place when the client used
-// SigV4 streaming chunked transfer (the aws-cli default for uploads). The wire
-// body is a sequence of signed chunks; we de-chunk it so handlers read the raw
-// object bytes. Per-chunk signatures are not re-verified (the seed signature in
-// the Authorization header was already verified).
-func decodeStreamingBody(req *http.Request) {
-	if !strings.EqualFold(req.Header.Get("X-Amz-Content-Sha256"), streamingPayload) {
-		return
+func (v *SigV4Verifier) prepareStreamingBody(req *http.Request) error {
+	credential, _, seedSignature, err := parseAuthHeader(req.Header.Get("Authorization"))
+	if err != nil {
+		return err
 	}
-	req.Body = &chunkedReader{br: bufio.NewReader(req.Body), src: req.Body}
-	// The true object length is advertised separately.
-	if dl := req.Header.Get("X-Amz-Decoded-Content-Length"); dl != "" {
-		if n, err := strconv.ParseInt(dl, 10, 64); err == nil {
-			req.ContentLength = n
+	accessKey, scope, err := splitCredential(credential)
+	if err != nil {
+		return err
+	}
+	cred, ok := v.creds[accessKey]
+	if !ok {
+		return errors.New("sigv4: unknown access key")
+	}
+	parts := strings.Split(scope, "/")
+	req.Body = &verifiedChunkReader{
+		reader:      bufio.NewReader(req.Body),
+		source:      req.Body,
+		signingKey:  deriveSigningKey(cred.secret, parts[0], parts[1]),
+		amzDate:     req.Header.Get("X-Amz-Date"),
+		scope:       scope,
+		previousSig: seedSignature,
+	}
+	if value := req.Header.Get("X-Amz-Decoded-Content-Length"); value != "" {
+		length, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || length < 0 {
+			return errors.New("sigv4: invalid decoded content length")
 		}
+		req.ContentLength = length
 	} else {
 		req.ContentLength = -1
 	}
+	return nil
 }
 
-// chunkedReader decodes the AWS streaming "aws-chunked" body format:
-//
-//	<hex-size>;chunk-signature=<sig>\r\n<data>\r\n ... 0;chunk-signature=<sig>\r\n\r\n
-type chunkedReader struct {
-	br        *bufio.Reader
-	src       io.Closer
-	remaining int64 // bytes left in the current chunk's data
-	done      bool
+type verifiedChunkReader struct {
+	reader      *bufio.Reader
+	source      io.Closer
+	current     *bytes.Reader
+	signingKey  []byte
+	amzDate     string
+	scope       string
+	previousSig string
+	done        bool
 }
 
-func (c *chunkedReader) Read(p []byte) (int, error) {
-	if c.done {
-		return 0, io.EOF
+func (r *verifiedChunkReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
 	}
-	if c.remaining == 0 {
-		size, err := c.nextChunkSize()
-		if err != nil {
-			return 0, err
-		}
-		if size == 0 {
-			c.done = true
+	for r.current == nil || r.current.Len() == 0 {
+		if r.done {
 			return 0, io.EOF
 		}
-		c.remaining = size
+		if err := r.loadChunk(); err != nil {
+			return 0, err
+		}
 	}
-	n := len(p)
-	if int64(n) > c.remaining {
-		n = int(c.remaining)
-	}
-	m, err := c.br.Read(p[:n])
-	c.remaining -= int64(m)
-	if c.remaining == 0 && err == nil {
-		// consume the trailing CRLF after the chunk data
-		_, _ = c.br.Discard(2)
-	}
-	return m, err
+	return r.current.Read(p)
 }
 
-// nextChunkSize reads a chunk header line and returns the data size.
-func (c *chunkedReader) nextChunkSize() (int64, error) {
-	line, err := c.br.ReadString('\n')
-	if err != nil && line == "" {
-		return 0, err
+func (r *verifiedChunkReader) loadChunk() error {
+	size, signature, err := r.readChunkHeader()
+	if err != nil {
+		return err
 	}
-	line = strings.TrimRight(line, "\r\n")
-	if i := strings.IndexByte(line, ';'); i >= 0 {
-		line = line[:i] // strip ";chunk-signature=..."
+	if size > maxChunkSize {
+		return errors.New("sigv4: streaming chunk too large")
 	}
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return 0, io.EOF
+	data := make([]byte, int(size))
+	if _, err := io.ReadFull(r.reader, data); err != nil {
+		return err
 	}
-	return strconv.ParseInt(line, 16, 64)
+	if err := consumeCRLF(r.reader); err != nil {
+		return err
+	}
+	expected := streamingChunkSignature(
+		r.signingKey, r.amzDate, r.scope, r.previousSig, data,
+	)
+	if !hmac.Equal([]byte(expected), []byte(strings.ToLower(signature))) {
+		return errors.New("sigv4: streaming chunk signature mismatch")
+	}
+	r.previousSig = expected
+	r.current = bytes.NewReader(data)
+	r.done = size == 0
+	return nil
 }
 
-func (c *chunkedReader) Close() error {
-	if c.src != nil {
-		return c.src.Close()
+func (r *verifiedChunkReader) readChunkHeader() (int64, string, error) {
+	line, err := r.reader.ReadString('\n')
+	if err != nil {
+		return 0, "", err
+	}
+	if len(line) > 4096 || !strings.HasSuffix(line, "\r\n") {
+		return 0, "", errors.New("sigv4: malformed streaming chunk header")
+	}
+	fields := strings.Split(strings.TrimSuffix(line, "\r\n"), ";")
+	if len(fields) != 2 || !strings.HasPrefix(fields[1], "chunk-signature=") {
+		return 0, "", errors.New("sigv4: missing streaming chunk signature")
+	}
+	size, err := strconv.ParseInt(fields[0], 16, 64)
+	signature := strings.TrimPrefix(fields[1], "chunk-signature=")
+	if err != nil || size < 0 || len(signature) != sha256HexLength {
+		return 0, "", errors.New("sigv4: malformed streaming chunk header")
+	}
+	if _, err := hex.DecodeString(signature); err != nil {
+		return 0, "", errors.New("sigv4: malformed streaming chunk signature")
+	}
+	return size, signature, nil
+}
+
+func consumeCRLF(reader io.Reader) error {
+	var suffix [2]byte
+	if _, err := io.ReadFull(reader, suffix[:]); err != nil {
+		return err
+	}
+	if suffix != [2]byte{'\r', '\n'} {
+		return errors.New("sigv4: malformed streaming chunk terminator")
+	}
+	return nil
+}
+
+func streamingChunkSignature(
+	signingKey []byte, amzDate, scope, previousSignature string, data []byte,
+) string {
+	emptyHash := sha256.Sum256(nil)
+	dataHash := sha256.Sum256(data)
+	stringToSign := strings.Join([]string{
+		chunkAlgorithm,
+		amzDate,
+		scope,
+		previousSignature,
+		hex.EncodeToString(emptyHash[:]),
+		hex.EncodeToString(dataHash[:]),
+	}, "\n")
+	return hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
+}
+
+func (r *verifiedChunkReader) Close() error {
+	if r.source != nil {
+		return r.source.Close()
 	}
 	return nil
 }

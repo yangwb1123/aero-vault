@@ -241,14 +241,28 @@ func (s *sqlStore) JobStats(ctx context.Context) (map[string]int64, error) {
 func (s *sqlStore) ReapStuckJobs(ctx context.Context, maxAge time.Duration) (int64, error) {
 	cutoff := time.Now().UTC().Add(-maxAge).Format(time.RFC3339Nano)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := s.db.ExecContext(ctx, s.rebind(
-		`UPDATE jobs SET status='pending', worker='', updated_at=$1 WHERE status='running' AND started_at <= $2`),
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE jobs SET status='failed', worker='',
+  last_error='worker lease expired after maximum attempts',
+  finished_at=$1, updated_at=$2
+WHERE status='running' AND attempts >= max_attempts AND started_at <= $3`),
+		now, now, cutoff); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE jobs SET status='pending', worker='', updated_at=$1
+WHERE status='running' AND attempts < max_attempts AND started_at <= $2`),
 		now, cutoff)
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	requeued, _ := result.RowsAffected()
+	return requeued, tx.Commit()
 }
 
 func scanJobRow(r *sql.Row) (Job, error)   { return scanJob(r) }

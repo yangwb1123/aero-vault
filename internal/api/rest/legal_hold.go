@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
-	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
@@ -65,19 +64,8 @@ func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 
 	hold, err := h.svc.GetLegalHold(r.Context(), tenant, service.DefaultBucket, key, versionID)
 	if err != nil {
-		if errors.Is(err, service.ErrNotFound) {
-			// If there's no dedicated legal hold, try listing all holds for the object.
-			holds, listErr := h.svc.ListLegalHolds(r.Context(), tenant, service.DefaultBucket, key)
-			if listErr != nil || len(holds) == 0 {
-				w.WriteHeader(http.StatusNotFound)
-				_, _ = w.Write([]byte(`{"error":"legal hold not found"}`))
-				return
-			}
-			hold = holds[0]
-		} else {
-			h.writeError(w, r, err)
-			return
-		}
+		h.writeError(w, r, err)
+		return
 	}
 
 	resp := LegalHoldResponse{
@@ -104,8 +92,7 @@ func (h *Handler) RemoveLegalHold(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ListLegalHolds returns all legal holds for an object.
@@ -140,6 +127,3 @@ func (h *Handler) ListLegalHolds(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
-
-// Ensure repository types are used (import reference).
-var _ = repository.LegalHold{}

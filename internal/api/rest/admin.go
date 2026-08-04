@@ -2,6 +2,7 @@ package rest
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -173,6 +174,8 @@ func (h *AdminHandler) IssueJWT(w http.ResponseWriter, r *http.Request) {
 		Sub        string   `json:"sub"`
 		Tenant     string   `json:"tenant"`
 		Scopes     []string `json:"scopes"`
+		Roles      []string `json:"roles,omitempty"`
+		Groups     []string `json:"groups,omitempty"`
 		TTLSeconds int      `json:"ttl_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -183,12 +186,11 @@ func (h *AdminHandler) IssueJWT(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: "tenant + scopes required"}})
 		return
 	}
-	tok, err := h.reg.JWT().Sign(struct {
-		Sub    string
-		Tenant string
-		Scopes []string
-		TTL    time.Duration
-	}{Sub: body.Sub, Tenant: body.Tenant, Scopes: body.Scopes, TTL: time.Duration(body.TTLSeconds) * time.Second})
+	tok, err := h.reg.JWT().SignWithPrincipal(auth.JWTSignClaims{
+		Sub: body.Sub, Tenant: body.Tenant, Scopes: body.Scopes,
+		Roles: body.Roles, Groups: body.Groups,
+		TTL: time.Duration(body.TTLSeconds) * time.Second,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
@@ -225,12 +227,14 @@ func (h *AdminHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}
-	h.audit(r, "bucket.lifecycle.update", bucket, fmt.Sprintf("days=%d", req.Days))
 	writeJSON(w, http.StatusOK, map[string]any{"days": req.Days, "action": req.Action})
 }
 
 // PUT /v1/admin/buckets/{bucket}/quota  {"max_bytes":N,"max_objects":N}
 func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(w, r) {
+		return
+	}
 	bucket := chiURLParam(r, "bucket")
 	var req struct {
 		MaxBytes   int64 `json:"max_bytes"`
@@ -317,7 +321,18 @@ func (h *AdminHandler) DeleteTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant := chiURLParam(r, "tenant")
+	keys, err := h.repo.ListAPIKeys(r.Context(), tenant)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		return
+	}
 	deleted, err := h.repo.DeleteTenant(r.Context(), tenant)
+	if errors.Is(err, repository.ErrTenantNotEmpty) {
+		writeJSON(w, http.StatusConflict, errorBody{Error: errorPayload{
+			Code: "TenantNotEmpty", Message: "delete tenant buckets, objects, and multipart uploads first",
+		}})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
@@ -325,6 +340,11 @@ func (h *AdminHandler) DeleteTenant(w http.ResponseWriter, r *http.Request) {
 	if !deleted {
 		writeJSON(w, http.StatusNotFound, errorBody{Error: errorPayload{Code: "NotFound", Message: "no such tenant"}})
 		return
+	}
+	if h.reg != nil {
+		for _, key := range keys {
+			h.reg.InvalidatePersistedKey(r.Context(), key.TokenHash)
+		}
 	}
 	h.audit(r, "tenant.delete", tenant, "")
 	w.WriteHeader(http.StatusNoContent)

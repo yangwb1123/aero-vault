@@ -42,6 +42,35 @@ func newBucketTestServer(t *testing.T) *httptest.Server {
 	r.Put("/v1/buckets/{bucket}/versioning", h.PutBucketVersioning)
 	r.Put("/v1/buckets/{bucket}/object-lock", h.PutBucketLock)
 	r.Put("/v1/buckets/{bucket}/lifecycle", adm.PutBucketLifecycle)
+	r.Get("/v1/admin/audit", adm.ListAudit)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+	return srv
+}
+
+func newBucketQuotaAuthTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "quota-auth.db"))
+	if err != nil {
+		t.Fatalf("open repo: %v", err)
+	}
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("new local storage: %v", err)
+	}
+	reg, err := auth.Parse("writer:default:write,operator:*:admin")
+	if err != nil {
+		t.Fatalf("parse auth: %v", err)
+	}
+	adm := NewAdminHandler(service.NewFileService(store, repo, nil), repo, reg)
+	r := chi.NewRouter()
+	r.Use(reg.Middleware())
+	r.Put("/v1/admin/buckets/{bucket}/quota", adm.PutBucketQuota)
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 	return srv
@@ -131,5 +160,33 @@ func TestBucketConfig(t *testing.T) {
 	}
 	if v, ok := cfg["expire_after_days"].(float64); !ok || v != 30 {
 		t.Errorf("expire_after_days after lifecycle: got %v want 30", cfg["expire_after_days"])
+	}
+
+	// Lifecycle changes are intentionally outside the audit contract.
+	_, body = req(t, "GET", srv.URL+"/v1/admin/audit", nil, nil)
+	var audit struct {
+		Entries []repository.AuditEntry `json:"audit"`
+	}
+	if err := json.Unmarshal(body, &audit); err != nil {
+		t.Fatalf("GET audit after lifecycle: parse JSON: %v", err)
+	}
+	if len(audit.Entries) != 0 {
+		t.Fatalf("lifecycle unexpectedly created audit entries: %+v", audit.Entries)
+	}
+}
+
+func TestAdminBucketQuotaRequiresAdmin(t *testing.T) {
+	srv := newBucketQuotaAuthTestServer(t)
+	url := srv.URL + "/v1/admin/buckets/default/quota"
+	body := []byte(`{"max_bytes":1024,"max_objects":10}`)
+
+	resp, got := req(t, http.MethodPut, url, body, map[string]string{"Authorization": "Bearer writer"})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("write-only key: status=%d want 403, body=%s", resp.StatusCode, got)
+	}
+
+	resp, got = req(t, http.MethodPut, url, body, map[string]string{"Authorization": "Bearer operator"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin key: status=%d want 200, body=%s", resp.StatusCode, got)
 	}
 }

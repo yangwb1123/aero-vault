@@ -2,7 +2,6 @@ package reconcile
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"time"
 
@@ -135,19 +134,15 @@ func (r *RetentionJob) purgeSoftDeleted(ctx context.Context) {
 // Returns true when the object was purged. Does NOT fail on chunk cleanup or
 // storage delete errors (best-effort).
 func (r *RetentionJob) purgeOneSoftDeleted(ctx context.Context, obj repository.Object) bool {
-	if obj.LockedUntil != nil && obj.LockedUntil.After(time.Now()) {
+	protected, err := objectKeyDeletionProtected(ctx, r.repo, obj)
+	if err != nil {
+		r.logger.Warn("retention protection check", "key", obj.Key, "err", err)
 		return false
 	}
-	if r.chunkCleaner != nil {
-		if err := r.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
-			r.logger.Warn("retention chunk cleanup", "id", obj.ID, "key", obj.Key, "err", err)
-		}
-	}
-	if err := r.store.Delete(ctx, obj.StorageKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		r.logger.Warn("retention storage delete", "key", obj.Key, "err", err)
+	if protected {
 		return false
 	}
-	if err := r.repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err != nil {
+	if err := hardDeleteKey(ctx, r.repo, r.store, r.chunkCleaner, obj, r.logger); err != nil {
 		r.logger.Warn("retention hard delete", "key", obj.Key, "err", err)
 		return false
 	}

@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -94,7 +95,7 @@ func TestBM25BuildAndSearch(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 
-	hits := b.Search("cat feline", "", 10)
+	hits := b.Search(testTenant, "cat feline", "", 10)
 	if len(hits) == 0 {
 		t.Fatal("expected BM25 hits for 'cat feline'")
 	}
@@ -121,26 +122,26 @@ func TestBM25SearchEmptyAndBucketFilter(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 	// Empty query -> no hits.
-	if got := b.Search("", "", 10); got != nil {
+	if got := b.Search(testTenant, "", "", 10); got != nil {
 		t.Fatalf("empty query should return nil, got %v", got)
 	}
 	// limit<=0 -> no hits.
-	if got := b.Search("alpha", "", 0); got != nil {
+	if got := b.Search(testTenant, "alpha", "", 0); got != nil {
 		t.Fatalf("limit<=0 should return nil, got %v", got)
 	}
 	// Non-existent bucket filter -> no hits.
-	if got := b.Search("alpha", "no-such-bucket", 10); len(got) != 0 {
+	if got := b.Search(testTenant, "alpha", "no-such-bucket", 10); len(got) != 0 {
 		t.Fatalf("bucket filter should exclude all, got %d hits", len(got))
 	}
 	// Matching bucket -> hit.
-	if got := b.Search("alpha", testBucket, 10); len(got) == 0 {
+	if got := b.Search(testTenant, "alpha", testBucket, 10); len(got) == 0 {
 		t.Fatal("matching bucket should return a hit")
 	}
 }
 
 func TestBM25EmptyIndex(t *testing.T) {
 	b := NewBM25()
-	if got := b.Search("anything", "", 10); got != nil {
+	if got := b.Search(testTenant, "anything", "", 10); got != nil {
 		t.Fatalf("empty index should return nil, got %v", got)
 	}
 }
@@ -528,7 +529,7 @@ func TestAgentRunStepBudgetExhausted(t *testing.T) {
 		{Model: "scripted", ToolCalls: []ToolCall{toolCall("list_files", `{}`)}},
 		{Model: "scripted", ToolCalls: []ToolCall{toolCall("list_files", `{}`)}},
 		// 5th call is the forced final answer (no tool calls in scripted default).
-		{Model: "scripted", Content: "forced final"},
+		{Model: "final-model", Content: "forced final"},
 	}}
 	agent := NewAgent(env.svc, s, llm, env.repo, nil)
 	resp, err := agent.Run(context.Background(), AgentReq{Tenant: testTenant, Query: "loop"})
@@ -541,6 +542,9 @@ func TestAgentRunStepBudgetExhausted(t *testing.T) {
 	}
 	if resp.Answer != "forced final" {
 		t.Fatalf("expected forced final answer, got %q", resp.Answer)
+	}
+	if resp.Model != "final-model" {
+		t.Fatalf("model=%q want forced response model", resp.Model)
 	}
 }
 
@@ -647,11 +651,44 @@ func TestIndexerDeleteObjectChunks(t *testing.T) {
 	}
 }
 
+func TestIndexerKeepsOnlyCurrentVersionSearchable(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+	if err := env.svc.SetBucketVersioning(ctx, "", "", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	embedder := NewHashEmbedder(64)
+	old := env.putObject(t, "versioned.txt", "text/plain", "old searchable content")
+	indexer := NewIndexer(
+		env.repo, env.store, NewDefaultExtractor(), NewChunker(), embedder, nil,
+	)
+	if err := indexer.IndexObjectByID(ctx, old.ID); err != nil {
+		t.Fatalf("index old: %v", err)
+	}
+	current := env.putObject(t, "versioned.txt", "text/plain", "current searchable content")
+	if err := indexer.IndexObjectByID(ctx, current.ID); err != nil {
+		t.Fatalf("index current: %v", err)
+	}
+	if chunks, _ := env.repo.ListChunksForObject(ctx, old.ID); len(chunks) != 0 {
+		t.Fatalf("old version retained %d chunks", len(chunks))
+	}
+	if chunks, _ := env.repo.ListChunksForObject(ctx, current.ID); len(chunks) == 0 {
+		t.Fatal("current version has no chunks")
+	}
+	if err := indexer.IndexObjectByID(ctx, old.ID); err != nil {
+		t.Fatalf("stale old-version job: %v", err)
+	}
+	if chunks, _ := env.repo.ListChunksForObject(ctx, old.ID); len(chunks) != 0 {
+		t.Fatalf("stale job restored %d old-version chunks", len(chunks))
+	}
+}
+
 func TestIndexerWithPIIScanWritesTags(t *testing.T) {
 	env := newTestEnv(t)
 	emb := NewHashEmbedder(64)
 	obj := env.putObject(t, "pii.txt", "text/plain", "reach me at alice@example.com or 123-45-6789")
 	ix := NewIndexer(env.repo, env.store, NewDefaultExtractor(), NewChunker(), emb, nil).
+		WithObjectTagger(env.svc).
 		WithPII(NewPIIDetector(), false)
 
 	if err := ix.IndexObjectByID(context.Background(), obj.ID); err != nil {
@@ -675,6 +712,7 @@ func TestIndexerWithPIIRedactsChunks(t *testing.T) {
 	emb := NewHashEmbedder(64)
 	obj := env.putObject(t, "redact.txt", "text/plain", "email secret@corp.com appears here")
 	ix := NewIndexer(env.repo, env.store, NewDefaultExtractor(), NewChunker(), emb, nil).
+		WithObjectTagger(env.svc).
 		WithPII(NewPIIDetector(), true) // redact=true
 
 	if err := ix.IndexObjectByID(context.Background(), obj.ID); err != nil {
@@ -697,6 +735,42 @@ type recordingEnqueuer struct{ jobs []repository.Job }
 func (r *recordingEnqueuer) Enqueue(_ context.Context, j repository.Job) (int64, bool, error) {
 	r.jobs = append(r.jobs, j)
 	return int64(len(r.jobs)), false, nil
+}
+
+type failingEnqueuer struct{}
+
+func (failingEnqueuer) Enqueue(context.Context, repository.Job) (int64, bool, error) {
+	return 0, false, errors.New("queue unavailable")
+}
+
+func TestIndexerLeavesEventUnconsumedWhenEnqueueFails(t *testing.T) {
+	env := newTestEnv(t)
+	obj := env.putObject(t, "retry.txt", "text/plain", "retry me")
+	objectID := obj.ID
+	event := repository.Event{
+		TenantID: testTenant, Bucket: testBucket, Key: obj.Key,
+		Type: repository.EventCreated, ObjectID: &objectID,
+	}
+	eventID, err := env.repo.InsertEvent(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.ID = eventID
+	indexer := NewIndexer(
+		env.repo, env.store, NewDefaultExtractor(), NewChunker(), NewHashEmbedder(64), nil,
+	).WithQueue(failingEnqueuer{})
+	indexer.handle(context.Background(), event)
+
+	pending, err := env.repo.NextUnconsumedEvents(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range pending {
+		if candidate.ID == eventID {
+			return
+		}
+	}
+	t.Fatalf("failed enqueue event %d was marked consumed", eventID)
 }
 
 func TestIndexerRunBridgesEventsToQueue(t *testing.T) {

@@ -90,6 +90,156 @@ func TestPostgresMigrationsApply(t *testing.T) {
 	}
 }
 
+// TestPostgresQuotaAndBucketVersioning covers values whose SQL syntax or wire
+// type differs from SQLite: quota row creation must not abort its transaction,
+// and versioning must be sent to PostgreSQL as a boolean.
+func TestPostgresQuotaAndBucketVersioning(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := freshRepo(t)
+
+	quota, err := repo.AddTenantUsage(ctx, "postgres-regression", 125, 2)
+	if err != nil {
+		t.Fatalf("AddTenantUsage: %v", err)
+	}
+	if quota.UsedBytes != 125 || quota.UsedObjects != 2 {
+		t.Fatalf("usage = (%d, %d), want (125, 2)", quota.UsedBytes, quota.UsedObjects)
+	}
+
+	if err := repo.SetBucketVersioning(ctx, "postgres-regression", "versioned", true); err != nil {
+		t.Fatalf("SetBucketVersioning(true): %v", err)
+	}
+	cfg, err := repo.GetBucketConfig(ctx, "postgres-regression", "versioned")
+	if err != nil {
+		t.Fatalf("GetBucketConfig after enable: %v", err)
+	}
+	if !cfg.Versioning {
+		t.Fatal("versioning is disabled after enabling it")
+	}
+
+	if err := repo.SetBucketVersioning(ctx, "postgres-regression", "versioned", false); err != nil {
+		t.Fatalf("SetBucketVersioning(false): %v", err)
+	}
+	cfg, err = repo.GetBucketConfig(ctx, "postgres-regression", "versioned")
+	if err != nil {
+		t.Fatalf("GetBucketConfig after disable: %v", err)
+	}
+	if cfg.Versioning {
+		t.Fatal("versioning is enabled after disabling it")
+	}
+}
+
+func TestPostgresVersionTombstoneUsageAndDeleteMarker(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := freshRepo(t)
+	if err := repo.SetBucketVersioning(ctx, "default", "versions", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	for i, version := range []string{"v1", "v2"} {
+		if _, err := repo.InsertObjectVersion(ctx, repository.Object{
+			TenantID: "default", Bucket: "versions", Key: "doc.txt",
+			VersionID: version, Backend: "local", StorageKey: "doc@" + version,
+			Size: int64((i + 1) * 10), ETag: version,
+		}); err != nil {
+			t.Fatalf("insert %s: %v", version, err)
+		}
+	}
+	usedBytes, usedObjects, err := repo.BucketUsage(ctx, "default", "versions")
+	if err != nil {
+		t.Fatalf("BucketUsage: %v", err)
+	}
+	if usedBytes != 30 || usedObjects != 2 {
+		t.Fatalf("BucketUsage = (%d, %d), want (30, 2)", usedBytes, usedObjects)
+	}
+	if _, err := repo.InsertDeleteMarker(ctx, repository.Object{
+		TenantID: "default", Bucket: "versions", Key: "doc.txt",
+		VersionID: "marker", Metadata: map[string]string{"_aero_delete_marker": "true"},
+	}); err != nil {
+		t.Fatalf("InsertDeleteMarker: %v", err)
+	}
+}
+
+func TestPostgresVersionTombstoneRestoreAndRetention(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := freshRepo(t)
+	obj := seedObject(t, repo, "restore.txt")
+	if err := repo.SoftDeleteObject(ctx, "default", "default", obj.Key); err != nil {
+		t.Fatalf("SoftDeleteObject: %v", err)
+	}
+	before := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	deleted, err := repo.ListSoftDeletedBefore(ctx, before, 10)
+	if err != nil {
+		t.Fatalf("ListSoftDeletedBefore: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0].ID != obj.ID {
+		t.Fatalf("soft-deleted objects = %+v, want object %d", deleted, obj.ID)
+	}
+	if err := repo.RestoreObject(ctx, "default", "default", obj.Key); err != nil {
+		t.Fatalf("RestoreObject: %v", err)
+	}
+	if _, err := repo.GetObject(ctx, "default", "default", obj.Key); err != nil {
+		t.Fatalf("GetObject after restore: %v", err)
+	}
+}
+
+func TestPostgresVersionTombstoneLifecycleAndPromotion(t *testing.T) {
+	ctx := context.Background()
+	repo, db := freshRepo(t)
+	if err := repo.SetBucketNoncurrentVersionLifecycle(ctx, "default", "versions", 1, 0); err != nil {
+		t.Fatalf("set noncurrent lifecycle: %v", err)
+	}
+	first, err := repo.InsertObjectVersion(ctx, repository.Object{
+		TenantID: "default", Bucket: "versions", Key: "doc.txt",
+		VersionID: "v1", Backend: "local", StorageKey: "doc@v1", Size: 10, ETag: "v1",
+	})
+	if err != nil {
+		t.Fatalf("insert first version: %v", err)
+	}
+	second, err := repo.InsertObjectVersion(ctx, repository.Object{
+		TenantID: "default", Bucket: "versions", Key: "doc.txt",
+		VersionID: "v2", Backend: "local", StorageKey: "doc@v2", Size: 20, ETag: "v2",
+	})
+	if err != nil {
+		t.Fatalf("insert second version: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE objects SET deleted_at=now()-interval '2 days' WHERE id=$1`, first.ID); err != nil {
+		t.Fatalf("age first version: %v", err)
+	}
+	expired, err := repo.ListExpiredNonCurrentVersions(ctx, 10)
+	if err != nil || len(expired) != 1 || expired[0].ID != first.ID {
+		t.Fatalf("expired versions = %+v, err=%v", expired, err)
+	}
+	if err := repo.DeleteObjectVersion(ctx, "default", "versions", "doc.txt", second.VersionID); err != nil {
+		t.Fatalf("DeleteObjectVersion: %v", err)
+	}
+	current, err := repo.GetObject(ctx, "default", "versions", "doc.txt")
+	if err != nil || current.ID != first.ID || current.VersionTombstone {
+		t.Fatalf("promoted object = %+v, err=%v", current, err)
+	}
+}
+
+func TestPostgresBucketCORSDeleteUsesValidJSON(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := freshRepo(t)
+	rules := []repository.CORSRule{{
+		AllowedOrigins: []string{"https://example.test"},
+		AllowedMethods: []string{"GET"},
+	}}
+	if err := repo.SetBucketCORS(ctx, "default", "cors", rules); err != nil {
+		t.Fatalf("SetBucketCORS: %v", err)
+	}
+	got, err := repo.GetBucketCORS(ctx, "default", "cors")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("GetBucketCORS = %+v, err=%v", got, err)
+	}
+	if err := repo.DeleteBucketCORS(ctx, "default", "cors"); err != nil {
+		t.Fatalf("DeleteBucketCORS: %v", err)
+	}
+	got, err = repo.GetBucketCORS(ctx, "default", "cors")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("GetBucketCORS after delete = %+v, err=%v", got, err)
+	}
+}
+
 // TestPgVectorSearch verifies the pgvector adapter returns nearest-neighbour
 // hits against a real vector column.
 func TestPgVectorSearch(t *testing.T) {

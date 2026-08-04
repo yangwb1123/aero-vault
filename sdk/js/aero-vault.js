@@ -871,6 +871,113 @@ export class Client {
       json: { daily_budget_usd: dailyUSD },
     });
   }
+
+  // ---- enterprise access / sharing / publishing ----
+
+  /** Create a revocable object capability link. */
+  async createShare(key, opts = {}) {
+    return this._requestJSON("POST", "/v1/shares", {
+      json: {
+        bucket: opts.bucket || "default", key, name: opts.name || "",
+        password: opts.password || "", allow_preview: opts.allowPreview ?? true,
+        allow_download: opts.allowDownload ?? false, max_uses: opts.maxUses || 0,
+        ttl_seconds: opts.ttlSeconds || 0,
+      },
+    });
+  }
+
+  /** List share records for one object. Raw share tokens are never returned. */
+  async listShares(key, bucket = "default") {
+    const out = await this._requestJSON("GET", "/v1/shares", { params: { bucket, key } });
+    return out?.shares || [];
+  }
+
+  /** Revoke one share link. */
+  async revokeShare(id) {
+    return this._requestJSON("DELETE", `/v1/shares/${encodeURIComponent(id)}`);
+  }
+
+  /** Publish an image under a stable public slug. */
+  async publishAsset(key, slug, opts = {}) {
+    return this._requestJSON("POST", "/v1/assets", {
+      json: {
+        bucket: opts.bucket || "default", key, slug,
+        cache_control: opts.cacheControl || "public, max-age=3600",
+      },
+    });
+  }
+
+  /** Remove a public image slug without deleting its source object. */
+  async unpublishAsset(slug) {
+    return this._requestJSON("DELETE", `/v1/assets/${escapeKey(slug)}`);
+  }
+
+  /** List published images for the active tenant. */
+  async listAssets() {
+    const out = await this._requestJSON("GET", "/v1/assets");
+    return out?.assets || [];
+  }
+
+  /** Grant or deny one or more actions on a resource. */
+  async putResourceACL(input) {
+    return this._requestJSON("PUT", "/v1/access/acl", { json: input });
+  }
+
+  /** List ACL entries directly attached to a resource. */
+  async listResourceACL(key = "", opts = {}) {
+    const out = await this._requestJSON("GET", "/v1/access/acl", {
+      params: { bucket: opts.bucket || "default", key, kind: opts.resourceKind || "object" },
+    });
+    return out?.entries || [];
+  }
+
+  /** Delete one resource ACL entry. */
+  async deleteResourceACL(id) {
+    return this._requestJSON("DELETE", `/v1/access/acl/${encodeURIComponent(id)}`);
+  }
+
+  /** Create a department (admin scope). */
+  async createDepartment(name, parentId = "") {
+    return this._requestJSON("POST", "/v1/admin/departments", {
+      json: { name, parent_id: parentId },
+    });
+  }
+
+  /** List departments for the active tenant (admin scope). */
+  async listDepartments() {
+    const out = await this._requestJSON("GET", "/v1/admin/departments");
+    return out?.departments || [];
+  }
+
+  /** Get one department and its members (admin scope). */
+  async getDepartment(id) {
+    return this._requestJSON("GET", `/v1/admin/departments/${encodeURIComponent(id)}`);
+  }
+
+  /** Delete a department (admin scope). */
+  async deleteDepartment(id) {
+    return this._requestJSON("DELETE", `/v1/admin/departments/${encodeURIComponent(id)}`);
+  }
+
+  /** Add or update a department member (admin scope). */
+  async putDepartmentMember(departmentId, subjectId, role = "member") {
+    const path = `/v1/admin/departments/${encodeURIComponent(departmentId)}/members/${encodeURIComponent(subjectId)}`;
+    return this._requestJSON("PUT", path, { json: { role } });
+  }
+
+  /** Remove a department member (admin scope). */
+  async deleteDepartmentMember(departmentId, subjectId) {
+    const path = `/v1/admin/departments/${encodeURIComponent(departmentId)}/members/${encodeURIComponent(subjectId)}`;
+    return this._requestJSON("DELETE", path);
+  }
+
+  /** Download an authorized portable tar.gz backup as Uint8Array. */
+  async exportArchive(opts = {}) {
+    const response = await this._fetchRaw("GET", "/v1/exports/archive", {
+      params: { bucket: opts.bucket || "default", prefix: opts.prefix || "" },
+    });
+    return new Uint8Array(await response.arrayBuffer());
+  }
 }
 
 // ---- helpers ------------------------------------------------------------

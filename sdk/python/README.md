@@ -51,7 +51,22 @@ for token in av.chat_stream("summarize everything"):
 
 # tool-calling agent
 print(av.agent("find the largest file and tell me its name")["answer"])
+
+# --- publish/share/backup ---
+av.upload("blog/hero.jpg", open("hero.jpg", "rb"), content_type="image/jpeg")
+published = av.publish_asset("blog/hero.jpg", "blog/hero.jpg")
+print(published["url"])
+share = av.create_share("blog/hero.jpg", allow_download=True, ttl_seconds=3600)
+print(share["url"])
+open("backup.tar.gz", "wb").write(av.export_archive(prefix="blog/"))
 ```
+
+Department and resource authorization are available through
+`create_department`, `list_departments`, `get_department`,
+`delete_department`, `put_department_member`, `delete_department_member`,
+`put_resource_acl`, `list_resource_acl`, and `delete_resource_acl`.
+Published-image and share lifecycle operations include `list_assets`,
+`unpublish_asset`, `list_shares`, and `revoke_share`.
 
 ## Authentication & tenancy
 

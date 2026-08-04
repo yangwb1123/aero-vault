@@ -30,7 +30,15 @@ type terminalRepo struct {
 
 	mu         sync.Mutex
 	markedDone []int64              // ids passed to MarkWebhookSucceeded
+	markedDead []int64              // ids passed to MarkWebhookDeadLettered
 	updates    []terminalRepoUpdate // args passed to UpdateWebhookFailure
+}
+
+func (r *terminalRepo) MarkWebhookDeadLettered(_ context.Context, id int64, _ string, _ int, _ int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.markedDead = append(r.markedDead, id)
+	return nil
 }
 
 type terminalRepoUpdate struct {
@@ -54,10 +62,8 @@ func (r *terminalRepo) UpdateWebhookFailure(_ context.Context, id int64, lastErr
 	return nil
 }
 
-// After the max-attempts threshold a still-failing delivery must be retired so
-// NextPendingFailures (WHERE succeeded = 0) stops re-selecting it; otherwise the
-// dead-letter table grows unbounded and the row retries forever. Since the schema
-// has only a binary `succeeded` flag, the terminal transition is MarkWebhookSucceeded.
+// After the max-attempts threshold a still-failing delivery enters the DLQ and
+// must not be mislabeled as a successful delivery.
 func TestWebhook_RetryOne_MaxAttemptsRetiresRow(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		rw.WriteHeader(http.StatusInternalServerError)
@@ -77,20 +83,14 @@ func TestWebhook_RetryOne_MaxAttemptsRetiresRow(t *testing.T) {
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
 
-	if len(repo.markedDone) != 1 || repo.markedDone[0] != 7 {
-		t.Fatalf("expected MarkWebhookSucceeded(7) to retire the maxed-out row, got markedDone=%v", repo.markedDone)
+	if len(repo.markedDone) != 0 {
+		t.Fatalf("terminal failure was mislabeled succeeded: %v", repo.markedDone)
 	}
-	if len(repo.updates) != 1 {
-		t.Fatalf("expected exactly one UpdateWebhookFailure recording the final error, got %d", len(repo.updates))
+	if len(repo.markedDead) != 1 || repo.markedDead[0] != 7 {
+		t.Fatalf("expected MarkWebhookDeadLettered(7), got %v", repo.markedDead)
 	}
-	last := repo.updates[0]
-	if last.attempts != 10 {
-		t.Fatalf("expected final attempts=10, got %d", last.attempts)
-	}
-	// Must not schedule a future retry — the old bug parked next_retry_at 24h out
-	// while leaving succeeded=0, so the row was re-selected every 24h forever.
-	if last.nextRetryAt.After(time.Now().Add(time.Minute)) {
-		t.Fatalf("terminal failure must not schedule a future retry, got next_retry_at=%s", last.nextRetryAt)
+	if len(repo.updates) != 0 {
+		t.Fatalf("terminal transition must be atomic, got updates=%v", repo.updates)
 	}
 }
 
@@ -117,6 +117,9 @@ func TestWebhook_RetryOne_BelowMaxReschedules(t *testing.T) {
 
 	if len(repo.markedDone) != 0 {
 		t.Fatalf("a below-threshold failure must not be retired, got markedDone=%v", repo.markedDone)
+	}
+	if len(repo.markedDead) != 0 {
+		t.Fatalf("below-threshold failure must not enter DLQ, got %v", repo.markedDead)
 	}
 	if len(repo.updates) != 1 {
 		t.Fatalf("expected one UpdateWebhookFailure rescheduling the retry, got %d", len(repo.updates))

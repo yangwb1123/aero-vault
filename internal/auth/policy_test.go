@@ -116,3 +116,76 @@ func TestPolicy_EvalActions(t *testing.T) {
 		}
 	}
 }
+
+func TestPolicy_ResourceMatching(t *testing.T) {
+	p, err := ParsePolicy(`{
+		"Version": "2012-10-17",
+		"Statement": [{
+			"Effect": "Allow",
+			"Principal": "*",
+			"Action": "s3:GetObject",
+			"Resource": [
+				"arn:aws:s3:::docs/exact.txt",
+				"arn:aws:s3:::docs/public/*"
+			]
+		}]
+	}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tests := []struct {
+		resource string
+		allowed  bool
+	}{
+		{"arn:aws:s3:::docs/exact.txt", true},
+		{"arn:aws:s3:::docs/public/nested/readme.txt", true},
+		{"arn:aws:s3:::docs/private/readme.txt", false},
+		{"arn:aws:s3:::other/public/readme.txt", false},
+		{"arn:aws:s3:::docs", false},
+	}
+	for _, tt := range tests {
+		got := AllowedResource(p, "s3:GetObject", tt.resource, "10.0.0.1")
+		if got != tt.allowed {
+			t.Errorf("AllowedResource(%q) = %v, want %v", tt.resource, got, tt.allowed)
+		}
+	}
+}
+
+func TestPolicy_BucketResourceAndExplicitDeny(t *testing.T) {
+	p, err := ParsePolicy(`{
+		"Version": "2012-10-17",
+		"Statement": [
+			{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"*"},
+			{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::docs/private/*"},
+			{"Effect":"Deny","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::blocked"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if AllowedResource(p, "s3:GetObject", "arn:aws:s3:::docs/private/secret.txt", "10.0.0.1") {
+		t.Fatal("explicit object-resource Deny must override wildcard Allow")
+	}
+	if !AllowedResource(p, "s3:GetObject", "arn:aws:s3:::docs/public/readme.txt", "10.0.0.1") {
+		t.Fatal("resource-mismatched Deny must not override Allow")
+	}
+	if AllowedResource(p, "s3:ListBucket", "arn:aws:s3:::blocked", "10.0.0.1") {
+		t.Fatal("exact bucket ARN should match Deny")
+	}
+	if !AllowedResource(p, "s3:ListBucket", "arn:aws:s3:::docs", "10.0.0.1") {
+		t.Fatal("different bucket ARN should retain wildcard Allow")
+	}
+}
+
+func TestParsePolicyRejectsUnsupportedOrInvalidIPConditions(t *testing.T) {
+	policies := []string{
+		`{"Statement":[{"Effect":"Allow","Action":"s3:*","Condition":{"StringEquals":{"aws:SourceIp":"10.0.0.1"}}}]}`,
+		`{"Statement":[{"Effect":"Allow","Action":"s3:*","Condition":{"IpAddress":{"aws:UserAgent":"10.0.0.0/8"}}}]}`,
+		`{"Statement":[{"Effect":"Allow","Action":"s3:*","Condition":{"NotIpAddress":{"aws:SourceIp":"invalid"}}}]}`,
+	}
+	for _, raw := range policies {
+		if _, err := ParsePolicy(raw); err == nil {
+			t.Fatalf("expected invalid condition rejection: %s", raw)
+		}
+	}
+}

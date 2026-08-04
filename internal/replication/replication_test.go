@@ -43,7 +43,8 @@ func TestReplicateObject(t *testing.T) {
 		t.Fatalf("replica unexpectedly has object before replication")
 	}
 
-	w := NewWorker(repo, primary, replica, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := NewWorker(repo, primary, replica, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithObjectTagger(svc)
 	if err := w.ReplicateObjectByID(ctx, obj.ID); err != nil {
 		t.Fatalf("replicate: %v", err)
 	}
@@ -66,6 +67,77 @@ func TestReplicateObject(t *testing.T) {
 	reread, _ := repo.GetObject(ctx, "default", "default", "docs/a.txt")
 	if reread.Tags[TagStatus] != "replicated" {
 		t.Fatalf("expected repl_status=replicated, got %v", reread.Tags)
+	}
+}
+
+func TestReplicateManagedEncryption(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "encrypted.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	primary, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "primary"), SSEKey: "primary-key"})
+	replica, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "replica"), SSEKey: "replica-key"})
+	svc := service.NewFileService(primary, repo, nil)
+	body := "encrypted replica"
+	obj, err := svc.Put(ctx, "", "", "encrypted.txt", strings.NewReader(body), int64(len(body)), service.PutOptions{
+		SSEAlgorithm: "AES256",
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	worker := NewWorker(repo, primary, replica, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithObjectTagger(svc)
+	if err := worker.ReplicateObjectByID(ctx, obj.ID); err != nil {
+		t.Fatalf("replicate: %v", err)
+	}
+	rc, _, err := replica.Get(ctx, obj.StorageKey)
+	if err != nil {
+		t.Fatalf("read replica: %v", err)
+	}
+	defer rc.Close()
+	got, _ := io.ReadAll(rc)
+	if string(got) != body {
+		t.Fatalf("replica body = %q", got)
+	}
+}
+
+func TestReplicationStatusTagsExactVersion(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "versions.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	primary, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "primary")})
+	replica, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "replica")})
+	svc := service.NewFileService(primary, repo, nil)
+	if err := svc.SetBucketVersioning(ctx, "", "", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	old, _ := svc.Put(ctx, "", "", "versioned.txt", strings.NewReader("old"), 3, service.PutOptions{})
+	current, _ := svc.Put(ctx, "", "", "versioned.txt", strings.NewReader("new"), 3, service.PutOptions{})
+	worker := NewWorker(repo, primary, replica, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithObjectTagger(svc)
+	if err := worker.ReplicateObjectByID(ctx, old.ID); err != nil {
+		t.Fatalf("replicate old version: %v", err)
+	}
+	oldAfter, _ := repo.GetObjectByID(ctx, old.ID)
+	currentAfter, _ := repo.GetObjectByID(ctx, current.ID)
+	if oldAfter.Tags[TagStatus] != "replicated" {
+		t.Fatalf("old version tags = %v", oldAfter.Tags)
+	}
+	if currentAfter.Tags[TagStatus] != "" {
+		t.Fatalf("current version received stale status: %v", currentAfter.Tags)
 	}
 }
 

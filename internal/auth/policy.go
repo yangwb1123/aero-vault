@@ -56,13 +56,26 @@ func ParsePolicy(jsonStr string) (*Policy, error) {
 	if len(p.Statement) == 0 {
 		return nil, nil
 	}
+	for index := range p.Statement {
+		if err := p.Statement[index].validateConditions(); err != nil {
+			return nil, fmt.Errorf("statement %d: %w", index, err)
+		}
+	}
 	return &p, nil
 }
 
 // Eval evaluates the policy for a given S3 action and source IP.
+// Resource constraints are intentionally ignored for compatibility with
+// callers that do not have a concrete S3 resource. New protocol adapters
+// should use EvalResource.
 // Returns EffectAllow, EffectDeny, or EffectImplicitDeny.
 // Deny always wins over Allow. If no statement matches, EffectImplicitDeny.
 func (p *Policy) Eval(action, sourceIP string) PolicyEffect {
+	return p.EvalResource(action, "", sourceIP)
+}
+
+// EvalResource evaluates the policy for an action, resource ARN, and source IP.
+func (p *Policy) EvalResource(action, resource, sourceIP string) PolicyEffect {
 	canonAction := s3Actions[action]
 	if canonAction == "" {
 		canonAction = action
@@ -71,6 +84,9 @@ func (p *Policy) Eval(action, sourceIP string) PolicyEffect {
 	allow := false
 	for _, stmt := range p.Statement {
 		if !stmt.matchesAction(canonAction) {
+			continue
+		}
+		if !stmt.matchesResource(resource) {
 			continue
 		}
 		if !stmt.matchesPrincipal() {
@@ -90,6 +106,48 @@ func (p *Policy) Eval(action, sourceIP string) PolicyEffect {
 		return EffectAllow
 	}
 	return EffectImplicitDeny
+}
+
+func (s *Statement) matchesResource(resource string) bool {
+	if resource == "" || len(s.Resource) == 0 {
+		return true
+	}
+	for _, pattern := range s.Resource {
+		if wildcardMatch(pattern, resource) {
+			return true
+		}
+	}
+	return false
+}
+
+// wildcardMatch implements IAM-style '*' matching. Unlike path.Match, '*'
+// may span '/' characters in object keys.
+func wildcardMatch(pattern, value string) bool {
+	patternIndex, valueIndex := 0, 0
+	starIndex, retryIndex := -1, 0
+	for valueIndex < len(value) {
+		if patternIndex < len(pattern) && pattern[patternIndex] == value[valueIndex] {
+			patternIndex++
+			valueIndex++
+			continue
+		}
+		if patternIndex < len(pattern) && pattern[patternIndex] == '*' {
+			starIndex = patternIndex
+			retryIndex = valueIndex
+			patternIndex++
+			continue
+		}
+		if starIndex < 0 {
+			return false
+		}
+		patternIndex = starIndex + 1
+		retryIndex++
+		valueIndex = retryIndex
+	}
+	for patternIndex < len(pattern) && pattern[patternIndex] == '*' {
+		patternIndex++
+	}
+	return patternIndex == len(pattern)
 }
 
 func (s *Statement) matchesAction(action string) bool {
@@ -167,10 +225,31 @@ func (s *Statement) matchesConditions(sourceIP string) bool {
 				if ipInAnyCIDR(sourceIP, values) {
 					return false
 				}
+			default:
+				return false
 			}
 		}
 	}
 	return true
+}
+
+func (s *Statement) validateConditions() error {
+	for operator, conditions := range s.Condition {
+		if operator != "IpAddress" && operator != "NotIpAddress" {
+			return fmt.Errorf("unsupported condition operator %q", operator)
+		}
+		for key, values := range conditions {
+			if key != "aws:SourceIp" || len(values) == 0 {
+				return fmt.Errorf("unsupported or empty condition key %q", key)
+			}
+			for _, value := range values {
+				if _, _, err := net.ParseCIDR(value); err != nil {
+					return fmt.Errorf("invalid source CIDR %q", value)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func ipInAnyCIDR(ip string, cidrs []string) bool {
@@ -198,6 +277,15 @@ func Allowed(policy *Policy, action, sourceIP string) bool {
 	}
 	e := policy.Eval(action, sourceIP)
 	return e == EffectAllow
+}
+
+// AllowedResource checks whether action is permitted for a concrete S3
+// resource ARN. A nil policy means that the bucket has no policy configured.
+func AllowedResource(policy *Policy, action, resource, sourceIP string) bool {
+	if policy == nil {
+		return true
+	}
+	return policy.EvalResource(action, resource, sourceIP) == EffectAllow
 }
 
 // StringOrArray normalises a JSON field that may be a string or []string.

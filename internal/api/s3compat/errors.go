@@ -40,11 +40,13 @@ var errMalformedXML = errors.New("the XML you provided was not well-formed or di
 // errNoSuchBucket signals a request against a bucket that does not exist
 // (404 NoSuchBucket).
 var errNoSuchBucket = errors.New("the specified bucket does not exist")
+var errBucketNotEmpty = errors.New("the bucket you tried to delete is not empty")
 
 var s3CodeStatus = map[string]int{
 	"MalformedJSON":                http.StatusBadRequest,
 	"MalformedXML":                 http.StatusBadRequest,
 	"NoSuchBucket":                 http.StatusNotFound,
+	"BucketNotEmpty":               http.StatusConflict,
 	"NoSuchBucketPolicy":           http.StatusNotFound,
 	"NoSuchLifecycleConfiguration": http.StatusNotFound,
 	"NoSuchWebsiteConfiguration":   http.StatusNotFound,
@@ -54,15 +56,19 @@ var s3CodeStatus = map[string]int{
 	"PreconditionFailed":           http.StatusPreconditionFailed,
 	"NoSuchUpload":                 http.StatusNotFound,
 	"InvalidArgument":              http.StatusBadRequest,
+	"BadDigest":                    http.StatusBadRequest,
+	"IncompleteBody":               http.StatusBadRequest,
 	"AccessDenied":                 http.StatusForbidden,
 	"AccessDenied.Locked":          http.StatusForbidden,
 	"ObjectCorrupt":                http.StatusGone,
 	"QuotaExceeded":                http.StatusForbidden,
+	"NotImplemented":               http.StatusNotImplemented,
 }
 
 var s3CodeMessage = map[string]string{
 	"MalformedXML":                 "The XML you provided was not well-formed or did not validate against our published schema.",
 	"NoSuchBucket":                 "The specified bucket does not exist.",
+	"BucketNotEmpty":               "The bucket you tried to delete is not empty.",
 	"NoSuchBucketPolicy":           "The bucket policy does not exist.",
 	"NoSuchLifecycleConfiguration": "The lifecycle configuration does not exist.",
 	"NoSuchWebsiteConfiguration":   "The website configuration does not exist.",
@@ -72,10 +78,13 @@ var s3CodeMessage = map[string]string{
 	"PreconditionFailed":           "At least one of the preconditions you specified did not hold.",
 	"NoSuchUpload":                 "The specified multipart upload does not exist.",
 	"InvalidArgument":              "",
+	"BadDigest":                    "The Content-MD5 or encryption-key MD5 you specified did not match what was received.",
+	"IncompleteBody":               "You did not provide the number of bytes specified by the Content-Length HTTP header.",
 	"AccessDenied":                 "Access denied.",
 	"AccessDenied.Locked":          "Object is under retention lock (WORM).",
 	"ObjectCorrupt":                "Object is marked as corrupt.",
 	"QuotaExceeded":                "The tenant storage quota has been exceeded.",
+	"NotImplemented":               "A requested feature is not implemented.",
 }
 
 var errToS3Code = []struct {
@@ -84,6 +93,7 @@ var errToS3Code = []struct {
 }{
 	{errMalformedXML, "MalformedXML"},
 	{errNoSuchBucket, "NoSuchBucket"},
+	{errBucketNotEmpty, "BucketNotEmpty"},
 	{errNoSuchBucketPolicy, "NoSuchBucketPolicy"},
 	{errNoSuchLifecycle, "NoSuchLifecycleConfiguration"},
 	{errNoSuchWebsite, "NoSuchWebsiteConfiguration"},
@@ -91,6 +101,11 @@ var errToS3Code = []struct {
 	{service.ErrNotFound, "NoSuchKey"},
 	{repository.ErrNotFound, "NoSuchKey"},
 	{service.ErrInvalidArgs, "InvalidArgument"},
+	{service.ErrMetadataTooLarge, "InvalidArgument"},
+	{service.ErrMetadataKeyTooLong, "InvalidArgument"},
+	{service.ErrMetadataValueTooLong, "InvalidArgument"},
+	{service.ErrBadDigest, "BadDigest"},
+	{service.ErrSizeMismatch, "IncompleteBody"},
 	{service.ErrRangeNotSatisfiable, "InvalidRange"},
 	{service.ErrPreconditionFailed, "PreconditionFailed"},
 	{service.ErrUploadNotFound, "NoSuchUpload"},

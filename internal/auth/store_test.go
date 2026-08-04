@@ -250,6 +250,33 @@ func TestInvalidateCachedKey_DropsEntry(t *testing.T) {
 	}
 }
 
+func TestInvalidatePersistedKey_DropsAndPublishes(t *testing.T) {
+	ctx := context.Background()
+	reg, _ := Parse("")
+	store := newFakeStore()
+	reg.WithStore(store).WithKeyCache(time.Minute, 16)
+	const token = "tenant-delete-key"
+	if err := reg.AddKey(ctx, Key{
+		Token: token, Tenant: "acme", Scopes: map[Scope]bool{ScopeRead: true},
+	}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reg.Lookup(ctx, token); !ok {
+		t.Fatal("key should resolve before tenant cleanup")
+	}
+	hash := HashToken(token)
+	delete(store.m, hash)
+	var published string
+	reg.WithKeyChangePublisher(func(_ context.Context, value string) { published = value })
+	reg.InvalidatePersistedKey(ctx, hash)
+	if _, ok := reg.Lookup(ctx, token); ok {
+		t.Fatal("externally deleted key survived the positive cache")
+	}
+	if published != hash {
+		t.Fatalf("published hash=%q, want %q", published, hash)
+	}
+}
+
 // TestNoStore_DefaultDisabled guards the MVP posture: without env keys / JWT /
 // SigV4 / store, auth stays disabled (pass-through).
 func TestNoStore_DefaultDisabled(t *testing.T) {

@@ -13,8 +13,9 @@ import (
 
 func buildAuthRegistry(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository) *auth.Registry {
 	authReg, err := auth.Parse(cfg.Auth.Keys)
+	authReg.WithPutPresigner(auth.NewPutPresigner(cfg.Auth.PresignSecret))
 	if err != nil {
-		logger.Error("parse auth keys failed; running without auth", "err", err)
+		logger.Error("parse auth keys failed; authentication locked down", "err", err)
 		return authReg
 	}
 	configureAuthSecrets(ctx, authReg, cfg, repo, logger)
@@ -35,14 +36,25 @@ func configureAuthSecrets(ctx context.Context, reg *auth.Registry, cfg *config.C
 	if cfg.Auth.JWKSEndpoint != "" {
 		keyTTL := time.Duration(cfg.Auth.JWKSKeyTTLSeconds) * time.Second
 		reg.WithJWKS(cfg.Auth.JWKSEndpoint, keyTTL, cfg.Auth.JWTIssuer)
-		logger.Info("JWKS-based RS256 JWT verification enabled", "jwks_url", cfg.Auth.JWKSEndpoint, "issuer", cfg.Auth.JWTIssuer)
+		reg.JWKS().
+			WithAudience(cfg.Auth.JWKSAudience).
+			WithTenantClaim(cfg.Auth.JWKSTenantClaim).
+			WithClientTenants(cfg.Auth.JWKSClientTenants).
+			WithDefaultScopes(authScopes(cfg.Auth.JWKSDefaultScopes))
+		logger.Info("JWKS-based JWT verification enabled",
+			"jwks_url", cfg.Auth.JWKSEndpoint,
+			"issuer", cfg.Auth.JWTIssuer,
+			"audience", cfg.Auth.JWKSAudience,
+			"tenant_claim", cfg.Auth.JWKSTenantClaim,
+			"client_tenant_mappings", len(cfg.Auth.JWKSClientTenants))
 	}
 	if cfg.Auth.AnonymousPublicRead {
 		reg.WithAnonymousPublicRead(true)
 		logger.Info("anonymous public-read enabled (ACL-gated object GET/HEAD)")
 	}
 	if sv, err := auth.ParseSigV4Credentials(cfg.Auth.SigV4Credentials); err != nil {
-		logger.Error("parse sigv4 credentials failed", "err", err)
+		reg.WithSigV4(sv)
+		logger.Error("parse sigv4 credentials failed; authentication locked down", "err", err)
 	} else if sv != nil {
 		reg.WithSigV4(sv)
 		logger.Info("s3 sigv4 verification enabled")
@@ -67,6 +79,28 @@ func configureAuthSecrets(ctx context.Context, reg *auth.Registry, cfg *config.C
 			}
 		}
 	}
+}
+
+func authScopes(values []string) []auth.Scope {
+	scopes := make([]auth.Scope, 0, len(values))
+	for _, value := range values {
+		scopes = append(scopes, auth.Scope(value))
+	}
+	return scopes
+}
+
+func buildOIDCHandler(cfg *config.Config) (*auth.OIDCHandler, error) {
+	if cfg.Auth.OIDCIssuer == "" {
+		return nil, nil
+	}
+	return auth.NewOIDCHandler(auth.OIDCConfig{
+		Issuer:                cfg.Auth.OIDCIssuer,
+		ClientID:              cfg.Auth.OIDCClientID,
+		RedirectURI:           cfg.Auth.OIDCRedirectURI,
+		AuthorizationEndpoint: cfg.Auth.OIDCAuthorizeURL,
+		TokenEndpoint:         cfg.Auth.OIDCTokenURL,
+		Scopes:                cfg.Auth.OIDCScopes,
+	})
 }
 
 // apiKeyStore adapts the repository to auth.PersistentStore, keeping the auth

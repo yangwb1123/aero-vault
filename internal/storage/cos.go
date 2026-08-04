@@ -53,6 +53,9 @@ func NewCOS(cfg COSConfig) (*COSStorage, error) {
 func (s *COSStorage) Backend() string { return "cos" }
 
 func (s *COSStorage) Put(ctx context.Context, key string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
 	opt := &cos.ObjectPutOptions{ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{}}
 	if opts.ContentType != "" {
 		opt.ContentType = opts.ContentType
@@ -82,6 +85,9 @@ func (s *COSStorage) Put(ctx context.Context, key string, r io.Reader, size int6
 }
 
 func (s *COSStorage) Get(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return nil, ObjectInfo{}, err
+	}
 	resp, err := s.client.Object.Get(ctx, key, nil)
 	if err != nil {
 		if isCOSNotFound(err) {
@@ -93,6 +99,9 @@ func (s *COSStorage) Get(ctx context.Context, key string) (io.ReadCloser, Object
 }
 
 func (s *COSStorage) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
 	resp, err := s.client.Object.Head(ctx, key, nil)
 	if err != nil {
 		if isCOSNotFound(err) {
@@ -104,11 +113,17 @@ func (s *COSStorage) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 }
 
 func (s *COSStorage) Delete(ctx context.Context, key string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	_, err := s.client.Object.Delete(ctx, key)
 	return err
 }
 
 func (s *COSStorage) List(ctx context.Context, prefix, marker string, limit int) (ListResult, error) {
+	if err := validateListPrefix(prefix); err != nil {
+		return ListResult{}, err
+	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
@@ -135,6 +150,9 @@ func (s *COSStorage) List(ctx context.Context, prefix, marker string, limit int)
 }
 
 func (s *COSStorage) PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	if err := validateObjectKey(key); err != nil {
+		return "", err
+	}
 	u, err := s.client.Object.GetPresignedURL(ctx, http.MethodGet, key, s.cfg.SecretID, s.cfg.SecretKey, expiry, nil)
 	if err != nil {
 		return "", err
@@ -143,6 +161,9 @@ func (s *COSStorage) PresignGet(ctx context.Context, key string, expiry time.Dur
 }
 
 func (s *COSStorage) PresignPut(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	if err := validateObjectKey(key); err != nil {
+		return "", err
+	}
 	u, err := s.client.Object.GetPresignedURL(ctx, http.MethodPut, key, s.cfg.SecretID, s.cfg.SecretKey, expiry, nil)
 	if err != nil {
 		return "", err
@@ -151,6 +172,9 @@ func (s *COSStorage) PresignPut(ctx context.Context, key string, expiry time.Dur
 }
 
 func (s *COSStorage) InitMultipart(ctx context.Context, key string, opts PutOptions) (MultipartInit, error) {
+	if err := validateObjectKey(key); err != nil {
+		return MultipartInit{}, err
+	}
 	opt := &cos.InitiateMultipartUploadOptions{ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{}}
 	if opts.ContentType != "" {
 		opt.ContentType = opts.ContentType
@@ -163,6 +187,9 @@ func (s *COSStorage) InitMultipart(ctx context.Context, key string, opts PutOpti
 }
 
 func (s *COSStorage) UploadPart(ctx context.Context, key, uploadID string, partNumber int32, r io.Reader, size int64) (MultipartPart, error) {
+	if err := validateObjectKey(key); err != nil {
+		return MultipartPart{}, err
+	}
 	opt := &cos.ObjectUploadPartOptions{}
 	if size > 0 {
 		opt.ContentLength = size
@@ -175,6 +202,9 @@ func (s *COSStorage) UploadPart(ctx context.Context, key, uploadID string, partN
 }
 
 func (s *COSStorage) CompleteMultipart(ctx context.Context, key, uploadID string, parts []MultipartPart) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
 	opt := &cos.CompleteMultipartUploadOptions{}
 	for _, p := range parts {
 		opt.Parts = append(opt.Parts, cos.Object{PartNumber: int(p.PartNumber), ETag: `"` + p.ETag + `"`})
@@ -187,11 +217,17 @@ func (s *COSStorage) CompleteMultipart(ctx context.Context, key, uploadID string
 }
 
 func (s *COSStorage) AbortMultipart(ctx context.Context, key, uploadID string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	_, err := s.client.Object.AbortMultipartUpload(ctx, key, uploadID)
 	return err
 }
 
 func (s *COSStorage) CleanupParts(ctx context.Context, key, uploadID string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	_, err := s.client.Object.AbortMultipartUpload(ctx, key, uploadID)
 	if err != nil && isCOSNotFound(err) {
 		return nil
@@ -228,6 +264,9 @@ func cosObjectInfo(key string, h http.Header) ObjectInfo {
 func (s *COSStorage) CanCopy() bool { return true }
 
 func (s *COSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
+	if err := validateObjectKeys(srcKey, dstKey); err != nil {
+		return ObjectInfo{}, err
+	}
 	sourceURL := fmt.Sprintf("%s/%s", s.cfg.BucketURL, srcKey)
 	hdr := &cos.ObjectCopyHeaderOptions{
 		XCosCopySource: sourceURL,
@@ -257,6 +296,9 @@ func (s *COSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyO
 }
 
 func (s *COSStorage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	if err := validateObjectKeys(dstKey, srcKey); err != nil {
+		return MultipartPart{}, err
+	}
 	// COS SDK does not provide a direct UploadPartCopy method on the ObjectService.
 	// Use Copy (which calls PutObjectCopy server-side) for full objects, or fall
 	// back to the client-stream copy in the service layer.

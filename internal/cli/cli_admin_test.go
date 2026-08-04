@@ -166,20 +166,22 @@ func TestCmdAdminKeys_Add_MinimalArgs(t *testing.T) {
 	}
 }
 
-func TestCmdAdminKeys_Add_HTTPError_Returns0(t *testing.T) {
+func TestCmdAdminKeys_Add_HTTPError_Returns1(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "conflict", http.StatusConflict)
 	}))
 	defer ts.Close()
 
 	c := newTestClient(t, ts)
-	out := captureStdout(t, func() {
-		if code := c.cmdAdminKeys("add", []string{"tok", "--scopes", "read"}); code != 0 {
-			t.Errorf("adminKeys add on 409 = %d; want 0 (bug: status not checked)", code)
-		}
+	var code int
+	out := captureStderr(t, func() {
+		code = c.cmdAdminKeys("add", []string{"tok", "--scopes", "read"})
 	})
-	if out != "conflict\n" {
-		t.Logf("output on 409: %q", out)
+	if code != 1 {
+		t.Errorf("adminKeys add on 409 = %d; want 1", code)
+	}
+	if !strings.Contains(out, "HTTP 409") {
+		t.Errorf("stderr %q missing HTTP 409", out)
 	}
 }
 
@@ -211,20 +213,22 @@ func TestCmdAdminKeys_Revoke_Success(t *testing.T) {
 	}
 }
 
-func TestCmdAdminKeys_Revoke_HTTPError_Returns0(t *testing.T) {
+func TestCmdAdminKeys_Revoke_HTTPError_Returns1(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "gone", http.StatusGone)
 	}))
 	defer ts.Close()
 
 	c := newTestClient(t, ts)
-	out := captureStdout(t, func() {
-		if code := c.cmdAdminKeys("revoke", []string{"missing"}); code != 0 {
-			t.Errorf("adminKeys revoke on 410 = %d; want 0 (bug: status not checked)", code)
-		}
+	var code int
+	out := captureStderr(t, func() {
+		code = c.cmdAdminKeys("revoke", []string{"missing"})
 	})
-	if !strings.Contains(out, "revoked") {
-		t.Errorf("output %q missing 'revoked'", out)
+	if code != 1 {
+		t.Errorf("adminKeys revoke on 410 = %d; want 1", code)
+	}
+	if !strings.Contains(out, "HTTP 410") {
+		t.Errorf("stderr %q missing HTTP 410", out)
 	}
 }
 
@@ -374,20 +378,22 @@ func TestCmdAdminTenants_Delete_Success(t *testing.T) {
 	}
 }
 
-func TestCmdAdminTenants_Delete_HTTPError_Returns0(t *testing.T) {
+func TestCmdAdminTenants_Delete_HTTPError_Returns1(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 	}))
 	defer ts.Close()
 
 	c := newTestClient(t, ts)
-	out := captureStdout(t, func() {
-		if code := c.cmdAdminTenants("delete", []string{"missing"}); code != 0 {
-			t.Errorf("adminTenants delete on 404 = %d; want 0 (bug: status not checked)", code)
-		}
+	var code int
+	out := captureStderr(t, func() {
+		code = c.cmdAdminTenants("delete", []string{"missing"})
 	})
-	if !strings.Contains(out, "deleted") {
-		t.Errorf("output %q missing 'deleted'", out)
+	if code != 1 {
+		t.Errorf("adminTenants delete on 404 = %d; want 1", code)
+	}
+	if !strings.Contains(out, "HTTP 404") {
+		t.Errorf("stderr %q missing HTTP 404", out)
 	}
 }
 
@@ -423,20 +429,22 @@ func TestCmdAdminTenants_Status_Success(t *testing.T) {
 	}
 }
 
-func TestCmdAdminTenants_Status_HTTPError_Returns0(t *testing.T) {
+func TestCmdAdminTenants_Status_HTTPError_Returns1(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 	}))
 	defer ts.Close()
 
 	c := newTestClient(t, ts)
-	out := captureStdout(t, func() {
-		if code := c.cmdAdminTenants("status", []string{"acme", "invalid"}); code != 0 {
-			t.Errorf("adminTenants status on 400 = %d; want 0 (bug: status not checked)", code)
-		}
+	var code int
+	out := captureStderr(t, func() {
+		code = c.cmdAdminTenants("status", []string{"acme", "invalid"})
 	})
-	if !strings.Contains(out, "updated") {
-		t.Errorf("output %q missing 'updated'", out)
+	if code != 1 {
+		t.Errorf("adminTenants status on 400 = %d; want 1", code)
+	}
+	if !strings.Contains(out, "HTTP 400") {
+		t.Errorf("stderr %q missing HTTP 400", out)
 	}
 }
 

@@ -72,6 +72,11 @@ func TestObjectACLAnonymousEnforcement(t *testing.T) {
 	if resp, body := req(t, "GET", u, nil, nil); resp.StatusCode != 200 || string(body) != "secret data" {
 		t.Fatalf("anon GET public: status=%d body=%q", resp.StatusCode, body)
 	}
+	for _, suffix := range []string{"/tags", "/versions", "/acl", "/metadata"} {
+		if resp, _ := req(t, "GET", u+suffix, nil, nil); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("anon GET public subresource %s: status=%d want 401", suffix, resp.StatusCode)
+		}
+	}
 	// Anonymous GET of a different private object still 403.
 	req(t, "PUT", s.URL+"/v1/files/other.txt", []byte("x"), authH)
 	if resp, _ := req(t, "GET", s.URL+"/v1/files/other.txt", nil, nil); resp.StatusCode != http.StatusForbidden {

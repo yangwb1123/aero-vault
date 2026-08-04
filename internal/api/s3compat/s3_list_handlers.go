@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/xml"
 	"net/http"
-	"strconv"
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -22,16 +21,17 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
 	q := r.URL.Query()
 	prefix := q.Get("prefix")
-	token := q.Get("continuation-token")
-	if token != "" {
-		if dec, err := base64.StdEncoding.DecodeString(token); err == nil && len(dec) > 0 {
-			token = string(dec)
+	rawToken := q.Get("continuation-token")
+	marker := ""
+	if rawToken != "" {
+		marker = rawToken
+		if decoded, err := base64.StdEncoding.DecodeString(rawToken); err == nil && len(decoded) > 0 {
+			marker = string(decoded)
 		}
+	} else {
+		marker = q.Get("start-after")
 	}
-	maxKeys, _ := strconv.Atoi(q.Get("max-keys"))
-	if maxKeys <= 0 {
-		maxKeys = 1000
-	}
+	maxKeys := s3PageLimit(q.Get("max-keys"), 1000)
 	tagKey := q.Get("tag-key")
 	tagValue := q.Get("tag-value")
 	ctx := r.Context()
@@ -39,10 +39,12 @@ func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket s
 
 	var page repository.ListPage
 	var err error
-	if tagKey != "" {
-		page, err = h.svc.ListByTag(ctx, tenant, bucket, prefix, token, maxKeys, tagKey, tagValue)
-	} else {
-		page, err = h.svc.List(ctx, tenant, bucket, prefix, token, maxKeys)
+	if maxKeys > 0 {
+		if tagKey != "" {
+			page, err = h.svc.ListByTag(ctx, tenant, bucket, prefix, marker, maxKeys, tagKey, tagValue)
+		} else {
+			page, err = h.svc.List(ctx, tenant, bucket, prefix, marker, maxKeys)
+		}
 	}
 	if err != nil {
 		writeS3Error(w, r, err)
@@ -55,11 +57,11 @@ func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket s
 		KeyCount:          len(page.Objects),
 		MaxKeys:           maxKeys,
 		IsTruncated:       page.HasMore,
-		ContinuationToken: token,
+		ContinuationToken: rawToken,
 		StartAfter:        q.Get("start-after"),
 	}
 	if page.HasMore {
-		out.NextContinuationToken = page.NextMarker
+		out.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(page.NextMarker))
 	}
 	for _, o := range page.Objects {
 		out.Contents = append(out.Contents, listContent{
@@ -77,11 +79,14 @@ func (h *Handler) listObjectsV1(w http.ResponseWriter, r *http.Request, bucket s
 	q := r.URL.Query()
 	prefix := q.Get("prefix")
 	marker := q.Get("marker")
-	maxKeys, _ := strconv.Atoi(q.Get("max-keys"))
-	if maxKeys <= 0 {
-		maxKeys = 1000
+	maxKeys := s3PageLimit(q.Get("max-keys"), 1000)
+	page := repository.ListPage{}
+	var err error
+	if maxKeys > 0 {
+		page, err = h.svc.List(
+			r.Context(), mw.TenantFrom(r.Context()), bucket, prefix, marker, maxKeys,
+		)
 	}
-	page, err := h.svc.List(r.Context(), mw.TenantFrom(r.Context()), bucket, prefix, marker, maxKeys)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return

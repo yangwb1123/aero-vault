@@ -146,7 +146,7 @@ func (a *Agent) Run(ctx context.Context, req AgentReq) (AgentResp, error) {
 	if err != nil {
 		return AgentResp{}, fmt.Errorf("forced final answer: %w", err)
 	}
-	return AgentResp{Answer: resp.Content, Steps: steps, Model: lastModel}, nil
+	return AgentResp{Answer: resp.Content, Steps: steps, Model: resp.Model}, nil
 }
 
 func (a *Agent) callListFiles(ctx context.Context, tenant string, args map[string]any) string {

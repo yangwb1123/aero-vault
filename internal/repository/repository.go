@@ -9,6 +9,7 @@ var (
 	ErrNotFound        = errors.New("object not found")
 	ErrDuplicate       = errors.New("object already exists")
 	ErrUploadNotFound  = errors.New("upload not found")
+	ErrTenantNotEmpty  = errors.New("tenant still owns buckets, objects, or uploads")
 	ErrLegalHoldActive = errors.New("object is under legal hold and cannot be deleted")
 )
 
@@ -73,15 +74,16 @@ type BucketConfig struct {
 	LoggingTarget                    string
 	LoggingPrefix                    string
 	NotificationRules                []NotificationRule
-	SSEAlgorithm                     string           `json:"sse_algorithm,omitempty"` // "" | "AES256" | "aws:kms"
-	SSEKMSKeyId                      string           `json:"sse_kms_key_id,omitempty"`
-	TransitionRules                  []TransitionRule `json:"transition_rules,omitempty"`
-	NoncurrentTransitionDays         int              `json:"noncurrent_transition_days,omitempty"`
-	NoncurrentTransitionStorageClass string           `json:"noncurrent_transition_storage_class,omitempty"`
-	WebsiteConfig                    WebsiteConfig    `json:"website_config,omitempty"`
-	BucketMaxBytes                   int64            `json:"bucket_max_bytes,omitempty"`
-	BucketMaxObjects                 int64            `json:"bucket_max_objects,omitempty"`
+	SSEAlgorithm                     string            `json:"sse_algorithm,omitempty"` // "" | "AES256" | "aws:kms"
+	SSEKMSKeyId                      string            `json:"sse_kms_key_id,omitempty"`
+	TransitionRules                  []TransitionRule  `json:"transition_rules,omitempty"`
+	NoncurrentTransitionDays         int               `json:"noncurrent_transition_days,omitempty"`
+	NoncurrentTransitionStorageClass string            `json:"noncurrent_transition_storage_class,omitempty"`
+	WebsiteConfig                    WebsiteConfig     `json:"website_config,omitempty"`
+	BucketMaxBytes                   int64             `json:"bucket_max_bytes,omitempty"`
+	BucketMaxObjects                 int64             `json:"bucket_max_objects,omitempty"`
 	Tags                             map[string]string `json:"tags,omitempty"`
+	AccelerateStatus                 string            `json:"accelerate_status,omitempty"`
 }
 
 // NotificationRule maps S3 events to notification targets.
@@ -145,10 +147,12 @@ type Upload struct {
 	TenantID       string
 	Bucket         string
 	Key            string
+	VersionID      string
 	StorageKey     string
 	UploadID       string
 	ContentType    string
 	Metadata       map[string]string
+	Tags           map[string]string
 	StorageClass   string
 	Backend        string
 	BackendUID     string

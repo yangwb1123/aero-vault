@@ -2,9 +2,12 @@ package repository_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
@@ -135,6 +138,109 @@ func TestTenantUpsertGetListDelete(t *testing.T) {
 	}
 	if deleted {
 		t.Fatalf("delete again: got true, want false")
+	}
+}
+
+func TestDeleteTenantRejectsStoredData(t *testing.T) {
+	ctx := context.Background()
+	repo := openTenantTestRepo(t)
+	if err := repo.UpsertTenant(ctx, repository.TenantRecord{TenantID: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpsertObject(ctx, repository.Object{
+		TenantID: "acme", Bucket: "default", Key: "report.txt",
+		StorageKey: "acme/default/report.txt", Size: 1, ETag: "etag",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := repo.DeleteTenant(ctx, "acme")
+	if deleted || !errors.Is(err, repository.ErrTenantNotEmpty) {
+		t.Fatalf("delete with object: deleted=%v err=%v", deleted, err)
+	}
+	if _, found, err := repo.GetTenant(ctx, "acme"); err != nil || !found {
+		t.Fatalf("tenant disappeared after rejected delete: found=%v err=%v", found, err)
+	}
+	if err := repo.HardDeleteObject(ctx, "acme", "default", "report.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateBucket(ctx, "acme", "archive"); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err = repo.DeleteTenant(ctx, "acme"); deleted || !errors.Is(err, repository.ErrTenantNotEmpty) {
+		t.Fatalf("delete with bucket: deleted=%v err=%v", deleted, err)
+	}
+	if err := repo.DeleteBucket(ctx, "acme", "archive"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUpload(ctx, repository.Upload{
+		ID: "upload", TenantID: "acme", Bucket: "default", Key: "large.bin",
+		Backend: "local", BackendUID: "backend-upload", StorageKey: "acme/default/large.bin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err = repo.DeleteTenant(ctx, "acme"); deleted || !errors.Is(err, repository.ErrTenantNotEmpty) {
+		t.Fatalf("delete with multipart upload: deleted=%v err=%v", deleted, err)
+	}
+}
+
+func TestDeleteTenantCleansControlPlane(t *testing.T) {
+	ctx := context.Background()
+	repo := openTenantTestRepo(t)
+	if err := repo.UpsertTenant(ctx, repository.TenantRecord{TenantID: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetTenantQuota(ctx, "acme", 10, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.PutAPIKey(ctx, repository.APIKeyRecord{
+		TokenHash: "hash", TenantID: "acme", Scopes: "read", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedTenantAccessState(t, ctx, repo.(access.Store))
+	deleted, err := repo.DeleteTenant(ctx, "acme")
+	if err != nil || !deleted {
+		t.Fatalf("delete empty tenant: deleted=%v err=%v", deleted, err)
+	}
+	keys, err := repo.ListAPIKeys(ctx, "acme")
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("API keys survived tenant delete: keys=%+v err=%v", keys, err)
+	}
+	store := repo.(access.Store)
+	departments, err := store.ListDepartments(ctx, "acme")
+	if err != nil || len(departments) != 0 {
+		t.Fatalf("departments survived tenant delete: departments=%+v err=%v", departments, err)
+	}
+	if _, err := store.GetShare(ctx, "acme", "share"); !errors.Is(err, access.ErrNotFound) {
+		t.Fatalf("share survived tenant delete: %v", err)
+	}
+	if _, err := store.GetPublicAsset(ctx, "tenant-delete-asset"); !errors.Is(err, access.ErrNotFound) {
+		t.Fatalf("public asset survived tenant delete: %v", err)
+	}
+}
+
+func seedTenantAccessState(t *testing.T, ctx context.Context, store access.Store) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := store.PutDepartment(ctx, access.Department{
+		ID: "department", TenantID: "acme", Name: "engineering", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutACLEntry(ctx, departmentACL("tenant-acl", "department", now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateShare(ctx, access.Share{
+		ID: "share", TenantID: "acme", Bucket: "default", Key: "gone.txt",
+		TokenHash: "tenant-delete-token", AllowPreview: true, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutPublicAsset(ctx, access.PublicAsset{
+		ID: "asset", TenantID: "acme", Bucket: "default", Key: "gone.txt",
+		Slug: "tenant-delete-asset", PublishedAt: now,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

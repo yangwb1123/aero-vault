@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -20,6 +21,9 @@ import (
 // PostObject handles POST /{bucket}/{key+}: CreateMultipartUpload (?uploads) and
 // CompleteMultipartUpload (?uploadId=...).
 func (h *Handler) PostObject(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizeS3Request(w, r) {
+		return
+	}
 	q := r.URL.Query()
 	switch {
 	case q.Has("uploads"):
@@ -39,30 +43,58 @@ func (h *Handler) PostObject(w http.ResponseWriter, r *http.Request) {
 // the request headers.
 func (h *Handler) copyObject(w http.ResponseWriter, r *http.Request, dstBucket, dstKey, copySource string) {
 	tenant := mw.TenantFrom(r.Context())
-	srcBucket, srcKey, ok := parseCopySource(copySource)
+	srcBucket, srcKey, srcVersionID, ok := parseCopySource(copySource)
 	if !ok {
 		writeS3Error(w, r, service.ErrInvalidArgs)
 		return
 	}
 
-	rc, src, err := h.svc.Get(r.Context(), tenant, srcBucket, srcKey)
+	sourceSSEC, err := parseSSECRequest(r.Header, ssecCopyHeaderPrefix)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
-	defer rc.Close()
-
-	opts := service.PutOptions{ContentType: src.ContentType, Metadata: src.Metadata}
-	if strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE") {
+	defer sourceSSEC.clear()
+	destinationSSEC, err := parseSSECRequest(r.Header, ssecHeaderPrefix)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	defer destinationSSEC.clear()
+	replace := strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE")
+	replaceTags := strings.EqualFold(r.Header.Get("x-amz-tagging-directive"), "REPLACE")
+	opts := service.PutOptions{}
+	opts.ACL = r.Header.Get("x-amz-acl")
+	opts.LegalHold, err = legalHoldFromHeader(r.Header)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	if replace {
 		opts.ContentType = r.Header.Get("Content-Type")
 		opts.Metadata = extractMetaHeaders(r.Header)
+		opts.ContentDisposition = r.Header.Get("Content-Disposition")
+		opts.ContentEncoding = r.Header.Get("Content-Encoding")
 	}
-
-	dst, err := h.svc.Put(r.Context(), tenant, dstBucket, dstKey, rc, src.Size, opts)
+	if replaceTags {
+		opts.Tags, err = parseTaggingHeader(r.Header)
+		if err != nil {
+			writeS3Error(w, r, err)
+			return
+		}
+	}
+	applyManagedSSEHeaders(r.Header, &opts)
+	destinationSSEC.applyPutOptions(&opts)
+	dst, err := h.svc.CopyObject(
+		r.Context(), tenant, srcBucket, srcKey, srcVersionID, dstBucket, dstKey,
+		sourceSSEC.readOptions(), opts, replace, replaceTags,
+	)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
+	h.writeCurrentVersionHeader(w, r, dst)
+	writeEncryptionHeaders(w, dst.Metadata)
 	writeXML(w, http.StatusOK, copyObjectResult{
 		Xmlns: s3Namespace, LastModified: dst.UpdatedAt.UTC(), ETag: `"` + dst.ETag + `"`,
 	})
@@ -70,19 +102,20 @@ func (h *Handler) copyObject(w http.ResponseWriter, r *http.Request, dstBucket, 
 
 // parseCopySource splits "/bucket/key" or "bucket/key" (optionally URL-encoded,
 // optionally with ?versionId) into bucket + key.
-func parseCopySource(s string) (bucket, key string, ok bool) {
+func parseCopySource(s string) (bucket, key, versionID string, ok bool) {
 	s = strings.TrimPrefix(s, "/")
-	if i := strings.IndexByte(s, '?'); i >= 0 {
-		s = s[:i]
+	rawPath, rawQuery, _ := strings.Cut(s, "?")
+	if values, err := url.ParseQuery(rawQuery); err == nil {
+		versionID = values.Get("versionId")
 	}
-	if dec, err := url.QueryUnescape(s); err == nil {
-		s = dec
+	if dec, err := url.PathUnescape(rawPath); err == nil {
+		rawPath = dec
 	}
-	parts := strings.SplitN(s, "/", 2)
+	parts := strings.SplitN(rawPath, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", false
+		return "", "", "", false
 	}
-	return parts[0], parts[1], true
+	return parts[0], parts[1], versionID, true
 }
 
 // --- Object tagging ---------------------------------------------------------
@@ -106,9 +139,10 @@ func (h *Handler) putObjectTagging(w http.ResponseWriter, r *http.Request, bucke
 		writeS3Error(w, r, service.ErrInvalidArgs)
 		return
 	}
-	tags := make(map[string]string, len(in.TagSet))
-	for _, t := range in.TagSet {
-		tags[t.Key] = t.Value
+	tags, err := tagsFromSet(in.TagSet)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
 	}
 	if err := h.svc.SetTags(r.Context(), mw.TenantFrom(r.Context()), bucket, key, tags); err != nil {
 		writeS3Error(w, r, err)
@@ -137,10 +171,10 @@ func (h *Handler) getObjectACL(w http.ResponseWriter, r *http.Request, bucket, k
 }
 
 func (h *Handler) putObjectACL(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	// Canned ACL via the x-amz-acl header (the common form).
-	acl := r.Header.Get("x-amz-acl")
-	if acl == "" {
-		acl = "private"
+	acl, err := cannedACLFromRequest(r)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
 	}
 	if err := h.svc.SetObjectACL(r.Context(), mw.TenantFrom(r.Context()), bucket, key, acl); err != nil {
 		writeS3Error(w, r, err)
@@ -149,63 +183,36 @@ func (h *Handler) putObjectACL(w http.ResponseWriter, r *http.Request, bucket, k
 	w.WriteHeader(http.StatusOK)
 }
 
-// --- Object Legal Hold & Retention (S3 Object Lock) -------------------------
-
-func (h *Handler) getObjectLegalHold(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	tenant := mw.TenantFrom(r.Context())
-	obj, err := h.svc.Stat(r.Context(), tenant, bucket, key)
-	if err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	status := "OFF"
-	onHold, _ := h.svc.Repo().ObjectHasLegalHold(r.Context(), obj.ID)
-	if onHold {
-		status = "ON"
-	}
-	writeXML(w, http.StatusOK, objectLegalHold{Xmlns: s3Namespace, Status: status})
-}
-
-func (h *Handler) putObjectLegalHold(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	tenant := mw.TenantFrom(r.Context())
-	status := r.Header.Get("x-amz-object-lock-legal-hold")
-	if status == "" {
-		writeS3Error(w, r, service.ErrInvalidArgs)
-		return
-	}
-	obj, err := h.svc.Stat(r.Context(), tenant, bucket, key)
-	if err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	if strings.EqualFold(status, "ON") {
-		err = h.svc.PutLegalHold(r.Context(), tenant, bucket, key, obj.VersionID, "s3 api", tenant)
-	} else {
-		err = h.svc.RemoveLegalHold(r.Context(), tenant, bucket, key, obj.VersionID)
-	}
-	if err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) getObjectRetention(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	writeXML(w, http.StatusOK, objectRetention{Xmlns: s3Namespace, Mode: "GOVERNANCE", RetainUntilDate: ""})
-}
-
-func (h *Handler) putObjectRetention(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	w.WriteHeader(http.StatusOK)
-}
-
 // --- Multipart --------------------------------------------------------------
 
 func (h *Handler) createMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
+	ssec, err := parseSSECRequest(r.Header, ssecHeaderPrefix)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	defer ssec.clear()
 	opts := service.PutOptions{
-		ContentType: r.Header.Get("Content-Type"),
-		Metadata:    extractMetaHeaders(r.Header),
+		ContentType:        r.Header.Get("Content-Type"),
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		Metadata:           extractMetaHeaders(r.Header),
+		ACL:                r.Header.Get("x-amz-acl"),
+		StorageClass:       r.Header.Get("x-amz-storage-class"),
+	}
+	opts.LegalHold, err = legalHoldFromHeader(r.Header)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	applyManagedSSEHeaders(r.Header, &opts)
+	ssec.applyPutOptions(&opts)
+	opts.Tags, err = parseTaggingHeader(r.Header)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
 	}
 	if r.URL.Query().Has("tagging") {
 		var in tagging
@@ -222,18 +229,31 @@ func (h *Handler) createMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		writeS3Error(w, r, err)
 		return
 	}
+	writeEncryptionHeaders(w, up.Metadata)
 	writeXML(w, http.StatusOK, initiateMultipartUploadResult{
 		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: up.ID,
 	})
 }
 
-func (h *Handler) uploadPart(w http.ResponseWriter, r *http.Request, uploadID string, partNumber int) {
+func (h *Handler) uploadPart(
+	w http.ResponseWriter, r *http.Request, bucket, key, uploadID string, partNumber int,
+) {
 	// S3 part numbers are 1..10000; reject out-of-range (e.g. a missing/0 value).
 	if partNumber < 1 || partNumber > 10000 {
 		writeS3Error(w, r, fmt.Errorf("%w: partNumber must be between 1 and 10000", service.ErrInvalidArgs))
 		return
 	}
-	part, err := h.svc.UploadPart(r.Context(), uploadID, int32(partNumber), r.Body, r.ContentLength)
+	ssec, parseErr := parseSSECRequest(r.Header, ssecHeaderPrefix)
+	if parseErr != nil {
+		writeS3Error(w, r, parseErr)
+		return
+	}
+	defer ssec.clear()
+	part, err := h.svc.UploadPartFor(
+		r.Context(),
+		service.MultipartScope{TenantID: mw.TenantFrom(r.Context()), Bucket: bucket, Key: key},
+		uploadID, int32(partNumber), r.Body, r.ContentLength, ssec.readOptions(),
+	)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
@@ -247,51 +267,76 @@ func (h *Handler) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket,
 		writeS3Error(w, r, fmt.Errorf("%w: partNumber must be between 1 and 10000", service.ErrInvalidArgs))
 		return
 	}
-	srcBucket, srcKey, ok := parseCopySource(copySource)
+	srcBucket, srcKey, srcVersionID, ok := parseCopySource(copySource)
 	if !ok {
 		writeS3Error(w, r, fmt.Errorf("%w: invalid x-amz-copy-source", service.ErrInvalidArgs))
 		return
 	}
-	_ = bucket // dst bucket, same as src for now
 	tenant := mw.TenantFrom(r.Context())
+	sourceSSEC, err := parseSSECRequest(r.Header, ssecCopyHeaderPrefix)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	defer sourceSSEC.clear()
+	destinationSSEC, err := parseSSECRequest(r.Header, ssecHeaderPrefix)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	defer destinationSSEC.clear()
 
-	// Parse optional byte range from x-amz-copy-source-range.
-	rangeHeader := r.Header.Get("x-amz-copy-source-range")
-	var srcOffset, length int64 = -1, 0
-	if rangeHeader != "" {
-		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &srcOffset, &length); err != nil {
+	srcOffset, length := int64(-1), int64(0)
+	if rangeHeader := r.Header.Get("x-amz-copy-source-range"); rangeHeader != "" {
+		srcOffset, length, err = parseCopySourceRange(rangeHeader)
+		if err != nil {
 			writeS3Error(w, r, fmt.Errorf("%w: invalid x-amz-copy-source-range", service.ErrInvalidArgs))
 			return
 		}
-		length = length - srcOffset + 1
 	}
 
-	// If no range specified, get source object size to know the part length.
-	if rangeHeader == "" {
-		src, err := h.svc.Stat(r.Context(), tenant, srcBucket, srcKey)
-		if err != nil {
-			writeS3Error(w, r, err)
-			return
-		}
-		length = src.Size
-	}
-
-	part, err := h.svc.UploadPartCopy(r.Context(), uploadID, int32(partNumber), srcKey, srcOffset, length)
+	part, err := h.svc.UploadPartCopyFor(
+		r.Context(), service.MultipartScope{TenantID: tenant, Bucket: bucket, Key: dstKey},
+		uploadID, int32(partNumber), srcBucket, srcKey, srcVersionID, srcOffset, length,
+		sourceSSEC.readOptions(), destinationSSEC.readOptions(),
+	)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
 	w.Header().Set("ETag", `"`+part.ETag+`"`)
-	writeXML(w, http.StatusOK, copyObjectResult{
-		Xmlns: s3Namespace,
-		ETag:  part.ETag,
+	writeXML(w, http.StatusOK, copyPartResult{
+		Xmlns: s3Namespace, LastModified: time.Now().UTC(), ETag: `"` + part.ETag + `"`,
 	})
+}
+
+func parseCopySourceRange(value string) (int64, int64, error) {
+	raw, ok := strings.CutPrefix(strings.TrimSpace(value), "bytes=")
+	if !ok || strings.Count(raw, "-") != 1 {
+		return 0, 0, service.ErrInvalidArgs
+	}
+	startRaw, endRaw, _ := strings.Cut(raw, "-")
+	start, err := strconv.ParseInt(startRaw, 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, service.ErrInvalidArgs
+	}
+	end, err := strconv.ParseInt(endRaw, 10, 64)
+	if err != nil || end < start {
+		return 0, 0, service.ErrInvalidArgs
+	}
+	return start, end - start + 1, nil
 }
 
 func (h *Handler) completeMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := keyFromURL(r)
 	uploadID := r.URL.Query().Get("uploadId")
+	ssec, err := parseSSECRequest(r.Header, ssecHeaderPrefix)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	defer ssec.clear()
 
 	// Parse the client-supplied part manifest and verify ETags against the
 	// server's stored parts before completing. This catches bit rot / partial
@@ -311,11 +356,17 @@ func (h *Handler) completeMultipartUpload(w http.ResponseWriter, r *http.Request
 		})
 	}
 
-	obj, err := h.svc.CompleteMultipartWithParts(r.Context(), uploadID, clientParts)
+	obj, err := h.svc.CompleteMultipartWithPartsFor(
+		r.Context(),
+		service.MultipartScope{TenantID: mw.TenantFrom(r.Context()), Bucket: bucket, Key: key},
+		uploadID, clientParts, ssec.readOptions(),
+	)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
+	h.writeCurrentVersionHeader(w, r, obj)
+	writeEncryptionHeaders(w, obj.Metadata)
 	writeXML(w, http.StatusOK, completeMultipartUploadResult{
 		Xmlns:    s3Namespace,
 		Location: "/" + bucket + "/" + key,
@@ -325,8 +376,15 @@ func (h *Handler) completeMultipartUpload(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (h *Handler) abortMultipartUpload(w http.ResponseWriter, r *http.Request, uploadID string) {
-	if err := h.svc.AbortMultipart(r.Context(), uploadID); err != nil && !errors.Is(err, service.ErrUploadNotFound) {
+func (h *Handler) abortMultipartUpload(
+	w http.ResponseWriter, r *http.Request, bucket, key, uploadID string,
+) {
+	err := h.svc.AbortMultipartFor(
+		r.Context(),
+		service.MultipartScope{TenantID: mw.TenantFrom(r.Context()), Bucket: bucket, Key: key},
+		uploadID,
+	)
+	if err != nil && !errors.Is(err, service.ErrUploadNotFound) {
 		writeS3Error(w, r, err)
 		return
 	}
@@ -334,7 +392,11 @@ func (h *Handler) abortMultipartUpload(w http.ResponseWriter, r *http.Request, u
 }
 
 func (h *Handler) listParts(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
-	parts, err := h.svc.Repo().ListParts(r.Context(), uploadID)
+	parts, err := h.svc.ListMultipartParts(
+		r.Context(),
+		service.MultipartScope{TenantID: mw.TenantFrom(r.Context()), Bucket: bucket, Key: key},
+		uploadID,
+	)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
@@ -344,10 +406,7 @@ func (h *Handler) listParts(w http.ResponseWriter, r *http.Request, bucket, key,
 	// default/cap 1000).
 	pnm, _ := strconv.Atoi(r.URL.Query().Get("part-number-marker")) // empty/invalid -> 0
 	marker := int32(pnm)
-	maxParts, _ := strconv.Atoi(r.URL.Query().Get("max-parts"))
-	if maxParts <= 0 || maxParts > 1000 {
-		maxParts = 1000
-	}
+	maxParts := s3PageLimit(r.URL.Query().Get("max-parts"), 1000)
 	out := listPartsResult{
 		Xmlns: s3Namespace, Bucket: bucket, Key: key, UploadID: uploadID,
 		StorageClass: "STANDARD", PartNumberMarker: marker, MaxParts: maxParts,
@@ -366,38 +425,6 @@ func (h *Handler) listParts(w http.ResponseWriter, r *http.Request, bucket, key,
 	writeXML(w, http.StatusOK, out)
 }
 
-func (h *Handler) listMultipartUploads(w http.ResponseWriter, r *http.Request, bucket string) {
-	q := r.URL.Query()
-	keyMarker := q.Get("key-marker")
-	uploadIDMarker := q.Get("upload-id-marker")
-	maxUploads, _ := strconv.Atoi(q.Get("max-uploads")) // empty/invalid -> 0 -> clamped below
-	if maxUploads <= 0 || maxUploads > 1000 {
-		maxUploads = 1000
-	}
-	// Fetch one extra to detect truncation (results are ordered by key,upload_id).
-	ups, err := h.svc.Repo().ListUploads(r.Context(), mw.TenantFrom(r.Context()), bucket, keyMarker, uploadIDMarker, maxUploads+1)
-	if err != nil {
-		writeS3Error(w, r, err)
-		return
-	}
-	out := listMultipartUploadsResult{
-		Xmlns: s3Namespace, Bucket: bucket, Prefix: q.Get("prefix"),
-		KeyMarker: keyMarker, UploadIDMarker: uploadIDMarker, MaxUploads: maxUploads,
-	}
-	if len(ups) > maxUploads {
-		ups = ups[:maxUploads]
-		out.IsTruncated = true
-		if n := len(ups); n > 0 {
-			out.NextKeyMarker = ups[n-1].Key
-			out.NextUploadIDMarker = ups[n-1].ID
-		}
-	}
-	for _, u := range ups {
-		out.Uploads = append(out.Uploads, uploadListItem{Key: u.Key, UploadID: u.ID, Initiated: u.CreatedAt.UTC()})
-	}
-	writeXML(w, http.StatusOK, out)
-}
-
 // --- Batch delete -----------------------------------------------------------
 
 func (h *Handler) deleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -409,14 +436,20 @@ func (h *Handler) deleteObjects(w http.ResponseWriter, r *http.Request, bucket s
 	tenant := mw.TenantFrom(r.Context())
 	out := deleteResult{Xmlns: s3Namespace}
 	for _, o := range in.Objects {
-		err := h.svc.Delete(r.Context(), tenant, bucket, o.Key, true)
+		versionID, deleteMarker, err := h.deleteS3Object(
+			r.Context(), tenant, bucket, o.Key, o.VersionID,
+		)
 		switch {
 		case err == nil, errors.Is(err, service.ErrNotFound):
 			if !in.Quiet {
-				out.Deleted = append(out.Deleted, deletedItem{Key: o.Key})
+				out.Deleted = append(out.Deleted, deletedItem{
+					Key: o.Key, VersionID: versionID, DeleteMarker: deleteMarker,
+				})
 			}
 		default:
-			out.Errors = append(out.Errors, deleteErrItem{Key: o.Key, Code: "InternalError", Message: err.Error()})
+			out.Errors = append(out.Errors, deleteErrItem{
+				Key: o.Key, VersionID: o.VersionID, Code: s3ErrorCode(err), Message: err.Error(),
+			})
 		}
 	}
 	writeXML(w, http.StatusOK, out)

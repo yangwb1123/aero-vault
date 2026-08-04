@@ -31,6 +31,13 @@ func TestSearch_FiltersEmbeddingModelDrift(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("insert foreign chunk: %v", err)
 	}
+	unknown := env.putObject(t, "unknown.txt", "text/plain", "alpha")
+	if err := env.repo.InsertChunks(ctx, []repository.Chunk{{
+		ObjectID: unknown.ID, TenantID: unknown.TenantID, Bucket: unknown.Bucket, ObjectKey: unknown.Key,
+		Seq: 0, Content: "alpha", Embedding: vecs[0], Dim: len(vecs[0]),
+	}}); err != nil {
+		t.Fatalf("insert unknown-model chunk: %v", err)
+	}
 
 	s := NewSearch(env.repo, emb, nil)
 	hits, err := s.Query(ctx, Request{Tenant: testTenant, Bucket: testBucket, Query: "alpha", K: 10, Mode: "vector"})
@@ -40,8 +47,8 @@ func TestSearch_FiltersEmbeddingModelDrift(t *testing.T) {
 
 	nativeFound := false
 	for _, h := range hits {
-		if h.EmbedModel == "other-model-64" {
-			t.Fatalf("drift: a foreign-model chunk leaked into results: %+v", h)
+		if h.EmbedModel != emb.Name() {
+			t.Fatalf("drift: a non-current-model chunk leaked into results: %+v", h)
 		}
 		if h.EmbedModel == "hash-64" {
 			nativeFound = true
@@ -49,5 +56,29 @@ func TestSearch_FiltersEmbeddingModelDrift(t *testing.T) {
 	}
 	if !nativeFound {
 		t.Fatal("expected the query model's own chunk in results")
+	}
+
+	bm25 := NewBM25()
+	for _, obj := range []repository.Object{native, foreign, unknown} {
+		chunks, err := env.repo.ListChunksForObject(ctx, obj.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := bm25.UpsertObjectChunks(ctx, obj.ID, chunks); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lexicalHits, err := NewSearch(env.repo, emb, nil).WithBM25(bm25).Query(
+		ctx,
+		Request{
+			Tenant: testTenant, Bucket: testBucket,
+			Query: "alpha", K: 10, Mode: "bm25",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lexicalHits) != 1 || lexicalHits[0].ObjectID != native.ID {
+		t.Fatalf("BM25 drift filter returned %+v, want only object %d", lexicalHits, native.ID)
 	}
 }

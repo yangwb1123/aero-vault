@@ -13,19 +13,24 @@ func (s *sqlStore) CreateUpload(ctx context.Context, u Upload) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, s.rebind(`INSERT INTO multipart_uploads (upload_id, tenant_id, bucket, key, backend, backend_uid, storage_key, metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
-		u.ID, u.TenantID, u.Bucket, u.Key, u.Backend, u.BackendUID, u.StorageKey, string(metaBytes))
+	tagBytes, err := jsonOrEmpty(u.Tags)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, s.rebind(`INSERT INTO multipart_uploads (upload_id, tenant_id, bucket, key, version_id, backend, backend_uid, storage_key, content_type, storage_class, metadata, tags) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`),
+		u.ID, u.TenantID, u.Bucket, u.Key, u.VersionID, u.Backend, u.BackendUID, u.StorageKey, u.ContentType, u.StorageClass, string(metaBytes), string(tagBytes))
 	return err
 }
 
 func (s *sqlStore) GetUpload(ctx context.Context, uploadID string) (Upload, error) {
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT upload_id, tenant_id, bucket, key, backend, backend_uid, storage_key, metadata, created_at FROM multipart_uploads WHERE upload_id=$1`), uploadID)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT upload_id, tenant_id, bucket, key, version_id, backend, backend_uid, storage_key, content_type, storage_class, metadata, tags, created_at FROM multipart_uploads WHERE upload_id=$1`), uploadID)
 	var (
 		u        Upload
 		metaRaw  []byte
+		tagRaw   []byte
 		createdT flexTime
 	)
-	if err := row.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &u.StorageKey, &metaRaw, &createdT); err != nil {
+	if err := row.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.VersionID, &u.Backend, &u.BackendUID, &u.StorageKey, &u.ContentType, &u.StorageClass, &metaRaw, &tagRaw, &createdT); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Upload{}, ErrUploadNotFound
 		}
@@ -33,6 +38,7 @@ func (s *sqlStore) GetUpload(ctx context.Context, uploadID string) (Upload, erro
 	}
 	u.CreatedAt = createdT.Time
 	u.Metadata, _ = unmarshalKV(metaRaw)
+	u.Tags, _ = unmarshalKV(tagRaw)
 	return u, nil
 }
 
@@ -53,7 +59,7 @@ func (s *sqlStore) ListUploads(ctx context.Context, tenant, bucket, keyMarker, u
 	if limit > 10000 {
 		limit = 10000
 	}
-	q := `SELECT upload_id, tenant_id, bucket, key, backend, backend_uid, storage_key, metadata, created_at FROM multipart_uploads WHERE tenant_id=$1`
+	q := `SELECT upload_id, tenant_id, bucket, key, version_id, backend, backend_uid, storage_key, content_type, storage_class, metadata, tags, created_at FROM multipart_uploads WHERE tenant_id=$1`
 	args := []any{tenant}
 	n := 1
 	if bucket != "" {
@@ -80,13 +86,15 @@ func (s *sqlStore) ListUploads(ctx context.Context, tenant, bucket, keyMarker, u
 		var (
 			u        Upload
 			metaRaw  []byte
+			tagRaw   []byte
 			createdT flexTime
 		)
-		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &u.StorageKey, &metaRaw, &createdT); err != nil {
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.VersionID, &u.Backend, &u.BackendUID, &u.StorageKey, &u.ContentType, &u.StorageClass, &metaRaw, &tagRaw, &createdT); err != nil {
 			return nil, err
 		}
 		u.CreatedAt = createdT.Time
 		u.Metadata, _ = unmarshalKV(metaRaw)
+		u.Tags, _ = unmarshalKV(tagRaw)
 		out = append(out, u)
 	}
 	return out, rows.Err()
@@ -98,7 +106,7 @@ func (s *sqlStore) ListExpiredUploads(ctx context.Context, before string, limit 
 	if limit <= 0 || limit > 10000 {
 		limit = 10000
 	}
-	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT upload_id, tenant_id, bucket, key, backend, backend_uid, storage_key, metadata, created_at FROM multipart_uploads WHERE created_at < $1 ORDER BY created_at LIMIT $2`), before, limit)
+	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT upload_id, tenant_id, bucket, key, version_id, backend, backend_uid, storage_key, content_type, storage_class, metadata, tags, created_at FROM multipart_uploads WHERE created_at < $1 ORDER BY created_at LIMIT $2`), before, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -108,13 +116,15 @@ func (s *sqlStore) ListExpiredUploads(ctx context.Context, before string, limit 
 		var (
 			u        Upload
 			metaRaw  []byte
+			tagRaw   []byte
 			createdT flexTime
 		)
-		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &u.StorageKey, &metaRaw, &createdT); err != nil {
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.VersionID, &u.Backend, &u.BackendUID, &u.StorageKey, &u.ContentType, &u.StorageClass, &metaRaw, &tagRaw, &createdT); err != nil {
 			return nil, err
 		}
 		u.CreatedAt = createdT.Time
 		u.Metadata, _ = unmarshalKV(metaRaw)
+		u.Tags, _ = unmarshalKV(tagRaw)
 		out = append(out, u)
 	}
 	return out, rows.Err()
@@ -157,7 +167,7 @@ func (s *sqlStore) ListZombieUploads(ctx context.Context, before string, limit i
 		limit = 10000
 	}
 	rows, err := s.db.QueryContext(ctx, s.rebind(`
-SELECT u.upload_id, u.tenant_id, u.bucket, u.key, u.backend, u.backend_uid, u.storage_key, u.metadata, u.created_at
+SELECT u.upload_id, u.tenant_id, u.bucket, u.key, u.version_id, u.backend, u.backend_uid, u.storage_key, u.content_type, u.storage_class, u.metadata, u.tags, u.created_at
 FROM multipart_uploads u
 WHERE u.created_at < $1
   AND EXISTS (SELECT 1 FROM multipart_parts p WHERE p.upload_id = u.upload_id)
@@ -172,13 +182,15 @@ LIMIT $2`), before, limit)
 		var (
 			u        Upload
 			metaRaw  []byte
+			tagRaw   []byte
 			createdT flexTime
 		)
-		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.Backend, &u.BackendUID, &u.StorageKey, &metaRaw, &createdT); err != nil {
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.Bucket, &u.Key, &u.VersionID, &u.Backend, &u.BackendUID, &u.StorageKey, &u.ContentType, &u.StorageClass, &metaRaw, &tagRaw, &createdT); err != nil {
 			return nil, err
 		}
 		u.CreatedAt = createdT.Time
 		u.Metadata, _ = unmarshalKV(metaRaw)
+		u.Tags, _ = unmarshalKV(tagRaw)
 		out = append(out, u)
 	}
 	return out, rows.Err()

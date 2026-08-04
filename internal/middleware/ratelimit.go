@@ -128,8 +128,10 @@ func (rl *RateLimiter) writeRateLimitHeaders(w http.ResponseWriter, wait time.Du
 }
 
 func rateLimitBypass(p string) bool {
-	return p == "/healthz" || p == "/readyz" || p == "/metrics" ||
+	return p == "/" || p == "/favicon.ico" ||
+		p == "/healthz" || p == "/readyz" || p == "/metrics" ||
 		p == "/openapi.json" || p == "/docs" ||
+		len(p) >= len("/auth/oidc/") && p[:len("/auth/oidc/")] == "/auth/oidc/" ||
 		p == "/ui" || len(p) >= 4 && p[:4] == "/ui/"
 }
 

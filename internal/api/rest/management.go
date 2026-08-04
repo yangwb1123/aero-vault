@@ -93,6 +93,10 @@ func (h *Handler) GetSpecificVersion(w http.ResponseWriter, r *http.Request, key
 		return
 	}
 	defer rc.Close()
+	if readPreconditionFailed(r, obj) {
+		h.writeError(w, r, service.ErrPreconditionFailed)
+		return
+	}
 	// Honour conditional GETs on versioned downloads too: a cache-aware client
 	// must be able to receive 304 Not Modified (matches the non-versioned Get).
 	if notModified(r, obj) {
@@ -138,7 +142,7 @@ func (h *Handler) LockObject(w http.ResponseWriter, r *http.Request) {
 // GET /v1/buckets/{bucket}/config
 func (h *Handler) GetBucketConfig(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), bucket)
+	cfg, err := h.svc.GetBucketConfigAuthorized(r.Context(), mw.TenantFrom(r.Context()), bucket)
 	if err != nil {
 		h.writeError(w, r, err)
 		return

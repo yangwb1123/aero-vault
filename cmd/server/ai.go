@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log/slog"
+
+	"github.com/aero-vault/aero-vault/internal/access"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/ai"
@@ -16,6 +18,9 @@ import (
 
 func buildAIComponents(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, bus *events.Bus, svc *service.FileService, embedder ai.Embedder, llm ai.LLM, reranker ai.Reranker, jobReg *jobs.Registry, jobQueue *jobs.Queue) (*ai.Search, *ai.Chat, *ai.Agent) {
 	search := ai.NewSearch(repo, embedder, logger)
+	if cfg.Access.Enabled {
+		search.WithHitAuthorizer(svc)
+	}
 	qdrantIndex := setupVectorIndexes(ctx, cfg, search, embedder, logger)
 	setupLexicalCache(ctx, cfg, search, logger)
 	bm := setupBM25Search(ctx, cfg, repo, search)
@@ -70,10 +75,7 @@ func setupBM25Search(ctx context.Context, cfg *config.Config, repo repository.Re
 	if cfg.AI.HybridSearch {
 		bm = ai.NewBM25()
 		search.WithBM25(bm)
-		warmTenants := cfg.Reconcile.Tenants
-		if len(warmTenants) == 0 {
-			warmTenants = []string{"default"}
-		}
+		warmTenants := aiStartupTenants(cfg)
 		go func() {
 			for _, t := range warmTenants {
 				_ = bm.BuildFromRepo(ctx, repo, t)
@@ -106,7 +108,9 @@ func buildIndexer(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 		extractor = ai.NewRemoteExtractor(cfg.AI.ExtractorEndpoint, cfg.AI.ExtractorAPIKey, extractor)
 		logger.Info("remote extractor enabled", "endpoint", cfg.AI.ExtractorEndpoint)
 	}
-	indexer := ai.NewIndexer(repo, store, extractor, &ai.Chunker{Window: cfg.AI.ChunkWindow, Overlap: cfg.AI.ChunkOverlap}, embedder, logger)
+	indexer := ai.NewIndexer(repo, store, extractor, &ai.Chunker{
+		Window: cfg.AI.ChunkWindow, Overlap: cfg.AI.ChunkOverlap,
+	}, embedder, logger).WithObjectTagger(svc)
 	if bm != nil {
 		indexer.WithChunkSink(bm)
 	}
@@ -120,10 +124,11 @@ func buildIndexer(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 	svc.WithChunkCleaner(indexer)
 	registerIndexerJobs(jobReg, jobQueue, indexer)
 	idxSub, _ := bus.Subscribe()
-	go indexer.Run(ctx, idxSub)
+	systemCtx := access.SystemContext(ctx, "*")
+	go indexer.Run(systemCtx, idxSub)
 
 	logger.Info("indexer started", "embedder", embedder.Name(), "dim", embedder.Dimensions(), "hybrid", cfg.AI.HybridSearch)
-	startReindexOnStartup(ctx, cfg, indexer, logger)
+	startReindexOnStartup(systemCtx, cfg, indexer, logger)
 }
 
 func registerIndexerJobs(jobReg *jobs.Registry, jobQueue *jobs.Queue, indexer *ai.Indexer) {
@@ -135,14 +140,14 @@ func registerIndexerJobs(jobReg *jobs.Registry, jobQueue *jobs.Queue, indexer *a
 		if err != nil {
 			return err
 		}
-		return indexer.IndexObjectByID(ctx, id)
+		return indexer.IndexObjectByID(access.SystemContext(ctx, job.TenantID), id)
 	})
 	jobReg.Register(ai.JobDeleteChunks, func(ctx context.Context, job repository.Job) error {
 		id, err := ai.DecodeObjectID(job.Payload)
 		if err != nil {
 			return err
 		}
-		return indexer.DeleteObjectChunks(ctx, id)
+		return indexer.DeleteObjectChunks(access.SystemContext(ctx, job.TenantID), id)
 	})
 	indexer.WithQueue(jobQueue)
 }
@@ -150,11 +155,40 @@ func registerIndexerJobs(jobReg *jobs.Registry, jobQueue *jobs.Queue, indexer *a
 func startReindexOnStartup(ctx context.Context, cfg *config.Config, indexer *ai.Indexer, logger *slog.Logger) {
 	if cfg.AI.ReindexStaleOnStart {
 		go func() {
-			if n, err := indexer.ReindexStale(ctx, "default", 1000); err != nil {
-				logger.Warn("reindex-stale-on-start failed", "err", err)
-			} else if n > 0 {
-				logger.Info("reindex-stale-on-start complete", "reindexed", n)
+			total := 0
+			for _, tenant := range aiStartupTenants(cfg) {
+				n, err := indexer.ReindexStale(ctx, tenant, 1000)
+				if err != nil {
+					logger.Warn("reindex-stale-on-start failed", "tenant", tenant, "err", err)
+					continue
+				}
+				total += n
+			}
+			if total > 0 {
+				logger.Info("reindex-stale-on-start complete", "reindexed", total)
 			}
 		}()
 	}
+}
+
+func aiStartupTenants(cfg *config.Config) []string {
+	if len(cfg.Reconcile.Tenants) == 0 {
+		return []string{"default"}
+	}
+	seen := make(map[string]struct{}, len(cfg.Reconcile.Tenants))
+	tenants := make([]string, 0, len(cfg.Reconcile.Tenants))
+	for _, tenant := range cfg.Reconcile.Tenants {
+		if tenant == "" {
+			continue
+		}
+		if _, ok := seen[tenant]; ok {
+			continue
+		}
+		seen[tenant] = struct{}{}
+		tenants = append(tenants, tenant)
+	}
+	if len(tenants) == 0 {
+		return []string{"default"}
+	}
+	return tenants
 }

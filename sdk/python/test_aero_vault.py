@@ -160,6 +160,51 @@ class ContractTests(unittest.TestCase):
         c.delete_tenant("a/b")
         self.assertEqual(c.calls[-1]["path"], "/v1/admin/tenants/a%2Fb")
 
+    def test_enterprise_share_acl_member_and_export(self):
+        c = StubClient(FakeResp(json.dumps({"token": "raw", "url": "https://source/share/raw"}).encode()))
+        out = c.create_share("blog/hero.jpg", allow_download=True, ttl_seconds=60)
+        self.assertEqual(out["token"], "raw")
+        self.assertEqual(c.calls[-1]["path"], "/v1/shares")
+        self.assertTrue(json.loads(c.calls[-1]["data"])["allow_download"])
+
+        c = StubClient(FakeResp(b"{}"))
+        c.put_resource_acl(key="blog/", resource_kind="folder",
+                           principal_type="department", principal_id="dept-1",
+                           actions=["object:read"], inherit=True)
+        self.assertEqual(c.calls[-1]["method"], "PUT")
+        self.assertEqual(json.loads(c.calls[-1]["data"])["actions"], ["object:read"])
+        c = StubClient(FakeResp(b"{}"))
+        c.put_department_member("dept/id", "user one")
+        self.assertEqual(c.calls[-1]["path"], "/v1/admin/departments/dept%2Fid/members/user%20one")
+
+        c = StubClient(FakeResp(b"archive"))
+        self.assertEqual(c.export_archive(prefix="blog/"), b"archive")
+        self.assertEqual(c.calls[-1]["params"]["prefix"], "blog/")
+
+    def test_enterprise_lifecycle_management_requests(self):
+        c = StubClient(FakeResp(b'{"assets":[{"id":"asset-1"}]}'))
+        self.assertEqual(c.list_assets()[0]["id"], "asset-1")
+
+        c = StubClient(FakeResp(b'{"entries":[{"id":"acl-1"}]}'))
+        self.assertEqual(c.list_resource_acl(key="team/", resource_kind="folder")[0]["id"], "acl-1")
+        self.assertEqual(c.calls[-1]["params"]["kind"], "folder")
+        c = StubClient(FakeResp(b""))
+        c.delete_resource_acl("acl/id")
+        self.assertEqual(c.calls[-1]["path"], "/v1/access/acl/acl%2Fid")
+
+        c = StubClient(FakeResp(b'{"departments":[{"id":"dept-1"}]}'))
+        self.assertEqual(c.list_departments()[0]["id"], "dept-1")
+        c = StubClient(FakeResp(b'{"department":{"id":"dept-1"},"members":[]}'))
+        self.assertEqual(c.get_department("dept/id")["department"]["id"], "dept-1")
+        self.assertEqual(c.calls[-1]["path"], "/v1/admin/departments/dept%2Fid")
+        c = StubClient(FakeResp(b""))
+        c.delete_department("dept/id")
+        self.assertEqual(c.calls[-1]["method"], "DELETE")
+        c = StubClient(FakeResp(b""))
+        c.delete_department_member("dept/id", "user one")
+        self.assertEqual(c.calls[-1]["path"],
+                         "/v1/admin/departments/dept%2Fid/members/user%20one")
+
 
 class ErrorTests(unittest.TestCase):
     def test_http_error_maps_to_aerovaulterror(self):

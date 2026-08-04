@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/antivirus"
 	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/events"
@@ -15,19 +16,21 @@ import (
 	"github.com/aero-vault/aero-vault/internal/reconcile"
 	"github.com/aero-vault/aero-vault/internal/replication"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
-func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, bus *events.Bus, jobReg *jobs.Registry, jobQueue *jobs.Queue, cc reconcile.ChunkCleaner) error {
+func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, bus *events.Bus, jobReg *jobs.Registry, jobQueue *jobs.Queue, svc *service.FileService) error {
 	if cfg.Antivirus.Enabled && jobReg != nil {
 		scanner := buildScanner(cfg, logger)
-		avw := antivirus.NewWorker(repo, store, scanner, jobQueue, cfg.Antivirus.Quarantine, logger)
+		avw := antivirus.NewWorker(repo, store, scanner, jobQueue, cfg.Antivirus.Quarantine, logger).
+			WithObjectController(svc)
 		jobReg.Register(antivirus.JobScan, func(ctx context.Context, job repository.Job) error {
 			id, err := antivirus.DecodeObjectID(job.Payload)
 			if err != nil {
 				return err
 			}
-			return avw.ScanObjectByID(ctx, id)
+			return avw.ScanObjectByID(access.SystemContext(ctx, job.TenantID), id)
 		})
 		avSub, _ := bus.Subscribe()
 		go avw.Run(ctx, avSub)
@@ -38,13 +41,14 @@ func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slo
 		if err != nil {
 			return fmt.Errorf("build replica storage: %w", err)
 		}
-		rw := replication.NewWorker(repo, store, replica, jobQueue, logger)
+		rw := replication.NewWorker(repo, store, replica, jobQueue, logger).
+			WithObjectTagger(svc)
 		jobReg.Register(replication.JobReplicate, func(ctx context.Context, job repository.Job) error {
 			id, err := replication.DecodeObjectID(job.Payload)
 			if err != nil {
 				return err
 			}
-			return rw.ReplicateObjectByID(ctx, id)
+			return rw.ReplicateObjectByID(access.SystemContext(ctx, job.TenantID), id)
 		})
 		rwSub, _ := bus.Subscribe()
 		go rw.Run(ctx, rwSub)
@@ -57,7 +61,7 @@ func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slo
 	startWebhook(ctx, cfg, logger, repo, bus)
 	startNotificationWorker(ctx, logger, repo, bus)
 	if cfg.Reconcile.IntervalMinutes > 0 {
-		startReconcile(ctx, cfg, logger, repo, store, cc)
+		startReconcile(ctx, cfg, logger, repo, store, svc.ChunkCleaner())
 	}
 	return nil
 }
@@ -79,7 +83,13 @@ func startReconcile(ctx context.Context, cfg *config.Config, logger *slog.Logger
 		cfg.Reconcile.DeleteOrphanBlobs,
 		time.Duration(cfg.Reconcile.OrphanGraceMinutes)*time.Minute,
 		cfg.Reconcile.Tenants, logger).WithScrub(cfg.Reconcile.ScrubEnabled, 100)
+	if cc != nil {
+		j.WithChunkCleaner(cc)
+	}
 	lf := reconcile.NewLifecycle(repo, store, time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute, logger)
+	if cc != nil {
+		lf.WithChunkCleaner(cc)
+	}
 	var rg *reconcile.RetentionJob
 	if cfg.Reconcile.RetentionDays > 0 || cfg.Reconcile.IdempotencyTTLHours > 0 {
 		rg = reconcile.NewRetention(repo, store, time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute,

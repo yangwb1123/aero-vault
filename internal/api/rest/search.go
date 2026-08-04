@@ -81,8 +81,8 @@ func (h *AIHandler) Search(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, searchResponse{Query: req.Query, Hits: hits})
 }
 
-// POST /v1/chat/stream — SSE response, each token chunk as a data: frame.
-// The final frame carries the citation list as event: citations.
+// POST /v1/chat/stream — SSE response. Token chunks use event:token and the
+// final event:done frame carries the answer and citations together.
 func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	if h.aiDegraded(w, r) {
 		return

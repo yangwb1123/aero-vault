@@ -25,7 +25,7 @@ func (c *Client) Health(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	resp, err := c.do(r)
+	resp, err := c.httpClient.Do(r)
 	if err != nil {
 		return false, err
 	}

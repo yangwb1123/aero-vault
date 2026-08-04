@@ -17,6 +17,7 @@ type Repository interface {
 	// ── Objects ──
 	UpsertObject(ctx context.Context, obj Object) (Object, error)
 	InsertObjectVersion(ctx context.Context, obj Object) (Object, error)
+	InsertDeleteMarker(ctx context.Context, obj Object) (Object, error)
 	GetObject(ctx context.Context, tenant, bucket, key string) (Object, error)
 	GetObjectByID(ctx context.Context, id int64) (Object, error)
 	GetObjectVersion(ctx context.Context, tenant, bucket, key, versionID string) (Object, error)
@@ -25,17 +26,22 @@ type Repository interface {
 	ListDeletedObjects(ctx context.Context, tenant, bucket, prefix, marker string, limit int) (ListPage, error)
 	ListObjectVersions(ctx context.Context, tenant, bucket, key string) ([]Object, error)
 	ListObjectVersionsWithOpts(ctx context.Context, tenant, bucket, key string, opts VersionListOpts) (VersionListPage, error)
+	ListObjectVersionKeys(ctx context.Context, tenant, bucket, prefix, marker string, limit int) ([]string, string, bool, error)
 	SoftDeleteObject(ctx context.Context, tenant, bucket, key string) error
+	SoftDeleteObjectByID(ctx context.Context, id int64) error
 	HardDeleteObject(ctx context.Context, tenant, bucket, key string) error
 	HardDeleteObjectByID(ctx context.Context, id int64) error
+	DeleteObjectVersion(ctx context.Context, tenant, bucket, key, versionID string) error
 	RestoreObject(ctx context.Context, tenant, bucket, key string) error
 	UpdateTags(ctx context.Context, tenant, bucket, key string, tags map[string]string) error
+	UpdateObjectTagsByID(ctx context.Context, id int64, tags map[string]string) error
 	SetObjectMetaKey(ctx context.Context, tenant, bucket, key, metaKey, metaValue string) error
 	SetObjectMetaKeys(ctx context.Context, tenant, bucket, key string, meta map[string]string) error
 	ReplaceObjectMetadata(ctx context.Context, tenant, bucket, key string, meta map[string]string) error
 	DeleteObjectMetaKey(ctx context.Context, tenant, bucket, key, metaKey string) error
 	UpdateObjectStorageClass(ctx context.Context, tenant, bucket, key, storageClass string) error
 	SetLockedUntil(ctx context.Context, tenant, bucket, key string, until time.Time) error
+	SetObjectRetention(ctx context.Context, objectID int64, until time.Time, metadata map[string]string) error
 	StorageKeyReferenced(ctx context.Context, storageKey string) (bool, error)
 	ListStorageKeys(ctx context.Context) ([]string, error)
 
@@ -60,6 +66,7 @@ type Repository interface {
 	BucketUsage(ctx context.Context, tenant, bucket string) (usedBytes, usedObjects int64, err error)
 	SetBucketTags(ctx context.Context, tenant, bucket string, tags map[string]string) error
 	DeleteBucketTags(ctx context.Context, tenant, bucket string) error
+	SetBucketAccelerate(ctx context.Context, tenant, bucket, status string) error
 	SetBucketACL(ctx context.Context, tenant, bucket, acl string) error
 	SetBucketPolicy(ctx context.Context, tenant, bucket, policy string) error
 	GetBucketCORS(ctx context.Context, tenant, bucket string) ([]CORSRule, error)
@@ -88,6 +95,7 @@ type Repository interface {
 
 	// ── Events ──
 	InsertEvent(ctx context.Context, e Event) (int64, error)
+	ListEventsAfter(ctx context.Context, tenant string, afterID int64, limit int) ([]Event, error)
 	NextUnconsumedEvents(ctx context.Context, limit int) ([]Event, error)
 	MarkEventConsumed(ctx context.Context, id int64) error
 
@@ -115,6 +123,7 @@ type Repository interface {
 	RecordWebhookFailure(ctx context.Context, f WebhookFailure) (int64, error)
 	NextPendingFailures(ctx context.Context, limit int) ([]WebhookFailure, error)
 	MarkWebhookSucceeded(ctx context.Context, id int64) error
+	MarkWebhookDeadLettered(ctx context.Context, id int64, lastErr string, lastStatus, attempts int) error
 	UpdateWebhookFailure(ctx context.Context, id int64, lastErr string, lastStatus int, nextRetryAt time.Time, attempts int) error
 	ListWebhookFailures(ctx context.Context, limit int) ([]WebhookFailure, error)
 

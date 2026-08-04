@@ -252,6 +252,66 @@ func (cb *circuitBreaker) Stat(ctx context.Context, key string) (ObjectInfo, err
 	return info, err
 }
 
+func (cb *circuitBreaker) SupportsSSEC() bool {
+	return SupportsSSEC(cb.Storage)
+}
+
+func (cb *circuitBreaker) SupportsServerSideEncryption(algorithm, keyID string) bool {
+	return SupportsServerSideEncryption(cb.Storage, algorithm, keyID)
+}
+
+func (cb *circuitBreaker) GetWithOptions(ctx context.Context, key string, opts GetOptions) (io.ReadCloser, ObjectInfo, error) {
+	if err := cb.beforeRequest(); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	secure, ok := cb.Storage.(SSECStorage)
+	if !ok || !secure.SupportsSSEC() {
+		return nil, ObjectInfo{}, ErrUnsupported
+	}
+	rc, info, err := secure.GetWithOptions(ctx, key, opts)
+	cb.recordOutcome(err)
+	return rc, info, err
+}
+
+func (cb *circuitBreaker) StatWithOptions(ctx context.Context, key string, opts GetOptions) (ObjectInfo, error) {
+	if err := cb.beforeRequest(); err != nil {
+		return ObjectInfo{}, err
+	}
+	secure, ok := cb.Storage.(SSECStorage)
+	if !ok || !secure.SupportsSSEC() {
+		return ObjectInfo{}, ErrUnsupported
+	}
+	info, err := secure.StatWithOptions(ctx, key, opts)
+	cb.recordOutcome(err)
+	return info, err
+}
+
+func (cb *circuitBreaker) UploadPartWithOptions(ctx context.Context, key, uploadID string, partNumber int32, r io.Reader, size int64, opts PutOptions) (MultipartPart, error) {
+	if err := cb.beforeRequest(); err != nil {
+		return MultipartPart{}, err
+	}
+	secure, ok := cb.Storage.(SSECStorage)
+	if !ok || !secure.SupportsSSEC() {
+		return MultipartPart{}, ErrUnsupported
+	}
+	part, err := secure.UploadPartWithOptions(ctx, key, uploadID, partNumber, r, size, opts)
+	cb.recordOutcome(err)
+	return part, err
+}
+
+func (cb *circuitBreaker) CompleteMultipartWithOptions(ctx context.Context, key, uploadID string, parts []MultipartPart, opts PutOptions) (ObjectInfo, error) {
+	if err := cb.beforeRequest(); err != nil {
+		return ObjectInfo{}, err
+	}
+	secure, ok := cb.Storage.(SSECStorage)
+	if !ok || !secure.SupportsSSEC() {
+		return ObjectInfo{}, ErrUnsupported
+	}
+	info, err := secure.CompleteMultipartWithOptions(ctx, key, uploadID, parts, opts)
+	cb.recordOutcome(err)
+	return info, err
+}
+
 func (cb *circuitBreaker) Delete(ctx context.Context, key string) error {
 	if err := cb.beforeRequest(); err != nil {
 		return err

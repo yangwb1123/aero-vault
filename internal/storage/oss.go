@@ -49,6 +49,9 @@ func NewOSS(cfg OSSConfig) (*OSSStorage, error) {
 func (s *OSSStorage) Backend() string { return "oss" }
 
 func (s *OSSStorage) Put(ctx context.Context, key string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
 	var respHeader http.Header
 	options := []oss.Option{oss.GetResponseHeader(&respHeader)}
 	if opts.ContentType != "" {
@@ -74,6 +77,9 @@ func (s *OSSStorage) Put(ctx context.Context, key string, r io.Reader, size int6
 }
 
 func (s *OSSStorage) Get(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return nil, ObjectInfo{}, err
+	}
 	var respHeader http.Header
 	body, err := s.bucket.GetObject(key, oss.GetResponseHeader(&respHeader))
 	if err != nil {
@@ -86,6 +92,9 @@ func (s *OSSStorage) Get(ctx context.Context, key string) (io.ReadCloser, Object
 }
 
 func (s *OSSStorage) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
 	header, err := s.bucket.GetObjectDetailedMeta(key)
 	if err != nil {
 		if isOSSNotFound(err) {
@@ -97,10 +106,16 @@ func (s *OSSStorage) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 }
 
 func (s *OSSStorage) Delete(ctx context.Context, key string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	return s.bucket.DeleteObject(key)
 }
 
 func (s *OSSStorage) List(ctx context.Context, prefix, marker string, limit int) (ListResult, error) {
+	if err := validateListPrefix(prefix); err != nil {
+		return ListResult{}, err
+	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
@@ -131,10 +146,16 @@ func (s *OSSStorage) List(ctx context.Context, prefix, marker string, limit int)
 }
 
 func (s *OSSStorage) PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	if err := validateObjectKey(key); err != nil {
+		return "", err
+	}
 	return s.bucket.SignURL(key, oss.HTTPGet, int64(expiry.Seconds()))
 }
 
 func (s *OSSStorage) PresignPut(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	if err := validateObjectKey(key); err != nil {
+		return "", err
+	}
 	return s.bucket.SignURL(key, oss.HTTPPut, int64(expiry.Seconds()))
 }
 
@@ -145,6 +166,9 @@ func (s *OSSStorage) imur(key, uploadID string) oss.InitiateMultipartUploadResul
 }
 
 func (s *OSSStorage) InitMultipart(ctx context.Context, key string, opts PutOptions) (MultipartInit, error) {
+	if err := validateObjectKey(key); err != nil {
+		return MultipartInit{}, err
+	}
 	var options []oss.Option
 	if opts.ContentType != "" {
 		options = append(options, oss.ContentType(opts.ContentType))
@@ -160,6 +184,9 @@ func (s *OSSStorage) InitMultipart(ctx context.Context, key string, opts PutOpti
 }
 
 func (s *OSSStorage) UploadPart(ctx context.Context, key, uploadID string, partNumber int32, r io.Reader, size int64) (MultipartPart, error) {
+	if err := validateObjectKey(key); err != nil {
+		return MultipartPart{}, err
+	}
 	part, err := s.bucket.UploadPart(s.imur(key, uploadID), r, size, int(partNumber))
 	if err != nil {
 		return MultipartPart{}, err
@@ -168,6 +195,9 @@ func (s *OSSStorage) UploadPart(ctx context.Context, key, uploadID string, partN
 }
 
 func (s *OSSStorage) CompleteMultipart(ctx context.Context, key, uploadID string, parts []MultipartPart) (ObjectInfo, error) {
+	if err := validateObjectKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
 	ossParts := make([]oss.UploadPart, 0, len(parts))
 	for _, p := range parts {
 		ossParts = append(ossParts, oss.UploadPart{PartNumber: int(p.PartNumber), ETag: p.ETag})
@@ -180,10 +210,16 @@ func (s *OSSStorage) CompleteMultipart(ctx context.Context, key, uploadID string
 }
 
 func (s *OSSStorage) AbortMultipart(ctx context.Context, key, uploadID string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	return s.bucket.AbortMultipartUpload(s.imur(key, uploadID))
 }
 
 func (s *OSSStorage) CleanupParts(ctx context.Context, key, uploadID string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
 	// OSS storage-level cleanup uses the same AbortMultipart API.
 	// If the upload is already gone, the OSS SDK returns a 404 which we treat
 	// as success (idempotent).
@@ -223,6 +259,9 @@ func ossObjectInfo(key string, h http.Header) ObjectInfo {
 func (s *OSSStorage) CanCopy() bool { return true }
 
 func (s *OSSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyOptions) (ObjectInfo, error) {
+	if err := validateObjectKeys(srcKey, dstKey); err != nil {
+		return ObjectInfo{}, err
+	}
 	// Use OSS CopyObject API (server-side copy, does not read body into memory).
 	hdrs := []oss.Option{}
 	if opts.MetadataDirective == "REPLACE" {
@@ -248,6 +287,9 @@ func (s *OSSStorage) Copy(ctx context.Context, srcKey, dstKey string, opts CopyO
 }
 
 func (s *OSSStorage) UploadPartCopy(ctx context.Context, dstKey, uploadID string, partNumber int32, srcKey string, srcOffset, length int64) (MultipartPart, error) {
+	if err := validateObjectKeys(dstKey, srcKey); err != nil {
+		return MultipartPart{}, err
+	}
 	// OSS SDK requires InitiateMultipartUploadResult which is not available at this
 	// abstraction level. Use Copy (which calls CopyObject server-side) for full
 	// objects, or fall back to the client-stream copy in the service layer.

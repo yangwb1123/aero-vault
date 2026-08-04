@@ -39,6 +39,9 @@ func TestMultipart_CreatesVersionOnVersionedBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if mpObj.StorageKey != storageKey(mpObj.TenantID, mpObj.Bucket, key)+"@v"+mpObj.VersionID {
+		t.Fatalf("multipart storage key/version mismatch: key=%q version=%q", mpObj.StorageKey, mpObj.VersionID)
+	}
 
 	// Two versions exist, with distinct storage keys (one blob per version).
 	versions, err := svc.ListVersions(ctx, "default", "", key)

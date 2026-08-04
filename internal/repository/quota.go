@@ -103,18 +103,21 @@ func (s *sqlStore) AddTenantUsage(ctx context.Context, tenant string, deltaBytes
 		return TenantQuota{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT OR IGNORE INTO tenant_quotas (tenant_id) VALUES ($1)`), tenant); err != nil {
-		// Postgres syntax differs.
-		if s.dialect == dialectPostgres {
-			if _, e2 := tx.ExecContext(ctx, `INSERT INTO tenant_quotas (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING`, tenant); e2 != nil {
-				return TenantQuota{}, e2
-			}
-		} else {
-			return TenantQuota{}, err
-		}
+	insert := `INSERT OR IGNORE INTO tenant_quotas (tenant_id) VALUES ($1)`
+	if s.dialect == dialectPostgres {
+		insert = `INSERT INTO tenant_quotas (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING`
 	}
-	if _, err := tx.ExecContext(ctx, s.rebind(`UPDATE tenant_quotas SET used_bytes = used_bytes + $1, used_objects = used_objects + $2, updated_at = $3 WHERE tenant_id = $4`),
-		deltaBytes, deltaObjects, time.Now().UTC().Format(time.RFC3339Nano), tenant); err != nil {
+	if _, err := tx.ExecContext(ctx, s.rebind(insert), tenant); err != nil {
+		return TenantQuota{}, err
+	}
+	if _, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE tenant_quotas
+SET used_bytes = CASE WHEN used_bytes + $1 < 0 THEN 0 ELSE used_bytes + $2 END,
+    used_objects = CASE WHEN used_objects + $3 < 0 THEN 0 ELSE used_objects + $4 END,
+    updated_at = $5
+WHERE tenant_id = $6`),
+		deltaBytes, deltaBytes, deltaObjects, deltaObjects,
+		time.Now().UTC().Format(time.RFC3339Nano), tenant); err != nil {
 		return TenantQuota{}, err
 	}
 	if err := tx.Commit(); err != nil {

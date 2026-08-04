@@ -47,7 +47,7 @@ func (h *Handler) dispatchBucketSubresource(w http.ResponseWriter, r *http.Reque
 		h.dispatchBucketNotifications(w, r, bucket)
 		return true
 	case q.Has("accelerate"):
-		h.getBucketAccelerate(w, r, bucket)
+		h.dispatchBucketAccelerate(w, r, bucket)
 		return true
 	case q.Has("encryption"):
 		h.dispatchBucketEncryption(w, r, bucket)
@@ -58,8 +58,24 @@ func (h *Handler) dispatchBucketSubresource(w http.ResponseWriter, r *http.Reque
 	case q.Has("tagging"):
 		h.dispatchBucketTagging(w, r, bucket)
 		return true
+	case q.Has("cors"):
+		h.dispatchBucketCORS(w, r, bucket)
+		return true
 	}
 	return false
+}
+
+func (h *Handler) dispatchBucketCORS(w http.ResponseWriter, r *http.Request, bucket string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.getBucketCORS(w, r, bucket)
+	case http.MethodPut:
+		h.putBucketCORS(w, r, bucket)
+	case http.MethodDelete:
+		h.deleteBucketCORS(w, r, bucket)
+	default:
+		writeS3Error(w, r, service.ErrInvalidArgs)
+	}
 }
 
 func (h *Handler) dispatchBucketTagging(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -270,15 +286,55 @@ func (h *Handler) headBucket(w http.ResponseWriter, r *http.Request, bucket stri
 }
 
 func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	acl := r.Header.Get("x-amz-acl")
+	if err := service.ValidateACL(acl); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
 	if err := h.svc.CreateBucket(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
-	if acl := r.Header.Get("x-amz-acl"); acl != "" {
-		_ = h.svc.SetBucketACL(r.Context(), mw.TenantFrom(r.Context()), bucket, acl)
+	if acl != "" {
+		if err := h.svc.SetBucketACL(r.Context(), mw.TenantFrom(r.Context()), bucket, acl); err != nil {
+			writeS3Error(w, r, err)
+			return
+		}
 	}
 	w.Header().Set("Location", "/"+bucket)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	tenant := mw.TenantFrom(r.Context())
+	exists, err := h.svc.HeadBucket(r.Context(), tenant, bucket)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	if !exists {
+		writeS3Error(w, r, errNoSuchBucket)
+		return
+	}
+	keys, _, _, err := h.svc.ListVersionKeys(r.Context(), tenant, bucket, "", "", 1)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	hasUploads, err := h.svc.BucketHasMultipartUploads(r.Context(), tenant, bucket)
+	if err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	if len(keys) != 0 || hasUploads {
+		writeS3Error(w, r, errBucketNotEmpty)
+		return
+	}
+	if err := h.svc.DeleteBucket(r.Context(), tenant, bucket); err != nil {
+		writeS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── Bucket CORS ─────────────────────────────────────────────────────────────
@@ -335,7 +391,7 @@ func (h *Handler) deleteBucketCORS(w http.ResponseWriter, r *http.Request, bucke
 		writeS3Error(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── Bucket Logging ──────────────────────────────────────────────────────────
@@ -375,4 +431,3 @@ func (h *Handler) putBucketLogging(w http.ResponseWriter, r *http.Request, bucke
 	}
 	w.WriteHeader(http.StatusOK)
 }
-

@@ -6,15 +6,41 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
 var (
-	ErrNotFound      = errors.New("object not found")
-	ErrAlreadyExists = errors.New("object already exists")
-	ErrInvalidKey    = errors.New("invalid object key")
-	ErrUnsupported   = errors.New("operation not supported by this backend")
+	ErrNotFound               = errors.New("object not found")
+	ErrAlreadyExists          = errors.New("object already exists")
+	ErrInvalidKey             = errors.New("invalid object key")
+	ErrUnsupported            = errors.New("operation not supported by this backend")
+	ErrSSECustomerKeyRequired = errors.New("SSE-C customer key is required")
+	ErrInvalidSSECustomerKey  = errors.New("SSE-C customer key is invalid")
 )
+
+func validateObjectKey(key string) error {
+	if key == "" || strings.HasPrefix(key, "/") || strings.Contains(key, "..") {
+		return ErrInvalidKey
+	}
+	return nil
+}
+
+func validateObjectKeys(keys ...string) error {
+	for _, key := range keys {
+		if err := validateObjectKey(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateListPrefix(prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	return validateObjectKey(prefix)
+}
 
 // ObjectInfo describes a stored object.
 type ObjectInfo struct {
@@ -30,6 +56,10 @@ type ObjectInfo struct {
 type PutOptions struct {
 	ContentType string
 	Metadata    map[string]string
+	// SSEAlgorithm requests provider-managed encryption ("AES256" or
+	// "aws:kms"). SSEKMSKeyID is valid only with "aws:kms".
+	SSEAlgorithm string
+	SSEKMSKeyID  string
 	// SSECustomerKey is an AES-256 key for server-side encryption with
 	// customer-provided key (SSE-C). When set, the key is used to encrypt the
 	// object on write and MUST be provided on subsequent read/stat/delete.

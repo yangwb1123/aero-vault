@@ -13,6 +13,7 @@ import (
 	"log/slog"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
@@ -25,6 +26,11 @@ const TagStatus = "repl_status"
 // Enqueuer is the slice of the job queue the bridge needs.
 type Enqueuer interface {
 	Enqueue(ctx context.Context, j repository.Job) (int64, bool, error)
+}
+
+// ObjectTagger is the FileService slice used for exact-version status tags.
+type ObjectTagger interface {
+	SetObjectTagsByID(ctx context.Context, objectID int64, tags map[string]string) error
 }
 
 type payload struct {
@@ -55,6 +61,7 @@ type Worker struct {
 	primary storage.Storage
 	replica storage.Storage
 	queue   Enqueuer
+	tagger  ObjectTagger
 	logger  *slog.Logger
 }
 
@@ -63,6 +70,12 @@ func NewWorker(repo repository.Repository, primary, replica storage.Storage, que
 		logger = slog.Default()
 	}
 	return &Worker{repo: repo, primary: primary, replica: replica, queue: queue, logger: logger}
+}
+
+// WithObjectTagger routes status mutations through FileService.
+func (w *Worker) WithObjectTagger(tagger ObjectTagger) *Worker {
+	w.tagger = tagger
+	return w
 }
 
 // Run drains created events and enqueues a replicate job per object.
@@ -99,16 +112,24 @@ func (w *Worker) ReplicateObjectByID(ctx context.Context, objectID int64) error 
 	if err != nil {
 		return fmt.Errorf("get object %d: %w", objectID, err)
 	}
+	if _, _, ok := service.SSECustomerInfo(obj.Metadata); ok {
+		return errors.New("replication: SSE-C object requires an unavailable customer key")
+	}
 	rc, info, err := w.primary.Get(ctx, obj.StorageKey)
 	if err != nil {
 		return fmt.Errorf("primary get %q: %w", obj.StorageKey, err)
 	}
 	defer rc.Close()
 
-	if _, err := w.replica.Put(ctx, obj.StorageKey, rc, info.Size, storage.PutOptions{
+	putOptions := storage.PutOptions{
 		ContentType: obj.ContentType,
 		Metadata:    obj.Metadata,
-	}); err != nil {
+	}
+	if algorithm, keyID, ok := service.ServerSideEncryptionInfo(obj.Metadata); ok {
+		putOptions.SSEAlgorithm = algorithm
+		putOptions.SSEKMSKeyID = keyID
+	}
+	if _, err := w.replica.Put(ctx, obj.StorageKey, rc, info.Size, putOptions); err != nil {
 		return fmt.Errorf("replica put %q: %w", obj.StorageKey, err)
 	}
 
@@ -117,7 +138,9 @@ func (w *Worker) ReplicateObjectByID(ctx context.Context, objectID int64) error 
 		tags[k] = v
 	}
 	tags[TagStatus] = "replicated"
-	if err := w.repo.UpdateTags(ctx, obj.TenantID, obj.Bucket, obj.Key, tags); err != nil {
+	if w.tagger == nil {
+		w.logger.Warn("replication: object tagger unavailable", "object_id", objectID)
+	} else if err := w.tagger.SetObjectTagsByID(ctx, objectID, tags); err != nil {
 		// Replica write already succeeded; a tag failure shouldn't fail the job.
 		w.logger.Warn("replication: tag update", "object_id", objectID, "err", err)
 	}

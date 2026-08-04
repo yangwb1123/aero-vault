@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -101,6 +102,74 @@ func TestTenantFrom_RoundTripAndDefault(t *testing.T) {
 func TestTenantHeaderConstant(t *testing.T) {
 	if TenantHeader != "X-Aero-Tenant" {
 		t.Fatalf("TenantHeader = %q, want X-Aero-Tenant", TenantHeader)
+	}
+}
+
+func TestTenantWithStatusRejectsDisabledTenant(t *testing.T) {
+	for _, path := range []string{"/v1/files", "/s3/default/key", "/webdav/key", "/mcp"} {
+		t.Run(path, func(t *testing.T) {
+			called := false
+			h := TenantWithStatus(func(_ context.Context, tenant string) (string, bool, error) {
+				if tenant != "acme" {
+					t.Fatalf("lookup tenant=%q, want acme", tenant)
+				}
+				return "disabled", true, nil
+			})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set(TenantHeader, "acme")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden || called {
+				t.Fatalf("status=%d called=%v, want 403/false", rec.Code, called)
+			}
+			if !strings.Contains(rec.Body.String(), "tenant is disabled") {
+				t.Fatalf("body=%q", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestTenantWithStatusMarksActiveAndAllowsUnknown(t *testing.T) {
+	lookup := func(_ context.Context, tenant string) (string, bool, error) {
+		if tenant == "acme" {
+			return "active", true, nil
+		}
+		return "", false, nil
+	}
+	for _, tenant := range []string{"acme", "implicit"} {
+		t.Run(tenant, func(t *testing.T) {
+			h := TenantWithStatus(lookup)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !TenantStatusVerified(r.Context(), tenant) {
+					t.Fatalf("tenant %q was not marked verified", tenant)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequest(http.MethodGet, "/v1/files", nil)
+			req.Header.Set(TenantHeader, tenant)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status=%d", rec.Code)
+			}
+		})
+	}
+}
+
+func TestTenantWithStatusFailureAndPublicBypass(t *testing.T) {
+	lookupErr := errors.New("database unavailable")
+	lookup := func(context.Context, string) (string, bool, error) { return "", false, lookupErr }
+	h := TenantWithStatus(lookup)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/files", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lookup failure status=%d, want 503", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/share/token", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("public capability bypass status=%d, want 204", rec.Code)
 	}
 }
 
@@ -441,6 +510,44 @@ func TestConcurrencyLimiter_ReturnsErrorBody(t *testing.T) {
 	body := strings.TrimSpace(rec.Body.String())
 	if body != "too many concurrent requests\n" && body != "too many concurrent requests" {
 		t.Fatalf("unexpected body: %q", body)
+	}
+	close(block)
+}
+
+func TestPerTenantConcurrencyAccountsWeightedCost(t *testing.T) {
+	limiter := NewPerTenantConcurrencyLimiter(10, 2)
+	if !limiter.acquireTenant("acme", 1) {
+		t.Fatal("first read should fit")
+	}
+	if limiter.acquireTenant("acme", 2) {
+		t.Fatal("write would exceed remaining per-tenant capacity")
+	}
+	limiter.releaseTenant("acme", 1)
+	if !limiter.acquireTenant("acme", 2) {
+		t.Fatal("write should fit after release")
+	}
+	limiter.releaseTenant("acme", 2)
+}
+
+func TestPerTenantConcurrencyWorksWithoutGlobalLimit(t *testing.T) {
+	limiter := NewPerTenantConcurrencyLimiter(0, 1)
+	block := make(chan struct{})
+	started := make(chan struct{})
+	handler := Tenant(limiter.Middleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(started)
+		<-block
+	})))
+	first := httptest.NewRequest(http.MethodGet, "/", nil)
+	first.Header.Set(TenantHeader, "acme")
+	go handler.ServeHTTP(httptest.NewRecorder(), first)
+	<-started
+
+	second := httptest.NewRequest(http.MethodGet, "/", nil)
+	second.Header.Set(TenantHeader, "acme")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, second)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d want %d", rec.Code, http.StatusTooManyRequests)
 	}
 	close(block)
 }

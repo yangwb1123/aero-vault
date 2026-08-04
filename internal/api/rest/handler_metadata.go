@@ -9,12 +9,24 @@ import (
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
+// GET /v1/files/{key}/metadata — return the complete metadata map.
+func (h *Handler) GetMetadata(w http.ResponseWriter, r *http.Request) {
+	key := trimSuffix(keyFromPath(r), "/metadata")
+	meta, err := h.svc.GetMetadata(
+		r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key,
+	)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, meta)
+}
+
 // PUT /v1/files/{key}/metadata — replace all metadata on an object.
 // Body: {"key": "value", ...} — the complete replacement map.
 // An empty object {} clears all metadata.
 func (h *Handler) PutMetadata(w http.ResponseWriter, r *http.Request) {
-	key := keyFromPath(r)
-	key = trimSuffix(key, "/metadata")
+	key := trimSuffix(keyFromPath(r), "/metadata")
 	var meta map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
 		h.writeError(w, r, fmt.Errorf("%w: invalid JSON: %v", service.ErrInvalidArgs, err))
@@ -30,8 +42,7 @@ func (h *Handler) PutMetadata(w http.ResponseWriter, r *http.Request) {
 // PATCH /v1/files/{key}/metadata — merge metadata keys.
 // Body: {"key": "value", ...} — only the provided keys are updated.
 func (h *Handler) PatchMetadata(w http.ResponseWriter, r *http.Request) {
-	key := keyFromPath(r)
-	key = trimSuffix(key, "/metadata")
+	key := trimSuffix(keyFromPath(r), "/metadata")
 	var meta map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
 		h.writeError(w, r, fmt.Errorf("%w: invalid JSON: %v", service.ErrInvalidArgs, err))
@@ -48,8 +59,7 @@ func (h *Handler) PatchMetadata(w http.ResponseWriter, r *http.Request) {
 // When ?key=<metaKey> is set, only that key is removed.
 // Without query params, all metadata is cleared.
 func (h *Handler) DeleteMetadata(w http.ResponseWriter, r *http.Request) {
-	key := keyFromPath(r)
-	key = trimSuffix(key, "/metadata")
+	key := trimSuffix(keyFromPath(r), "/metadata")
 	metaKey := r.URL.Query().Get("key")
 	if metaKey != "" {
 		if err := h.svc.DeleteMetadataKey(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key, metaKey); err != nil {

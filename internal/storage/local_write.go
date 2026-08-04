@@ -21,6 +21,9 @@ func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader, size in
 		),
 	)
 	defer span.End()
+	if err := s.validateServerSideEncryption(opts); err != nil {
+		return ObjectInfo{}, err
+	}
 
 	path, err := s.objectPath(key)
 	if err != nil {
@@ -38,6 +41,20 @@ func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader, size in
 		return ObjectInfo{}, err
 	}
 	return meta.toInfo(), nil
+}
+
+func (s *LocalStorage) validateServerSideEncryption(opts PutOptions) error {
+	if opts.SSEAlgorithm == "" {
+		if opts.SSEKMSKeyID != "" {
+			return ErrUnsupported
+		}
+		return nil
+	}
+	if len(opts.SSECustomerKey) != 0 ||
+		!s.SupportsServerSideEncryption(opts.SSEAlgorithm, opts.SSEKMSKeyID) {
+		return ErrUnsupported
+	}
+	return nil
 }
 
 func (s *LocalStorage) writeObject(ctx context.Context, path, key string, r io.Reader, size int64, opts PutOptions) (localMeta, error) {
@@ -59,7 +76,7 @@ func (s *LocalStorage) writeObject(ctx context.Context, path, key string, r io.R
 	)
 	// SSE-C: use customer-provided key instead of server-side encrypter.
 	if len(opts.SSECustomerKey) == 32 {
-		enc = newEnvelopeEncrypter(&ssecProvider{key: opts.SSECustomerKey})
+		enc = newEnvelopeEncrypter(newSSECProvider(opts.SSECustomerKey))
 	}
 	if enc != nil {
 		plain, err := io.ReadAll(reader)
@@ -88,7 +105,7 @@ func (s *LocalStorage) writeObject(ctx context.Context, path, key string, r io.R
 	}
 	return localMeta{
 		Key:          key,
-		Size:         plaintextSize(written, s.enc != nil),
+		Size:         plaintextSize(written, enc != nil),
 		ETag:         hex.EncodeToString(h.Sum(nil)),
 		ContentType:  opts.ContentType,
 		LastModified: time.Now().UTC(),

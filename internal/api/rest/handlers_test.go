@@ -38,7 +38,7 @@ func setupTest(t *testing.T) (*service.FileService, repository.Repository, *http
 		t.Fatalf("new local storage: %v", err)
 	}
 	svc := service.NewFileService(store, repo, nil)
-	router := NewRouter(svc, repo, nil, nil, nil, nil, nil, slog.Default(), false, nil, 0, false)
+	router := NewRouter(svc, repo, nil, nil, nil, nil, nil, slog.Default(), false, nil, nil, 0, false)
 	ts := httptest.NewServer(router)
 	t.Cleanup(func() { ts.Close(); _ = repo.Close() })
 	return svc, repo, ts
@@ -167,6 +167,37 @@ func TestContentMD5RoundTrip(t *testing.T) {
 	// System _aero_ prefix should not leak into X-Meta-* headers.
 	if v := resp.Header.Get("X-Meta-_aero-content-md5"); v != "" {
 		t.Errorf("system metadata should not be leaked: X-Meta-_aero-content-md5=%q", v)
+	}
+}
+
+func TestContentMD5MismatchReturnsBadDigest(t *testing.T) {
+	_, _, ts := setupTest(t)
+	resp, body := req(
+		t, http.MethodPut, ts.URL+"/files/bad-md5.txt", []byte("content"),
+		map[string]string{"Content-MD5": "AAAAAAAAAAAAAAAAAAAAAA=="},
+	)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT status=%d, want 400; body=%s", resp.StatusCode, body)
+	}
+	var got errorBody
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Error.Code != "BadDigest" {
+		t.Fatalf("error code=%q, want BadDigest", got.Error.Code)
+	}
+}
+
+func TestMetadataLimitErrorsAreBadRequests(t *testing.T) {
+	for _, err := range []error{
+		service.ErrMetadataTooLarge,
+		service.ErrMetadataKeyTooLong,
+		service.ErrMetadataValueTooLong,
+	} {
+		code, _, status := classify(err)
+		if status != http.StatusBadRequest || code != "InvalidArgument" {
+			t.Fatalf("classify(%v)=(%q,%d), want InvalidArgument,400", err, code, status)
+		}
 	}
 }
 
@@ -424,6 +455,10 @@ func TestBucketPolicyDenyPut(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("PUT after deny policy: status=%d want 403, body=%s", resp.StatusCode, body)
 	}
+	resp, body = req(t, "POST", base+"/presign?op=put", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("presign PUT after deny policy: status=%d want 403, body=%s", resp.StatusCode, body)
+	}
 
 	// GET should still work (explicit Allow for s3:GetObject).
 	resp, body = req(t, "GET", base, nil, nil)
@@ -468,6 +503,10 @@ func TestBucketPolicyDenyGet(t *testing.T) {
 	resp, body = req(t, "GET", base, nil, nil)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("GET after deny policy: status=%d want 403, body=%s", resp.StatusCode, body)
+	}
+	resp, body = req(t, "POST", base+"/presign?op=get", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("presign GET after deny policy: status=%d want 403, body=%s", resp.StatusCode, body)
 	}
 
 	// HEAD should also be denied.
@@ -625,5 +664,22 @@ func TestBucketPolicyNoPolicyDoesNotBlock(t *testing.T) {
 	resp, body = req(t, "DELETE", base, nil, nil)
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("DELETE no policy: status=%d want 204, body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestBucketPolicyRejectsInvalidDocument(t *testing.T) {
+	_, repo, ts := setupTest(t)
+	policyURL := ts.URL + "/buckets/default/policy"
+
+	resp, body := req(t, "PUT", policyURL, bodyPolicy(`{"Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Condition":{"Bool":{"aws:SecureTransport":["true"]}}}]}`), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid policy status=%d want 400, body=%s", resp.StatusCode, body)
+	}
+	cfg, err := repo.GetBucketConfig(context.Background(), "default", "default")
+	if err != nil {
+		t.Fatalf("get bucket config: %v", err)
+	}
+	if cfg.Policy != "" {
+		t.Fatalf("invalid policy was persisted: %s", cfg.Policy)
 	}
 }

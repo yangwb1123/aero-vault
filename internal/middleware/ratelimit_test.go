@@ -214,7 +214,10 @@ func TestMiddleware_BypassPaths(t *testing.T) {
 	rl := NewRateLimiter(1e-9, 1) // a single token shared by non-bypass paths
 	h := rl.Middleware()(okHandler())
 
-	bypass := []string{"/healthz", "/readyz", "/metrics", "/openapi.json", "/docs", "/ui", "/ui/index.html"}
+	bypass := []string{
+		"/", "/favicon.ico", "/healthz", "/readyz", "/metrics", "/openapi.json", "/docs",
+		"/auth/oidc/login", "/auth/oidc/callback", "/ui", "/ui/index.html",
+	}
 	// Hammer bypass paths well beyond the token budget; all must succeed.
 	for _, p := range bypass {
 		for i := 0; i < 5; i++ {

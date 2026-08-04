@@ -19,6 +19,7 @@ type Config struct {
 	Events      EventsConfig
 	AI          AIConfig
 	Auth        AuthConfig
+	Access      AccessConfig
 	CORS        CORSCfg
 	RateLimit   RateLimitCfg
 	Reconcile   ReconcileCfg
@@ -117,7 +118,7 @@ func Load() (*Config, error) {
 			DSN:    getEnv("DB_DSN", "file:./var/aero.db?_pragma=foreign_keys(1)"),
 		},
 		S3Compat: S3CompatConfig{
-			Prefix: getEnv("S3_COMPAT_PREFIX", "/s3"),
+			Prefix: getEnv("S3_COMPAT_PREFIX", ""),
 		},
 		Events: EventsConfig{
 			WebhookURL:    getEnv("EVENTS_WEBHOOK_URL", ""),
@@ -179,10 +180,28 @@ func Load() (*Config, error) {
 			JWTIssuer:           getEnv("AUTH_JWT_ISSUER", ""),
 			JWKSEndpoint:        getEnv("AUTH_JWKS_ENDPOINT", ""),
 			JWKSKeyTTLSeconds:   getEnvInt("AUTH_JWKS_KEY_TTL", 3600),
+			JWKSAudience:        getEnv("AUTH_JWKS_AUDIENCE", ""),
+			JWKSTenantClaim:     getEnv("AUTH_JWKS_TENANT_CLAIM", "ten"),
+			JWKSClientTenants:   splitMapping(getEnv("AUTH_JWKS_CLIENT_TENANTS", "")),
+			JWKSClientTenantRaw: getEnv("AUTH_JWKS_CLIENT_TENANTS", ""),
+			JWKSDefaultScopes:   splitCSV(getEnv("AUTH_JWKS_DEFAULT_SCOPES", "")),
+			OIDCIssuer:          getEnv("AUTH_OIDC_ISSUER", ""),
+			OIDCClientID:        getEnv("AUTH_OIDC_CLIENT_ID", ""),
+			OIDCRedirectURI:     getEnv("AUTH_OIDC_REDIRECT_URI", ""),
+			OIDCAuthorizeURL:    getEnv("AUTH_OIDC_AUTHORIZATION_ENDPOINT", ""),
+			OIDCTokenURL:        getEnv("AUTH_OIDC_TOKEN_ENDPOINT", ""),
+			OIDCScopes:          splitCSV(getEnv("AUTH_OIDC_SCOPES", "openid,profile,email")),
 			AnonymousPublicRead: getEnvBool("AUTH_ANONYMOUS_PUBLIC_READ", false),
 			SigV4Credentials:    getEnv("S3_SIGV4_CREDENTIALS", ""),
+			PresignSecret:       getEnv("AUTH_PRESIGN_SECRET", ""),
 			PersistKeys:         getEnvBool("AUTH_PERSIST_KEYS", false),
 			KeyCacheTTLSeconds:  getEnvInt("AUTH_KEY_CACHE_TTL_SECONDS", 0),
+		},
+		Access: AccessConfig{
+			Enabled:       getEnvBool("ACCESS_CONTROL_ENABLED", false),
+			DefaultPolicy: strings.ToLower(getEnv("ACCESS_DEFAULT_POLICY", "deny")),
+			ShareSecret:   getEnv("ACCESS_SHARE_SECRET", ""),
+			PublicBaseURL: strings.TrimRight(getEnv("ACCESS_PUBLIC_BASE_URL", ""), "/"),
 		},
 		Telemetry: TelemetryCfg{
 			PrometheusEnabled: getEnvBool("PROMETHEUS_ENABLED", false),
@@ -273,10 +292,58 @@ func (c *Config) Validate() error {
 	if c.AI.Enabled && c.AI.Provider == "http" && c.AI.Endpoint == "" {
 		return errors.New("AI_EMBED_ENDPOINT is required when AI_EMBED_PROVIDER=http")
 	}
+	if err := c.validateAI(); err != nil {
+		return err
+	}
 	if err := c.validateTimeouts(); err != nil {
 		return err
 	}
+	if c.Auth.PresignSecret != "" && len(c.Auth.PresignSecret) < 32 {
+		return errors.New("AUTH_PRESIGN_SECRET must be at least 32 bytes")
+	}
+	if err := validateAuth(c.Auth); err != nil {
+		return err
+	}
+	if err := validateAccess(c.Access, c.Auth); err != nil {
+		return err
+	}
 	return c.validateRateLimits()
+}
+
+func validateAccess(cfg AccessConfig, auth AuthConfig) error {
+	if cfg.DefaultPolicy != "" && cfg.DefaultPolicy != "deny" && cfg.DefaultPolicy != "tenant" {
+		return errors.New("ACCESS_DEFAULT_POLICY must be deny or tenant")
+	}
+	if !cfg.Enabled {
+		return nil
+	}
+	if len(cfg.ShareSecret) < 32 {
+		return errors.New("ACCESS_SHARE_SECRET must be at least 32 bytes when access control is enabled")
+	}
+	if auth.Keys == "" && auth.JWTSecret == "" && auth.JWKSEndpoint == "" &&
+		auth.SigV4Credentials == "" && !auth.PersistKeys {
+		return errors.New("access control requires AUTH_KEYS, JWT/JWKS, SigV4, or persistent API keys")
+	}
+	return nil
+}
+
+func (c *Config) validateAI() error {
+	if c.AI.ChatCostPromptPer1K < 0 || c.AI.ChatCostCompletionPer1K < 0 {
+		return errors.New("AI cost rates must not be negative")
+	}
+	if c.AI.TenantDailyBudgetUSD < 0 {
+		return errors.New("AI_TENANT_DAILY_BUDGET_USD must not be negative")
+	}
+	if c.AI.AgentMaxSteps < 0 {
+		return errors.New("AI_AGENT_MAX_STEPS must not be negative")
+	}
+	if c.AI.SearchCacheSize < 0 || c.AI.SearchCacheTTLSeconds < 0 {
+		return errors.New("AI search cache values must not be negative")
+	}
+	if c.AI.SearchCacheSize > 0 && c.AI.SearchCacheTTLSeconds == 0 {
+		return errors.New("AI_SEARCH_CACHE_TTL_SECONDS must be positive when cache is enabled")
+	}
+	return nil
 }
 
 func (c *Config) validateStorage() error {
@@ -378,6 +445,17 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+func splitMapping(raw string) map[string]string {
+	values := map[string]string{}
+	for _, item := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(item), ":", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
+			values[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+	return values
 }
 
 // reconcileTenants returns the tenants configured via RECONCILE_TENANTS as a

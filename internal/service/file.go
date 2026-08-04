@@ -8,6 +8,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/storage"
@@ -31,6 +32,7 @@ var (
 	ErrRangeNotSatisfiable  = errors.New("requested range not satisfiable")
 	ErrPreconditionFailed   = errors.New("precondition failed")
 	ErrForbidden            = errors.New("forbidden")
+	ErrTenantDisabled       = errors.New("tenant is disabled")
 	ErrBadDigest            = errors.New("content-md5 mismatch")
 	ErrSizeMismatch         = errors.New("size mismatch: actual bytes differ from Content-Length")
 	ErrObjectCorrupt        = errors.New("object is marked as corrupt")
@@ -85,6 +87,22 @@ type FileService struct {
 	sink         EventSink
 	chunkCleaner ChunkCleaner
 	readVerify   ReadVerificationConfig
+	authorizer   access.Authorizer
+	tenantStatus bool
+}
+
+// WithAuthorizer enables resource-level authorization at the FileService
+// boundary. A nil authorizer preserves the CI/MVP baseline.
+func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService {
+	s.authorizer = authorizer
+	return s
+}
+
+// WithTenantStatusEnforcement rejects data-plane operations for known disabled
+// tenants. Unknown tenants preserve the implicit-tenant compatibility model.
+func (s *FileService) WithTenantStatusEnforcement() *FileService {
+	s.tenantStatus = true
+	return s
 }
 
 func NewFileService(store storage.Storage, repo repository.Repository, logger *slog.Logger) *FileService {
@@ -126,16 +144,16 @@ func (s *FileService) WithReadVerification(cfg ReadVerificationConfig) *FileServ
 	return s
 }
 
-// validateMetadata checks size and key-length constraints on user metadata.
-// System keys (prefixed _aero_) are exempt. Returns nil when meta is empty.
+// validateMetadata checks user metadata. The _aero_ namespace is reserved for
+// service-owned integrity, encryption, retention, and multipart state.
 func validateMetadata(meta map[string]string) error {
 	if len(meta) == 0 {
 		return nil
 	}
 	var total int
 	for k, v := range meta {
-		if strings.HasPrefix(k, "_aero_") {
-			continue
+		if strings.HasPrefix(strings.ToLower(k), "_aero_") {
+			return fmt.Errorf("%w: metadata key %q uses reserved _aero_ namespace", ErrInvalidArgs, k)
 		}
 		if len(k) > MaxMetadataKeyLen {
 			return fmt.Errorf("%w: %q (%d bytes)", ErrMetadataKeyTooLong, k, len(k))
@@ -177,12 +195,25 @@ func (s *FileService) Repo() repository.Repository { return s.repo }
 
 // PutOptions mirrors storage.PutOptions plus tags and optional Content-MD5.
 type PutOptions struct {
-	ContentType    string
-	Metadata       map[string]string
-	Tags           map[string]string
-	ContentMD5     string
-	StorageClass   string
-	SSECustomerKey []byte // AES-256 key for SSE-C (client-provided encryption)
+	ContentType        string
+	ContentDisposition string
+	ContentEncoding    string
+	Metadata           map[string]string
+	Tags               map[string]string
+	ACL                string
+	LegalHold          bool
+	ContentMD5         string
+	StorageClass       string
+	SSEAlgorithm       string
+	SSEKMSKeyID        string
+	SSECustomerKey     []byte
+	SSECustomerKeyMD5  []byte
+}
+
+// ReadOptions carries request-scoped encryption information.
+type ReadOptions struct {
+	SSECustomerKey    []byte
+	SSECustomerKeyMD5 []byte
 }
 
 // WithDefaultStorageClass overrides package-level DefaultStorageClass.
@@ -227,6 +258,14 @@ func defaults(tenant, bucket string) (string, string) {
 		bucket = DefaultBucket
 	}
 	return tenant, bucket
+}
+
+func checkedObjectDefaults(tenant, bucket, key string) (string, string, error) {
+	tenant, bucket = defaults(tenant, bucket)
+	if err := validateKey(key); err != nil {
+		return "", "", err
+	}
+	return tenant, bucket, nil
 }
 
 // uploadStorageKey returns the upload's persisted assembly key, falling back to

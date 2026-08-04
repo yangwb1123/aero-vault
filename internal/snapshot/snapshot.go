@@ -11,13 +11,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
 
 // Create writes a tar.gz to outPath containing:
 //
-//	./manifest.json
 //	./db/aero.db (+ -wal, -shm)
 //	./objects/...
 //
@@ -104,11 +104,68 @@ func validateSnapshot(path string) error {
 	if err != nil {
 		return err
 	}
-	f.Close()
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	reader := tar.NewReader(gz)
+	seen := map[string]bool{}
+	seenDatabaseKinds := map[snapshotEntry]bool{}
+	for {
+		header, nextErr := reader.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nextErr
+		}
+		kind, _, classifyErr := classifySnapshotEntry(header)
+		if classifyErr != nil {
+			return classifyErr
+		}
+		if seen[header.Name] {
+			return fmt.Errorf("snapshot: duplicate entry %q", header.Name)
+		}
+		seen[header.Name] = true
+		if kind != entryObject {
+			if seenDatabaseKinds[kind] {
+				return fmt.Errorf("snapshot: duplicate database component %q", header.Name)
+			}
+			seenDatabaseKinds[kind] = true
+		}
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			return err
+		}
+	}
+	if !seenDatabaseKinds[entryDBMain] {
+		return errors.New("snapshot: main database entry is missing")
+	}
 	return nil
 }
 
 func unpackSnapshot(src, dbFile, objectsRoot string) error {
+	if err := os.MkdirAll(filepath.Dir(dbFile), 0o700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(objectsRoot, 0o700); err != nil {
+		return err
+	}
+	dbRoot, err := os.OpenRoot(filepath.Dir(dbFile))
+	if err != nil {
+		return err
+	}
+	defer dbRoot.Close()
+	objectRoot, err := os.OpenRoot(objectsRoot)
+	if err != nil {
+		return err
+	}
+	defer objectRoot.Close()
+	return unpackToRoots(src, filepath.Base(dbFile), dbRoot, objectRoot)
+}
+
+func unpackToRoots(src, dbName string, dbRoot, objectRoot *os.Root) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -119,31 +176,69 @@ func unpackSnapshot(src, dbFile, objectsRoot string) error {
 		return err
 	}
 	defer gz.Close()
-	tr := tar.NewReader(gz)
+	reader := tar.NewReader(gz)
 	for {
-		hdr, err := tr.Next()
+		header, err := reader.Next()
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
 			return err
 		}
-		switch {
-		case strings.HasPrefix(hdr.Name, "db/"):
-			base := strings.TrimPrefix(hdr.Name, "db/")
-			out := filepath.Join(filepath.Dir(dbFile), base)
-			if err := writeOut(tr, out); err != nil {
-				return err
-			}
-		case strings.HasPrefix(hdr.Name, "objects/"):
-			rel := strings.TrimPrefix(hdr.Name, "objects/")
-			out := filepath.Join(objectsRoot, filepath.FromSlash(rel))
-			if err := writeOut(tr, out); err != nil {
-				return err
-			}
+		kind, relative, err := classifySnapshotEntry(header)
+		if err != nil {
+			return err
+		}
+		switch kind {
+		case entryDBMain:
+			err = writeRootFile(dbRoot, dbName, reader)
+		case entryDBWAL:
+			err = writeRootFile(dbRoot, dbName+"-wal", reader)
+		case entryDBSHM:
+			err = writeRootFile(dbRoot, dbName+"-shm", reader)
+		case entryObject:
+			err = writeRootFile(objectRoot, filepath.FromSlash(relative), reader)
+		}
+		if err != nil {
+			return err
 		}
 	}
-	return nil
+}
+
+type snapshotEntry uint8
+
+const (
+	entryDBMain snapshotEntry = iota
+	entryDBWAL
+	entryDBSHM
+	entryObject
+)
+
+func classifySnapshotEntry(header *tar.Header) (snapshotEntry, string, error) {
+	if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+		return 0, "", fmt.Errorf("snapshot: unsupported entry type for %q", header.Name)
+	}
+	name := header.Name
+	if name == "" || strings.Contains(name, `\`) || path.IsAbs(name) || path.Clean(name) != name {
+		return 0, "", fmt.Errorf("snapshot: unsafe entry name %q", name)
+	}
+	if relative, ok := strings.CutPrefix(name, "objects/"); ok {
+		if relative == "" || relative == "." || strings.HasPrefix(relative, "../") {
+			return 0, "", fmt.Errorf("snapshot: unsafe object entry %q", name)
+		}
+		return entryObject, relative, nil
+	}
+	relative, ok := strings.CutPrefix(name, "db/")
+	if !ok || relative == "" || strings.Contains(relative, "/") {
+		return 0, "", fmt.Errorf("snapshot: unexpected entry %q", name)
+	}
+	if strings.HasSuffix(relative, "-wal") {
+		return entryDBWAL, relative, nil
+	}
+	if strings.HasSuffix(relative, "-shm") {
+		return entryDBSHM, relative, nil
+	}
+	return entryDBMain, relative, nil
 }
 
 func addFile(tw *tar.Writer, fsPath, tarName string) error {
@@ -169,17 +264,24 @@ func addFile(tw *tar.Writer, fsPath, tarName string) error {
 	return err
 }
 
-func writeOut(r io.Reader, out string) error {
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		return err
+func writeRootFile(root *os.Root, name string, reader io.Reader) error {
+	if name == "" || filepath.IsAbs(name) {
+		return fmt.Errorf("snapshot: unsafe output path %q", name)
 	}
-	f, err := os.Create(out)
+	if dir := filepath.Dir(name); dir != "." {
+		if err := root.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	file, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(f, r)
-	return err
+	if _, err := io.Copy(file, reader); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // dbFileFromDSN extracts `./var/aero.db` from `file:./var/aero.db?_pragma=…`.

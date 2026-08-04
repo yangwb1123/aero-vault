@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>aero-vault console</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; margin: 0; background: #0e1116; color: #d8e1eb; }
@@ -39,8 +40,11 @@
 <header>
   <h1>aero-vault</h1>
   <label>tenant <input id="tenant" type="text" value="default" style="width: 110px"></label>
-  <label>api key <input id="apikey" type="text" placeholder="(optional)" style="width: 200px"></label>
+  <label>token <input id="apikey" type="password" placeholder="API key or OIDC token" style="width: 200px"></label>
+  <span class="pill" id="auth-status">local</span>
   <span style="flex:1"></span>
+  <button id="oidc-login" onclick="oidcLogin()">Snaplink login</button>
+  <button class="ghost" id="oidc-logout" onclick="oidcLogout()" style="display:none">logout</button>
   <button onclick="refresh()">refresh</button>
 </header>
 <main>
@@ -63,6 +67,7 @@
       <div class="tab" onclick="switchTab('detail')" id="t-detail">object detail</div>
       <div class="tab" onclick="switchTab('lineage')" id="t-lineage">lineage</div>
       <div class="tab" onclick="switchTab('chat')" id="t-chat">chat</div>
+      <div class="tab" onclick="switchTab('access')" id="t-access">access &amp; sharing</div>
     </div>
     <div id="pane-search">
       <div style="display:flex; gap: 8px; margin-bottom: 12px">
@@ -97,15 +102,143 @@
       <div id="chat-resp" style="white-space: pre-wrap; font-size: 13px; line-height: 1.6; padding: 12px 14px; background: #0a0d12; border: 1px solid #1a2029; border-radius: 6px; min-height: 80px; margin-bottom: 12px"></div>
       <div id="chat-cites"></div>
     </div>
+    <div id="pane-access" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div>
+          <h3>share / publish / backup</h3>
+          <label>object key</label><input id="access-key" type="text" placeholder="blog/hero.jpg">
+          <div style="display:flex;gap:8px;margin:8px 0;flex-wrap:wrap">
+            <button class="ghost" onclick="downloadObject()">download</button>
+            <button class="ghost" onclick="createPresignedGet()">presigned GET</button>
+            <button class="ghost" onclick="deleteObject()">soft delete</button>
+            <button class="ghost" onclick="restoreObject()">restore</button>
+          </div>
+          <label>share password (optional)</label><input id="share-password" type="text">
+          <div style="display:flex;gap:8px;margin:8px 0">
+            <input id="share-ttl" type="text" value="3600" placeholder="TTL seconds">
+            <button onclick="createShare()">create share</button>
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:8px">
+            <input id="share-id" type="text" placeholder="share id to revoke">
+            <button class="ghost" onclick="listShares()">list</button>
+            <button class="ghost" onclick="revokeShare()">revoke</button>
+          </div>
+          <label>public image slug</label><input id="asset-slug" type="text" placeholder="blog/hero.jpg">
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button onclick="publishAsset()">publish image</button>
+            <button class="ghost" onclick="listAssets()">list</button>
+            <button class="ghost" onclick="unpublishAsset()">unpublish</button>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <input id="export-prefix" type="text" placeholder="backup prefix">
+            <button onclick="exportBackup()">export backup</button>
+          </div>
+        </div>
+        <div>
+          <h3>department / resource ACL</h3>
+          <div style="display:flex;gap:8px">
+            <input id="dept-name" type="text" placeholder="department name">
+            <input id="dept-parent-id" type="text" placeholder="parent id (optional)">
+            <button onclick="createDepartment()">create</button>
+          </div>
+          <div style="display:flex;gap:8px;margin:8px 0">
+            <input id="dept-id" type="text" placeholder="department id">
+            <button class="ghost" onclick="listDepartments()">list</button>
+            <button class="ghost" onclick="getDepartment()">get</button>
+            <button class="ghost" onclick="deleteDepartment()">delete</button>
+          </div>
+          <label>department membership</label>
+          <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px">
+            <input id="member-dept-id" type="text" placeholder="department id">
+            <input id="member-subject-id" type="text" placeholder="user subject id">
+            <button onclick="putDepartmentMember()">add</button>
+          </div>
+          <button class="ghost" onclick="deleteDepartmentMember()" style="margin:8px 0">remove member</button>
+          <label>resource kind / principal type</label>
+          <div style="display:flex;gap:8px">
+            <select id="acl-kind"><option>object</option><option>folder</option><option>bucket</option></select>
+            <select id="acl-principal"><option>user</option><option>department</option><option>group</option><option>role</option><option>authenticated</option><option>everyone</option></select>
+            <select id="acl-effect"><option>allow</option><option>deny</option></select>
+          </div>
+          <input id="acl-principal-id" type="text" placeholder="principal subject / department id" style="margin-top:8px">
+          <input id="acl-actions" type="text" value="object:read,object:download" placeholder="comma-separated actions" style="margin-top:8px">
+          <label><input id="acl-inherit" type="checkbox"> inherit into descendants</label>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button onclick="putResourceACL()">save ACL</button>
+            <button class="ghost" onclick="listResourceACL()">list ACL</button>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <input id="acl-id" type="text" placeholder="ACL entry id">
+            <button class="ghost" onclick="deleteResourceACL()">delete ACL</button>
+          </div>
+        </div>
+      </div>
+      <pre id="access-result" style="margin-top:16px">select an object or enter a key</pre>
+    </div>
   </section>
 </main>
 <script>
+function jwtClaims(token) {
+  try {
+    const encoded = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, '='));
+    const bytes = Uint8Array.from(raw, c => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (_) {
+    return {};
+  }
+}
+
+function acceptOIDCCallback() {
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  const token = fragment.get('oidc_access_token');
+  if (!token) return;
+  localStorage.setItem('aero_apikey', token);
+  localStorage.setItem('aero_oidc_token', token);
+  const idToken = fragment.get('oidc_id_token');
+  if (idToken) localStorage.setItem('aero_oidc_id_token', idToken);
+  const expiresIn = Number(fragment.get('oidc_expires_in') || 0);
+  if (expiresIn > 0) localStorage.setItem('aero_oidc_expires_at', String(Date.now() + expiresIn * 1000));
+  const claims = jwtClaims(token);
+  const tokenTenant = claims.tenant_id || claims.ten;
+  if (tokenTenant) localStorage.setItem('aero_tenant', tokenTenant);
+  history.replaceState(null, '', location.pathname + location.search);
+}
+
+acceptOIDCCallback();
 const tenantInp = document.getElementById('tenant');
 const apiInp = document.getElementById('apikey');
 tenantInp.value = localStorage.getItem('aero_tenant') || 'default';
 apiInp.value    = localStorage.getItem('aero_apikey') || '';
 tenantInp.oninput = () => { localStorage.setItem('aero_tenant', tenantInp.value); refresh(); };
-apiInp.oninput    = () => localStorage.setItem('aero_apikey', apiInp.value);
+apiInp.oninput    = () => {
+  localStorage.setItem('aero_apikey', apiInp.value);
+  if (apiInp.value !== localStorage.getItem('aero_oidc_token')) clearOIDCState();
+  renderAuthState();
+};
+
+function clearOIDCState() {
+  ['aero_oidc_token','aero_oidc_id_token','aero_oidc_expires_at'].forEach(k => localStorage.removeItem(k));
+}
+
+function renderAuthState() {
+  const signedIn = !!localStorage.getItem('aero_oidc_token');
+  document.getElementById('auth-status').textContent = signedIn ? 'Snaplink SSO' : 'local token';
+  document.getElementById('oidc-login').style.display = signedIn ? 'none' : '';
+  document.getElementById('oidc-logout').style.display = signedIn ? '' : 'none';
+}
+
+function oidcLogin() {
+  location.assign('/auth/oidc/login');
+}
+
+function oidcLogout() {
+  clearOIDCState();
+  localStorage.removeItem('aero_apikey');
+  location.assign('/auth/oidc/logout');
+}
+
+renderAuthState();
 
 function headers(extra) {
   const h = { 'X-Aero-Tenant': tenantInp.value || 'default', ...(extra || {}) };
@@ -114,7 +247,7 @@ function headers(extra) {
 }
 
 function switchTab(name) {
-  ['search','detail','lineage','chat'].forEach(n => {
+  ['search','detail','lineage','chat','access'].forEach(n => {
     document.getElementById('t-'+n).classList.toggle('active', n === name);
     document.getElementById('pane-'+n).style.display = n === name ? '' : 'none';
   });
@@ -148,6 +281,8 @@ async function refresh() {
 }
 
 async function showDetail(obj) {
+  document.getElementById('access-key').value = obj.key;
+  document.getElementById('asset-slug').value = obj.key;
   switchTab('detail');
   const r = await fetch('/v1/files/' + encodePath(obj.key), { headers: headers() });
   const body = await r.text();
@@ -158,6 +293,15 @@ async function showDetail(obj) {
     '\n\n== tags ==\n' + JSON.stringify(tags, null, 2) +
     '\n\n== versions ==\n' + JSON.stringify(versions, null, 2) +
     '\n\n== content (first 4KB) ==\n' + body.slice(0, 4096);
+}
+
+async function accessJSON(path, method, body) {
+  const r = await fetch(path, { method, headers: headers({ 'Content-Type': 'application/json' }), body: body ? JSON.stringify(body) : undefined });
+  const text = await r.text();
+  let data; try { data = text ? JSON.parse(text) : { status: r.status }; } catch (_) { data = { status: r.status, body: text }; }
+  document.getElementById('access-result').textContent = JSON.stringify(data, null, 2);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return data;
 }
 
 async function upload() {
@@ -237,11 +381,17 @@ async function doChat() {
       if (line.startsWith('data: ')) {
         const data = line.slice(6);
         if (evtType === 'token') {
-          respEl.textContent += data;
-        } else if (evtType === 'done' || evtType === 'citations') {
+          try {
+            const token = JSON.parse(data);
+            respEl.textContent += typeof token === 'string' ? token : String(token);
+          } catch (_) {
+            respEl.textContent += data;
+          }
+        } else if (evtType === 'done') {
           try {
             const obj = JSON.parse(data);
-            const hits = obj.hits || obj.citations || (Array.isArray(obj) ? obj : []);
+            if (!respEl.textContent && obj.answer) respEl.textContent = obj.answer;
+            const hits = obj.citations || [];
             for (const h of hits) {
               const div = el('div', { className: 'hit' },
                 el('div', { className: 'src' }, (h.bucket || '') + '/' + (h.object_key || '') + ' #' + (h.seq ?? '')),
@@ -278,5 +428,6 @@ async function handleDrop(ev) {
 
 refresh();
 </script>
+<script src="/ui/enterprise.js"></script>
 </body>
 </html>

@@ -619,6 +619,104 @@ class Client:
         return self._request_json("PUT", f"/v1/admin/tenants/{tenant_id}/budget",
                                   json_body={"daily_budget_usd": daily_usd}) or {}
 
+    # ---- enterprise access / sharing / publishing ---------------------
+
+    def create_share(self, key: str, *, bucket: str = "default", name: str = "",
+                     password: str = "", allow_preview: bool = True,
+                     allow_download: bool = False, max_uses: int = 0,
+                     ttl_seconds: int = 0) -> t.Dict[str, t.Any]:
+        """Create a revocable object capability link."""
+        return self._request_json("POST", "/v1/shares", json_body={
+            "bucket": bucket, "key": key, "name": name, "password": password,
+            "allow_preview": allow_preview, "allow_download": allow_download,
+            "max_uses": max_uses, "ttl_seconds": ttl_seconds,
+        }) or {}
+
+    def list_shares(self, key: str, bucket: str = "default") -> t.List[t.Any]:
+        """List share links for one object; raw tokens are never returned."""
+        out = self._request_json("GET", "/v1/shares", params={"bucket": bucket, "key": key})
+        return (out or {}).get("shares", [])
+
+    def revoke_share(self, share_id: str) -> None:
+        """Revoke a share link immediately."""
+        self._request_json("DELETE", "/v1/shares/" + urllib.parse.quote(share_id, safe=""))
+
+    def publish_asset(self, key: str, slug: str, *, bucket: str = "default",
+                      cache_control: str = "public, max-age=3600") -> t.Dict[str, t.Any]:
+        """Publish an image at /public/assets/<slug>."""
+        return self._request_json("POST", "/v1/assets", json_body={
+            "bucket": bucket, "key": key, "slug": slug, "cache_control": cache_control,
+        }) or {}
+
+    def unpublish_asset(self, slug: str) -> None:
+        """Remove a public image slug without deleting the source object."""
+        self._request_json("DELETE", "/v1/assets/" + _escape_key(slug))
+
+    def list_assets(self) -> t.List[t.Any]:
+        """List the tenant's published image records."""
+        return (self._request_json("GET", "/v1/assets") or {}).get("assets", [])
+
+    def put_resource_acl(self, *, key: str = "", bucket: str = "default",
+                         resource_kind: str = "object", principal_type: str,
+                         principal_id: str = "", actions: t.Sequence[str],
+                         effect: str = "allow", inherit: bool = False) -> t.Any:
+        """Grant or explicitly deny resource actions for a user/department/role/group."""
+        return self._request_json("PUT", "/v1/access/acl", json_body={
+            "bucket": bucket, "key": key, "resource_kind": resource_kind,
+            "principal_type": principal_type, "principal_id": principal_id,
+            "actions": list(actions), "effect": effect, "inherit": inherit,
+        })
+
+    def list_resource_acl(self, *, key: str = "", bucket: str = "default",
+                          resource_kind: str = "object") -> t.List[t.Any]:
+        """List ACL entries applying directly to one resource."""
+        out = self._request_json("GET", "/v1/access/acl", params={
+            "bucket": bucket, "key": key, "kind": resource_kind,
+        })
+        return (out or {}).get("entries", [])
+
+    def delete_resource_acl(self, acl_id: str) -> None:
+        """Delete one ACL entry by ID."""
+        self._request_json("DELETE", "/v1/access/acl/" + urllib.parse.quote(acl_id, safe=""))
+
+    def create_department(self, name: str, parent_id: str = "") -> t.Dict[str, t.Any]:
+        """Create a department (admin scope)."""
+        return self._request_json("POST", "/v1/admin/departments",
+                                  json_body={"name": name, "parent_id": parent_id}) or {}
+
+    def list_departments(self) -> t.List[t.Any]:
+        """List tenant departments (admin scope)."""
+        return (self._request_json("GET", "/v1/admin/departments") or {}).get("departments", [])
+
+    def get_department(self, department_id: str) -> t.Dict[str, t.Any]:
+        """Get one department and its members (admin scope)."""
+        path = "/v1/admin/departments/" + urllib.parse.quote(department_id, safe="")
+        return self._request_json("GET", path) or {}
+
+    def delete_department(self, department_id: str) -> None:
+        """Delete a department and its descendant directory state."""
+        path = "/v1/admin/departments/" + urllib.parse.quote(department_id, safe="")
+        self._request_json("DELETE", path)
+
+    def put_department_member(self, department_id: str, subject_id: str,
+                              role: str = "member") -> None:
+        """Add/update a department member (admin scope)."""
+        path = "/v1/admin/departments/{}/members/{}".format(
+            urllib.parse.quote(department_id, safe=""), urllib.parse.quote(subject_id, safe=""))
+        self._request_json("PUT", path, json_body={"role": role})
+
+    def delete_department_member(self, department_id: str, subject_id: str) -> None:
+        """Remove a subject from a department (admin scope)."""
+        path = "/v1/admin/departments/{}/members/{}".format(
+            urllib.parse.quote(department_id, safe=""), urllib.parse.quote(subject_id, safe=""))
+        self._request_json("DELETE", path)
+
+    def export_archive(self, *, bucket: str = "default", prefix: str = "") -> bytes:
+        """Download an authorized portable tar.gz backup."""
+        with self._open("GET", "/v1/exports/archive",
+                        params={"bucket": bucket, "prefix": prefix}) as response:
+            return response.read()
+
 
 # ---- helpers ------------------------------------------------------------
 

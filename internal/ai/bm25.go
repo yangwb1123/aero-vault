@@ -34,14 +34,15 @@ type BM25 struct {
 }
 
 type bm25Doc struct {
-	tenant    string
-	bucket    string
-	objectKey string
-	objectID  int64
-	seq       int
-	content   string
-	length    int
-	tokens    map[string]int // term -> tf
+	tenant     string
+	bucket     string
+	objectKey  string
+	objectID   int64
+	seq        int
+	content    string
+	embedModel string
+	length     int
+	tokens     map[string]int // term -> tf
 }
 
 func NewBM25() *BM25 {
@@ -68,10 +69,10 @@ func tokenize(text string) []string {
 }
 
 // BuildFromRepo refreshes the index from every chunk in the repository for the
-// given tenant. It iterates all buckets the tenant owns and paginates through
-// all objects — not just the first 1000 in the "default" bucket. Call this
-// on startup to warm the index from persisted data; subsequent writes are
-// kept current via the ChunkSink (UpsertObjectChunks / DeleteObjectChunks).
+// given tenant. It replaces only that tenant's documents, preserving documents
+// already warmed for other tenants. It iterates all buckets the tenant owns and
+// paginates through all objects — not just the first 1000 in the "default"
+// bucket. Subsequent writes are kept current via the ChunkSink.
 func (b *BM25) BuildFromRepo(ctx context.Context, repo repository.Repository, tenant string) error {
 	buckets, err := repo.ListBuckets(ctx, tenant)
 	if err != nil {
@@ -86,14 +87,21 @@ func (b *BM25) BuildFromRepo(ctx context.Context, repo repository.Repository, te
 		for {
 			page, err := repo.ListObjects(ctx, tenant, bucket, "", marker, pageSize)
 			if err != nil {
-				break
+				return err
 			}
 			for _, o := range page.Objects {
 				chunks, err := repo.ListChunksForObject(ctx, o.ID)
 				if err != nil {
-					continue
+					return err
 				}
-				all = append(all, chunks...)
+				for _, chunk := range chunks {
+					if chunk.TenantID == "" {
+						chunk.TenantID = tenant
+					}
+					if chunk.TenantID == tenant {
+						all = append(all, chunk)
+					}
+				}
 			}
 			if !page.HasMore {
 				break
@@ -104,11 +112,7 @@ func (b *BM25) BuildFromRepo(ctx context.Context, repo repository.Repository, te
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.docs = make(map[int64]bm25Doc, len(all))
-	b.df = make(map[string]int)
-	b.objDocs = make(map[int64][]int64)
-	b.totalDoc = 0
-	b.totalLen = 0
+	b.removeTenantLocked(tenant)
 	for _, c := range all {
 		b.insertDocLocked(c)
 	}
@@ -130,7 +134,8 @@ func (b *BM25) insertDocLocked(c repository.Chunk) {
 	}
 	b.docs[c.ID] = bm25Doc{
 		tenant: c.TenantID, bucket: c.Bucket, objectKey: c.ObjectKey,
-		objectID: c.ObjectID, seq: c.Seq, content: c.Content, length: len(toks), tokens: tf,
+		objectID: c.ObjectID, seq: c.Seq, content: c.Content,
+		embedModel: c.EmbedModel, length: len(toks), tokens: tf,
 	}
 	b.objDocs[c.ObjectID] = append(b.objDocs[c.ObjectID], c.ID)
 	b.totalDoc++
@@ -159,6 +164,22 @@ func (b *BM25) removeObjectLocked(objectID int64) {
 		delete(b.docs, id)
 	}
 	delete(b.objDocs, objectID)
+}
+
+// removeTenantLocked removes every indexed object owned by tenant while
+// preserving all other tenants. Object IDs are globally unique repository
+// primary keys, so removing through objDocs also keeps the aggregate counters
+// and document-frequency map consistent.
+func (b *BM25) removeTenantLocked(tenant string) {
+	objectIDs := make(map[int64]struct{})
+	for _, d := range b.docs {
+		if d.tenant == tenant {
+			objectIDs[d.objectID] = struct{}{}
+		}
+	}
+	for objectID := range objectIDs {
+		b.removeObjectLocked(objectID)
+	}
 }
 
 func (b *BM25) recomputeAvgLenLocked() {
@@ -204,25 +225,50 @@ type bm25Hit struct {
 	Doc     bm25Doc
 }
 
-// Search scores every doc against the query terms.
-func (b *BM25) Search(query string, bucket string, limit int) []bm25Hit {
+// Search scores documents owned by tenant against the query terms. Tenant is a
+// mandatory isolation key: documents and corpus statistics from other tenants
+// cannot affect the returned hits or their scores.
+func (b *BM25) Search(tenant, query, bucket string, limit int) []bm25Hit {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	if b.totalDoc == 0 || limit <= 0 {
+	if limit <= 0 {
 		return nil
 	}
-	candidates := b.collectCandidates(query, bucket, limit)
+	candidates := b.collectCandidates(tenant, query, bucket)
 	return rankAndTrim(candidates, limit)
 }
 
-func (b *BM25) collectCandidates(query string, bucket string, _ int) []bm25Hit {
+func (b *BM25) collectCandidates(tenant, query, bucket string) []bm25Hit {
 	terms := tokenize(query)
 	if len(terms) == 0 {
 		return nil
 	}
+	tenantDF := make(map[string]int, len(terms))
+	uniqueTerms := make(map[string]struct{}, len(terms))
+	for _, term := range terms {
+		uniqueTerms[term] = struct{}{}
+	}
+	tenantDocs := 0
+	tenantLen := 0
+	for _, d := range b.docs {
+		if d.tenant != tenant {
+			continue
+		}
+		tenantDocs++
+		tenantLen += d.length
+		for term := range uniqueTerms {
+			if d.tokens[term] > 0 {
+				tenantDF[term]++
+			}
+		}
+	}
+	if tenantDocs == 0 {
+		return nil
+	}
+	avgLen := float64(tenantLen) / float64(tenantDocs)
 	var out []bm25Hit
 	for id, d := range b.docs {
-		if bucket != "" && d.bucket != bucket {
+		if d.tenant != tenant || (bucket != "" && d.bucket != bucket) {
 			continue
 		}
 		var score float64
@@ -231,12 +277,12 @@ func (b *BM25) collectCandidates(query string, bucket string, _ int) []bm25Hit {
 			if tf == 0 {
 				continue
 			}
-			df := b.df[t]
+			df := tenantDF[t]
 			if df == 0 {
 				continue
 			}
-			idf := math.Log(1 + (float64(b.totalDoc)-float64(df)+0.5)/(float64(df)+0.5))
-			norm := float64(tf) * (b.k1 + 1) / (float64(tf) + b.k1*(1-b.b+b.b*float64(d.length)/b.avgLen))
+			idf := math.Log(1 + (float64(tenantDocs)-float64(df)+0.5)/(float64(df)+0.5))
+			norm := float64(tf) * (b.k1 + 1) / (float64(tf) + b.k1*(1-b.b+b.b*float64(d.length)/avgLen))
 			score += idf * norm
 		}
 		if score > 0 {
@@ -257,7 +303,8 @@ func rankAndTrim(candidates []bm25Hit, k int) []bm25Hit {
 func sortHitsDesc(h []bm25Hit) {
 	for i := 1; i < len(h); i++ {
 		j := i
-		for j > 0 && h[j].Score > h[j-1].Score {
+		for j > 0 && (h[j].Score > h[j-1].Score ||
+			(h[j].Score == h[j-1].Score && h[j].ChunkID < h[j-1].ChunkID)) {
 			h[j], h[j-1] = h[j-1], h[j]
 			j--
 		}

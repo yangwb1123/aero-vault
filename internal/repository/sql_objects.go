@@ -49,24 +49,26 @@ func (s *sqlStore) UpsertObject(ctx context.Context, obj Object) (Object, error)
 	switch s.dialect {
 	case dialectPostgres:
 		q = `
-INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12, now(), now(), NULL)
+INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at, locked_until)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12, now(), now(), NULL, $13)
 ON CONFLICT (tenant_id, bucket, key) WHERE deleted_at IS NULL
 DO UPDATE SET backend=EXCLUDED.backend, storage_key=EXCLUDED.storage_key, size=EXCLUDED.size, etag=EXCLUDED.etag,
               content_type=EXCLUDED.content_type, metadata=EXCLUDED.metadata, tags=EXCLUDED.tags,
-              storage_class=EXCLUDED.storage_class, version_id=EXCLUDED.version_id, updated_at=now()
+              storage_class=EXCLUDED.storage_class, version_id=EXCLUDED.version_id,
+              locked_until=EXCLUDED.locked_until, updated_at=now()
 RETURNING id, version_id, created_at, updated_at`
-		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass}
+		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass, nullableTime(obj.LockedUntil)}
 	default:
 		q = `
-INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, NULL)
+INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at, locked_until)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, NULL, $15)
 ON CONFLICT (tenant_id, bucket, key) WHERE deleted_at IS NULL
 DO UPDATE SET backend=excluded.backend, storage_key=excluded.storage_key, size=excluded.size, etag=excluded.etag,
               content_type=excluded.content_type, metadata=excluded.metadata, tags=excluded.tags,
-              storage_class=excluded.storage_class, version_id=excluded.version_id, updated_at=excluded.updated_at
+              storage_class=excluded.storage_class, version_id=excluded.version_id,
+              locked_until=excluded.locked_until, updated_at=excluded.updated_at
 RETURNING id, version_id, created_at, updated_at`
-		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass, now, now}
+		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass, now, now, nullableTime(obj.LockedUntil)}
 	}
 
 	row := s.db.QueryRowContext(ctx, s.rebind(q), args...)
@@ -120,15 +122,15 @@ func (s *sqlStore) InsertObjectVersion(ctx context.Context, obj Object) (Object,
 		args []any
 	)
 	if s.dialect == dialectPostgres {
-		q = `INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12, now(), now(), NULL)
+		q = `INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at, locked_until)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12, now(), now(), NULL, $13)
 RETURNING id, version_id, created_at, updated_at`
-		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass}
+		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass, nullableTime(obj.LockedUntil)}
 	} else {
-		q = `INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, NULL)
+		q = `INSERT INTO objects (tenant_id, bucket, key, version_id, backend, storage_key, size, etag, content_type, metadata, tags, storage_class, created_at, updated_at, deleted_at, locked_until)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, NULL, $15)
 RETURNING id, version_id, created_at, updated_at`
-		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass, now, now}
+		args = []any{obj.TenantID, obj.Bucket, obj.Key, obj.VersionID, obj.Backend, obj.StorageKey, obj.Size, obj.ETag, obj.ContentType, string(metaBytes), string(tagBytes), obj.StorageClass, now, now, nullableTime(obj.LockedUntil)}
 	}
 	row := tx.QueryRowContext(ctx, s.rebind(q), args...)
 	var (
@@ -148,6 +150,13 @@ RETURNING id, version_id, created_at, updated_at`
 	obj.CreatedAt = createdT.Time
 	obj.UpdatedAt = updatedT.Time
 	return obj, nil
+}
+
+func nullableTime(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 // ── Read operations ─────────────────────────────────────────────────────────

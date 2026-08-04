@@ -113,9 +113,10 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 			req.Header.Set("Authorization", "Bearer "+c.token)
 		}
 	}
-	if c.tenant != "" && c.tenant != DefaultTenant {
+	if c.tenant != "" {
 		req.Header.Set("X-Aero-Tenant", c.tenant)
 	}
+	req.Header.Set("Accept", "application/json")
 	if c.userAgent != "" {
 		req.Header.Set("User-Agent", c.userAgent)
 	}
@@ -157,8 +158,9 @@ func jsonBody(v any) (io.Reader, reqOpt, error) {
 }
 
 func parseError(resp *http.Response) error {
-	var e Error
-	e.Status = resp.StatusCode
+	defer resp.Body.Close()
+	e := Error{Status: resp.StatusCode}
+	body, _ := io.ReadAll(resp.Body)
 	var env struct {
 		Error struct {
 			Code      string `json:"code"`
@@ -166,12 +168,15 @@ func parseError(resp *http.Response) error {
 			RequestID string `json:"request_id,omitempty"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err == nil && env.Error.Code != "" {
+	if err := json.Unmarshal(body, &env); err == nil && env.Error.Code != "" {
 		e.Code = env.Error.Code
 		e.Message = env.Error.Message
 		e.RequestID = env.Error.RequestID
 	}
-	if e.Code == "" {
+	if e.Message == "" && len(body) > 0 {
+		e.Message = strings.TrimSpace(string(body))
+	}
+	if e.Message == "" {
 		e.Code = fmt.Sprintf("HTTP%d", resp.StatusCode)
 		e.Message = resp.Status
 	}
@@ -179,7 +184,12 @@ func parseError(resp *http.Response) error {
 }
 
 func escapeKey(key string) string {
-	return url.PathEscape(key)
+	key = strings.TrimLeft(key, "/")
+	parts := strings.Split(key, "/")
+	for i := range parts {
+		parts[i] = url.PathEscape(parts[i])
+	}
+	return strings.Join(parts, "/")
 }
 
 func filesPath(key, suffix string) string {

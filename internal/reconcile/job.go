@@ -42,6 +42,12 @@ type Job struct {
 	singleton         *cluster.Singleton
 	logger            *slog.Logger
 	scrub             scrubSettings
+	chunkCleaner      ChunkCleaner
+}
+
+func (j *Job) WithChunkCleaner(cleaner ChunkCleaner) *Job {
+	j.chunkCleaner = cleaner
+	return j
 }
 
 // WithScrub enables the data-integrity scrub that verifies stored Content-MD5
@@ -143,8 +149,9 @@ func (j *Job) sweepOrphanRows(ctx context.Context, tenant string) (scanned, orph
 					orphans++
 					j.logger.Warn("reconcile: storage missing for DB row",
 						"tenant", tenant, "bucket", obj.Bucket, "key", obj.Key, "storage_key", obj.StorageKey)
-					// Soft-delete to take it out of the active set; admin can restore.
-					_ = j.repo.SoftDeleteObject(ctx, tenant, obj.Bucket, obj.Key)
+					if err := softDeleteKey(ctx, j.repo, j.chunkCleaner, obj, j.logger); err != nil {
+						j.logger.Warn("reconcile: soft-delete orphan row", "key", obj.Key, "err", err)
+					}
 				}
 			}
 			if !page.HasMore {

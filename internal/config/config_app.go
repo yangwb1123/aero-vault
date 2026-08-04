@@ -9,6 +9,13 @@ type S3CompatConfig struct {
 	Prefix string
 }
 
+type AccessConfig struct {
+	Enabled       bool
+	DefaultPolicy string
+	ShareSecret   string
+	PublicBaseURL string
+}
+
 type EventsConfig struct {
 	WebhookURL    string
 	WebhookSecret string

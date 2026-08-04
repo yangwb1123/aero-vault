@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -51,8 +50,11 @@ func (c *Client) adminBucketLifecycle(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }
 
@@ -78,33 +80,61 @@ func (c *Client) adminBucketEncryption(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }
 
 func (c *Client) adminBucketWebsite(args []string) int {
-	bucket := ""
-	var idxDoc string
-	for i := 0; i < len(args); i++ {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: admin buckets website <bucket> --index <suffix> [--error <key>]")
+		return 2
+	}
+	bucket := args[0]
+	var idxDoc, errorDoc string
+	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--index":
 			if i+1 < len(args) {
 				idxDoc = args[i+1]
 				i++
 			}
-		default:
-			if bucket == "" {
-				bucket = args[i]
+		case "--error":
+			if i+1 < len(args) {
+				errorDoc = args[i+1]
+				i++
 			}
 		}
 	}
-	if bucket == "" || idxDoc == "" {
-		fmt.Fprintln(os.Stderr, "usage: admin buckets website <bucket> --index <suffix>")
+	if idxDoc == "" {
+		fmt.Fprintln(os.Stderr, "usage: admin buckets website <bucket> --index <suffix> [--error <key>]")
 		return 2
 	}
-	fmt.Fprintf(os.Stderr, "website config: not yet supported via admin API, use S3 endpoint directly\n")
-	return 1
+	body := map[string]any{
+		"index_document": map[string]string{"suffix": idxDoc},
+	}
+	if errorDoc != "" {
+		body["error_document"] = map[string]string{"key": errorDoc}
+	}
+	payload, _ := json.Marshal(body)
+	resp, err := c.do(
+		http.MethodPut, "/v1/buckets/"+url.PathEscape(bucket)+"/website",
+		bytes.NewReader(payload), map[string]string{"Content-Type": "application/json"},
+	)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer resp.Body.Close()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
+	return 0
 }
 
 func (c *Client) adminBucketQuota(args []string) int {
@@ -124,8 +154,11 @@ func (c *Client) adminBucketQuota(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }
 
@@ -140,7 +173,10 @@ func (c *Client) adminBucketDelete(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	respBody, ok := readSuccessfulResponse(resp)
+	if !ok {
+		return 1
+	}
+	printResponseBody(respBody)
 	return 0
 }

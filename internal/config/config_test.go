@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"os"
 	"reflect"
 	"testing"
 )
@@ -321,6 +322,28 @@ func TestValidate_AIHTTPRequiresEndpoint(t *testing.T) {
 	}
 }
 
+func TestValidateAIAccountingAndCacheValues(t *testing.T) {
+	tests := []func(*Config){
+		func(c *Config) { c.AI.ChatCostPromptPer1K = -1 },
+		func(c *Config) { c.AI.ChatCostCompletionPer1K = -1 },
+		func(c *Config) { c.AI.TenantDailyBudgetUSD = -1 },
+		func(c *Config) { c.AI.AgentMaxSteps = -1 },
+		func(c *Config) { c.AI.SearchCacheSize = -1 },
+		func(c *Config) { c.AI.SearchCacheTTLSeconds = -1 },
+		func(c *Config) {
+			c.AI.SearchCacheSize = 10
+			c.AI.SearchCacheTTLSeconds = 0
+		},
+	}
+	for index, mutate := range tests {
+		config := baseValid()
+		mutate(config)
+		if err := config.Validate(); err == nil {
+			t.Fatalf("case %d: expected validation error", index)
+		}
+	}
+}
+
 // --- Load() ---
 
 // clearEnv unsets every env var Load() reads so a polluted host environment
@@ -335,6 +358,7 @@ func clearEnv(t *testing.T) {
 		"STORAGE_OSS_ENDPOINT", "STORAGE_OSS_BUCKET",
 		"STORAGE_COS_BUCKET_URL",
 		"DB_DRIVER", "DB_DSN",
+		"S3_COMPAT_PREFIX",
 		"AI_INDEX_ENABLED", "AI_EMBED_PROVIDER", "AI_EMBED_ENDPOINT", "AI_EMBED_DIM",
 		"CORS_ALLOWED_ORIGINS", "CORS_ALLOWED_METHODS",
 		"RATE_LIMIT_RPS", "RATE_LIMIT_BURST",
@@ -367,6 +391,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.DB.Driver != "sqlite" {
 		t.Errorf("default DB.Driver = %q, want sqlite", cfg.DB.Driver)
 	}
+	if cfg.S3Compat.Prefix != "" {
+		t.Errorf("default S3Compat.Prefix = %q, want disabled", cfg.S3Compat.Prefix)
+	}
 	if cfg.Storage.S3.ForcePathStyle != true {
 		t.Errorf("default S3.ForcePathStyle = %v, want true", cfg.Storage.S3.ForcePathStyle)
 	}
@@ -382,6 +409,46 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.RateLimit.RPS != 0 || cfg.RateLimit.Burst != 0 {
 		t.Errorf("default RateLimit = %+v, want zero", cfg.RateLimit)
 	}
+}
+
+func TestLoad_S3CompatPrefixOptIn(t *testing.T) {
+	t.Run("unset disables gateway", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.Unsetenv("S3_COMPAT_PREFIX"); err != nil {
+			t.Fatalf("unset S3_COMPAT_PREFIX: %v", err)
+		}
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() failed: %v", err)
+		}
+		if cfg.S3Compat.Prefix != "" {
+			t.Fatalf("unset prefix = %q, want disabled", cfg.S3Compat.Prefix)
+		}
+	})
+
+	t.Run("explicit empty disables gateway", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("S3_COMPAT_PREFIX", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() failed: %v", err)
+		}
+		if cfg.S3Compat.Prefix != "" {
+			t.Fatalf("empty prefix = %q, want disabled", cfg.S3Compat.Prefix)
+		}
+	})
+
+	t.Run("non-empty prefix enables gateway", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("S3_COMPAT_PREFIX", "/s3")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() failed: %v", err)
+		}
+		if cfg.S3Compat.Prefix != "/s3" {
+			t.Fatalf("configured prefix = %q, want /s3", cfg.S3Compat.Prefix)
+		}
+	})
 }
 
 func TestLoad_OverridesAndLowercasing(t *testing.T) {

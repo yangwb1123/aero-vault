@@ -80,7 +80,8 @@ func TestWorkerScanCleanTagsObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	w := NewWorker(repo, svc.Storage(), NewSignatureScanner(nil), nil, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := NewWorker(repo, svc.Storage(), NewSignatureScanner(nil), nil, true, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithObjectController(svc)
 	if err := w.ScanObjectByID(ctx, obj.ID); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -100,7 +101,8 @@ func TestWorkerQuarantinesInfected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	w := NewWorker(repo, svc.Storage(), NewSignatureScanner(nil), nil, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := NewWorker(repo, svc.Storage(), NewSignatureScanner(nil), nil, true, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithObjectController(svc)
 	if err := w.ScanObjectByID(ctx, obj.ID); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -108,13 +110,21 @@ func TestWorkerQuarantinesInfected(t *testing.T) {
 	if _, err := repo.GetObject(ctx, "default", "default", "bad.txt"); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("infected object should be quarantined, got err=%v", err)
 	}
+	quota, err := repo.GetTenantQuota(ctx, "default")
+	if err != nil {
+		t.Fatalf("quota: %v", err)
+	}
+	if quota.UsedBytes != 0 || quota.UsedObjects != 0 {
+		t.Fatalf("quarantine left usage at %d bytes/%d objects", quota.UsedBytes, quota.UsedObjects)
+	}
 }
 
 func TestWorkerNoQuarantineKeepsButTags(t *testing.T) {
 	ctx := context.Background()
 	repo, svc := setupSvc(t)
 	obj, _ := svc.Put(ctx, "default", "default", "bad2.txt", strings.NewReader(EICAR), int64(len(EICAR)), service.PutOptions{})
-	w := NewWorker(repo, svc.Storage(), NewSignatureScanner(nil), nil, false, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := NewWorker(repo, svc.Storage(), NewSignatureScanner(nil), nil, false, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithObjectController(svc)
 	if err := w.ScanObjectByID(ctx, obj.ID); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -124,6 +134,45 @@ func TestWorkerNoQuarantineKeepsButTags(t *testing.T) {
 	}
 	if got.Tags[TagStatus] != "infected" || got.Tags[TagSignature] != "EICAR-Test-File" {
 		t.Fatalf("expected infected tags, got %v", got.Tags)
+	}
+}
+
+func TestWorkerQuarantinesOnlyInfectedVersion(t *testing.T) {
+	ctx := context.Background()
+	repo, svc := setupSvc(t)
+	if err := svc.SetBucketVersioning(ctx, "default", "default", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	infected, err := svc.Put(ctx, "", "", "versioned.txt", strings.NewReader(EICAR), int64(len(EICAR)), service.PutOptions{})
+	if err != nil {
+		t.Fatalf("put infected version: %v", err)
+	}
+	cleanBody := "replacement"
+	current, err := svc.Put(ctx, "", "", "versioned.txt", strings.NewReader(cleanBody), int64(len(cleanBody)), service.PutOptions{})
+	if err != nil {
+		t.Fatalf("put clean version: %v", err)
+	}
+	w := NewWorker(repo, svc.Storage(), NewSignatureScanner(nil), nil, true, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithObjectController(svc)
+	if err := w.ScanObjectByID(ctx, infected.ID); err != nil {
+		t.Fatalf("scan old version: %v", err)
+	}
+	if _, err := repo.GetObjectByID(ctx, infected.ID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("infected historical version still exists: %v", err)
+	}
+	got, err := repo.GetObjectByID(ctx, current.ID)
+	if err != nil {
+		t.Fatalf("current version removed: %v", err)
+	}
+	if got.Tags[TagStatus] != "" {
+		t.Fatalf("current version received stale antivirus tag: %v", got.Tags)
+	}
+	quota, err := repo.GetTenantQuota(ctx, "default")
+	if err != nil {
+		t.Fatalf("quota: %v", err)
+	}
+	if quota.UsedBytes != int64(len(cleanBody)) || quota.UsedObjects != 1 {
+		t.Fatalf("usage = %d bytes/%d objects", quota.UsedBytes, quota.UsedObjects)
 	}
 }
 

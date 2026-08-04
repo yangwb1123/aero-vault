@@ -1,6 +1,8 @@
 package snapshot
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -193,6 +195,152 @@ func TestRestore_OverwritesExisting(t *testing.T) {
 	}
 	assertFileEquals(t, dstDBFile, []byte("new-contents"))
 	assertFileEquals(t, filepath.Join(dstObjs, "k.txt"), []byte("fresh"))
+}
+
+func TestRestoreRejectsUnsafeArchiveEntries(t *testing.T) {
+	tests := []snapshotTestEntry{
+		{name: "objects/../../escape.txt", body: "escape"},
+		{name: `objects\..\escape.txt`, body: "escape"},
+		{name: "/objects/absolute.txt", body: "escape"},
+		{name: "objects/link", typeflag: tar.TypeSymlink, linkname: "../../outside"},
+		{name: "db/nested/aero.db", body: "escape"},
+		{name: "unexpected.txt", body: "escape"},
+	}
+	for _, malicious := range tests {
+		t.Run(malicious.name, func(t *testing.T) {
+			archive := filepath.Join(t.TempDir(), "malicious.tar.gz")
+			writeSnapshotEntries(t, archive, []snapshotTestEntry{
+				{name: "db/aero.db", body: "database"}, malicious,
+			})
+			destination := t.TempDir()
+			dbFile := filepath.Join(destination, "aero.db")
+			if err := Restore(archive, "file:"+dbFile, filepath.Join(destination, "objects")); err == nil {
+				t.Fatal("Restore accepted unsafe snapshot entry")
+			}
+			if _, err := os.Stat(dbFile); !os.IsNotExist(err) {
+				t.Fatalf("validation failure wrote database: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestoreRejectsMissingDatabaseAndDuplicateSidecar(t *testing.T) {
+	for name, entries := range map[string][]snapshotTestEntry{
+		"missing database": {{name: "objects/file.txt", body: "file"}},
+		"duplicate wal": {
+			{name: "db/aero.db", body: "db"},
+			{name: "db/aero.db-wal", body: "one"},
+			{name: "db/other.db-wal", body: "two"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			archive := filepath.Join(t.TempDir(), "invalid.tar.gz")
+			writeSnapshotEntries(t, archive, entries)
+			if err := Restore(archive, "file:"+filepath.Join(t.TempDir(), "db.sqlite"), t.TempDir()); err == nil {
+				t.Fatal("Restore accepted structurally invalid snapshot")
+			}
+		})
+	}
+}
+
+func TestRestoreMapsDatabaseToRequestedBasename(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "renamed.tar.gz")
+	writeSnapshotEntries(t, archive, []snapshotTestEntry{{name: "db/source.db", body: "database"}})
+	destination := t.TempDir()
+	target := filepath.Join(destination, "renamed.db")
+	if err := Restore(archive, "file:"+target, filepath.Join(destination, "objects")); err != nil {
+		t.Fatal(err)
+	}
+	assertFileEquals(t, target, []byte("database"))
+}
+
+func TestRestoreRejectsTruncatedArchiveBeforeWriting(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "truncated.tar.gz")
+	writeSnapshotEntries(t, archive, []snapshotTestEntry{
+		{name: "db/aero.db", body: "database-content"},
+		{name: "objects/file.txt", body: "object-content"},
+	})
+	payload, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archive, payload[:len(payload)/2], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	destination := t.TempDir()
+	target := filepath.Join(destination, "aero.db")
+	if err := Restore(archive, "file:"+target, filepath.Join(destination, "objects")); err == nil {
+		t.Fatal("Restore accepted a truncated archive")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("truncated archive wrote database: %v", err)
+	}
+}
+
+func TestRestoreDoesNotFollowEscapingDestinationSymlink(t *testing.T) {
+	sourceDB, sourceObjects := t.TempDir(), t.TempDir()
+	writeFile(t, filepath.Join(sourceDB, "aero.db"), []byte("database"))
+	writeFile(t, filepath.Join(sourceObjects, "linked", "outside.txt"), []byte("object"))
+	archive := filepath.Join(t.TempDir(), "snapshot.tar.gz")
+	if err := Create(archive, "file:"+filepath.Join(sourceDB, "aero.db"), sourceObjects); err != nil {
+		t.Fatal(err)
+	}
+	destination, outside := t.TempDir(), t.TempDir()
+	objects := filepath.Join(destination, "objects")
+	if err := os.MkdirAll(objects, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(objects, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Restore(archive, "file:"+filepath.Join(destination, "aero.db"), objects); err == nil {
+		t.Fatal("Restore followed a destination symlink outside the object root")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "outside.txt")); !os.IsNotExist(err) {
+		t.Fatalf("restore wrote outside object root: %v", err)
+	}
+}
+
+type snapshotTestEntry struct {
+	name, body, linkname string
+	typeflag             byte
+}
+
+func writeSnapshotEntries(t *testing.T, destination string, entries []snapshotTestEntry) {
+	t.Helper()
+	file, err := os.Create(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gzipWriter := gzip.NewWriter(file)
+	tarWriter := tar.NewWriter(gzipWriter)
+	for _, entry := range entries {
+		typeflag := entry.typeflag
+		if typeflag == 0 {
+			typeflag = tar.TypeReg
+		}
+		header := &tar.Header{
+			Name: entry.name, Mode: 0o600, Size: int64(len(entry.body)),
+			Typeflag: typeflag, Linkname: entry.linkname,
+		}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if entry.body != "" {
+			if _, err := tarWriter.Write([]byte(entry.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // --- helpers ---
