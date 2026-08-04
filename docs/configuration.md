@@ -30,10 +30,13 @@ Validation (fails fast on startup): the storage backend must be one of
 | `APP_LOG_LEVEL` | `info` | Log level: `debug` \| `info` \| `warn`/`warning` \| `error`. Invalid values fail startup. |
 | `APP_WRITE_TIMEOUT` | `60` | HTTP write timeout in seconds. SSE streams exempt themselves via `SetWriteDeadline`. Set to `0` to disable. |
 | `APP_IDLE_TIMEOUT` | `120` | HTTP idle (keep-alive) timeout in seconds. Set to `0` to disable. |
+| `APP_MAX_BODY_SIZE` | `0` | Maximum request body size in bytes. Requests above the limit receive `413`; `0` disables the limit. |
 | `APP_TLS_ENABLED` | `false` | Enable TLS/HTTPS. Requires `APP_TLS_CERT_FILE` and `APP_TLS_KEY_FILE`. |
 | `APP_TLS_CERT_FILE` | _(empty)_ | Path to TLS certificate file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `APP_TLS_KEY_FILE` | _(empty)_ | Path to TLS private key file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`). Set to `0` to disable. |
+| `MAX_INFLIGHT_REQUESTS` | `0` | Global weighted in-flight request limit (reads cost 1, writes cost 2); `0` disables. |
+| `PER_TENANT_CONCURRENCY_MAX` | `0` | Optional per-tenant in-flight limit used alongside the global cap; `0` disables per-tenant partitioning. |
 | `EVENTS_SUB_BUFFER` | `64` | Per-subscriber in-process event channel buffer depth. Increase if subscribers fall behind under high event throughput. Set to `0` to use the default. |
 | `CORS_EXPOSE_HEADERS` | _(empty)_ | Comma-separated extra response headers browsers may read. Default set: `ETag`, `Idempotency-Replayed`, `Retry-After`, `X-Request-ID`, `X-Version-Id`. |
 
@@ -42,6 +45,17 @@ Validation (fails fast on startup): the storage backend must be one of
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `STORAGE_BACKEND` | `local` | Active backend: `local` \| `s3` \| `oss` \| `cos`. Lower-cased. |
+| `STORAGE_DEFAULT_CLASS` | _(empty = `STANDARD`)_ | Default storage class assigned when a request does not provide one. |
+| `STORAGE_CONNECT_TIMEOUT` | `5` | Cloud-backend connect timeout in seconds. |
+| `STORAGE_READ_TIMEOUT` | `30` | Cloud-backend response/read timeout in seconds. |
+| `STORAGE_WRITE_TIMEOUT` | `30` | Cloud-backend write/overall request timeout in seconds. |
+| `STORAGE_VERIFY_ON_READ` | `false` | Verify stored object integrity while it is read. |
+| `STORAGE_VERIFY_MAX_SIZE` | `10485760` | Maximum object size fully verified on read before large-object sampling rules apply. |
+| `STORAGE_VERIFY_SAMPLE` | `true` | Permit sampled verification for objects larger than `STORAGE_VERIFY_MAX_SIZE`. |
+| `STORAGE_CB_ENABLED` | `false` | Enable the storage circuit-breaker wrapper. |
+| `STORAGE_CB_FAILURE_THRESHOLD` | `5` | Consecutive backend failures before the circuit opens. |
+| `STORAGE_CB_RECOVERY_TIMEOUT` | `30` | Seconds before an open circuit admits a half-open probe. |
+| `STORAGE_CB_HALF_OPEN_MAX` | `1` | Maximum concurrent probes admitted while half-open. |
 
 ### Local filesystem (`STORAGE_BACKEND=local`)
 
@@ -106,7 +120,7 @@ Validation (fails fast on startup): the storage backend must be one of
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_COMPAT_PREFIX` | `/s3` | Mount prefix for the S3-compatible router. Set empty to disable the S3 gateway. |
+| `S3_COMPAT_PREFIX` | _(empty / disabled)_ | Mount prefix for the S3-compatible router. Set a non-empty prefix such as `/s3` to enable the gateway. |
 
 ## Background jobs
 
@@ -121,6 +135,10 @@ Validation (fails fast on startup): the storage backend must be one of
 |----------|---------|-------------|
 | `AI_INDEX_ENABLED` | `false` | Enable text extraction + chunking + embedding of uploaded objects. Master switch for the AI pipeline. |
 | `AI_HYBRID_SEARCH` | `false` | Fuse vector + BM25 retrieval with reciprocal-rank fusion. |
+| `AI_DEGRADED_MODE` | `false` | Global AI kill switch: all AI endpoints return `503` without calling providers. |
+| `AI_CHUNK_WINDOW` | `600` | Text chunk window size in characters. |
+| `AI_CHUNK_OVERLAP` | `80` | Character overlap between adjacent chunks. |
+| `AI_AGENT_MAX_STEPS` | `4` | Maximum agent tool-call loop iterations before forcing a final answer. |
 | `AI_EMBED_CACHE_SIZE` | `0` | `>0` memoizes up to N query embeddings in a bounded in-memory cache, cutting repeated embed latency and provider cost. `0` disables. |
 | `AI_SEARCH_CACHE_SIZE` | `0` | `>0` caches up to N whole search results; identical normalized queries skip embed + retrieval + rerank. `0` disables. |
 | `AI_SEARCH_CACHE_TTL_SECONDS` | `30` | TTL (seconds) bounding staleness of cached search results. Only used when `AI_SEARCH_CACHE_SIZE > 0`. |
@@ -159,13 +177,51 @@ Validation (fails fast on startup): the storage backend must be one of
 |----------|---------|-------------|
 | `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = operator (any tenant). Empty disables API-key auth (MVP/open mode). |
 | `AUTH_JWT_SECRET` | _(empty)_ | Secret enabling HS256 JWT verification and issuance (`POST /v1/admin/jwt`). |
-| `AUTH_JWKS_ENDPOINT` | _(empty)_ | JWKS endpoint URL for RS256 JWT verification (OIDC integration, e.g. `https://oidc.example.com/.well-known/jwks.json`). |
+| `AUTH_JWKS_ENDPOINT` | _(empty)_ | JWKS endpoint URL for RS256 or EdDSA JWT verification. |
 | `AUTH_JWKS_KEY_TTL` | `3600` | JWKS key cache TTL in seconds. Keys are refreshed on cache miss; a stale cache is served when refresh fails. |
-| `AUTH_JWT_ISSUER` | _(empty)_ | When set, verifies the `iss` claim matches this value for both HS256 and RS256 JWTs. |
+| `AUTH_JWT_ISSUER` | _(empty)_ | When set, verifies the `iss` claim matches this value for HS256 and JWKS JWTs. |
+| `AUTH_JWKS_AUDIENCE` | _(empty)_ | Pins external tokens to an `aud`, `client_id`, or `azp` value. Required for browser OIDC login. |
+| `AUTH_JWKS_TENANT_CLAIM` | `ten` | External JWT claim mapped to the Aero tenant: `ten`, `tenant_id`, or `sub`. |
+| `AUTH_JWKS_CLIENT_TENANTS` | _(empty)_ | Optional `client_id:tenant` pairs. Use this for Snaplink tenant-bound clients because Snaplink access tokens intentionally omit `tenant_id`; an unmapped client fails closed when this map is configured. |
+| `AUTH_JWKS_DEFAULT_SCOPES` | _(empty)_ | Comma-separated Aero scopes used only when a verified external token has no recognized `read`/`write`/`admin` scope. Use only with issuer and audience/client pinning. |
+| `AUTH_OIDC_ISSUER` | _(empty)_ | Enables browser Authorization Code + PKCE login when supplied with client ID and redirect URI. |
+| `AUTH_OIDC_CLIENT_ID` | _(empty)_ | Public OIDC client ID; must equal `AUTH_JWKS_AUDIENCE`. |
+| `AUTH_OIDC_REDIRECT_URI` | _(empty)_ | Exact registered callback, e.g. `https://vault.example.com/auth/oidc/callback`. |
+| `AUTH_OIDC_AUTHORIZATION_ENDPOINT` | `<issuer>/auth/login` | Snaplink browser-hosted login endpoint. |
+| `AUTH_OIDC_TOKEN_ENDPOINT` | `<issuer>/token` | Authorization-code token endpoint. |
+| `AUTH_OIDC_SCOPES` | `openid,profile,email` | Comma-separated scopes requested during login. |
+| `AUTH_PRESIGN_SECRET` | _(empty = process-random)_ | HMAC key for REST presigned GET/PUT capability URLs. Configured values must be at least 32 bytes. Set the same value on every replica so URLs survive restarts and load-balancer routing; an empty value is suitable only for single-process development because issued URLs become invalid after restart. GET capabilities still traverse Aero Vault, so tenant suspension, bucket policy, ACL explicit deny, and object deletion take effect immediately. |
 | `AUTH_ANONYMOUS_PUBLIC_READ` | `false` | Allow unauthenticated `GET`/`HEAD` of public-read objects (the handler still enforces the object ACL). |
 | `AUTH_PERSIST_KEYS` | `false` | Back runtime API keys with the DB (`api_keys` table, tokens sha256-hashed). Keys survive restart and are shared across replicas. Also acts as an implicit auth switch: setting this without `AUTH_KEYS` still enables auth. |
 | `AUTH_KEY_CACHE_TTL_SECONDS` | `0` | `>0` adds a bounded TTL'd read-through cache in front of the DB key lookup, reducing per-request DB hits. Revokes are bounded by this TTL — keep short (e.g. 30). When `EVENTS_TRANSPORT_DSN` is set, add/revoke also broadcasts immediately via a dedicated Postgres LISTEN/NOTIFY channel (`aero_key_invalidate`) so other replicas drop the cache entry without waiting for TTL expiry. |
 | `S3_SIGV4_CREDENTIALS` | _(empty)_ | AWS SigV4 credentials for the S3 endpoint: `accessKey:secretKey:tenant[:scope+scope]`, comma-separated (e.g. `AKIA...:secret...:acme:read+write`). |
+
+## Enterprise access, shares, and public assets
+
+These controls are opt-in. Enabling them also requires at least one ordinary
+authentication source (API key, JWT/JWKS, SigV4, or persistent API-key store).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ACCESS_CONTROL_ENABLED` | `false` | Enable normalized principals, ownership, department/resource ACL enforcement, protected shares, and public assets. |
+| `ACCESS_DEFAULT_POLICY` | `deny` | `deny` requires ownership/ACL/admin access. `tenant` allows the existing `read`/`write` scope fallback only when no resource ACL applies; useful for gradual migration. |
+| `ACCESS_SHARE_SECRET` | _(empty)_ | Required when enabled; at least 32 bytes and identical on every replica. HMAC-protects share passwords. |
+| `ACCESS_PUBLIC_BASE_URL` | _(empty)_ | Canonical external base URL placed in returned share/asset URLs, e.g. `https://source.ywbsd.site`. Empty derives it from the request. |
+
+For Snaplink, configure a tenant-bound `aero-vault` OAuth client, pin issuer and
+audience, and map that trusted client to the Aero tenant:
+
+```dotenv
+AUTH_JWT_ISSUER=https://sso.example.com
+AUTH_JWKS_ENDPOINT=https://sso.example.com/.well-known/jwks.json
+AUTH_JWKS_AUDIENCE=aero-vault
+AUTH_JWKS_CLIENT_TENANTS=aero-vault:default
+AUTH_JWKS_DEFAULT_SCOPES=read,write
+```
+
+Snaplink remains the identity, login, tenant-membership, and application-role
+authority. Aero Vault owns file/folder ACLs, ownership, shares, and published
+asset state; no Snaplink domain type enters the service layer.
 
 ## CORS *(config.go only)*
 
@@ -185,6 +241,8 @@ Validation (fails fast on startup): the storage backend must be one of
 | `RATE_LIMIT_BURST` | `0` | Token-bucket burst capacity. |
 | `AI_RATE_LIMIT_RPS` | `0` | Per-tenant AI endpoint rate limit (req/s). Applies to `/v1/search`, `/v1/chat`, `/v1/chat/stream`, `/v1/agent`, and `/v1/lineage` independently of `RATE_LIMIT_RPS`. `0` disables. |
 | `AI_RATE_LIMIT_BURST` | `0` | Burst size for the AI rate limiter. `0` disables. |
+| `ADMIN_RATE_LIMIT_RPS` | `0` | Per-tenant rate limit for `/v1/admin/*`, independent of the global and AI limiters. `0` disables. |
+| `ADMIN_RATE_LIMIT_BURST` | `0` | Burst size for the admin rate limiter. `0` disables. |
 
 ## Antivirus
 
@@ -240,6 +298,8 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 | `RECONCILE_TENANTS` | `default` | Comma-separated list of tenants to scan. Empty/unset defaults to `default`. |
 | `RECONCILE_CLUSTER_SINGLETON` | `false` | Run reconcile and lifecycle sweeps on only one instance at a time, using a DB advisory `leases` table. Prevents duplicate destructive sweeps when running multiple replicas. Requires `RECONCILE_INTERVAL_MINUTES > 0`. |
 | `RECONCILE_RETENTION_DAYS` | `0` | `>0` permanently purges rows soft-deleted more than N days ago (and their blobs) during the retention sweep. `0` disables. Runs as a cluster singleton when `RECONCILE_CLUSTER_SINGLETON=true`. |
+| `RECONCILE_SCRUB_ENABLED` | `false` | Verify stored Content-MD5 checksums during reconcile and mark corrupt objects. |
+| `UPLOAD_GC_TTL_HOURS` | `168` | Remove abandoned multipart uploads older than this many hours during reconcile. `0` disables upload GC. |
 
 ## Write idempotency (`/v1`)
 

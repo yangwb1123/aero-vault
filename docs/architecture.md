@@ -18,7 +18,7 @@ written through one protocol is immediately visible through all others.
 ├───────────────────────────────────────────────────────────────────────────┤
 │  Service layer                                                              │
 │  internal/service.FileService — the single object-CRUD entry point          │
-│  (quota, versioning, object-lock, tags, ACLs, range, conditional, presign)  │
+│  (authorization, quota, versioning, locks, tags, range, presign, events)     │
 ├──────────────────────────────┬────────────────────────────────────────────┤
 │  Storage abstraction         │  Repository / metadata                      │
 │  internal/storage.Storage    │  internal/repository.Repository             │
@@ -63,7 +63,7 @@ Implementations:
 
 | Backend | File | Notes |
 |---------|------|-------|
-| `local` | `local.go` | On-disk objects with sidecar `*.meta.json` metadata. Optional envelope (AES-GCM) server-side encryption when `STORAGE_LOCAL_SSE_KEY` is set. HMAC-signed presigned URLs. |
+| `local` | `local.go` | On-disk objects with sidecar `*.meta.json` metadata. Optional envelope (AES-GCM) server-side encryption when `STORAGE_LOCAL_SSE_KEY` is set. The storage interface retains raw HMAC presigning, while the REST adapter uses Aero capability URLs so GET/PUT remain inside FileService policy enforcement. |
 | `s3` | `s3.go` | AWS SDK v2; works against AWS S3 or any S3-compatible endpoint (MinIO, OSS-S3, COS-S3). Path-style toggle. |
 | `oss` | `oss.go` | Native Alibaba Cloud OSS SDK. |
 | `cos` | `cos.go` | Native Tencent Cloud COS SDK. |
@@ -109,6 +109,28 @@ that must hold regardless of protocol:
 
 The service depends only on `storage.Storage` and `repository.Repository`,
 keeping it backend-agnostic.
+
+### Enterprise authorization boundary
+
+`internal/access` is an independent policy-decision domain. Authentication
+adapters normalize API keys, local JWTs, and Snaplink/OIDC access tokens into a
+small `Principal`; FileService sends `{action, tenant, bucket, key, owner}` to
+the authorizer before every object operation. REST, S3, WebDAV, MCP, multipart,
+copy, version reads, and AI retrieval therefore share one enforcement point.
+
+Snaplink is reused for identity, login, tenant membership, and coarse
+application authorization. It intentionally does not own Aero's resource ACL:
+Snaplink's current permission provider is application-scoped and its access
+tokens omit a tenant claim. Aero maps the issuer-pinned `client_id` to a tenant
+with `AUTH_JWKS_CLIENT_TENANTS`, then resolves local department membership and
+file/folder ACLs. This prevents coupling storage policy to Snaplink data types
+or availability.
+
+The access repository is a narrow `access.Store` implemented by the SQL
+repository, rather than widening the core object repository interface. It owns
+department hierarchy/membership, allow/deny ACL entries, hashed share tokens,
+and stable public-asset slugs. Shares and public assets resolve to exact,
+short-lived request capabilities; FileService still makes the final decision.
 
 ### Eventing & async
 
@@ -172,7 +194,8 @@ A request entering the server passes through the middleware chain (defined in
 `cmd/server/main.go`), outermost first:
 
 ```
-RequestID → CORS → Auth → Tenant → RateLimit → OTel → Recoverer → AccessLog → handler
+RequestID → BucketCORS → CORS → SecureHeaders → MaxBodySize → Auth → Tenant
+          → RateLimit → OTel → Recoverer → Concurrency → AccessLog → handler
 ```
 
 - **RequestID** assigns/echoes `X-Request-ID` (also exposed via CORS).
@@ -181,8 +204,14 @@ RequestID → CORS → Auth → Tenant → RateLimit → OTel → Recoverer → 
   a JWT, or an AWS SigV4 signature; enforces per-method scopes; and, for
   tenant-scoped keys, **pins `X-Aero-Tenant`** to the key's tenant. Health,
   `/metrics`, `/openapi.json`, `/docs`, and `/ui` bypass auth.
+  Share and public-asset reads do not bypass Auth: it explicitly admits only
+  anonymous `GET`/`HEAD`, after which the handler resolves an exact capability
+  and FileService enforces it.
 - **Tenant** reads `X-Aero-Tenant` into the request context (defaults to
-  `default`). Auth runs *before* Tenant so a key can pin the tenant.
+  `default`) and rejects known tenants whose persisted status is `disabled`.
+  Auth runs *before* Tenant so a key can pin the tenant. FileService repeats the
+  status guard at its protocol-independent boundary, which also covers public
+  share/asset capabilities; trusted system workers retain cleanup access.
 - **RateLimit** applies a per-tenant token bucket when `RATE_LIMIT_RPS > 0`.
 - **OTel** records the span + metrics.
 - **Recoverer** turns panics into `500`s; **AccessLog** writes one structured log
@@ -221,6 +250,9 @@ Tenancy is a first-class, header-driven concept:
   tenant** (see below), so two tenants can use identical bucket/key names without
   collision.
 - Per-tenant **quotas** (byte + object limits) are enforced in the service layer.
+- A persisted tenant with status **`disabled`** receives `403 TenantDisabled`
+  on data-plane access. Unknown tenant IDs remain valid for compatibility with
+  deployments that use implicit tenants without provisioning tenant records.
 - The MCP server resolves the request-scoped tenant from context, falling back to
   its configured default in stdio mode.
 

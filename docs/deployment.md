@@ -210,5 +210,45 @@ optionally enable cross-region replication (`REPLICATION_*`) for a second copy.
 Use `RECONCILE_INTERVAL_MINUTES>0` to periodically reconcile orphans and apply
 lifecycle expiry.
 
+**Backup scope.** `GET /v1/exports/archive` is a portable, permission-filtered
+object export; it is not a control-plane disaster-recovery image. SQLite + local
+FS installations can capture the database (including departments, ACLs,
+shares, assets, keys, and audit state) together with blobs while the server is
+stopped:
+
+```bash
+aero-vault cli snapshot create backup.tgz \
+  --db file:./var/aero.db --objects ./var/objects
+aero-vault cli snapshot restore backup.tgz \
+  --db file:./var/aero.db --objects ./var/objects
+```
+
+Restore pre-validates the full gzip/tar stream, rejects non-regular or escaping
+paths, and confines writes to the selected database and object roots. For
+Postgres + S3/MinIO deployments, back up PostgreSQL with `pg_dump`/WAL archival
+and enable bucket versioning or replication; both metadata and object-store
+backups are required for a complete restore.
+
 **Health checks.** Wire liveness to `/healthz` and readiness to `/readyz` so the
 app is only sent traffic once the database is reachable.
+
+### `source.ywbsd.site` systemd + FRP deployment
+
+This workspace's production-shaped single-node deployment uses
+[`deploy/systemd/aero-vault.service`](../deploy/systemd/aero-vault.service) and
+[`deploy/run-fullstack-snaplink.sh`](../deploy/run-fullstack-snaplink.sh). It
+binds Aero Vault to `127.0.0.1:18081`; the `mlf2-web-aero-vault` FRP HTTP proxy
+publishes that listener as `source.ywbsd.site` and fixes
+`X-Forwarded-Proto: https` for OIDC callbacks and generated public URLs.
+
+The launch script reuses PostgreSQL/MinIO data and creates three mode-0600
+secrets in `/var/lib/aero-vault`: `presign-secret`, `share-secret`, and the
+bootstrap `operator-token`. Persistent project API keys are SHA-256 hashed in
+PostgreSQL. Restart only the application after rebuilding; the FRP client does
+not need a restart unless its proxy definition changes.
+
+```bash
+make check
+sudo systemctl restart aero-vault.service
+curl -fsS https://source.ywbsd.site/readyz
+```

@@ -1,0 +1,21 @@
+[Unit]
+Description=Aero Vault with Snaplink OIDC
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=u1
+Group=u1
+WorkingDirectory=/home/u1/aero-vault
+StateDirectory=aero-vault
+Environment=AERO_STATE_DIR=/var/lib/aero-vault
+ExecStartPre=/usr/bin/test -x /home/u1/aero-vault/bin/aero-vault
+ExecStart=/home/u1/aero-vault/deploy/run-fullstack-snaplink.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

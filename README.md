@@ -1,19 +1,19 @@
 # aero-vault
 
-**An AI-native file platform** that exposes the same unified object backend over
+**An AI-native file platform** that can expose the same unified object backend over
 **REST**, an **S3-compatible** API, **WebDAV**, and the **Model Context Protocol
 (MCP)** — with a built-in retrieval-augmented generation (RAG) pipeline,
 multi-tenancy, and first-class observability.
 
-Upload a file once and it is immediately available as an S3 object, a WebDAV
-file, an MCP resource, and (optionally) an embedded, searchable chunk that a RAG
-chat endpoint can cite. Storage is pluggable across local disk and any
+Upload a file once and it is immediately available through every enabled
+protocol and (optionally) as an embedded, searchable chunk that a RAG chat
+endpoint can cite. Storage is pluggable across local disk and any
 S3-compatible store (AWS S3, MinIO, Alibaba OSS, Tencent COS).
 
 ```
                        ┌──────────────────────────────────────────────┐
    REST  /v1/*         │                                              │
-   S3    /s3/*    ───▶ │   auth · tenant · rate-limit · OTel · CORS    │
+   S3 (opt-in) /s3/* ─▶ │   auth · tenant · rate-limit · OTel · CORS    │
    WebDAV /webdav      │            (middleware chain)                 │
    MCP   /mcp          │                                              │
                        └───────────────────────┬──────────────────────┘
@@ -42,16 +42,19 @@ S3-compatible store (AWS S3, MinIO, Alibaba OSS, Tencent COS).
 
 ## Features
 
-- **Four protocols, one backend** — REST (`/v1`), S3-compatible gateway (`/s3`),
-  WebDAV (`/webdav`), and MCP (`/mcp` JSON-RPC + stdio).
+- **Four protocols, one backend** — REST (`/v1`), opt-in S3-compatible gateway
+  (for example `/s3`), WebDAV (`/webdav`), and MCP (`/mcp` JSON-RPC + stdio).
 - **Pluggable storage** — `local` filesystem, `s3` (AWS / MinIO / any
   S3-compatible endpoint), native Alibaba `oss`, native Tencent `cos`.
 - **Pluggable metadata DB** — SQLite (default, embedded) or PostgreSQL.
 - **Multi-tenancy** — tenant isolation via the `X-Aero-Tenant` header and a
   `tenant/bucket/key` storage-key scheme.
-- **Authentication & authorization** — scoped API keys, HS256 JWTs, and AWS
-  SigV4 for the S3 endpoint; per-route `read`/`write`/`admin` scopes; optional
-  anonymous public-read.
+- **Enterprise identity & authorization** — API keys, JWT/JWKS, Snaplink OIDC,
+  SigV4, normalized principals, object ownership, nested departments, and
+  inheritable user/group/role/department allow/deny ACLs enforced in FileService.
+- **File operations & distribution** — revocable/password/expiry/use-limited
+  share links, stable cacheable public image URLs for blogs, and portable
+  per-prefix tar.gz backup exports.
 - **Per-tenant quotas** — byte and object limits enforced before upload.
 - **Versioning, object-lock / WORM, tagging, ACLs, lifecycle** — bucket-level
   toggles plus per-object retention locks and canned ACLs.
@@ -141,12 +144,12 @@ production-shaped configuration.
 | Protocol | Mount | Notes |
 |----------|-------|-------|
 | **REST** | `/v1` | Primary JSON API: files, search, chat, agent, events, buckets, admin. OpenAPI at `/openapi.json`, Swagger UI at `/docs`. |
-| **S3-compatible** | `/s3` (configurable via `S3_COMPAT_PREFIX`) | Path-style `GET/PUT/HEAD/DELETE` objects, `ListObjectsV2`, multipart, tagging, ACL, copy, batch delete. Auth via AWS SigV4 or `X-Api-Key`. |
+| **S3-compatible** | Disabled by default; set `S3_COMPAT_PREFIX` (for example `/s3`) | Path-style `GET/PUT/HEAD/DELETE` objects, `ListObjectsV2`, multipart, tagging, ACL, copy, batch delete. Auth via AWS SigV4 or `X-Api-Key`. |
 | **WebDAV** | `/webdav` (set `WEBDAV_PREFIX`; empty disables) | Mountable from Finder, Explorer, rclone, Cyberduck. `PROPFIND`/`MKCOL` supported. |
 | **MCP** | `POST /mcp` (HTTP) or `aero-vault mcp` (stdio) | Model Context Protocol server exposing `list_files`, `read_file`, and `search` tools plus object resources (`aero-vault://{tenant}/{bucket}/{key}`). |
 
-All protocols share one `FileService` core, so an object written through any
-protocol is visible through every other.
+All enabled protocols share one `FileService` core, so an object written through
+any protocol is visible through every other enabled protocol.
 
 See [`docs/api.md`](docs/api.md) for the full REST reference and S3-compatibility
 matrix.
@@ -168,7 +171,7 @@ The most common knobs:
 | `STORAGE_S3_BUCKET` | _(required for s3)_ | Backing S3 bucket. |
 | `DB_DRIVER` | `sqlite` | `sqlite` \| `postgres`. |
 | `DB_DSN` | `file:./var/aero.db?_pragma=foreign_keys(1)` | Database DSN. |
-| `S3_COMPAT_PREFIX` | `/s3` | Mount prefix for the S3 gateway (empty disables). |
+| `S3_COMPAT_PREFIX` | _(empty / disabled)_ | Mount prefix for the S3 gateway; set a value such as `/s3` to enable it. |
 | `JOBS_WORKERS` | `4` | Background worker pool size (`0` = inline indexing). |
 | `AI_INDEX_ENABLED` | `false` | Enable extraction + chunking + embedding of uploads. |
 | `AI_HYBRID_SEARCH` | `false` | Fuse vector + BM25 with reciprocal-rank fusion. |
@@ -176,6 +179,8 @@ The most common knobs:
 | `AI_CHAT_PROVIDER` | _(off)_ | `http` (OpenAI-compatible), `mock`, or empty. |
 | `AUTH_KEYS` | _(open)_ | `token:tenant:scope+scope,...`; empty = no auth. |
 | `AUTH_JWT_SECRET` | _(off)_ | Enables HS256 JWT verification + issuance. |
+| `AUTH_OIDC_ISSUER` | _(off)_ | Enables browser OIDC Authorization Code + PKCE login (with JWKS verification). |
+| `ACCESS_CONTROL_ENABLED` | `false` | Enable ownership, departments, resource ACLs, shares, and public assets. |
 | `S3_SIGV4_CREDENTIALS` | _(off)_ | `accessKey:secretKey:tenant[:scope+scope],...` for the S3 endpoint. |
 | `PROMETHEUS_ENABLED` | `false` | Expose `/metrics`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | OTLP/HTTP endpoint, e.g. `http://localhost:4318`. |
@@ -203,6 +208,11 @@ from aero_vault import Client
 
 av = Client("http://localhost:8080", token="prod-rw", tenant="acme")
 av.upload("docs/readme.txt", b"hello world", content_type="text/plain")
+av.upload("images/hero.jpg", open("hero.jpg", "rb"), content_type="image/jpeg")
+asset = av.publish_asset("images/hero.jpg", "blog/hero.jpg")
+print(av.list_assets())
+share = av.create_share("images/hero.jpg", allow_download=True, ttl_seconds=3600)
+av.revoke_share(share["share"]["id"])
 hits = av.search("vector database", k=5, mode="hybrid")
 print(av.chat("what is in the docs?").answer)
 ```

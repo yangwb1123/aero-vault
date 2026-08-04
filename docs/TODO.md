@@ -25,3 +25,8 @@ Current backlog, prioritized. Update this file after each completed item.
 - [x] `RemoteExtractor` configurable timeout (`AI_EXTRACTOR_TIMEOUT_SECONDS`)
 - [x] Grafana tenant template variable uses storage_bytes source
 - [x] Go SDK admin methods (AddKey, ListKeys, RevokeKey, IssueJWT, ListWebhookFailures, ListJobs, RetryJob, CreateTenant, ListTenants, DeleteTenant, SetTenantStatus, ListAudit, SetQuota, SetBudget)
+- [x] Enterprise departments, nested membership, object/folder/bucket ACLs, shares, and public image assets
+- [x] Tenant suspension enforced across REST, S3/SigV4, WebDAV, HTTP MCP, shares, and public assets
+- [x] Revocable REST GET/PUT capability URLs that remain inside FileService and bucket-policy enforcement
+- [x] Snaplink/OIDC + FRP production deployment at `source.ywbsd.site`, with public multi-protocol E2E verification
+- [x] Complete enterprise lifecycle management in Python, JS/TS, and Go SDKs plus the Web UI

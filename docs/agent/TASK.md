@@ -1,11 +1,24 @@
 # TASK — 当前状态
 
-> 更新于: 2026-07-24
+> 更新于: 2026-08-03
 > 当前 Sprint: `CURRENT_SPRINT.md`
 
 ---
 
 ## 已完成
+
+### 企业文件平台与公网交付（source.ywbsd.site）
+- [x] Snaplink/OIDC 身份接入与 Aero Vault 本地部门、个人、ACL 显式拒绝/允许解耦
+- [x] 企业文件 CRUD、版本、配额、WORM/legal hold、分享、博客图片公开引用与导出备份
+- [x] REST/S3/WebDAV/MCP、Python/JS/Go SDK 与 Web UI 统一走 FileService 权限边界
+- [x] 已知停用租户在 REST、S3/SigV4、WebDAV、HTTP MCP、分享和公开资源路径均被封禁
+- [x] REST 预签名 GET/PUT 均回到 Aero Vault；签名绑定方法、租户、对象路径和过期时间
+- [x] 已签发 GET 链接可被 tenant suspension、bucket policy、ACL deny、对象删除即时撤销
+- [x] `make check` 与 `python3 cli.py accept` 全量通过
+- [x] 公网 E2E：GET/HEAD 200、篡改 403、停用全协议 403、恢复 200、临时数据清理 204
+- [x] `aero-vault.service` 已部署并健康；`frpc.service` 未修改、未重启
+- [x] Python/JS/Go SDK 与 Web UI 已补齐分享、公开图片、ACL、部门/成员的列出和回收操作
+- [x] 公网 Python SDK E2E 已验证上传、分享/图片/部门/ACL 全生命周期、tar.gz 备份及自动清理
 
 ### 工程 CLI 体系
 - [x] `cli.py` 统一入口（19 个命令）

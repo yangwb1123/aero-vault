@@ -103,10 +103,10 @@ RequestID → BucketCORS → CORS → SecureHeaders → MaxBodySize
 ```
 > **不可变的载荷不变量**（I4）：`Auth ≺ Tenant ≺ RateLimit`；`RequestID` 最外、`AccessLog` 最内。**Handler 不自挂链**——隔离 handler 测试无 tenant/auth 是设计行为，非 bug。
 
-- **Auth**（`api/rest` 之外的注册表中间件）：Bearer JWT(`AUTH_JWT_SECRET`/`AUTH_JWT_ISSUER`) · X-Api-Key(sha256；静态 `AUTH_KEYS` 或持久化 `AUTH_PERSIST_KEYS`) · SigV4(`S3_SIGV4_CREDENTIALS`，头+预签名) · 匿名公读。任一凭据源配置即启用；全未配置则整体透传。tenant-scoped key 与冲突 `X-Aero-Tenant` → 403。
+- **Auth**（`api/rest` 之外的注册表中间件）：Bearer JWT（HS256 或 JWKS RS256/EdDSA；issuer+audience/client 可固定）· Snaplink/OIDC Authorization Code+PKCE（opt-in）· X-Api-Key(sha256；静态 `AUTH_KEYS` 或持久化 `AUTH_PERSIST_KEYS`) · SigV4(`S3_SIGV4_CREDENTIALS`，头+预签名) · REST PUT capability HMAC(`AUTH_PRESIGN_SECRET`；空值为进程随机，多副本须共享同一 ≥32-byte 值) · 匿名公读。任一普通凭据源配置即启用；仅 PUT capability signer 不改变默认透传。tenant-scoped key 与冲突 `X-Aero-Tenant` → 403。
 - **Tenant：** 从 JWT/Key/Header 提取；`*` = operator key；缺省 `default`。
 - **限流/并发：** token-bucket per-tenant（`RATE_LIMIT_RPS` 全局 + `AI_RATE_LIMIT_RPS` AI 组）；bucket map 上限 5w + 空闲淘汰；`Concurrency` 加权信号量（写=2/读=1，`MAX_INFLIGHT_REQUESTS`/`PER_TENANT_CONCURRENCY_MAX`）。
-- **免鉴权 & 免限流路径：** `/healthz` `/readyz` `/metrics` `/openapi.json` `/docs` `/ui*`（前缀）。
+- **免鉴权 & 免限流路径：** `/`（仅 302 到 `/ui/`）· `/favicon.ico` · `/healthz` `/readyz` `/metrics` `/openapi.json` `/docs` `/ui*`（前缀）及 opt-in `/auth/oidc/*` 登录回调。
 
 ### 2.6 Storage + Repository
 
@@ -135,7 +135,7 @@ RequestID → BucketCORS → CORS → SecureHeaders → MaxBodySize
 
 **SDK `sdk/`：** Python·JS·Go，覆盖对象/搜索/chat + 管理面（数量随 API 演进，以各 SDK README 为准，勿在本文写死计数）。
 
-**Web UI `/ui`（`WEBUI_ENABLED`，默认开）：** 内嵌 vanilla-JS SPA，4 tab（search/detail/lineage/chat）+ 拖拽/文件上传 + SSE chat 流式；tenant/apikey 存 localStorage。
+**Web UI `/ui`（`WEBUI_ENABLED`，默认开）：** 内嵌 vanilla-JS SPA，5 tab（search/detail/lineage/chat/access）+ 拖拽/文件上传 + SSE chat 流式 + 文件生命周期/分享/公开图片/部门/ACL/备份管理；tenant/apikey 存 localStorage。
 
 **Ops：** `/healthz` `/readyz` · `/metrics`(**`PROMETHEUS_ENABLED`，默认关**；域指标 ~32 个 + HTTP + gauges，实时清单 `grep internal/telemetry`) · OTLP 推送(`OTEL_EXPORTER_OTLP_ENDPOINT`)。`deploy/`：2 个 Grafana 仪表盘（AI/Ops 12 panel + HTTP/runtime 17 panel）、`deploy/prometheus/alerts.yml` 共 12 条告警（http/latency/ai-cost/integrity 四组）。
 

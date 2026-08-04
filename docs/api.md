@@ -1,9 +1,9 @@
 # API reference
 
-aero-vault exposes a JSON REST API under `/v1`, an S3-compatible gateway under
-`/s3`, WebDAV, and MCP. This document covers the **REST API** (derived from
-`internal/api/rest/openapi.json`, version `0.4.0`) and the **S3-compatibility
-matrix**.
+aero-vault exposes a JSON REST API under `/v1`, an optional S3-compatible
+gateway, WebDAV, and MCP. This document covers the **REST API** (derived from
+the runtime route table in `internal/api/rest/router.go` and served at
+`/openapi.json`) and the **S3-compatibility matrix**.
 
 - **Base URL:** the server root (e.g. `http://localhost:8080`).
 - **OpenAPI spec:** `GET /openapi.json`
@@ -18,7 +18,7 @@ Two REST security schemes are advertised (either works):
 | `bearer` | `Authorization: Bearer <token>` | API key **or** JWT. `ApiKey <token>` is also accepted. |
 | `apiKey` | `X-Api-Key: <token>` | Convenience header (also used by S3 clients that can't sign). |
 
-When `AUTH_KEYS` (and/or `AUTH_JWT_SECRET`) is unset, auth is **disabled** and all
+When all API-key/JWT/JWKS credential sources are unset, auth is **disabled** and all
 requests pass through (MVP mode). When enabled, scopes are enforced by method:
 
 - `read` — `GET`, `HEAD`, `OPTIONS` (and WebDAV `PROPFIND`/`PROPPATCH`)
@@ -28,6 +28,20 @@ requests pass through (MVP mode). When enabled, scopes are enforced by method:
 
 The active tenant is selected with the `X-Aero-Tenant` header (defaults to
 `default`). A tenant-scoped key pins this header to the key's tenant.
+
+### Browser OIDC login
+
+When `AUTH_OIDC_*` is configured, the embedded UI exposes a provider login:
+
+| Method | Path | Summary |
+|--------|------|---------|
+| `GET` | `/auth/oidc/login` | Start Authorization Code + PKCE. |
+| `GET` | `/auth/oidc/callback` | Validate state and exchange the code. |
+| `GET` | `/auth/oidc/logout` | Clear the UI token and end the provider session. |
+
+The callback returns tokens to `/ui` in the URL fragment, which the UI removes
+from browser history before making API requests. External access tokens are
+still verified server-side through JWKS with issuer and client/audience pinning.
 
 ## Errors
 
@@ -148,7 +162,21 @@ List response:
 # op = get | put ; expires in seconds (default 300)
 curl -s -X POST "$BASE/v1/files/docs/report.pdf/presign?op=get&expires=900"
 # -> { "url": "https://…", "expires": "2026-05-24T12:34:56Z" }
+
+PUT_URL=$(curl -s -X POST \
+  "$BASE/v1/files/docs/direct.txt/presign?op=put&expires=900" | jq -r .url)
+curl -X PUT --data-binary @direct.txt "$PUT_URL"
 ```
+
+REST presigned GET and PUT URLs terminate at Aero Vault's object routes rather
+than at the raw storage backend. GET supports `GET`, `HEAD`, conditional and
+Range requests while remaining subject to the current tenant status, bucket
+policy, explicit ACL denies, and object lifecycle; disabling a tenant or
+deleting the object therefore invalidates an already-issued URL immediately.
+PUT continues through quota, versioning, object lock, integrity, event, and
+indexing checks. The signature binds the operation, tenant, object path, and
+expiry; extra query parameters are rejected. In a multi-replica deployment,
+configure the same `AUTH_PRESIGN_SECRET` (at least 32 bytes) on every replica.
 
 ### Tags
 
@@ -202,6 +230,146 @@ curl -s -X POST "$BASE/v1/multipart/$UID/complete"
 # abort instead:
 curl -s -X DELETE "$BASE/v1/multipart/$UID"
 ```
+
+---
+
+## Enterprise permissions, sharing, image publishing, and backup
+
+Set `ACCESS_CONTROL_ENABLED=true` to activate this surface. Every authenticated
+caller is normalized to `{subject, tenant, roles, groups, scopes}`. Snaplink can
+provide identity and application scopes; Aero Vault independently owns
+resource-level decisions so the same ACL applies to REST, S3, WebDAV, MCP, and
+AI search/chat results.
+
+Authorization order is fail-closed: explicit deny → explicit allow → exact
+share/public capability → object owner → tenant/file administrator → optional
+tenant scope fallback. A folder ACL with `inherit=true` covers descendants, and
+membership in a child department also inherits parent-department grants.
+
+Supported actions are `object:list`, `object:read`, `object:preview`,
+`object:download`, `object:create`, `object:write`, `object:delete`,
+`object:restore`, `object:share`, `object:manage_acl`, `asset:publish`,
+`object:export`, and `*`.
+
+For server-to-server integrations, provision a separate persisted key instead
+of copying a browser OIDC token. The full-stack deployment keeps its bootstrap
+operator token in `/var/lib/aero-vault/operator-token` (mode 0600):
+
+```bash
+OPERATOR_TOKEN=$(sudo cat /var/lib/aero-vault/operator-token)
+curl -s -X POST "$BASE/v1/admin/keys" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"replace-with-a-random-project-secret",\
+       "tenant":"default","scopes":["read","write"],\
+       "label":"blog-production"}'
+```
+
+Only a SHA-256 hash of a persisted project key is stored. Give each project a
+different key so it can be audited and revoked without affecting browser SSO or
+other applications.
+
+### Departments and resource ACLs
+
+```bash
+# Operator: create a department and add a Snaplink/Aero subject.
+DEPT=$(curl -s -X POST "$BASE/v1/admin/departments" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"engineering"}' | jq -r .id)
+curl -s -X PUT "$BASE/v1/admin/departments/$DEPT/members/user-42" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"role":"member"}'
+
+# Owner/admin: make engineering/ readable by the department, recursively.
+curl -s -X PUT "$BASE/v1/access/acl" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"key\":\"engineering/\",\"resource_kind\":\"folder\",\
+       \"principal_type\":\"department\",\"principal_id\":\"$DEPT\",\
+       \"actions\":[\"object:read\",\"object:download\"],\
+       \"effect\":\"allow\",\"inherit\":true}"
+```
+
+ACL principals may be `user`, `department`, `group`, `role`, `authenticated`,
+or `everyone`. `GET /v1/access/check?...&action=object:read` explains the current
+caller's decision. Canned S3 ACLs remain available for compatibility; resource
+ACLs are the enterprise authorization model.
+
+### Revocable sharing
+
+```bash
+SHARE=$(curl -s -X POST "$BASE/v1/shares" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"key":"images/photo.jpg","password":"review-only",\
+       "allow_preview":true,"allow_download":true,\
+       "ttl_seconds":3600,"max_uses":20}')
+SHARE_URL=$(printf '%s' "$SHARE" | jq -r .url)
+
+# Password header is preferred; query passwords may appear in logs/history.
+curl -H 'X-Aero-Share-Password: review-only' "$SHARE_URL" -o photo.jpg
+```
+
+Only the creation response contains the raw token. The database stores its
+SHA-256 hash. Links can be expired, use-limited, password-protected, and revoked
+with `DELETE /v1/shares/{id}`. `HEAD` does not consume a use; each successful
+`GET` does. Invalid ranges and conditional `304` responses do not consume a
+use. Deleting the source object revokes all of its share links before the key
+can be reused, so an old capability can never expose a newly uploaded object.
+Deletion also removes exact-object ACLs; inherited folder and bucket policies
+continue to apply when the key is restored or uploaded again.
+
+### Stable public image URLs for blogs
+
+```bash
+curl -s -X PUT "$BASE/v1/files/blog/hero.jpg" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: image/jpeg' \
+  --data-binary @hero.jpg
+
+curl -s -X POST "$BASE/v1/assets" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"key":"blog/hero.jpg","slug":"blog/hero.jpg",\
+       "cache_control":"public, max-age=86400"}'
+# -> {"asset":{...},"url":"https://source.ywbsd.site/public/assets/blog/hero.jpg"}
+```
+
+Only `image/*` objects may be published. Public endpoints support `GET`,
+`HEAD`, ETag/304, byte ranges/206, `nosniff`, and caller-selected cache control.
+Unpublishing removes the stable URL without deleting the protected source file.
+Deleting the source automatically unpublishes it; restoring or re-uploading the
+key requires an explicit publish operation.
+
+Other projects can upload and publish with the SDKs:
+
+```python
+av.upload("blog/hero.jpg", open("hero.jpg", "rb"), content_type="image/jpeg")
+published = av.publish_asset("blog/hero.jpg", "blog/hero.jpg",
+                             cache_control="public, max-age=86400")
+print(published["url"])
+```
+
+```js
+await av.upload("blog/hero.jpg", imageBytes, { contentType: "image/jpeg" });
+const published = await av.publishAsset("blog/hero.jpg", "blog/hero.jpg", {
+  cacheControl: "public, max-age=86400",
+});
+document.querySelector("img").src = published.url;
+```
+
+The SDKs also expose the management side of these resources: list/revoke
+shares, list/unpublish assets, list/delete ACL entries, and full department and
+membership lifecycle operations. Applications therefore do not need to mix
+SDK calls with hand-written REST requests for administrative cleanup.
+
+### Portable backup export
+
+```bash
+curl -L "$BASE/v1/exports/archive?bucket=default&prefix=blog/" \
+  -H "Authorization: Bearer $TOKEN" -o aero-blog-backup.tar.gz
+```
+
+The gzip-compressed tar contains `manifest.json` plus `objects/<key>` entries.
+The manifest records content type, ETag, user metadata, tags, size, and update
+time. Export is backend-independent and includes only objects for which the
+caller has `object:export`; internal `_aero_*` metadata is never exposed.
 
 ---
 
@@ -324,12 +492,17 @@ set).
 
 | Method | Path | Summary |
 |--------|------|---------|
+| `GET` | `/v1/buckets` | List buckets for the current tenant. |
 | `GET` | `/v1/buckets/{bucket}/config` | Get config. |
 | `PUT` | `/v1/buckets/{bucket}/versioning` | Toggle versioning. |
 | `PUT` | `/v1/buckets/{bucket}/object-lock` | Default retention (seconds). |
 | `PUT` | `/v1/buckets/{bucket}/lifecycle` | Expire-after-days policy. |
+| `GET` | `/v1/buckets/{bucket}/lifecycle` | Get lifecycle policy. |
 | `GET` | `/v1/buckets/{bucket}/acl` | Get bucket ACL. |
 | `PUT` | `/v1/buckets/{bucket}/acl` | Set bucket canned ACL. |
+| `GET` | `/v1/buckets/{bucket}/versions` | List all versions and delete markers with `prefix`, `key-marker`, `version-id-marker`, and `max-keys` pagination. |
+| `GET` | `/v1/buckets/{bucket}/stats` | Get object count and total bytes. |
+| `DELETE` | `/v1/buckets/{bucket}` | Delete the bucket and its objects. |
 
 ```bash
 curl -s "$BASE/v1/buckets/default/config"
@@ -340,6 +513,7 @@ curl -s -X PUT -d '{"seconds":3600}'                       "$BASE/v1/buckets/def
 curl -s -X PUT -d '{"days":30,"action":"soft_delete"}'     "$BASE/v1/buckets/default/lifecycle"
 curl -s -X PUT -H 'x-amz-acl: private'                     "$BASE/v1/buckets/default/acl"
 curl -s         "$BASE/v1/buckets/default/acl"
+curl -s         "$BASE/v1/buckets/default/versions?max-keys=100"
 ```
 
 ---
@@ -355,7 +529,7 @@ All `/v1/admin/*` routes require the `admin` scope (when auth is enabled).
 | `PUT` | `/v1/admin/tenants/{tenant}/budget` | Set per-tenant daily AI spend cap (USD). |
 | `POST` | `/v1/admin/tenants` | Create or upsert a tenant record. |
 | `GET` | `/v1/admin/tenants` | List all tenants. |
-| `DELETE` | `/v1/admin/tenants/{tenant}` | Delete a tenant record. |
+| `DELETE` | `/v1/admin/tenants/{tenant}` | Delete an empty tenant and its control-plane records; returns `409 TenantNotEmpty` while buckets, objects, or uploads remain. |
 | `PUT` | `/v1/admin/tenants/{tenant}/status` | Set tenant status (`active`\|`disabled`). |
 | `GET` | `/v1/admin/audit` | List audit-log entries (admin actions). |
 | `GET` | `/v1/admin/keys` | List API keys (tokens redacted). |
@@ -405,11 +579,15 @@ curl -s -X POST -d '{"tenant_id":"acme","display_name":"Acme Corp"}' \
 curl -s "$BASE/v1/admin/tenants"
 # -> { "tenants": [ { "tenant_id":"acme", … } ] }
 
-# Disable / re-enable a tenant (status: "active" | "disabled")
+# Disable / re-enable a tenant (status: "active" | "disabled"). Disabled
+# tenants receive 403 on data-plane APIs and public share/asset reads; operator
+# health, readiness, UI, docs, and OIDC endpoints remain available.
 curl -s -X PUT -d '{"status":"disabled"}' "$BASE/v1/admin/tenants/acme/status"
 curl -s -X PUT -d '{"status":"active"}'   "$BASE/v1/admin/tenants/acme/status"
 
-# Delete a tenant record (204; 404 if not found)
+# Delete an empty tenant (204; 404 if not found; 409 while data resources remain).
+# Delete objects/uploads/buckets through their normal APIs first so storage and
+# indexing cleanup runs through FileService.
 curl -s -X DELETE "$BASE/v1/admin/tenants/acme"
 
 # Set per-tenant daily AI budget (0 clears the override)
@@ -430,10 +608,10 @@ curl -s "$BASE/v1/admin/audit?limit=50"
 
 # S3-compatibility
 
-The S3 gateway is mounted at `S3_COMPAT_PREFIX` (default `/s3`) and implements a
-practical subset of the S3 REST API in **path-style** form
-(`/{bucket}/{key+}`). It shares the same `FileService`, so S3 and REST see the
-same objects.
+The S3 gateway is disabled by default. Set `S3_COMPAT_PREFIX` to a non-empty
+mount prefix such as `/s3` to enable a practical subset of the S3 REST API in
+**path-style** form (`/{bucket}/{key+}`). It shares the same `FileService`, so
+S3 and REST see the same objects.
 
 ## Supported operations
 
@@ -442,7 +620,7 @@ same objects.
 | PutObject | `PUT /{bucket}/{key}` | ✅ | User metadata via `x-amz-meta-*`; canned ACL via `x-amz-acl`. |
 | GetObject | `GET /{bucket}/{key}` | ✅ | Honors `Range` → `206`; returns `x-amz-meta-*`. |
 | HeadObject | `HEAD /{bucket}/{key}` | ✅ | |
-| DeleteObject | `DELETE /{bucket}/{key}` | ✅ | Physical delete. |
+| DeleteObject | `DELETE /{bucket}/{key}` | ✅ | Creates a delete marker when versioning is enabled; otherwise deletes the object. `versionId` deletes an exact version. |
 | CopyObject | `PUT` + `x-amz-copy-source` | ✅ | `x-amz-metadata-directive: COPY` (default) or `REPLACE`. |
 | ListObjectsV2 | `GET /{bucket}?list-type=2` | ✅ | `prefix`, `continuation-token`, `max-keys`, `start-after`. |
 | HeadBucket | `HEAD /{bucket}` | ✅ | |
@@ -464,7 +642,7 @@ same objects.
 | DeleteBucketLifecycle | `DELETE /{bucket}?lifecycle` | ✅ | Clears the expiry policy; `204 No Content`. |
 | GetBucketAcl / PutBucketAcl | `GET`/`PUT /{bucket}?acl` | ✅ | Canned ACL ↔ `AccessControlPolicy`; PUT via `x-amz-acl` header or policy body. |
 | GetBucketLocation | `GET /{bucket}?location` | ✅ | Empty `LocationConstraint` (us-east-1); `404 NoSuchBucket` if absent. |
-| ListObjectVersions | `GET /{bucket}?versions` | ✅ | Honors `?prefix`; every stored version is a `<Version>` (newest `IsLatest=true`); paginated by key via `?max-keys`/`?key-marker` (`NextKeyMarker` when truncated). |
+| ListObjectVersions | `GET /{bucket}?versions` | ✅ | Returns `<Version>` and `<DeleteMarker>` entries. Combined-count pagination supports `prefix`, `max-keys`, `key-marker`, and `version-id-marker`, including continuation within one key. |
 | Presigned URLs | — | ✅ (REST) | Use `POST /v1/files/{key}/presign`. |
 
 ## SigV4 usage
@@ -485,7 +663,9 @@ A SigV4 request resolves to that tenant (the gateway sets `X-Aero-Tenant`
 accordingly unless the credential's tenant is `*`) and is scope-checked by method
 (`GET`/`HEAD` → `read`, otherwise `write`). Both header-signed and presigned-URL
 forms are supported, including streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`)
-bodies.
+bodies. The S3 gateway is inside the global Auth → Tenant status chain, so
+known disabled tenants are also rejected for both header-signed and presigned
+SigV4 requests.
 
 ### Example: AWS CLI against the S3 gateway
 
