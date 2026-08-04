@@ -177,14 +177,14 @@ Validation (fails fast on startup): the storage backend must be one of
 |----------|---------|-------------|
 | `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = operator (any tenant). Empty disables API-key auth (MVP/open mode). |
 | `AUTH_JWT_SECRET` | _(empty)_ | Secret enabling HS256 JWT verification and issuance (`POST /v1/admin/jwt`). |
-| `AUTH_JWKS_ENDPOINT` | _(empty)_ | JWKS endpoint URL for RS256 or EdDSA JWT verification. |
-| `AUTH_JWKS_KEY_TTL` | `3600` | JWKS key cache TTL in seconds. Keys are refreshed on cache miss; a stale cache is served when refresh fails. |
-| `AUTH_JWT_ISSUER` | _(empty)_ | When set, verifies the `iss` claim matches this value for HS256 and JWKS JWTs. |
+| `AUTH_JWKS_ENDPOINT` | _(empty)_ | Snaplink JWKS URL. Setting it activates `interfaces/ssoclient/rs`; Aero does not implement external JWT cryptography. |
+| `AUTH_JWKS_KEY_TTL` | `3600` | Snaplink SDK background JWKS refresh interval in seconds; unknown keys also trigger the SDK's bounded refresh path. |
+| `AUTH_JWT_ISSUER` | _(empty)_ | Pins `iss` for local HS256 and the Snaplink resource-server SDK. |
 | `AUTH_JWKS_AUDIENCE` | _(empty)_ | Pins external tokens to an `aud`, `client_id`, or `azp` value. Required for browser OIDC login. |
 | `AUTH_JWKS_TENANT_CLAIM` | `ten` | External JWT claim mapped to the Aero tenant: `ten`, `tenant_id`, or `sub`. |
 | `AUTH_JWKS_CLIENT_TENANTS` | _(empty)_ | Optional `client_id:tenant` pairs. Use this for Snaplink tenant-bound clients because Snaplink access tokens intentionally omit `tenant_id`; an unmapped client fails closed when this map is configured. |
 | `AUTH_JWKS_DEFAULT_SCOPES` | _(empty)_ | Comma-separated Aero scopes used only when a verified external token has no recognized `read`/`write`/`admin` scope. Use only with issuer and audience/client pinning. |
-| `AUTH_OIDC_ISSUER` | _(empty)_ | Enables browser Authorization Code + PKCE login when supplied with client ID and redirect URI. |
+| `AUTH_OIDC_ISSUER` | _(empty)_ | Enables browser Authorization Code + PKCE login through Snaplink's `remote.TokenClient` when supplied with client ID and redirect URI. |
 | `AUTH_OIDC_CLIENT_ID` | _(empty)_ | Public OIDC client ID; must equal `AUTH_JWKS_AUDIENCE`. |
 | `AUTH_OIDC_REDIRECT_URI` | _(empty)_ | Exact registered callback, e.g. `https://vault.example.com/auth/oidc/callback`. |
 | `AUTH_OIDC_AUTHORIZATION_ENDPOINT` | `<issuer>/auth/login` | Snaplink browser-hosted login endpoint. |
@@ -209,7 +209,9 @@ authentication source (API key, JWT/JWKS, SigV4, or persistent API-key store).
 | `ACCESS_PUBLIC_BASE_URL` | _(empty)_ | Canonical external base URL placed in returned share/asset URLs, e.g. `https://source.ywbsd.site`. Empty derives it from the request. |
 
 For Snaplink, configure a tenant-bound `aero-vault` OAuth client, pin issuer and
-audience, and map that trusted client to the Aero tenant:
+audience, and map that trusted client to the Aero tenant. PKCE and code exchange
+use Snaplink's `interfaces/ssoclient/remote.TokenClient`; validation calls
+`interfaces/ssoclient/rs` directly. Only the mapping below is application-specific:
 
 ```dotenv
 AUTH_JWT_ISSUER=https://sso.example.com

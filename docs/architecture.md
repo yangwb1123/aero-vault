@@ -113,13 +113,15 @@ keeping it backend-agnostic.
 ### Enterprise authorization boundary
 
 `internal/access` is an independent policy-decision domain. Authentication
-adapters normalize API keys, local JWTs, and Snaplink/OIDC access tokens into a
-small `Principal`; FileService sends `{action, tenant, bucket, key, owner}` to
+adapters normalize API keys and local JWTs directly. Snaplink's
+`interfaces/ssoclient/remote.TokenClient` owns PKCE and OAuth token exchange;
+access tokens pass through `interfaces/ssoclient/rs` and then a thin identity
+mapper. FileService sends `{action, tenant, bucket, key, owner}` to
 the authorizer before every object operation. REST, S3, WebDAV, MCP, multipart,
 copy, version reads, and AI retrieval therefore share one enforcement point.
 
-Snaplink is reused for identity, login, tenant membership, and coarse
-application authorization. It intentionally does not own Aero's resource ACL:
+Snaplink is reused for identity, login, token cryptography/JWKS rotation, tenant
+membership, and coarse application authorization. It intentionally does not own Aero's resource ACL:
 Snaplink's current permission provider is application-scoped and its access
 tokens omit a tenant claim. Aero maps the issuer-pinned `client_id` to a tenant
 with `AUTH_JWKS_CLIENT_TENANTS`, then resolves local department membership and

@@ -2,17 +2,17 @@ package auth
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yangwb1123/snaplink/interfaces/ssoclient"
+	"github.com/yangwb1123/snaplink/interfaces/ssoclient/remote"
 )
 
 const (
@@ -39,7 +39,7 @@ type pendingOIDCFlow struct {
 // are returned in a URL fragment so they never enter access logs or referrers.
 type OIDCHandler struct {
 	cfg     OIDCConfig
-	client  *http.Client
+	tokens  *remote.TokenClient
 	mu      sync.Mutex
 	pending map[string]pendingOIDCFlow
 }
@@ -61,10 +61,10 @@ func NewOIDCHandler(cfg OIDCConfig) (*OIDCHandler, error) {
 	if err := validateOIDCEndpoints(cfg); err != nil {
 		return nil, err
 	}
-	return &OIDCHandler{
-		cfg: cfg, client: &http.Client{Timeout: 15 * time.Second},
-		pending: map[string]pendingOIDCFlow{},
-	}, nil
+	tokens := remote.NewTokenClient(cfg.TokenEndpoint,
+		remote.WithClientID(cfg.ClientID), remote.WithRedirectURI(cfg.RedirectURI),
+		remote.WithPKCE(true), remote.WithHTTPClient(&http.Client{Timeout: 15 * time.Second}))
+	return &OIDCHandler{cfg: cfg, tokens: tokens, pending: map[string]pendingOIDCFlow{}}, nil
 }
 
 func validateOIDCEndpoints(cfg OIDCConfig) error {
@@ -89,14 +89,14 @@ func (h *OIDCHandler) Login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not start login", http.StatusInternalServerError)
 		return
 	}
-	verifier, err := randomURLToken(48)
+	verifier, challenge, err := h.tokens.GeneratePKCE()
 	if err != nil {
 		http.Error(w, "could not start login", http.StatusInternalServerError)
 		return
 	}
 	h.storePending(state, verifier)
 	h.setStateCookie(w, state, int(oidcFlowTTL.Seconds()))
-	target, err := h.authorizationURL(state, verifier)
+	target, err := h.authorizationURL(state, challenge)
 	if err != nil {
 		http.Error(w, "invalid authorization endpoint", http.StatusInternalServerError)
 		return
@@ -104,19 +104,18 @@ func (h *OIDCHandler) Login(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, target, http.StatusFound)
 }
 
-func (h *OIDCHandler) authorizationURL(state, verifier string) (string, error) {
+func (h *OIDCHandler) authorizationURL(state, challenge string) (string, error) {
 	target, err := url.Parse(h.cfg.AuthorizationEndpoint)
 	if err != nil {
 		return "", err
 	}
-	challenge := sha256.Sum256([]byte(verifier))
 	query := target.Query()
 	query.Set("client_id", h.cfg.ClientID)
 	query.Set("response_type", "code")
 	query.Set("redirect_uri", h.cfg.RedirectURI)
 	query.Set("scope", strings.Join(h.cfg.Scopes, " "))
 	query.Set("state", state)
-	query.Set("code_challenge", base64.RawURLEncoding.EncodeToString(challenge[:]))
+	query.Set("code_challenge", challenge)
 	query.Set("code_challenge_method", "S256")
 	target.RawQuery = query.Encode()
 	return target.String(), nil
@@ -136,60 +135,21 @@ func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or expired login state", http.StatusBadRequest)
 		return
 	}
-	token, err := h.exchangeCode(r, code, verifier)
+	token, err := h.tokens.ExchangeCode(r.Context(), code, verifier)
 	if err != nil {
 		http.Error(w, "OIDC token exchange failed", http.StatusBadGateway)
 		return
 	}
-	http.Redirect(w, r, token.uiRedirect(), http.StatusFound)
+	http.Redirect(w, r, uiRedirect(token), http.StatusFound)
 }
 
-type oidcTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	IDToken     string `json:"id_token,omitempty"`
-	TokenType   string `json:"token_type,omitempty"`
-	ExpiresIn   int64  `json:"expires_in,omitempty"`
-}
-
-func (h *OIDCHandler) exchangeCode(r *http.Request, code, verifier string) (oidcTokenResponse, error) {
-	form := url.Values{
-		"grant_type":    {"authorization_code"},
-		"client_id":     {h.cfg.ClientID},
-		"code":          {code},
-		"redirect_uri":  {h.cfg.RedirectURI},
-		"code_verifier": {verifier},
+func uiRedirect(token *ssoclient.TokenResponse) string {
+	fragment := url.Values{"oidc_access_token": {token.AccessToken}}
+	if token.IDToken != "" {
+		fragment.Set("oidc_id_token", token.IDToken)
 	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, h.cfg.TokenEndpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return oidcTokenResponse{}, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return oidcTokenResponse{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		return oidcTokenResponse{}, fmt.Errorf("token endpoint returned HTTP %d", resp.StatusCode)
-	}
-	var token oidcTokenResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&token); err != nil {
-		return token, err
-	}
-	if token.AccessToken == "" {
-		return token, errors.New("token endpoint omitted access_token")
-	}
-	return token, nil
-}
-
-func (t oidcTokenResponse) uiRedirect() string {
-	fragment := url.Values{"oidc_access_token": {t.AccessToken}}
-	if t.IDToken != "" {
-		fragment.Set("oidc_id_token", t.IDToken)
-	}
-	if t.ExpiresIn > 0 {
-		fragment.Set("oidc_expires_in", fmt.Sprint(t.ExpiresIn))
+	if token.ExpiresIn > 0 {
+		fragment.Set("oidc_expires_in", fmt.Sprint(token.ExpiresIn))
 	}
 	return "/ui#" + fragment.Encode()
 }

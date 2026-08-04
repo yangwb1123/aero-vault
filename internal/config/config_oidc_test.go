@@ -33,3 +33,15 @@ func TestValidateJWKSMapping(t *testing.T) {
 		t.Fatal("unknown fallback scope should fail")
 	}
 }
+
+func TestValidateSnaplinkRequiresIssuer(t *testing.T) {
+	cfg := baseValid()
+	cfg.Auth.JWKSEndpoint = "https://sso.example/.well-known/jwks.json"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Snaplink SDK configuration without an issuer should fail")
+	}
+	cfg.Auth.JWTIssuer = "https://sso.example"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid Snaplink SDK config: %v", err)
+	}
+}

@@ -19,7 +19,7 @@ The repository `Dockerfile` is a two-stage build producing a `distroless`
 `nonroot` image (uid/gid `65532`):
 
 ```dockerfile
-FROM golang:1.25-alpine AS build      # CGO_ENABLED=0, trimpath
+FROM golang:1.26.1-alpine AS build    # CGO_ENABLED=0, trimpath
 ...
 FROM gcr.io/distroless/static-debian12:nonroot
 EXPOSE 8080

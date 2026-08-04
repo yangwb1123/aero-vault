@@ -58,11 +58,11 @@ type Registry struct {
 	enabled   bool
 	jwt       *JWTVerifier
 	sigv4     *SigV4Verifier
-	store     PersistentStore // optional repo-backed store for runtime keys (hashed)
-	jwks      *JWKSVerifier   // optional JWKS-based RS256/EdDSA verifier
-	anonRead  bool            // allow unauthenticated GET/HEAD on object paths (ACL-gated)
-	keyCache  *keyCache       // optional bounded TTL cache for persisted-key lookups (nil = off)
-	putSigner *PutPresigner   // REST PUT capabilities; does not enable global auth by itself
+	store     PersistentStore   // optional repo-backed store for runtime keys (hashed)
+	snaplink  *SnaplinkVerifier // optional Snaplink resource-server SDK adapter
+	anonRead  bool              // allow unauthenticated GET/HEAD on object paths (ACL-gated)
+	keyCache  *keyCache         // optional bounded TTL cache for persisted-key lookups (nil = off)
+	putSigner *PutPresigner     // REST PUT capabilities; does not enable global auth by itself
 	// keyChangePublisher, when set, is invoked after a local persisted-key
 	// add/revoke with the affected token hash, so other replicas can drop it from
 	// their caches immediately. nil = single-instance (local invalidation only).
@@ -143,7 +143,7 @@ func knownScope(scope Scope) bool {
 func (r *Registry) Enabled() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.enabled || r.jwt != nil || r.jwks != nil || r.sigv4 != nil || r.store != nil
+	return r.enabled || r.jwt != nil || r.snaplink != nil || r.sigv4 != nil || r.store != nil
 }
 
 // WithStore attaches an optional persistent store so runtime API keys survive
@@ -224,7 +224,7 @@ func (r *Registry) Lookup(ctx context.Context, token string) (Key, bool) {
 	k, ok := r.keys[token]
 	store := r.store
 	jwt := r.jwt
-	jwks := r.jwks
+	snaplink := r.snaplink
 	r.mu.RUnlock()
 	if ok {
 		return k, true
@@ -239,16 +239,16 @@ func (r *Registry) Lookup(ctx context.Context, token string) (Key, bool) {
 			return resolved, true
 		}
 	}
-	if jwks != nil {
-		if resolved, ok := r.lookupJWKS(ctx, token); ok {
+	if snaplink != nil {
+		if resolved, ok := r.lookupSnaplink(ctx, token); ok {
 			return resolved, true
 		}
 	}
 	return Key{}, false
 }
 
-func (r *Registry) lookupJWKS(_ context.Context, token string) (Key, bool) {
-	if k, err := r.jwks.Verify(token); err == nil {
+func (r *Registry) lookupSnaplink(ctx context.Context, token string) (Key, bool) {
+	if k, err := r.snaplink.Verify(ctx, token); err == nil {
 		return k, true
 	}
 	return Key{}, false
@@ -302,16 +302,16 @@ func (r *Registry) WithJWT(secret string) *Registry {
 // JWT returns the verifier (or nil) so /admin/keys can sign new tokens.
 func (r *Registry) JWT() *JWTVerifier { return r.jwt }
 
-// WithJWKS enables RS256/EdDSA JWT verification via a JWKS endpoint.
-func (r *Registry) WithJWKS(jwksURL string, keyTTL time.Duration, issuer string) *Registry {
+// WithSnaplink enables external token validation through Snaplink's resource-server SDK.
+func (r *Registry) WithSnaplink(verifier *SnaplinkVerifier) *Registry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.jwks = NewJWKSVerifier(jwksURL, keyTTL, issuer)
+	r.snaplink = verifier
+	if verifier == nil {
+		r.enabled = true
+	}
 	return r
 }
-
-// JWKS returns the external-token verifier for startup-only configuration.
-func (r *Registry) JWKS() *JWKSVerifier { return r.jwks }
 
 // WithAnonymousPublicRead allows unauthenticated GET/HEAD on object paths to
 // pass through (flagged anonymous); the handler then serves only public-read

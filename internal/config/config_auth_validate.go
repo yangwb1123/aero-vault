@@ -23,6 +23,9 @@ func validateAuth(cfg AuthConfig) error {
 	if cfg.JWKSAudience != "" && cfg.JWKSEndpoint == "" {
 		return errors.New("AUTH_JWKS_ENDPOINT is required with AUTH_JWKS_AUDIENCE")
 	}
+	if cfg.JWKSEndpoint != "" && cfg.JWTIssuer == "" {
+		return errors.New("AUTH_JWT_ISSUER is required by the Snaplink resource-server SDK")
+	}
 	if !oidcConfigured(cfg) {
 		return nil
 	}

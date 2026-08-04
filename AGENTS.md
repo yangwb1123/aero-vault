@@ -20,7 +20,7 @@
 
 ## 1. 系统架构与装配 (System Overview & DAG)
 
-**Binary:** `github.com/aero-vault/aero-vault` · Go 1.25 · `cmd/server/main.go`
+**Binary:** `github.com/aero-vault/aero-vault` · Go 1.26.1 · `cmd/server/main.go`
 **装配顺序（main.go 唯一）：** `config → storage → repo → service → workers → middleware → router`
 
 ```mermaid
@@ -103,7 +103,7 @@ RequestID → BucketCORS → CORS → SecureHeaders → MaxBodySize
 ```
 > **不可变的载荷不变量**（I4）：`Auth ≺ Tenant ≺ RateLimit`；`RequestID` 最外、`AccessLog` 最内。**Handler 不自挂链**——隔离 handler 测试无 tenant/auth 是设计行为，非 bug。
 
-- **Auth**（`api/rest` 之外的注册表中间件）：Bearer JWT（HS256 或 JWKS RS256/EdDSA；issuer+audience/client 可固定）· Snaplink/OIDC Authorization Code+PKCE（opt-in）· X-Api-Key(sha256；静态 `AUTH_KEYS` 或持久化 `AUTH_PERSIST_KEYS`) · SigV4(`S3_SIGV4_CREDENTIALS`，头+预签名) · REST PUT capability HMAC(`AUTH_PRESIGN_SECRET`；空值为进程随机，多副本须共享同一 ≥32-byte 值) · 匿名公读。任一普通凭据源配置即启用；仅 PUT capability signer 不改变默认透传。tenant-scoped key 与冲突 `X-Aero-Tenant` → 403。
+- **Auth**（`api/rest` 之外的注册表中间件）：Bearer JWT（本地 HS256；外部令牌必须复用 Snaplink `interfaces/ssoclient/rs` SDK 做 JWKS/issuer/audience 验证，Aero 仅映射 Principal）· Snaplink/OIDC Authorization Code+PKCE（opt-in；PKCE/Token exchange 必须复用 `interfaces/ssoclient/remote.TokenClient`）· X-Api-Key(sha256；静态 `AUTH_KEYS` 或持久化 `AUTH_PERSIST_KEYS`) · SigV4(`S3_SIGV4_CREDENTIALS`，头+预签名) · REST PUT capability HMAC(`AUTH_PRESIGN_SECRET`；空值为进程随机，多副本须共享同一 ≥32-byte 值) · 匿名公读。任一普通凭据源配置即启用；仅 PUT capability signer 不改变默认透传。tenant-scoped key 与冲突 `X-Aero-Tenant` → 403。
 - **Tenant：** 从 JWT/Key/Header 提取；`*` = operator key；缺省 `default`。
 - **限流/并发：** token-bucket per-tenant（`RATE_LIMIT_RPS` 全局 + `AI_RATE_LIMIT_RPS` AI 组）；bucket map 上限 5w + 空闲淘汰；`Concurrency` 加权信号量（写=2/读=1，`MAX_INFLIGHT_REQUESTS`/`PER_TENANT_CONCURRENCY_MAX`）。
 - **免鉴权 & 免限流路径：** `/`（仅 302 到 `/ui/`）· `/favicon.ico` · `/healthz` `/readyz` `/metrics` `/openapi.json` `/docs` `/ui*`（前缀）及 opt-in `/auth/oidc/*` 登录回调。

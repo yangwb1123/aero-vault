@@ -5,7 +5,7 @@
 ## Prerequisites
 
 ```bash
-# Install Go 1.25+, Python 3.10+, and Docker (optional).
+# Install Go 1.26.1+, Python 3.10+, and Docker (optional).
 
 # One-time setup (installs gocyclo, golangci-lint, pre-commit hook)
 python3 cli.py setup

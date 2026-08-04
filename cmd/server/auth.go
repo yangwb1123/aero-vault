@@ -34,14 +34,19 @@ func configureAuthSecrets(ctx context.Context, reg *auth.Registry, cfg *config.C
 		}
 	}
 	if cfg.Auth.JWKSEndpoint != "" {
-		keyTTL := time.Duration(cfg.Auth.JWKSKeyTTLSeconds) * time.Second
-		reg.WithJWKS(cfg.Auth.JWKSEndpoint, keyTTL, cfg.Auth.JWTIssuer)
-		reg.JWKS().
-			WithAudience(cfg.Auth.JWKSAudience).
-			WithTenantClaim(cfg.Auth.JWKSTenantClaim).
-			WithClientTenants(cfg.Auth.JWKSClientTenants).
-			WithDefaultScopes(authScopes(cfg.Auth.JWKSDefaultScopes))
-		logger.Info("JWKS-based JWT verification enabled",
+		verifier, err := auth.NewSnaplinkVerifier(ctx, auth.SnaplinkConfig{
+			Issuer: cfg.Auth.JWTIssuer, JWKSURL: cfg.Auth.JWKSEndpoint,
+			Audience: cfg.Auth.JWKSAudience, TenantClaim: cfg.Auth.JWKSTenantClaim,
+			ClientTenants: cfg.Auth.JWKSClientTenants,
+			DefaultScopes: authScopes(cfg.Auth.JWKSDefaultScopes),
+			RefreshEvery:  time.Duration(cfg.Auth.JWKSKeyTTLSeconds) * time.Second,
+		})
+		reg.WithSnaplink(verifier)
+		if err != nil {
+			logger.Error("initialize Snaplink SDK failed; authentication locked down", "err", err)
+			return
+		}
+		logger.Info("Snaplink resource-server SDK enabled",
 			"jwks_url", cfg.Auth.JWKSEndpoint,
 			"issuer", cfg.Auth.JWTIssuer,
 			"audience", cfg.Auth.JWKSAudience,

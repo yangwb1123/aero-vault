@@ -49,7 +49,8 @@ S3-compatible store (AWS S3, MinIO, Alibaba OSS, Tencent COS).
 - **Pluggable metadata DB** — SQLite (default, embedded) or PostgreSQL.
 - **Multi-tenancy** — tenant isolation via the `X-Aero-Tenant` header and a
   `tenant/bucket/key` storage-key scheme.
-- **Enterprise identity & authorization** — API keys, JWT/JWKS, Snaplink OIDC,
+- **Enterprise identity & authorization** — API keys, local JWT, Snaplink's Go
+  resource-server verifier and OAuth token-client SDKs,
   SigV4, normalized principals, object ownership, nested departments, and
   inheritable user/group/role/department allow/deny ACLs enforced in FileService.
 - **File operations & distribution** — revocable/password/expiry/use-limited
@@ -78,7 +79,7 @@ S3-compatible store (AWS S3, MinIO, Alibaba OSS, Tencent COS).
 
 ### Prerequisites
 
-- Go **1.25+** (matches `go.mod`) to build from source, or Docker to run the image.
+- Go **1.26.1+** (matches Snaplink's SDK requirement), or Docker to run the image.
 - Optional: Docker + Docker Compose for the full demo stack.
 
 ### Build and run locally
@@ -179,7 +180,7 @@ The most common knobs:
 | `AI_CHAT_PROVIDER` | _(off)_ | `http` (OpenAI-compatible), `mock`, or empty. |
 | `AUTH_KEYS` | _(open)_ | `token:tenant:scope+scope,...`; empty = no auth. |
 | `AUTH_JWT_SECRET` | _(off)_ | Enables HS256 JWT verification + issuance. |
-| `AUTH_OIDC_ISSUER` | _(off)_ | Enables browser OIDC Authorization Code + PKCE login (with JWKS verification). |
+| `AUTH_OIDC_ISSUER` | _(off)_ | Enables browser OIDC Authorization Code + PKCE through Snaplink's SDK. |
 | `ACCESS_CONTROL_ENABLED` | `false` | Enable ownership, departments, resource ACLs, shares, and public assets. |
 | `S3_SIGV4_CREDENTIALS` | _(off)_ | `accessKey:secretKey:tenant[:scope+scope],...` for the S3 endpoint. |
 | `PROMETHEUS_ENABLED` | `false` | Expose `/metrics`. |

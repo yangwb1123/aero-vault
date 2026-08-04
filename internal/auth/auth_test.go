@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 // A record with an empty (or whitespace-only) scope segment yields a key with
@@ -128,13 +127,13 @@ func TestParse_NonEmptyConfigWithoutRecordsFailsClosed(t *testing.T) {
 	}
 }
 
-func TestRegistryEnabledWithJWKSOnly(t *testing.T) {
+func TestRegistryEnabledWithSnaplinkOnly(t *testing.T) {
 	reg, err := Parse("")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	reg.WithJWKS("https://issuer.example/.well-known/jwks.json", time.Minute, "issuer")
+	reg.WithSnaplink(nil)
 	if !reg.Enabled() {
-		t.Fatal("JWKS-only authentication must enable the registry")
+		t.Fatal("Snaplink-only authentication must enable the registry")
 	}
 }
