@@ -14,7 +14,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.73
-	github.com/yangwb1123/snaplink v0.0.0-20260804021122-e9f1e1a83451
+	github.com/yangwb1123/snaplink v0.0.0-20260804032512-14e3aecb3fca
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.43.0

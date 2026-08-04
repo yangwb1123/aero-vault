@@ -209,8 +209,9 @@ authentication source (API key, JWT/JWKS, SigV4, or persistent API-key store).
 | `ACCESS_PUBLIC_BASE_URL` | _(empty)_ | Canonical external base URL placed in returned share/asset URLs, e.g. `https://source.ywbsd.site`. Empty derives it from the request. |
 
 For Snaplink, configure a tenant-bound `aero-vault` OAuth client, pin issuer and
-audience, and map that trusted client to the Aero tenant. PKCE and code exchange
-use Snaplink's `interfaces/ssoclient/remote.TokenClient`; validation calls
+audience, and map that trusted client to the Aero tenant. Authorization URL
+construction, PKCE, and code exchange use Snaplink's
+`interfaces/ssoclient/remote.TokenClient`; validation calls
 `interfaces/ssoclient/rs` directly. Only the mapping below is application-specific:
 
 ```dotenv

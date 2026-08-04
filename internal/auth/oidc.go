@@ -62,6 +62,7 @@ func NewOIDCHandler(cfg OIDCConfig) (*OIDCHandler, error) {
 		return nil, err
 	}
 	tokens := remote.NewTokenClient(cfg.TokenEndpoint,
+		remote.WithAuthorizationEndpoint(cfg.AuthorizationEndpoint),
 		remote.WithClientID(cfg.ClientID), remote.WithRedirectURI(cfg.RedirectURI),
 		remote.WithPKCE(true), remote.WithHTTPClient(&http.Client{Timeout: 15 * time.Second}))
 	return &OIDCHandler{cfg: cfg, tokens: tokens, pending: map[string]pendingOIDCFlow{}}, nil
@@ -89,36 +90,14 @@ func (h *OIDCHandler) Login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not start login", http.StatusInternalServerError)
 		return
 	}
-	verifier, challenge, err := h.tokens.GeneratePKCE()
+	target, verifier, err := h.tokens.AuthorizationCodeURL(state, h.cfg.Scopes...)
 	if err != nil {
 		http.Error(w, "could not start login", http.StatusInternalServerError)
 		return
 	}
 	h.storePending(state, verifier)
 	h.setStateCookie(w, state, int(oidcFlowTTL.Seconds()))
-	target, err := h.authorizationURL(state, challenge)
-	if err != nil {
-		http.Error(w, "invalid authorization endpoint", http.StatusInternalServerError)
-		return
-	}
 	http.Redirect(w, r, target, http.StatusFound)
-}
-
-func (h *OIDCHandler) authorizationURL(state, challenge string) (string, error) {
-	target, err := url.Parse(h.cfg.AuthorizationEndpoint)
-	if err != nil {
-		return "", err
-	}
-	query := target.Query()
-	query.Set("client_id", h.cfg.ClientID)
-	query.Set("response_type", "code")
-	query.Set("redirect_uri", h.cfg.RedirectURI)
-	query.Set("scope", strings.Join(h.cfg.Scopes, " "))
-	query.Set("state", state)
-	query.Set("code_challenge", challenge)
-	query.Set("code_challenge_method", "S256")
-	target.RawQuery = query.Encode()
-	return target.String(), nil
 }
 
 func (h *OIDCHandler) Callback(w http.ResponseWriter, r *http.Request) {

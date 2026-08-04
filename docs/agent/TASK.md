@@ -19,7 +19,7 @@
 - [x] `aero-vault.service` 已部署并健康；`frpc.service` 未修改、未重启
 - [x] Python/JS/Go SDK 与 Web UI 已补齐分享、公开图片、ACL、部门/成员的列出和回收操作
 - [x] 公网 Python SDK E2E 已验证上传、分享/图片/部门/ACL 全生命周期、tar.gz 备份及自动清理
-- [x] PKCE/Token exchange 与外部令牌验证分别复用 Snaplink `remote.TokenClient`、`rs` SDK；Aero 仅保留登录状态和 Principal 薄映射
+- [x] 授权 URL/PKCE/Token exchange 与外部令牌验证分别复用 Snaplink `remote.TokenClient`、`rs` SDK；Aero 仅保留登录状态和 Principal 薄映射
 
 ### 工程 CLI 体系
 - [x] `cli.py` 统一入口（19 个命令）
