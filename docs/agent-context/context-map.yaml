@@ -1,34 +1,7 @@
-# Context Engineering 映射（pbatch/context.py 读取）。
-# 按任务关键词/文件路径把项目文档注入 agent 上下文；缺失文档显式警告。
-# 与 docs/agent/BOOTSTRAP.md 的启动加载顺序保持一致。
+# Context routing map (generated from the platform map; edit with care).
 routes:
   - when:
-      task_contains: [storage, blob, chunk, fs, object, 存储, 对象]
-    load:
-      - docs/architecture.md
-      - docs/configuration.md
-  - when:
-      task_contains: [auth, key, jwt, sigv4, oidc, acl, policy, 鉴权, 权限]
-    load:
-      - docs/agent/BOOTSTRAP.md
-      - docs/architecture.md
-  - when:
-      task_contains: [s3, webdav, mcp, rest, protocol, 协议, api]
-    load:
-      - docs/architecture.md
-  - when:
-      task_contains: [ai, search, embed, chunk, rag, vector, 检索]
-    load:
-      - docs/architecture.md
-  - when:
-      task_contains: [event, webhook, job, queue, worker, 事件, 队列]
-    load:
-      - docs/architecture.md
-  - when:
-      task_contains: [sqlite, postgres, migration, repo, repository, 数据库, 迁移]
-    load:
-      - docs/architecture.md
-  - when:
-      paths: [internal/**]
-    load:
-      - AGENTS.md
+      task_contains: [平台, 组合, 契约, 边界, 职责, 审计, 权限, 租户, 事件,
+                      platform, contract, composition, boundary, audit,
+                      permission, scope, tenant, event]
+    load: [docs/agent-context/platform-contract.md]
