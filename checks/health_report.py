@@ -13,8 +13,19 @@ def run() -> int:
     print(f"  aero-vault — Engineering Health Report")
     print(f"  {datetime.now().isoformat()}")
     print("=" * 72)
+    _file_sizes()
+    _recent_changes()
+    _dependency_overview()
+    print("\n--- 4. Complexity Summary ---")
+    subprocess.run(
+        [sys.executable, "checks/complexity.py"],
+        cwd=str(ROOT),
+    )
+    print("\n" + "=" * 72)
+    return 0
 
-    # ── 1. File size outliers ──
+
+def _file_sizes() -> None:
     print("\n--- 1. File Size Report (limit: 500 lines) ---")
     result = subprocess.run(
         [sys.executable, "checks/filesize.py"],
@@ -22,7 +33,8 @@ def run() -> int:
     )
     print(result.stdout)
 
-    # ── 2. Recent changes (top 10) ──
+
+def _recent_changes() -> None:
     print("\n--- 2. Recent Changes (top 10) ---")
     result = subprocess.run(
         "find . -name '*.go' -not -path './.git/*' -not -path './.claude/*'"
@@ -39,7 +51,8 @@ def run() -> int:
             dt = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
             print(f"  {dt}  {parts[1]}")
 
-    # ── 3. Package dependency overview ──
+
+def _dependency_overview() -> None:
     print("\n--- 3. Package Dependency Overview ---")
     pkg_dirs = sorted(d for d in ROOT.iterdir() if d.is_dir() and not d.name.startswith("."))
     for d in pkg_dirs:
@@ -54,16 +67,6 @@ def run() -> int:
                         imports.add(imp)
             if imports:
                 print(f"  {d.name}: {len(src)} src files, imports {sorted(imports)}")
-
-    # ── 4. Quick complexity summary ──
-    print("\n--- 4. Complexity Summary ---")
-    subprocess.run(
-        [sys.executable, "checks/complexity.py"],
-        cwd=str(ROOT),
-    )
-
-    print("\n" + "=" * 72)
-    return 0
 
 
 if __name__ == "__main__":

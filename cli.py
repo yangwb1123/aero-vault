@@ -235,53 +235,50 @@ def cmd_diagnose():
     """System diagnosis: check Python, Go, tools, environment."""
     import shutil
     import platform
-    # Extend PATH with Go bin dir so locally installed tools are found
+    _extend_path_with_go_bin()
+    print("=" * 60)
+    print("  aero-vault — System Diagnosis")
+    print("=" * 60)
+    diagnostics = _collect_diagnostics(shutil)
+    for name, value, ok in diagnostics:
+        status = "✅" if ok else "❌"
+        print(f"  {status} {name}: {value}")
+    ok_count = sum(1 for _, _, ok in diagnostics if ok)
+    total = len(diagnostics)
+    print(f"\n  {ok_count}/{total} checks passed")
+    return 0 if ok_count == total else 1
+
+
+def _extend_path_with_go_bin() -> None:
+    """Extend PATH with Go bin dir so locally installed tools are found."""
     _gopath = subprocess.run(["go", "env", "GOPATH"], capture_output=True, text=True).stdout.strip()
     if _gopath:
         _extra = os.pathsep.join([os.path.join(_gopath, "bin"), os.path.expanduser("~/go/bin")])
         os.environ["PATH"] = _extra + os.pathsep + os.environ.get("PATH", "")
-    print("=" * 60)
-    print("  aero-vault — System Diagnosis")
-    print("=" * 60)
-    diagnostics = []
 
-    # Python
+
+def _collect_diagnostics(shutil):
+    """Collect environment diagnostic rows: (name, value, ok)."""
+    import platform
+    diagnostics = []
     py_ver = sys.version.split()[0]
     diagnostics.append(("Python", py_ver, True))
-
-    # Go
     go_path = shutil.which("go")
     if go_path:
         r = subprocess.run(["go", "version"], capture_output=True, text=True)
         diagnostics.append(("Go", r.stdout.strip() if r.returncode == 0 else "not found", r.returncode == 0))
     else:
         diagnostics.append(("Go", "not installed", False))
-
-    # gocyclo
     gocyclo_path = shutil.which("gocyclo")
     diagnostics.append(("gocyclo", gocyclo_path or "not installed", gocyclo_path is not None))
-
-    # Tools
     for tool in ["gofmt", "git", "docker"]:
         found = shutil.which(tool) is not None
         diagnostics.append((tool, "available" if found else "not installed", found))
-
-    # Config
     from checks.config import get_config
     cfg = get_config()
     diagnostics.append(("engineering.yaml", str(cfg.path), cfg.path.exists()))
     diagnostics.append(("Project", cfg.project.name, bool(cfg.project.name)))
-
-    # Print table
-    for name, value, ok in diagnostics:
-        status = "✅" if ok else "❌"
-        print(f"  {status} {name}: {value}")
-
-    # Summary
-    ok_count = sum(1 for _, _, ok in diagnostics if ok)
-    total = len(diagnostics)
-    print(f"\n  {ok_count}/{total} checks passed")
-    return 0 if ok_count == total else 1
+    return diagnostics
 
 
 def cmd_skill(args: list):

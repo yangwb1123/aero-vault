@@ -95,6 +95,8 @@ root_policy:
     - ".air.toml"
     - "server"
     - "pyproject.toml"
+    - "pi-batch.yaml"
+    - "quality.py"
     - "pi-batch-campaign.yaml"
     - "pi-batch-campaign-pipeline.yaml"
   banned_patterns:
