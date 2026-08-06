@@ -24,21 +24,22 @@ var DefaultStorageClass = "STANDARD"
 const DefaultTenant = "default"
 
 var (
-	ErrNotFound             = errors.New("object not found")
-	ErrInvalidArgs          = errors.New("invalid arguments")
-	ErrUploadNotFound       = errors.New("upload not found")
-	ErrLocked               = errors.New("object is under retention lock")
-	ErrQuotaExceeded        = errors.New("tenant quota exceeded")
-	ErrRangeNotSatisfiable  = errors.New("requested range not satisfiable")
-	ErrPreconditionFailed   = errors.New("precondition failed")
-	ErrForbidden            = errors.New("forbidden")
-	ErrTenantDisabled       = errors.New("tenant is disabled")
-	ErrBadDigest            = errors.New("content-md5 mismatch")
-	ErrSizeMismatch         = errors.New("size mismatch: actual bytes differ from Content-Length")
-	ErrObjectCorrupt        = errors.New("object is marked as corrupt")
-	ErrMetadataTooLarge     = errors.New("metadata too large: total exceeds 64 KiB")
-	ErrMetadataKeyTooLong   = errors.New("metadata key too long: max 256 bytes")
-	ErrMetadataValueTooLong = errors.New("metadata value too long: max 64 KiB")
+	ErrNotFound               = errors.New("object not found")
+	ErrInvalidArgs            = errors.New("invalid arguments")
+	ErrUploadNotFound         = errors.New("upload not found")
+	ErrLocked                 = errors.New("object is under retention lock")
+	ErrQuotaExceeded          = errors.New("tenant quota exceeded")
+	ErrEntitlementUnavailable = errors.New("tenant entitlement unavailable")
+	ErrRangeNotSatisfiable    = errors.New("requested range not satisfiable")
+	ErrPreconditionFailed     = errors.New("precondition failed")
+	ErrForbidden              = errors.New("forbidden")
+	ErrTenantDisabled         = errors.New("tenant is disabled")
+	ErrBadDigest              = errors.New("content-md5 mismatch")
+	ErrSizeMismatch           = errors.New("size mismatch: actual bytes differ from Content-Length")
+	ErrObjectCorrupt          = errors.New("object is marked as corrupt")
+	ErrMetadataTooLarge       = errors.New("metadata too large: total exceeds 64 KiB")
+	ErrMetadataKeyTooLong     = errors.New("metadata key too long: max 256 bytes")
+	ErrMetadataValueTooLong   = errors.New("metadata value too long: max 64 KiB")
 
 	// MaxMetadataSize is the maximum total bytes across all user metadata k/v.
 	MaxMetadataSize = 64 * 1024 // 64 KiB
@@ -81,14 +82,15 @@ type ReadVerificationConfig struct {
 }
 
 type FileService struct {
-	store        storage.Storage
-	repo         repository.Repository
-	logger       *slog.Logger
-	sink         EventSink
-	chunkCleaner ChunkCleaner
-	readVerify   ReadVerificationConfig
-	authorizer   access.Authorizer
-	tenantStatus bool
+	store           storage.Storage
+	repo            repository.Repository
+	logger          *slog.Logger
+	sink            EventSink
+	chunkCleaner    ChunkCleaner
+	readVerify      ReadVerificationConfig
+	authorizer      access.Authorizer
+	tenantStatus    bool
+	usageAccountant UsageAccountant
 }
 
 // WithAuthorizer enables resource-level authorization at the FileService
@@ -102,6 +104,15 @@ func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService 
 // tenants. Unknown tenants preserve the implicit-tenant compatibility model.
 func (s *FileService) WithTenantStatusEnforcement() *FileService {
 	s.tenantStatus = true
+	return s
+}
+
+// WithUsageAccountant attaches subscription-aware quota checks and durable
+// usage accounting. The accountant must keep local usage and its outbox in one
+// transaction; it must never make FileService request success depend on a
+// synchronous remote call.
+func (s *FileService) WithUsageAccountant(accountant UsageAccountant) *FileService {
+	s.usageAccountant = accountant
 	return s
 }
 

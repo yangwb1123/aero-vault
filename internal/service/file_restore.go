@@ -46,8 +46,8 @@ func (s *FileService) RestoreObject(ctx context.Context, tenant, bucket, key str
 		}
 		return err
 	}
-	if _, err := s.repo.AddTenantUsage(ctx, tenant, obj.Size, 1); err != nil {
-		s.logger.Warn("quota increment on restore failed", "tenant", tenant, "err", err)
+	if _, err := s.addTenantUsage(ctx, tenant, UsageObjectRestore, obj.Size, 1); err != nil {
+		return err
 	}
 	obj.DeletedAt = nil
 	s.emit(ctx, obj, repository.EventCreated)

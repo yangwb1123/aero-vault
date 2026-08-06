@@ -226,6 +226,61 @@ Snaplink remains the identity, login, tenant-membership, and application-role
 authority. Aero Vault owns file/folder ACLs, ownership, shares, and published
 asset state; no Snaplink domain type enters the service layer.
 
+## Snaplink billing and metering
+
+This optional machine-to-machine integration is independent from browser OIDC.
+Each Aero tenant has its own Snaplink confidential client. The binding file
+contains identifiers and the name of a secret environment variable; it cannot
+contain a client secret because the decoder rejects unknown fields.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BILLING_ENABLED` | `false` | Enable entitlement projection and the durable usage outbox. |
+| `BILLING_BASE_URL` | _(required)_ | HTTPS base URL of `snaplink-billing`. |
+| `BILLING_TOKEN_URL` | _(required)_ | HTTPS Snaplink OAuth token endpoint used for `client_credentials`. |
+| `BILLING_BINDINGS_FILE` | _(required)_ | Server-only JSON mapping each Aero `tenant_id` to a Snaplink `client_id` and `client_secret_env`. |
+| `BILLING_ALLOW_INSECURE_HTTP` | `false` | Permit HTTP only for `localhost` or a loopback IP in development. Never permits a non-loopback HTTP endpoint. |
+| `BILLING_HTTP_TIMEOUT_SECONDS` | `5` | End-to-end timeout for token, entitlement, and usage HTTP requests. |
+| `BILLING_PROJECTION_INTERVAL_SECONDS` | `60` | Refresh interval for versioned entitlement snapshots. |
+| `BILLING_OUTBOX_POLL_MILLISECONDS` | `1000` | Durable usage outbox polling interval. |
+| `BILLING_OUTBOX_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
+| `BILLING_OUTBOX_CLAIM_TTL_SECONDS` | `30` | Multi-replica delivery lease; must exceed the HTTP timeout. |
+
+See [Snaplink billing integration](snaplink-billing.md) for binding format,
+central source-binding requirements, quota semantics, failure behavior, and a
+Helm mounting example.
+
+## Snaplink Audit Governance relay
+
+This optional, default-off runtime forwards only redacted admin, security, and
+file lifecycle facts. It is independent from browser OIDC and from Billing;
+startup rejects reused Billing/Audit client IDs, secret environment names, or
+secret values.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUDIT_GOVERNANCE_ENABLED` | `false` | Enable durable capture, reconcile, and delivery. |
+| `AUDIT_GOVERNANCE_BASE_URL` | _(required)_ | Audit Governance base URL. HTTPS is required except for a literal loopback HTTP endpoint. |
+| `AUDIT_GOVERNANCE_TOKEN_URL` | _(required)_ | Snaplink OAuth token endpoint, with the same URL policy. |
+| `AUDIT_GOVERNANCE_BINDINGS_FILE` | _(required)_ | Revisioned, strict JSON tenant/client binding file; duplicate credentials, symlinks, and group/world-writable files are rejected. |
+| `AUDIT_GOVERNANCE_HMAC_KEY` | _(required)_ | Dedicated `32..4096` byte HMAC key for tenant/field-domain pseudonyms. It must be identical on every replica and must not reuse an OAuth or Billing credential. |
+| `AUDIT_GOVERNANCE_HTTP_TIMEOUT_SECONDS` | `5` | Token/event/database operation timeout (`1..29`). |
+| `AUDIT_GOVERNANCE_POLL_MILLISECONDS` | `1000` | Outbox reconcile/claim interval. |
+| `AUDIT_GOVERNANCE_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
+| `AUDIT_GOVERNANCE_CLAIM_TTL_SECONDS` | `30` | Fenced delivery lease (`1..60`); must exceed twice the HTTP timeout so publish plus acknowledgement/retry remain fenced. |
+| `AUDIT_GOVERNANCE_INITIAL_BACKOFF_SECONDS` | `1` | Initial retry delay before deterministic jitter. |
+| `AUDIT_GOVERNANCE_MAX_BACKOFF_SECONDS` | `300` | Retry cap; facts retry indefinitely. |
+| `AUDIT_GOVERNANCE_MAX_LAG_SECONDS` | `900` | Oldest undelivered outbox age that `/readyz` permits. |
+| `AUDIT_GOVERNANCE_RECONCILE_BATCH_SIZE` | `100` | Historical local facts reconciled per tenant and poll (`2..500`); batches alternate admin/security and file origins. |
+| `AUDIT_GOVERNANCE_DELIVERED_RETENTION_SECONDS` | `604800` | Retain delivered outbox bodies before replacing them with permanent origin tombstones (`3600..31536000`). |
+| `AUDIT_GOVERNANCE_CLEANUP_INTERVAL_SECONDS` | `3600` | Delivered-row cleanup interval (`60..86400`, no greater than retention). Full batches continue at the poll interval. |
+| `AUDIT_GOVERNANCE_CLEANUP_BATCH_SIZE` | `100` | Delivered rows atomically tombstoned and removed per cleanup transaction (`1..500`). |
+
+The OAuth request always asks for the single scope `audit:event:write` and
+RFC 8707 resource `audit-governance`; neither is runtime-configurable. See
+[Snaplink Audit Governance integration](snaplink-audit-governance.md) for the
+fixed schema, source provisioning, redaction, HA, and deployment contract.
+
 ## CORS *(config.go only)*
 
 | Variable | Default | Description |

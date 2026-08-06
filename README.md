@@ -61,6 +61,9 @@ S3-compatible store (AWS S3, MinIO, Alibaba OSS, Tencent COS).
   toggles plus per-object retention locks and canned ACLs.
 - **Events & webhooks** — an in-process event bus persists object-lifecycle
   events, streams them over SSE, and POSTs HMAC-signed webhooks with retry.
+- **Governed audit export** — optional durable, redacted admin/security/file
+  facts delivered through tenant-bound Snaplink machine credentials to
+  Snaplink Audit Governance, with fenced multi-replica claims and replay.
 - **Streaming without a second stateful transport** — SSE powers event and
   chat streams; gRPC and WebSocket endpoints are intentionally not exposed in
   v0.4 because the REST/SDK surface covers the current public and browser use
@@ -192,6 +195,9 @@ The most common knobs:
 | `AUTH_KEYS` | _(open)_ | `token:tenant:scope+scope,...`; empty = no auth. |
 | `AUTH_JWT_SECRET` | _(off)_ | Enables HS256 JWT verification + issuance. |
 | `AUTH_OIDC_ISSUER` | _(off)_ | Enables browser OIDC Authorization Code + PKCE through Snaplink's SDK. |
+| `BILLING_ENABLED` | `false` | Project Snaplink entitlements and deliver durable storage usage facts; see [Snaplink billing integration](docs/snaplink-billing.md). |
+| `AUDIT_GOVERNANCE_ENABLED` | `false` | Relay durable redacted facts to Snaplink Audit Governance; see [Audit Governance integration](docs/snaplink-audit-governance.md). |
+| `AUDIT_GOVERNANCE_HMAC_KEY` | _(required when enabled)_ | Dedicated key for irreversible, tenant-scoped audit pseudonyms; do not reuse OAuth credentials. |
 | `ACCESS_CONTROL_ENABLED` | `false` | Enable ownership, departments, resource ACLs, shares, and public assets. |
 | `S3_SIGV4_CREDENTIALS` | _(off)_ | `accessKey:secretKey:tenant[:scope+scope],...` for the S3 endpoint. |
 | `PROMETHEUS_ENABLED` | `false` | Expose `/metrics`. |

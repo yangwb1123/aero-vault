@@ -27,6 +27,11 @@ func (s *FileService) preflightQuota(ctx context.Context, tenant string, deltaBy
 	if qErr != nil {
 		return fmt.Errorf("get tenant quota: %w", qErr)
 	}
+	if s.usageAccountant != nil {
+		if err := s.usageAccountant.CheckQuota(ctx, tenant, q, deltaBytes, deltaObjects); err != nil {
+			return err
+		}
+	}
 	if err := checkBytesQuota(q, deltaBytes); err != nil {
 		return err
 	}
@@ -105,6 +110,9 @@ func (s *FileService) Put(ctx context.Context, tenant, bucket, key string, r io.
 		return repository.Object{}, err
 	}
 	defer cleanup()
+	if err := s.preflightQuota(ctx, tenant, 0, 0); err != nil {
+		return repository.Object{}, err
+	}
 	if err := s.repo.CreateBucket(ctx, tenant, bucket); err != nil {
 		return repository.Object{}, fmt.Errorf("ensure bucket: %w", err)
 	}
@@ -241,7 +249,9 @@ func (s *FileService) writePutObject(
 			return repository.Object{}, fmt.Errorf("set object legal hold: %w", err)
 		}
 	}
-	s.accountObjectUsage(ctx, obj.TenantID, usage, saved.Size)
+	if err := s.accountObjectUsage(ctx, obj.TenantID, usage, saved.Size); err != nil {
+		return repository.Object{}, err
+	}
 	s.emit(ctx, saved, repository.EventCreated)
 	return saved, nil
 }

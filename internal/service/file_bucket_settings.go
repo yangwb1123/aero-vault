@@ -52,6 +52,9 @@ func (s *FileService) DeleteBucket(ctx context.Context, tenant, bucket string) e
 			return err
 		}
 	}
+	if err := s.preflightQuota(ctx, tenant, 0, 0); err != nil {
+		return err
+	}
 	if err := s.deleteBucketData(ctx, tenant, bucket, objects); err != nil {
 		return err
 	}
@@ -59,8 +62,8 @@ func (s *FileService) DeleteBucket(ctx context.Context, tenant, bucket string) e
 		return err
 	}
 	bytes, count := countedObjectUsage(objects)
-	if _, err := s.repo.AddTenantUsage(ctx, tenant, -bytes, -count); err != nil {
-		s.logger.Warn("quota decrement on bucket delete failed", "tenant", tenant, "err", err)
+	if _, err := s.addTenantUsage(ctx, tenant, UsageBucketDelete, -bytes, -count); err != nil {
+		return fmt.Errorf("record bucket-delete usage: %w", err)
 	}
 	return nil
 }
@@ -68,6 +71,9 @@ func (s *FileService) DeleteBucket(ctx context.Context, tenant, bucket string) e
 func (s *FileService) CreateBucket(ctx context.Context, tenant, bucket string) error {
 	tenant, bucket = defaults(tenant, bucket)
 	if err := s.authorizeBucket(ctx, access.ActionCreate, tenant, bucket); err != nil {
+		return err
+	}
+	if err := s.preflightQuota(ctx, tenant, 0, 0); err != nil {
 		return err
 	}
 	return s.repo.CreateBucket(ctx, tenant, bucket)

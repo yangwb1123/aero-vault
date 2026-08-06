@@ -134,6 +134,21 @@ secrets: {}
 # When set, the chart skips creating its own Secret and envFrom-references this.
 existingSecret: ""
 
+# Optional Snaplink Audit Governance durable relay. The referenced ConfigMap
+# contains only the revisioned binding JSON; put each client secret environment
+# variable in existingSecret/the chart Secret. Binding changes require a roll.
+auditGovernance:
+  enabled: false
+  baseURL: ""
+  tokenURL: ""
+  # Dedicated Secret/key containing >=32 random bytes. Do not reuse an OAuth,
+  # Billing, JWT, presign, or storage credential.
+  hmacSecretName: ""
+  hmacSecretKey: "AUDIT_GOVERNANCE_HMAC_KEY"
+  bindingsConfigMap: ""
+  bindingsKey: "bindings.json"
+  mountPath: "/etc/aero-vault/audit-governance-bindings.json"
+
 # Extra raw env entries (full container env syntax: name+value or name+valueFrom).
 extraEnv: []
   # - name: POD_IP

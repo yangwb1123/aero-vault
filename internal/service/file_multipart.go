@@ -46,6 +46,9 @@ func (s *FileService) InitMultipart(ctx context.Context, tenant, bucket, key str
 	if err := s.prepareSSECWrite(&opts); err != nil {
 		return repository.Upload{}, err
 	}
+	if err := s.preflightQuota(ctx, tenant, 0, 0); err != nil {
+		return repository.Upload{}, err
+	}
 	if err := s.repo.CreateBucket(ctx, tenant, bucket); err != nil {
 		return repository.Upload{}, err
 	}
@@ -117,6 +120,9 @@ func (s *FileService) UploadPartFor(
 ) (repository.PartRecord, error) {
 	u, err := s.loadMultipartUpload(ctx, scope, uploadID)
 	if err != nil {
+		return repository.PartRecord{}, err
+	}
+	if err := s.preflightQuota(ctx, u.TenantID, 0, 0); err != nil {
 		return repository.PartRecord{}, err
 	}
 	if err := validateSSECRead(u.Metadata, opts); err != nil {

@@ -148,6 +148,11 @@ func (h *AdminHandler) RevokeKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tok := chiURLParam(r, "token")
+	tenant, _, err := h.reg.TenantForKey(r.Context(), tok)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		return
+	}
 	revoked, err := h.reg.RevokeKey(r.Context(), tok)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
@@ -157,7 +162,7 @@ func (h *AdminHandler) RevokeKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorBody{Error: errorPayload{Code: "NotFound", Message: "no such key"}})
 		return
 	}
-	h.audit(r, "key.revoke", redactToken(tok), "")
+	h.auditForTenant(r, "key.revoke", redactToken(tok), "", tenant)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -244,11 +249,13 @@ func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: err.Error()}})
 		return
 	}
-	if err := h.svc.SetBucketQuota(r.Context(), mw.TenantFrom(r.Context()), bucket, req.MaxBytes, req.MaxObjects); err != nil {
+	tenant := mw.TenantFrom(r.Context())
+	if err := h.svc.SetBucketQuota(r.Context(), tenant, bucket, req.MaxBytes, req.MaxObjects); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}
-	h.audit(r, "bucket.quota.update", bucket, fmt.Sprintf("max_bytes=%d,max_objects=%d", req.MaxBytes, req.MaxObjects))
+	h.auditForTenant(r, "bucket.quota.update", bucket,
+		fmt.Sprintf("max_bytes=%d,max_objects=%d", req.MaxBytes, req.MaxObjects), tenant)
 	writeJSON(w, http.StatusOK, map[string]any{"max_bytes": req.MaxBytes, "max_objects": req.MaxObjects})
 }
 
@@ -401,6 +408,12 @@ func tenantJSON(rec repository.TenantRecord) map[string]any {
 // and writes an audit-log entry. Any error is intentionally swallowed —
 // auditing must never break or fail the underlying admin action.
 func (h *AdminHandler) audit(r *http.Request, action, target, detail string) {
+	h.auditForTenant(r, action, target, detail, target)
+}
+
+func (h *AdminHandler) auditForTenant(
+	r *http.Request, action, target, detail, tenant string,
+) {
 	actor := ""
 	if k, ok := auth.FromContext(r.Context()); ok {
 		actor = k.Tenant
@@ -409,7 +422,7 @@ func (h *AdminHandler) audit(r *http.Request, action, target, detail string) {
 		Actor:    actor,
 		Action:   action,
 		Target:   target,
-		TenantID: target,
+		TenantID: tenant,
 		Detail:   detail,
 	})
 }

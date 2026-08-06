@@ -1,0 +1,9 @@
+{
+  "bindings": [
+    {
+      "tenant_id": "acme",
+      "client_id": "aero-vault-acme",
+      "client_secret_env": "SNAPLINK_BILLING_ACME_SECRET"
+    }
+  ]
+}

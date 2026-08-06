@@ -30,6 +30,8 @@ func classify(err error) (string, string, int) {
 	switch {
 	case errors.Is(err, service.ErrTenantDisabled):
 		return "TenantDisabled", service.ErrTenantDisabled.Error(), http.StatusForbidden
+	case errors.Is(err, service.ErrEntitlementUnavailable):
+		return "EntitlementUnavailable", service.ErrEntitlementUnavailable.Error(), http.StatusServiceUnavailable
 	case errors.Is(err, service.ErrQuotaExceeded):
 		return "QuotaExceeded", err.Error(), http.StatusInsufficientStorage
 	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):

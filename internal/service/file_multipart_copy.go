@@ -59,6 +59,9 @@ func (s *FileService) UploadPartCopyFor(
 	if err != nil {
 		return repository.PartRecord{}, err
 	}
+	if err := s.preflightQuota(ctx, upload.TenantID, 0, 0); err != nil {
+		return repository.PartRecord{}, err
+	}
 	if srcBucket == "" {
 		srcBucket = upload.Bucket
 	}

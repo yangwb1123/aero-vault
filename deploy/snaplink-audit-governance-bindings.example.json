@@ -1,0 +1,11 @@
+{
+  "revision": 1,
+  "bindings": [
+    {
+      "tenant_id": "tenant-example",
+      "client_id": "aero-vault-audit-relay",
+      "client_secret_env": "AUDIT_GOVERNANCE_CLIENT_SECRET_TENANT_EXAMPLE",
+      "state": "active"
+    }
+  ]
+}

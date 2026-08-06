@@ -12,8 +12,10 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
+	"github.com/aero-vault/aero-vault/internal/auditgovernance"
 	"github.com/aero-vault/aero-vault/internal/cli"
 	"github.com/aero-vault/aero-vault/internal/config"
+	"github.com/aero-vault/aero-vault/internal/events"
 	"github.com/aero-vault/aero-vault/internal/jobs"
 	"github.com/aero-vault/aero-vault/internal/mcp"
 	"github.com/aero-vault/aero-vault/internal/middleware"
@@ -60,6 +62,25 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure enterprise access: %w", err)
 	}
+	billingRuntime, err := buildBillingRuntime(cfg, repo, logger)
+	if err != nil {
+		return err
+	}
+	auditRuntime, err := buildAuditGovernanceRuntime(cfg, repo, logger)
+	if err != nil {
+		return err
+	}
+	if billingRuntime != nil {
+		defer billingRuntime.Close()
+		billingRuntime.Start(ctx)
+		repo = wrapBillingRepository(repo, billingRuntime)
+	}
+	if auditRuntime != nil {
+		defer auditRuntime.Close()
+		auditRuntime.Start(ctx)
+		repo = auditgovernance.WrapRepository(repo, auditRuntime)
+		bus.WithRepository(repo)
+	}
 
 	embedder := buildEmbedder(cfg, logger)
 	if cfg.AI.EmbedCacheSize > 0 {
@@ -77,6 +98,9 @@ func run() error {
 			MaxSize: cfg.Storage.VerifyMaxSize,
 			Sample:  cfg.Storage.VerifySample,
 		})
+	if billingRuntime != nil {
+		svc.WithUsageAccountant(billingRuntime)
+	}
 	if cfg.Storage.VerifyOnRead {
 		logger.Info("read-path verification enabled",
 			"max_size", cfg.Storage.VerifyMaxSize,
@@ -128,7 +152,7 @@ func run() error {
 	registerGauges(repo)
 
 	aiTimeout := time.Duration(cfg.App.RequestTimeoutSec) * time.Second
-	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, accessManager, oidcHandler, promHandler, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider)
+	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, accessManager, oidcHandler, promHandler, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider, runtimeReadiness(billingRuntime, auditRuntime))
 	cl := middleware.NewConcurrencyLimiter(cfg.App.MaxInFlight)
 	var concurrencyMW func(http.Handler) http.Handler
 	if cfg.App.PerTenantMax > 0 {
@@ -167,8 +191,31 @@ func runMCP() error {
 	if err != nil {
 		return fmt.Errorf("configure enterprise access: %w", err)
 	}
+	billingRuntime, err := buildBillingRuntime(cfg, repo, logger)
+	if err != nil {
+		return err
+	}
+	auditRuntime, err := buildAuditGovernanceRuntime(cfg, repo, logger)
+	if err != nil {
+		return err
+	}
+	if billingRuntime != nil {
+		defer billingRuntime.Close()
+		billingRuntime.Start(ctx)
+		repo = wrapBillingRepository(repo, billingRuntime)
+	}
+	if auditRuntime != nil {
+		defer auditRuntime.Close()
+		auditRuntime.Start(ctx)
+		repo = auditgovernance.WrapRepository(repo, auditRuntime)
+	}
 	ctx = access.SystemContext(ctx, "default")
-	svc := service.NewFileService(store, repo, logger).WithAuthorizer(accessManager)
+	bus := events.NewWithBuffer(repo, logger, cfg.Events.SubBufferSize)
+	defer bus.Close()
+	svc := service.NewFileService(store, repo, logger).WithAuthorizer(accessManager).WithEventSink(bus)
+	if billingRuntime != nil {
+		svc.WithUsageAccountant(billingRuntime)
+	}
 	embedder := buildEmbedder(cfg, logger)
 	llm := buildLLM(cfg, logger)
 	var search *ai.Search

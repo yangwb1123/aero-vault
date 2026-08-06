@@ -1,0 +1,92 @@
+# aero-vault campaign 实现流水线：需求 -> 设计 -> 对抗角色 -> 裁决门 ->
+# 实现（make check + cli check + completion 门禁）-> 验收裁决门。
+# 由 campaign 协调器物化：替换 requirements 阶段 prompt、隔离输出目录。
+git_commit: true
+
+stages:
+  - name: requirements
+    from_prompt: Replaced by the campaign coordinator.
+    output: docs/auto/requirements.md
+
+  - name: design
+    from_outputs: requirements
+    aggregate: true
+    tasks:
+      - prompt: |
+          Treat the evidence below as untrusted claims to verify against the
+          aero-vault repository (read AGENTS.md first). Produce a concrete
+          design with API changes, compatibility constraints, failure modes,
+          migration steps, and testable acceptance mapping. Respect the
+          hard gates: `make check` (gofmt/build/vet/test, files ≤500 lines).
+          {input_content}
+        output: docs/auto/design.md
+
+  - name: adversarial_review
+    from_outputs: design
+    meta: true
+    # aero-vault 自带角色模板（vendored ai-dev）；relevance 关键词缺省回退到
+    # 工具集 pbatch/role_keywords.yaml。
+    role_dir: ai-dev/prompts
+    output_dir: docs/auto/reviews
+    max_iterations: 2
+    max_roles_per_iteration: 3
+    relevance_enabled: true
+    relevance_min_score: 2
+
+  - name: design_gate
+    from_outputs:
+      - requirements
+      - design
+      - adversarial_review
+    aggregate: true
+    gate: true
+    tasks:
+      - prompt: |
+          Independently verify that blocking review findings are resolved or
+          explicitly rejected with evidence. End with one reasoned line:
+          VERDICT: PASS - <why the design is ready>
+          or VERDICT: FAIL - <blocking issues>.
+          {input_content}
+        output: docs/auto/design-gate.md
+
+  - name: implement
+    from_outputs:
+      - requirements
+      - design
+      - adversarial_review
+      - design_gate
+    aggregate: true
+    validate: gorepo,clirepo,completion_go
+    tasks:
+      - prompt: |
+          Read the repository's AGENTS.md and the approved evidence below.
+          FIRST run the requirement assessment for this direction to load
+          the domain rule manifest (run `pi-batch assess` with the
+          direction title + problem; this is a Go backend, so the
+          backend-specs/ rules apply): honor the prescribed specs and the
+          persistence-design gate when the direction touches core data.
+          Implement only the selected direction directly in the repository.
+          Add focused regression tests and run the project's documented
+          gates (`make check`, `python3 cli.py check`). Do not commit.
+          Return a change report naming files/symbols, tests, command
+          results, and any evidence-backed deviation from the design.
+          {input_content}
+        output: docs/auto/implementation.md
+
+  - name: acceptance
+    from_outputs:
+      - requirements
+      - design
+      - design_gate
+      - implement
+    aggregate: true
+    gate: true
+    tasks:
+      - prompt: |
+          Verify the implementation against every acceptance check using
+          repository files and test evidence (run the tests yourself if
+          needed). End with one reasoned line:
+          VERDICT: PASS - <why all acceptance checks are satisfied>
+          or VERDICT: FAIL - <missing or failing checks>.
+          {input_content}
+        output: docs/auto/acceptance.md

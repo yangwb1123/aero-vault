@@ -86,6 +86,14 @@ than putting credentials in values.
   single replica (ReadWriteOnce). For multiple replicas use Postgres + S3 and
   disable persistence.
 - Probes hit `/healthz` (liveness/startup) and `/readyz` (readiness).
+- Enable the Snaplink Audit Governance relay with
+  `auditGovernance.enabled=true`, its HTTPS `baseURL`/`tokenURL`, and
+  `bindingsConfigMap`. Set `hmacSecretName` to a dedicated Secret containing
+  the key selected by `hmacSecretKey`. Store the binding JSON under
+  `bindingsKey` and put every named `AUDIT_GOVERNANCE_CLIENT_SECRET_*` variable
+  in `existingSecret`; the HMAC key, Audit OAuth clients, and Billing machine
+  credentials must all be distinct. See
+  [`docs/snaplink-audit-governance.md`](../../../docs/snaplink-audit-governance.md).
 
 ## Validate locally
 

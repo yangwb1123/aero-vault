@@ -62,6 +62,7 @@ var s3CodeStatus = map[string]int{
 	"AccessDenied.Locked":          http.StatusForbidden,
 	"ObjectCorrupt":                http.StatusGone,
 	"QuotaExceeded":                http.StatusForbidden,
+	"ServiceUnavailable":           http.StatusServiceUnavailable,
 	"NotImplemented":               http.StatusNotImplemented,
 }
 
@@ -84,6 +85,7 @@ var s3CodeMessage = map[string]string{
 	"AccessDenied.Locked":          "Object is under retention lock (WORM).",
 	"ObjectCorrupt":                "Object is marked as corrupt.",
 	"QuotaExceeded":                "The tenant storage quota has been exceeded.",
+	"ServiceUnavailable":           "The tenant entitlement projection is unavailable.",
 	"NotImplemented":               "A requested feature is not implemented.",
 }
 
@@ -112,6 +114,7 @@ var errToS3Code = []struct {
 	{repository.ErrUploadNotFound, "NoSuchUpload"},
 	{service.ErrLocked, "AccessDenied.Locked"},
 	{service.ErrQuotaExceeded, "QuotaExceeded"},
+	{service.ErrEntitlementUnavailable, "ServiceUnavailable"},
 	{service.ErrForbidden, "AccessDenied"},
 	{service.ErrObjectCorrupt, "ObjectCorrupt"},
 }

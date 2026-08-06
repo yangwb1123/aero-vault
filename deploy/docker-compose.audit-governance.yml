@@ -1,0 +1,12 @@
+services:
+  app:
+    stop_grace_period: 95s
+    environment:
+      AUDIT_GOVERNANCE_ENABLED: "true"
+      AUDIT_GOVERNANCE_BASE_URL: "${AUDIT_GOVERNANCE_BASE_URL}"
+      AUDIT_GOVERNANCE_TOKEN_URL: "${AUDIT_GOVERNANCE_TOKEN_URL}"
+      AUDIT_GOVERNANCE_BINDINGS_FILE: /run/aero-vault/audit-governance-bindings.json
+      AUDIT_GOVERNANCE_HMAC_KEY: "${AUDIT_GOVERNANCE_HMAC_KEY:?set a dedicated random HMAC key of at least 32 bytes}"
+      AUDIT_GOVERNANCE_CLIENT_SECRET_TENANT_EXAMPLE: "${AUDIT_GOVERNANCE_CLIENT_SECRET_TENANT_EXAMPLE}"
+    volumes:
+      - ./snaplink-audit-governance-bindings.example.json:/run/aero-vault/audit-governance-bindings.json:ro

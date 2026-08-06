@@ -222,7 +222,9 @@ func (s *FileService) finishMultipartCompletion(
 	if err != nil {
 		return repository.Object{}, s.releaseMultipartCompletion(ctx, scope, idemKey, err)
 	}
-	s.persistMultipartCompletion(ctx, u, saved, usage, idemKey)
+	if err := s.persistMultipartCompletion(ctx, u, saved, usage, idemKey); err != nil {
+		return repository.Object{}, err
+	}
 	return saved, nil
 }
 
@@ -274,18 +276,21 @@ func (s *FileService) persistMultipartCompletion(
 	saved repository.Object,
 	usage objectWriteUsage,
 	idemKey string,
-) {
+) error {
+	if err := s.accountObjectUsage(ctx, u.TenantID, usage, saved.Size); err != nil {
+		return err
+	}
 	body, _ := json.Marshal(saved)
 	if err := s.repo.CompleteIdempotencyKey(
 		ctx, u.TenantID, idemKey, http.StatusOK, body, "application/json", nil,
 	); err != nil {
 		s.logger.Warn("cache multipart completion", "upload_id", u.ID, "err", err)
 	}
-	s.accountObjectUsage(ctx, u.TenantID, usage, saved.Size)
 	if err := s.repo.DeleteUpload(ctx, u.ID); err != nil {
 		s.logger.Warn("delete completed multipart upload", "upload_id", u.ID, "err", err)
 	}
 	s.emit(ctx, saved, repository.EventCreated)
+	return nil
 }
 
 func buildPartList(

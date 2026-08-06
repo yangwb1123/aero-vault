@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/aero-vault/aero-vault/internal/auth"
+	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
@@ -63,14 +64,16 @@ func newBucketQuotaAuthTestServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatalf("new local storage: %v", err)
 	}
-	reg, err := auth.Parse("writer:default:write,operator:*:admin")
+	reg, err := auth.Parse("writer:default:write,operator:acme:admin")
 	if err != nil {
 		t.Fatalf("parse auth: %v", err)
 	}
 	adm := NewAdminHandler(service.NewFileService(store, repo, nil), repo, reg)
 	r := chi.NewRouter()
+	r.Use(mw.Tenant)
 	r.Use(reg.Middleware())
 	r.Put("/v1/admin/buckets/{bucket}/quota", adm.PutBucketQuota)
+	r.Get("/v1/admin/audit", adm.ListAudit)
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 	return srv
@@ -180,13 +183,29 @@ func TestAdminBucketQuotaRequiresAdmin(t *testing.T) {
 	url := srv.URL + "/v1/admin/buckets/default/quota"
 	body := []byte(`{"max_bytes":1024,"max_objects":10}`)
 
-	resp, got := req(t, http.MethodPut, url, body, map[string]string{"Authorization": "Bearer writer"})
+	writerHeaders := map[string]string{"Authorization": "Bearer writer", mw.TenantHeader: "acme"}
+	resp, got := req(t, http.MethodPut, url, body, writerHeaders)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("write-only key: status=%d want 403, body=%s", resp.StatusCode, got)
 	}
 
-	resp, got = req(t, http.MethodPut, url, body, map[string]string{"Authorization": "Bearer operator"})
+	operatorHeaders := map[string]string{"Authorization": "Bearer operator", mw.TenantHeader: "acme"}
+	resp, got = req(t, http.MethodPut, url, body, operatorHeaders)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin key: status=%d want 200, body=%s", resp.StatusCode, got)
+	}
+
+	resp, got = req(t, http.MethodGet, srv.URL+"/v1/admin/audit", nil, operatorHeaders)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("audit list: status=%d body=%s", resp.StatusCode, got)
+	}
+	var audit struct {
+		Entries []repository.AuditEntry `json:"audit"`
+	}
+	if err := json.Unmarshal(got, &audit); err != nil || len(audit.Entries) != 1 {
+		t.Fatalf("audit entries=%+v err=%v", audit.Entries, err)
+	}
+	if audit.Entries[0].TenantID != "acme" || audit.Entries[0].Target != "default" {
+		t.Fatalf("bucket quota audit attribution=%+v", audit.Entries[0])
 	}
 }

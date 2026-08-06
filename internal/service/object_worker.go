@@ -55,6 +55,9 @@ func (s *FileService) QuarantineObjectByID(ctx context.Context, objectID int64) 
 	if obj.DeletedAt != nil {
 		return nil
 	}
+	if err := s.preflightQuota(ctx, obj.TenantID, 0, 0); err != nil {
+		return err
+	}
 	if s.chunkCleaner != nil && !IsDeleteMarker(obj) {
 		if err := s.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
 			s.logger.Warn("chunk cleanup on quarantine failed", "object_id", obj.ID, "err", err)
@@ -64,8 +67,8 @@ func (s *FileService) QuarantineObjectByID(ctx context.Context, objectID int64) 
 		return err
 	}
 	bytes, objects := countedObjectUsage([]repository.Object{obj})
-	if _, err := s.repo.AddTenantUsage(ctx, obj.TenantID, -bytes, -objects); err != nil {
-		s.logger.Warn("quota decrement on quarantine failed", "tenant", obj.TenantID, "err", err)
+	if _, err := s.addTenantUsage(ctx, obj.TenantID, UsageQuarantine, -bytes, -objects); err != nil {
+		return err
 	}
 	s.emit(ctx, obj, repository.EventDeleted)
 	return nil

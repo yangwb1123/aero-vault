@@ -10,11 +10,12 @@ Group=u1
 WorkingDirectory=/home/u1/aero-vault
 StateDirectory=aero-vault
 Environment=AERO_STATE_DIR=/var/lib/aero-vault
+EnvironmentFile=-/etc/aero-vault/audit-governance.env
 ExecStartPre=/usr/bin/test -x /home/u1/aero-vault/bin/aero-vault
 ExecStart=/home/u1/aero-vault/deploy/run-fullstack-snaplink.sh
 Restart=always
 RestartSec=5
-TimeoutStopSec=20
+TimeoutStopSec=95
 NoNewPrivileges=true
 
 [Install]

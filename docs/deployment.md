@@ -229,8 +229,12 @@ Postgres + S3/MinIO deployments, back up PostgreSQL with `pg_dump`/WAL archival
 and enable bucket versioning or replication; both metadata and object-store
 backups are required for a complete restore.
 
-**Health checks.** Wire liveness to `/healthz` and readiness to `/readyz` so the
-app is only sent traffic once the database is reachable.
+**Health checks.** Wire liveness to `/healthz` and readiness to `/readyz`.
+Readiness covers database/storage plus enabled Billing projection and Audit
+Governance binding drain/maximum-backlog-lag checks; liveness never depends on
+those remote services. Supervisors must allow at least 95 seconds for a bounded
+Audit Governance relay drain. See
+[the Audit Governance deployment contract](snaplink-audit-governance.md).
 
 ### `source.ywbsd.site` systemd + FRP deployment
 

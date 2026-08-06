@@ -48,11 +48,14 @@ func (s *FileService) objectWriteUsage(ctx context.Context, tenant, bucket, key 
 	return objectWriteUsage{previousSize: current.Size}, nil
 }
 
-func (s *FileService) accountObjectUsage(ctx context.Context, tenant string, usage objectWriteUsage, actualSize int64) {
+func (s *FileService) accountObjectUsage(
+	ctx context.Context, tenant string, usage objectWriteUsage, actualSize int64,
+) error {
 	deltaBytes, deltaObjects := usage.deltas(actualSize)
-	if _, err := s.repo.AddTenantUsage(ctx, tenant, deltaBytes, deltaObjects); err != nil {
-		s.logger.Warn("quota usage update failed", "tenant", tenant, "err", err)
+	if _, err := s.addTenantUsage(ctx, tenant, UsageObjectWrite, deltaBytes, deltaObjects); err != nil {
+		return fmt.Errorf("record quota usage: %w", err)
 	}
+	return nil
 }
 
 func (s *FileService) validateStoredSize(

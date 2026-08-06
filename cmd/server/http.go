@@ -28,16 +28,40 @@ import (
 	"log/slog"
 )
 
-func readyzHandler(repo repository.Repository, store storage.Storage) http.HandlerFunc {
+type readinessChecker interface {
+	Ready(context.Context) error
+}
+
+type readinessGroup []readinessChecker
+
+func (g readinessGroup) Ready(ctx context.Context) error {
+	for _, checker := range g {
+		if err := checker.Ready(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readyzHandler(
+	repo repository.Repository, store storage.Storage, extra readinessChecker,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if err := repo.Ping(req.Context()); err != nil {
-			http.Error(w, "db: "+err.Error(), http.StatusServiceUnavailable)
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		if _, err := store.Stat(req.Context(), "@healthz/probe"); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			http.Error(w, "storage: "+err.Error(), http.StatusServiceUnavailable)
+			http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		if extra != nil {
+			if err := extra.Ready(req.Context()); err != nil {
+				http.Error(w, "runtime dependency unavailable", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}
@@ -56,7 +80,7 @@ func buildDispatcher(r *chi.Mux, davH http.Handler, cfg *config.Config) http.Han
 	})
 }
 
-func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider) http.Handler {
+func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider, extraReady readinessChecker) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -67,7 +91,7 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"service":"aero-vault","version":"0.1.0"}` + "\n"))
 	})
-	r.Get("/readyz", readyzHandler(repo, store))
+	r.Get("/readyz", readyzHandler(repo, store, extraReady))
 	if promHandler != nil {
 		r.Method(http.MethodGet, "/metrics", promHandler)
 	}

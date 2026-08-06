@@ -45,8 +45,8 @@ func (s *FileService) hardDeleteObject(ctx context.Context, obj repository.Objec
 		return err
 	}
 	bytes, objects := countedObjectUsage(versions)
-	if _, qErr := s.repo.AddTenantUsage(ctx, tenant, -bytes, -objects); qErr != nil {
-		s.logger.Warn("quota decrement on hard delete failed", "err", qErr)
+	if _, qErr := s.addTenantUsage(ctx, tenant, UsageObjectDelete, -bytes, -objects); qErr != nil {
+		return fmt.Errorf("record hard-delete usage: %w", qErr)
 	}
 	s.emit(ctx, obj, repository.EventDeleted)
 	return nil
@@ -84,8 +84,8 @@ func (s *FileService) softDeleteObject(ctx context.Context, obj repository.Objec
 	if err := s.repo.SoftDeleteObject(ctx, tenant, bucket, key); err != nil {
 		return err
 	}
-	if _, qErr := s.repo.AddTenantUsage(ctx, tenant, -obj.Size, -1); qErr != nil {
-		s.logger.Warn("quota decrement on soft delete failed", "err", qErr)
+	if _, qErr := s.addTenantUsage(ctx, tenant, UsageObjectDelete, -obj.Size, -1); qErr != nil {
+		return fmt.Errorf("record soft-delete usage: %w", qErr)
 	}
 	s.emit(ctx, obj, repository.EventDeleted)
 	return nil
@@ -108,6 +108,9 @@ func (s *FileService) Delete(ctx context.Context, tenant, bucket, key string, ha
 	if err := s.authorizeObject(ctx, access.ActionDelete, obj); err != nil {
 		return err
 	}
+	if err := s.preflightQuota(ctx, tenant, 0, 0); err != nil {
+		return err
+	}
 	if hard {
 		return s.hardDeleteObject(ctx, obj, tenant, bucket, key)
 	}
@@ -126,6 +129,9 @@ func (s *FileService) DeleteVersion(ctx context.Context, tenant, bucket, key, ve
 		return err
 	}
 	if err := s.checkObjectProtection(ctx, obj); err != nil {
+		return err
+	}
+	if err := s.preflightQuota(ctx, obj.TenantID, 0, 0); err != nil {
 		return err
 	}
 	versions, err := s.repo.ListObjectVersions(
@@ -149,8 +155,8 @@ func (s *FileService) DeleteVersion(ctx context.Context, tenant, bucket, key, ve
 		return err
 	}
 	bytes, objects := countedObjectUsage([]repository.Object{obj})
-	if _, err := s.repo.AddTenantUsage(ctx, obj.TenantID, -bytes, -objects); err != nil {
-		s.logger.Warn("quota decrement on version delete failed", "tenant", obj.TenantID, "err", err)
+	if _, err := s.addTenantUsage(ctx, obj.TenantID, UsageObjectDelete, -bytes, -objects); err != nil {
+		return fmt.Errorf("record version-delete usage: %w", err)
 	}
 	s.emit(ctx, obj, repository.EventDeleted)
 	if wasCurrent {

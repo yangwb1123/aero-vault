@@ -1,9 +1,12 @@
 package events
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -135,6 +138,35 @@ func TestPublish_InsertFailureSuppressesBroadcast(t *testing.T) {
 	b.Publish(context.Background(), repository.Event{Key: "k", Type: repository.EventCreated})
 
 	expectNothing(t, ch, 50*time.Millisecond)
+}
+
+func TestPublishFailureLogDoesNotExposeIdentifiersOrErrorText(t *testing.T) {
+	const raw = "tenant-secret raw/key bearer-token client-secret"
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	repo := &fakeRepo{err: errors.New(raw)}
+	b := New(repo, logger)
+	event := repository.Event{
+		TenantID: "tenant-secret", Bucket: "private", Key: "raw/key",
+		Type: repository.EventCreated, Payload: map[string]string{"token": "bearer-token"},
+	}
+	b.Publish(context.Background(), event)
+	assertEventLogRedacted(t, logs.String(), raw)
+
+	logs.Reset()
+	repo.err = nil
+	b.WithTransport(func(context.Context, repository.Event) error { return errors.New(raw) })
+	b.Publish(context.Background(), event)
+	assertEventLogRedacted(t, logs.String(), raw)
+}
+
+func assertEventLogRedacted(t *testing.T, logs, raw string) {
+	t.Helper()
+	for _, forbidden := range strings.Fields(raw) {
+		if strings.Contains(logs, forbidden) {
+			t.Fatalf("event log leaked %q: %s", forbidden, logs)
+		}
+	}
 }
 
 func TestSubscribe_BufferedAndDropsWhenFull(t *testing.T) {

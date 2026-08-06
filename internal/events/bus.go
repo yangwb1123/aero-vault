@@ -61,13 +61,29 @@ func (b *Bus) WithTransport(fn func(context.Context, repository.Event) error) *B
 	return b
 }
 
+// WithRepository replaces the persistence adapter before traffic is served.
+// It is used by optional durable wrappers that must atomically extend event
+// persistence without changing FileService or protocol adapters.
+func (b *Bus) WithRepository(repo repository.Repository) *Bus {
+	if repo == nil {
+		return b
+	}
+	b.mu.Lock()
+	b.repo = repo
+	b.mu.Unlock()
+	return b
+}
+
 // Publish persists the event then broadcasts it locally and, if a transport is
 // attached, fans it out to other instances. Errors are logged but never
 // propagated — lifecycle events must not break user requests.
 func (b *Bus) Publish(ctx context.Context, e repository.Event) {
-	id, err := b.repo.InsertEvent(ctx, e)
+	b.mu.RLock()
+	repo := b.repo
+	b.mu.RUnlock()
+	id, err := repo.InsertEvent(ctx, e)
 	if err != nil {
-		b.logger.Warn("event insert failed", "type", string(e.Type), "key", e.Key, "err", err)
+		b.logger.Warn("event insert failed", "type", string(e.Type), "error_class", "persistence")
 		return
 	}
 	e.ID = id
@@ -77,7 +93,8 @@ func (b *Bus) Publish(ctx context.Context, e repository.Event) {
 	b.mu.RUnlock()
 	if transport != nil {
 		if err := transport(ctx, e); err != nil {
-			b.logger.Warn("event transport publish failed", "type", string(e.Type), "err", err)
+			b.logger.Warn("event transport publish failed",
+				"type", string(e.Type), "error_class", "transport")
 		}
 	}
 }

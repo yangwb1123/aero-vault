@@ -17,6 +17,7 @@ spec:
         # Roll pods when the rendered config/secret changes.
         checksum/config: {{ .Values.config | toYaml | sha256sum }}
         checksum/secret: {{ .Values.secrets | toYaml | sha256sum }}
+        checksum/audit-governance: {{ .Values.auditGovernance | toYaml | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -26,6 +27,8 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # Covers the relay's maximum 60s lease plus its maximum 29s HTTP bound.
+      terminationGracePeriodSeconds: 95
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -50,9 +53,26 @@ spec:
             - secretRef:
                 name: {{ include "aero-vault.secretName" . }}
             {{- end }}
-          {{- with .Values.extraEnv }}
+          {{- if or .Values.auditGovernance.enabled .Values.extraEnv }}
           env:
+            {{- if .Values.auditGovernance.enabled }}
+            - name: AUDIT_GOVERNANCE_ENABLED
+              value: "true"
+            - name: AUDIT_GOVERNANCE_BASE_URL
+              value: {{ required "auditGovernance.baseURL is required when enabled" .Values.auditGovernance.baseURL | quote }}
+            - name: AUDIT_GOVERNANCE_TOKEN_URL
+              value: {{ required "auditGovernance.tokenURL is required when enabled" .Values.auditGovernance.tokenURL | quote }}
+            - name: AUDIT_GOVERNANCE_BINDINGS_FILE
+              value: {{ required "auditGovernance.mountPath is required when enabled" .Values.auditGovernance.mountPath | quote }}
+            - name: AUDIT_GOVERNANCE_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auditGovernance.hmacSecretName is required when enabled" .Values.auditGovernance.hmacSecretName }}
+                  key: {{ required "auditGovernance.hmacSecretKey is required when enabled" .Values.auditGovernance.hmacSecretKey }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           livenessProbe:
             httpGet:
@@ -81,6 +101,12 @@ spec:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
             {{- end }}
+            {{- if .Values.auditGovernance.enabled }}
+            - name: audit-governance-bindings
+              mountPath: {{ required "auditGovernance.mountPath is required when enabled" .Values.auditGovernance.mountPath }}
+              subPath: {{ required "auditGovernance.bindingsKey is required when enabled" .Values.auditGovernance.bindingsKey }}
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -92,6 +118,15 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "aero-vault.pvcName" . }}
+        {{- end }}
+        {{- if .Values.auditGovernance.enabled }}
+        - name: audit-governance-bindings
+          configMap:
+            name: {{ required "auditGovernance.bindingsConfigMap is required when enabled" .Values.auditGovernance.bindingsConfigMap }}
+            defaultMode: 0444
+            items:
+              - key: {{ required "auditGovernance.bindingsKey is required when enabled" .Values.auditGovernance.bindingsKey }}
+                path: {{ required "auditGovernance.bindingsKey is required when enabled" .Values.auditGovernance.bindingsKey }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
