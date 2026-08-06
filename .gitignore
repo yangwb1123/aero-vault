@@ -40,3 +40,4 @@ logs/
 docs/archive/
 docs/auto/
 docs/requirements/runs/
+.pi-batch.lock

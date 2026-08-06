@@ -18,6 +18,11 @@ stages:
           design with API changes, compatibility constraints, failure modes,
           migration steps, and testable acceptance mapping. Respect the
           hard gates: `make check` (gofmt/build/vet/test, files ≤500 lines).
+          BEFORE finalizing: look for previous attempts of this direction in
+          docs/auto/runs/ (this pipeline's own directory and siblings with a
+          similar name): read their DECISIONS.md and design-gate verdicts
+          and resolve or explicitly disposition EVERY outstanding finding
+          with evidence — the gate will re-check them.
           {input_content}
         output: docs/auto/design.md
 
@@ -68,6 +73,9 @@ stages:
           Implement only the selected direction directly in the repository.
           Add focused regression tests and run the project's documented
           gates (`make check`, `python3 cli.py check`). Do not commit.
+          BEFORE implementing: read this pipeline's DECISIONS.md and any
+          prior design-gate verdicts in docs/auto/runs/ and address every
+          outstanding finding in code + tests (not just in prose).
           Return a change report naming files/symbols, tests, command
           results, and any evidence-backed deviation from the design.
           {input_content}
