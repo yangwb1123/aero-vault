@@ -95,6 +95,24 @@ func TestInvalidBucketPolicyRejectedAndStoredInvalidPolicyFailsClosed(t *testing
 	}
 }
 
+func TestPutBucketPolicyRejectsInvalidEffect(t *testing.T) {
+	s := newTestServer(t)
+	base := s.URL + "/bucket"
+	resp, _ := do(t, http.MethodPut, base+"/init.txt", []byte("init"), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("init status = %d", resp.StatusCode)
+	}
+	resp, _ = do(t, http.MethodPut, base+"/?policy",
+		[]byte(`{"Statement":[{"Effect":"deny","Action":"s3:*"}]}`), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid Effect write status = %d, want 400", resp.StatusCode)
+	}
+	resp, _ = do(t, http.MethodGet, base+"/init.txt", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rejected policy must not persist, GET status = %d", resp.StatusCode)
+	}
+}
+
 func TestSSECPutGetHeadAndRange(t *testing.T) {
 	s := newTestServer(t)
 	key := []byte("0123456789abcdef0123456789abcdef")

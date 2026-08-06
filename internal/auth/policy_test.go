@@ -189,3 +189,135 @@ func TestParsePolicyRejectsUnsupportedOrInvalidIPConditions(t *testing.T) {
 		}
 	}
 }
+
+// AC-1: parse must reject any Effect other than exactly "Allow" or "Deny".
+func TestParsePolicyRejectsInvalidEffect(t *testing.T) {
+	invalid := []string{
+		`{"Statement":[{"Effect":"deny","Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"ALlow","Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"Allow ","Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"ALLOW","Action":"s3:*"}]}`,
+		`{"Statement":[{"Action":"s3:*"}]}`, // Effect 缺失 → ""
+	}
+	for _, raw := range invalid {
+		if _, err := ParsePolicy(raw); err == nil {
+			t.Fatalf("expected parse rejection for invalid Effect: %s", raw)
+		}
+	}
+	// 合法 Effect 不受影响（回归保护）
+	for _, raw := range []string{
+		`{"Statement":[{"Effect":"Allow","Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"Deny","Action":"s3:*"}]}`,
+	} {
+		if _, err := ParsePolicy(raw); err != nil {
+			t.Fatalf("valid Effect must parse: %s: %v", raw, err)
+		}
+	}
+}
+
+// AC-2: a typo'd Deny must never downgrade to Allow at eval time.
+func TestEvalResource_TypoEffectDenyNeverAllows(t *testing.T) {
+	principal := map[string]interface{}{"*": "*"}
+	p := &Policy{Statement: []Statement{
+		{Effect: "Allow", Principal: principal, Action: []string{"s3:GetObject"}},
+		{Effect: "Deny ", Principal: principal, Action: []string{"s3:GetObject"}}, // 拼写错误（尾随空格）
+	}}
+	if got := p.EvalResource("s3:GetObject", "", "10.0.0.1"); got != EffectDeny {
+		t.Fatalf("typo'd Deny must not downgrade to Allow: got %v, want EffectDeny", got)
+	}
+	// 单独一条拼错 Effect 的 Deny：同样不得产出 Allow
+	alone := &Policy{Statement: []Statement{
+		{Effect: "deny", Principal: principal, Action: []string{"s3:GetObject"}},
+	}}
+	if got := alone.EvalResource("s3:GetObject", "", "10.0.0.1"); got == EffectAllow {
+		t.Fatal("single typo'd Deny must never evaluate to Allow")
+	}
+}
+
+// AC-3a: an unknown condition operator must be rejected at parse (existing
+// behavior, regression-locked) and never skip a Deny at eval time.
+func TestDeny_UnknownConditionOperatorNeverSkipped(t *testing.T) {
+	raw := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject"},
+		{"Effect":"Deny","Principal":"*","Action":"s3:GetObject",
+		 "Condition":{"BogusOp":{"aws:SourceIp":["10.0.0.0/8"]}}}]}`
+	if _, err := ParsePolicy(raw); err == nil {
+		t.Fatal("unknown condition operator must be rejected at parse")
+	}
+	// 纵深防御：绕过解析直接构造时，Deny 不得因未知操作符被跳过
+	principal := map[string]interface{}{"*": "*"}
+	p := &Policy{Statement: []Statement{
+		{Effect: "Allow", Principal: principal, Action: []string{"s3:GetObject"}},
+		{Effect: "Deny", Principal: principal, Action: []string{"s3:GetObject"},
+			Condition: map[string]map[string][]string{"BogusOp": {"aws:SourceIp": {"10.0.0.0/8"}}}},
+	}}
+	if got := p.EvalResource("s3:GetObject", "", "10.0.0.1"); got == EffectAllow {
+		t.Fatal("un-evaluable Deny condition must not be skipped (fail-open)")
+	}
+}
+
+// AC-3b: a Deny with a non-wildcard principal must never be silently skipped.
+// Branch A (parse rejection) satisfies this via the early return; the eval
+// guard is covered directly by TestEvalResource_DenyNonWildcardPrincipalFailsClosed.
+func TestDeny_NonWildcardPrincipalNeverSkipped(t *testing.T) {
+	raw := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject"},
+		{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::123:root"},"Action":"s3:GetObject"}]}`
+	p, err := ParsePolicy(raw)
+	if err != nil {
+		return // 分支 A：解析期拒绝 —— 满足 AC-3
+	}
+	// 分支 B：求值期显式 Deny
+	if got := p.EvalResource("s3:GetObject", "", "10.0.0.1"); got != EffectDeny {
+		t.Fatalf("Deny with non-wildcard principal must be explicit Deny, got %v", got)
+	}
+	// 对称约束：Allow + 非通配 principal 绝不构成授权（inert Allow 允许，授权禁止）
+	p2, _ := ParsePolicy(`{"Statement":[{"Effect":"Allow",
+		"Principal":{"AWS":"arn:aws:iam::123:root"},"Action":"s3:GetObject"}]}`)
+	if p2 != nil && p2.EvalResource("s3:GetObject", "", "10.0.0.1") == EffectAllow {
+		t.Fatal("Allow with non-wildcard principal must never grant")
+	}
+}
+
+// Branch A: parse must reject any non-wildcard Principal form, while keeping
+// "*", {"AWS":"*"}, {"AWS":["*"]} and absent Principal valid.
+func TestParsePolicyRejectsNonWildcardPrincipal(t *testing.T) {
+	invalid := []string{
+		`{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123:root"},"Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"Allow","Principal":{"AWS":["*","arn:aws:iam::123:root"]},"Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"Allow","Principal":{"Service":"s3.amazonaws.com"},"Action":"s3:*"}]}`,
+	}
+	for _, raw := range invalid {
+		if _, err := ParsePolicy(raw); err == nil {
+			t.Fatalf("expected parse rejection for non-wildcard Principal: %s", raw)
+		}
+	}
+	valid := []string{
+		`{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":"s3:*"}]}`,
+		`{"Statement":[{"Effect":"Allow","Action":"s3:*"}]}`, // 缺省 Principal = 通配
+	}
+	for _, raw := range valid {
+		if _, err := ParsePolicy(raw); err != nil {
+			t.Fatalf("wildcard Principal must parse: %s: %v", raw, err)
+		}
+	}
+}
+
+// Eval-layer guard (defense in depth): under branch A the AC-3b eval assertion
+// is dead code after the parse early-return, so exercise the guard directly.
+func TestEvalResource_DenyNonWildcardPrincipalFailsClosed(t *testing.T) {
+	p := &Policy{Statement: []Statement{
+		{Effect: "Allow", Principal: map[string]interface{}{"*": "*"}, Action: []string{"s3:GetObject"}},
+		{Effect: "Deny", Principal: map[string]interface{}{"AWS": "arn:aws:iam::123:root"}, Action: []string{"s3:GetObject"}},
+	}}
+	if got := p.EvalResource("s3:GetObject", "", "10.0.0.1"); got != EffectDeny {
+		t.Fatalf("Deny with non-wildcard principal must be explicit Deny, got %v", got)
+	}
+	// 对称约束：Allow + 非通配 principal 绝不构成授权
+	only := &Policy{Statement: []Statement{
+		{Effect: "Allow", Principal: map[string]interface{}{"AWS": "arn:aws:iam::123:root"}, Action: []string{"s3:GetObject"}},
+	}}
+	if got := only.EvalResource("s3:GetObject", "", "10.0.0.1"); got == EffectAllow {
+		t.Fatal("Allow with non-wildcard principal must never grant")
+	}
+}

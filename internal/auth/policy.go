@@ -57,7 +57,17 @@ func ParsePolicy(jsonStr string) (*Policy, error) {
 		return nil, nil
 	}
 	for index := range p.Statement {
-		if err := p.Statement[index].validateConditions(); err != nil {
+		stmt := &p.Statement[index]
+		// FR-1: Effect must be exactly "Allow" or "Deny". No trim or case
+		// normalization: "deny", "ALlow", "Allow " are all rejected at write
+		// time instead of silently downgrading a Deny to an Allow at eval time.
+		if stmt.Effect != "Allow" && stmt.Effect != "Deny" {
+			return nil, fmt.Errorf("statement %d: invalid Effect %q (must be \"Allow\" or \"Deny\")", index, stmt.Effect)
+		}
+		if err := stmt.validateConditions(); err != nil {
+			return nil, fmt.Errorf("statement %d: %w", index, err)
+		}
+		if err := stmt.validatePrincipal(); err != nil {
 			return nil, fmt.Errorf("statement %d: %w", index, err)
 		}
 	}
@@ -83,23 +93,32 @@ func (p *Policy) EvalResource(action, resource, sourceIP string) PolicyEffect {
 
 	allow := false
 	for _, stmt := range p.Statement {
-		if !stmt.matchesAction(canonAction) {
-			continue
-		}
-		if !stmt.matchesResource(resource) {
-			continue
-		}
-		if !stmt.matchesPrincipal() {
-			continue
-		}
-		if !stmt.matchesConditions(sourceIP) {
+		if !stmt.matchesAction(canonAction) || !stmt.matchesResource(resource) {
 			continue
 		}
 		switch stmt.Effect {
 		case "Deny":
-			return EffectDeny
+			// FR-3: a Deny that cannot be evaluated must deny, never be
+			// skipped. Skipping would let a sibling Allow win (fail-open).
+			if !stmt.matchesPrincipal() || stmt.validateConditions() != nil {
+				return EffectDeny
+			}
+			// A valid condition that simply does not match (e.g. IP outside
+			// the denied range) is not "un-evaluable": the Deny is scoped to
+			// that range and the statement is correctly skipped.
+			if stmt.matchesConditions(sourceIP) {
+				return EffectDeny
+			}
 		case "Allow":
-			allow = true
+			// An Allow with a non-wildcard principal must never grant
+			// (inert Allow = implicit deny is the safe direction).
+			if stmt.matchesPrincipal() && stmt.matchesConditions(sourceIP) {
+				allow = true
+			}
+		default:
+			// FR-2: unknown Effect fails closed as an explicit Deny instead
+			// of being silently skipped.
+			return EffectDeny
 		}
 	}
 	if allow {
@@ -231,6 +250,22 @@ func (s *Statement) matchesConditions(sourceIP string) bool {
 		}
 	}
 	return true
+}
+
+// validatePrincipal rejects any Principal value other than "*" or its
+// equivalent forms ({"AWS":"*"}, {"AWS":["*"]}). An absent Principal is
+// preserved as wildcard (matchesPrincipal returns true for empty maps).
+// A non-wildcard Deny would otherwise be permanently inert (fail-open), so
+// it is rejected loudly at parse time.
+func (s *Statement) validatePrincipal() error {
+	for _, v := range s.Principal {
+		for _, candidate := range principalValues(v) {
+			if candidate != "*" {
+				return fmt.Errorf("unsupported Principal %q: only \"*\" is supported", candidate)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Statement) validateConditions() error {

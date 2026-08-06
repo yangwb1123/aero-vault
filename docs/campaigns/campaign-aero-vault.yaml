@@ -1,0 +1,84 @@
+# aero-vault 分仓实施 campaign（COMPOSE-2026-017 主责任）
+# 已批准决策摘要：docs/snaplink-platform/decisions/summary.json（归档于
+# docs/archive/requirement-pipeline-20260805-180207/summary.json）
+#
+# 方向约束（analysis prompt 已写入，候选方向按价值排序）：
+#   1. 管理删除流程：元数据 + 对象状态迁移、分享/版本/RAG 引用失效、
+#      outbox 事件 vault.file.deleted@1.1（durable_async）
+#   2. 通知事件 vault.file.notify@1.1（自包含载荷，best_effort 语义）
+#   3. AuditPublisher 端口化：核心依赖 AuditSink 接口，GovernanceSink
+#      适配器可选（L0/L1/L2 分级，不硬编码兄弟项目）
+#   4. 授权接入：vault.file.delete 权限 → snaplink authorization-check
+#      （fail_closed，无权限 403）
+#
+# 用法（aero-vault 仓库内，先 dry-run）：
+#   python3 pi-batch.py campaign --config examples/snaplink-platform/campaigns/campaign-aero-vault.yaml --dry-run
+#   python3 pi-batch.py campaign --config examples/snaplink-platform/campaigns/campaign-aero-vault.yaml \
+#     --jobs 4 --max-directions 2 --validate gobuild,gotest,pyquality
+
+name: aero-vault-compose-2026-017
+
+discovery:
+  roots:
+    - internal
+    - cmd
+  exclude:
+    - testdata
+    - gen
+    - generated
+    - mock
+    - tests
+    - docs
+    - examples
+    - logs
+    - vendor
+    - .git
+    - .pi-batch
+    - __pycache__
+    - ai-dev
+  max_depth: 2
+  fallback_top_level: true
+
+analysis:
+  jobs: 4
+  retries: 2
+  candidate_limit: 3
+  prompt: |
+    Analyze module '{module}' at {module_path} of aero-vault (file platform:
+    REST/S3/WebDAV/MCP + RAG, multi-tenant). An approved composition change
+    (COMPOSE-2026-017) assigns aero-vault as PRIMARY project for: admin file
+    deletion (metadata + object state, share/version/RAG references
+    invalidated), audit events vault.file.deleted@1.1 via transactional
+    outbox (durable_async, never blocking the business flow), notification
+    event vault.file.notify@1.1 (self-contained payload), permission
+    vault.file.delete enforced via an AuthorizationProvider port
+    (fail_closed), and an AuditSink port with replaceable adapters
+    (L0 local / L1 protocol / L2 governance — no hardcoding of sibling
+    project names). Return ONLY a JSON array with at most {candidate_limit}
+    high-value directions toward this change, sorted by value. Each object
+    must contain: title, problem, value (1-10), risk_reduction (1-10),
+    effort (1-10), confidence (1-10), evidence (existing file/symbol paths),
+    and acceptance (testable checks: unit + outbox delivery + event schema
+    + composition e2e). Do not modify code. Claims without repository
+    evidence must be identified as proposed, not verified.
+
+selection:
+  max_directions: 2
+  minimum_score: 0
+
+implementation:
+  pipeline: examples/repository-campaign-pipeline.yaml
+  requirement_stage: requirements
+  concurrency: 1
+  timeout: 14400
+  worktree_root: .pi-batch/worktrees
+
+state:
+  output_dir: docs/auto
+  state_file: docs/auto/state.jsonl
+  summary_file: docs/auto/SUMMARY.md
+  line_max_bytes: 262144
+
+estimates:
+  analysis_minutes: 3
+  pipeline_minutes: 25

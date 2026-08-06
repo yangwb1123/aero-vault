@@ -166,11 +166,12 @@ func idemConflict(w http.ResponseWriter, reqID, msg string) {
 }
 
 // fingerprint identifies the request so the same key reused for a different
-// method/path is rejected. Bodies are not part of this v1 fingerprint, so it
-// guards against same-key/different-target, not same-key/different-bytes —
-// bodyFingerprint covers that when IDEMPOTENCY_HASH_BODY is on.
+// method/path/query is rejected. Bodies are not part of this v1 fingerprint,
+// so it guards against same-key/different-target, not
+// same-key/different-bytes — bodyFingerprint covers that when
+// IDEMPOTENCY_HASH_BODY is on.
 func fingerprint(r *http.Request) string {
-	sum := sha256.Sum256([]byte(r.Method + " " + r.URL.Path))
+	sum := sha256.Sum256([]byte(fingerprintInput(r, "")))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -178,8 +179,28 @@ func fingerprint(r *http.Request) string {
 // request body (computed by spoolBody) into the hash so the same key replayed
 // with different bytes no longer matches and is rejected with 409.
 func bodyFingerprint(r *http.Request, bodyHash string) string {
-	sum := sha256.Sum256([]byte(r.Method + " " + r.URL.Path + " " + bodyHash))
+	sum := sha256.Sum256([]byte(fingerprintInput(r, bodyHash)))
 	return hex.EncodeToString(sum[:])
+}
+
+// fingerprintInput is the canonical string identifying a write request for
+// idempotency purposes: method + path + query + optional body hash. The raw
+// query string (r.URL.RawQuery, verbatim, no normalization) is folded in so
+// query variants such as DELETE ?hard=1 no longer collide with the query-less
+// soft-delete form under the same Idempotency-Key. It is appended only when
+// non-empty, so query-less fingerprints stay byte-identical to the pre-query
+// format: records claimed before this change keep replaying for identical
+// query-less retries across a deploy, while a query-bearing request never
+// matches a legacy record and fails closed with 409.
+func fingerprintInput(r *http.Request, bodyHash string) string {
+	in := r.Method + " " + r.URL.Path
+	if q := r.URL.RawQuery; q != "" {
+		in += "?" + q
+	}
+	if bodyHash != "" {
+		in += " " + bodyHash
+	}
+	return in
 }
 
 // idemSpoolThreshold is the number of request-body bytes kept in memory before
