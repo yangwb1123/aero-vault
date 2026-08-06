@@ -64,6 +64,22 @@ func (n *Notifier) deliver(ctx context.Context, e repository.Event) {
 		return // not an S3-style event
 	}
 
+	// D2: deletes that committed through the transactional outbox are delivered
+	// by the relay from the self-contained notify@1.1 payload. Skip the bus path
+	// only when the outbox row exists (any status — the WithEvent transaction
+	// commits before s.emit, so the row is visible regardless of relay progress;
+	// no race). E14 paths (DeleteVersion / delete-marker / quarantine) have no
+	// outbox row and keep the bus path — never silently drop them.
+	if e.Type == repository.EventDeleted && e.ObjectID != nil {
+		has, err := n.repo.HasEventOutboxFact(ctx, *e.ObjectID, repository.EventTypeFileNotify11)
+		if err != nil {
+			n.logger.Warn("notification outbox check failed; falling back to bus delivery",
+				"key", e.Key, "err", err)
+		} else if has {
+			return
+		}
+	}
+
 	for _, rule := range rules {
 		if !ruleMatches(rule, eventName, e.Key) {
 			continue
@@ -77,7 +93,7 @@ func (n *Notifier) dispatchToTargets(ctx context.Context, e repository.Event, ru
 	payload := buildS3Event(e, eventName)
 	body, _ := json.Marshal(payload)
 
-	targets := n.resolveTargets(rule)
+	targets := resolveTargets(rule)
 	for _, target := range targets {
 		if err := n.postEvent(ctx, target, body); err != nil {
 			n.logger.Warn("notification delivery failed",
@@ -91,8 +107,9 @@ func (n *Notifier) dispatchToTargets(ctx context.Context, e repository.Event, ru
 	}
 }
 
-// resolveTargets returns the HTTP URL(s) to deliver to for this rule.
-func (n *Notifier) resolveTargets(rule repository.NotificationRule) []string {
+// resolveTargets returns the HTTP URL(s) to deliver to for this rule. Shared
+// by the bus Notifier and the outbox relay.
+func resolveTargets(rule repository.NotificationRule) []string {
 	var targets []string
 	if rule.EndpointURL != "" {
 		targets = append(targets, rule.EndpointURL)
@@ -111,13 +128,23 @@ func (n *Notifier) resolveTargets(rule repository.NotificationRule) []string {
 
 // postEvent sends an HTTP POST with the S3 notification payload.
 func (n *Notifier) postEvent(ctx context.Context, url string, body []byte) error {
+	return postEventTo(ctx, n.client, url, body)
+}
+
+// postEventTo POSTs body to url with the standard notification headers. Shared
+// by the bus Notifier and the outbox relay (which posts the stored payload
+// byte-exact).
+func postEventTo(ctx context.Context, client *http.Client, url string, body []byte) error {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "aero-vault/notifier")
-	resp, err := n.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("http post: %w", err)
 	}

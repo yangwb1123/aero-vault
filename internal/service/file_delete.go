@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/aero-vault/aero-vault/internal/access"
+	"github.com/aero-vault/aero-vault/internal/events"
+	"github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
@@ -41,7 +43,7 @@ func (s *FileService) hardDeleteObject(ctx context.Context, obj repository.Objec
 		}
 		deletedKeys[version.StorageKey] = struct{}{}
 	}
-	if err := s.repo.HardDeleteObject(ctx, tenant, bucket, key); err != nil {
+	if err := s.repo.HardDeleteObjectWithEvent(ctx, tenant, bucket, key, s.deleteAuditEntry(ctx, obj, tenant, true), s.deleteFacts(ctx, obj, tenant)); err != nil {
 		return err
 	}
 	bytes, objects := countedObjectUsage(versions)
@@ -81,7 +83,7 @@ func (s *FileService) softDeleteObject(ctx context.Context, obj repository.Objec
 			s.logger.Warn("chunk cleanup on soft delete failed", "key", key, "err", err)
 		}
 	}
-	if err := s.repo.SoftDeleteObject(ctx, tenant, bucket, key); err != nil {
+	if err := s.repo.SoftDeleteObjectWithEvent(ctx, tenant, bucket, key, s.deleteAuditEntry(ctx, obj, tenant, false), s.deleteFacts(ctx, obj, tenant)); err != nil {
 		return err
 	}
 	if _, qErr := s.addTenantUsage(ctx, tenant, UsageObjectDelete, -obj.Size, -1); qErr != nil {
@@ -89,6 +91,55 @@ func (s *FileService) softDeleteObject(ctx context.Context, obj repository.Objec
 	}
 	s.emit(ctx, obj, repository.EventDeleted)
 	return nil
+}
+
+// deleteAuditEntry builds the audit_log row committed atomically with the
+// delete (FR-1). actor comes from the access principal (empty is legal — no
+// new identity pipeline); detail distinguishes the delete mode without
+// growing the action vocabulary.
+func (s *FileService) deleteAuditEntry(ctx context.Context, obj repository.Object, tenant string, hard bool) repository.AuditEntry {
+	actor := ""
+	if principal, ok := access.PrincipalFrom(ctx); ok {
+		actor = principal.SubjectID
+	}
+	detail := "soft"
+	if hard {
+		detail = "hard"
+	}
+	return repository.AuditEntry{
+		Actor:    actor,
+		Action:   repository.AuditActionFileDelete,
+		Target:   obj.Bucket + "/" + obj.Key,
+		TenantID: tenant,
+		Detail:   detail,
+	}
+}
+
+// deleteFacts builds the two versioned outbox facts (deleted@1.1 + notify@1.1)
+// for one delete, fully self-contained at emit time (FR-2). actor comes from
+// the access principal (empty is legal — no new identity pipeline); request_id
+// reuses the middleware value; the notify sequencer is freshly generated per
+// occurrence (never obj.ID — RestoreObject reuses row ids, D6).
+func (s *FileService) deleteFacts(ctx context.Context, obj repository.Object, tenant string) []repository.OutboxFact {
+	actor := ""
+	if principal, ok := access.PrincipalFrom(ctx); ok {
+		actor = principal.SubjectID
+	}
+	requestID := middleware.RequestIDFrom(ctx)
+	return []repository.OutboxFact{
+		{
+			EventType: repository.EventTypeFileDeleted11,
+			OriginID:  obj.ID,
+			TenantID:  tenant,
+			Payload:   events.BuildDeletedFact(obj, actor, requestID, tenant),
+		},
+		{
+			EventType: repository.EventTypeFileNotify11,
+			OriginID:  obj.ID,
+			TenantID:  tenant,
+			Payload:   events.BuildNotifyFact(obj, actor, requestID, tenant, ""),
+		},
+	}
 }
 
 // Delete removes an object. When hard is true the storage object is also

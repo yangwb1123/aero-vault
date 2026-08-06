@@ -60,6 +60,9 @@ func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slo
 	}
 	startWebhook(ctx, cfg, logger, repo, bus)
 	startNotificationWorker(ctx, logger, repo, bus)
+	if err := startEventOutboxRelay(ctx, cfg, logger, repo); err != nil {
+		return err
+	}
 	if cfg.Reconcile.IntervalMinutes > 0 {
 		startReconcile(ctx, cfg, logger, repo, store, svc.ChunkCleaner())
 	}
@@ -141,4 +144,57 @@ func startNotificationWorker(ctx context.Context, logger *slog.Logger, repo repo
 	sub, _ := bus.Subscribe()
 	go notif.Run(ctx, sub)
 	logger.Info("bucket notification worker started")
+}
+
+// startEventOutboxRelay drains the transactional deletion outbox (claim →
+// deliver → complete). It always starts: deletion atomicity is not gated, and
+// with no notification rules the relay is a silent no-op. Notify facts are
+// delivered from their self-contained payload; deleted@1.1 facts are
+// completed without local re-broadcast (D3) unless an L2 AuditSink is
+// configured, in which case they are delivered to the audit sink (FR-2/FR-4).
+// An L2 adapter that fails its own endpoint validation aborts startup
+// (fail-fast, F6 — config.Validate already rejected it; this is the second
+// enforcement point).
+func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository) error {
+	opts := events.EventOutboxRelayOptions{
+		PollInterval: time.Duration(cfg.EventOutbox.PollMilliseconds) * time.Millisecond,
+		BatchSize:    cfg.EventOutbox.BatchSize,
+		ClaimTTL:     time.Duration(cfg.EventOutbox.ClaimTTLSeconds) * time.Second,
+		HTTPTimeout:  time.Duration(cfg.EventOutbox.HTTPTimeoutSeconds) * time.Second,
+		MaxAttempts:  cfg.EventOutbox.MaxAttempts,
+	}
+	if cfg.AuditSinkL2.Endpoint != "" {
+		sink, err := events.NewAuditSinkL2(cfg.AuditSinkL2.Endpoint,
+			auditSinkL2Bindings(cfg.AuditSinkL2.Bindings),
+			events.NewAuditSinkL2Client(opts.HTTPTimeout), logger)
+		if err != nil {
+			return fmt.Errorf("build audit sink L2: %w", err)
+		}
+		opts.AuditSink = sink
+		logger.Info("event outbox relay L2 audit sink enabled", "endpoint", cfg.AuditSinkL2.Endpoint,
+			"bindings", len(cfg.AuditSinkL2.Bindings))
+	}
+	relay := events.NewEventOutboxRelay(repo, logger, opts)
+	go relay.Run(ctx)
+	logger.Info("event outbox relay started",
+		"poll_ms", cfg.EventOutbox.PollMilliseconds,
+		"batch", cfg.EventOutbox.BatchSize,
+		"claim_ttl_s", cfg.EventOutbox.ClaimTTLSeconds,
+		"http_timeout_s", cfg.EventOutbox.HTTPTimeoutSeconds,
+		"max_attempts", cfg.EventOutbox.MaxAttempts)
+	return nil
+}
+
+// auditSinkL2Bindings flattens the config bindings into the adapter's
+// tenant → token map. Token values never appear in logs (the caller logs
+// only the count).
+func auditSinkL2Bindings(bindings []config.AuditSinkL2Binding) map[string]string {
+	if len(bindings) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(bindings))
+	for _, binding := range bindings {
+		out[binding.Tenant] = binding.Token
+	}
+	return out
 }

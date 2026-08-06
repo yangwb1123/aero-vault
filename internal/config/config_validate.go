@@ -38,6 +38,13 @@ func (c *Config) Validate() error {
 	if err := validateCommercialIntegrations(c.Billing, c.AuditGovernance); err != nil {
 		return err
 	}
+	c.EventOutbox = c.EventOutbox.withDefaults()
+	if err := c.EventOutbox.Validate(); err != nil {
+		return err
+	}
+	if err := c.AuditSinkL2.Validate(); err != nil {
+		return err
+	}
 	return c.validateRateLimits()
 }
 

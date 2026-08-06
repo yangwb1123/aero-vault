@@ -30,6 +30,8 @@ type Config struct {
 	Telemetry       TelemetryCfg
 	Billing         BillingConfig
 	AuditGovernance AuditGovernanceConfig
+	EventOutbox     EventOutboxConfig
+	AuditSinkL2     AuditSinkL2Config
 }
 
 type AppConfig struct {
@@ -58,6 +60,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	auditGovernance, err := loadAuditGovernanceConfig()
+	if err != nil {
+		return nil, err
+	}
+	auditSinkL2, err := loadAuditSinkL2Config()
 	if err != nil {
 		return nil, err
 	}
@@ -217,6 +223,8 @@ func Load() (*Config, error) {
 		},
 		Billing:         billing,
 		AuditGovernance: auditGovernance,
+		EventOutbox:     loadEventOutboxConfig(),
+		AuditSinkL2:     auditSinkL2,
 		CORS: CORSCfg{
 			AllowedOrigins: splitCSV(getEnv("CORS_ALLOWED_ORIGINS", "")),
 			AllowedMethods: splitCSV(getEnv("CORS_ALLOWED_METHODS", "")),

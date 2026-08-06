@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,14 +12,18 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	_ "modernc.org/sqlite"
 
 	"github.com/aero-vault/aero-vault/internal/api/rest"
 	"github.com/aero-vault/aero-vault/internal/api/s3compat"
 	dav "github.com/aero-vault/aero-vault/internal/api/webdav"
 	"github.com/aero-vault/aero-vault/internal/auth"
+	"github.com/aero-vault/aero-vault/internal/events"
 	"github.com/aero-vault/aero-vault/internal/mcp"
 	"github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -27,13 +32,30 @@ import (
 	"github.com/aero-vault/aero-vault/internal/webui"
 )
 
+// fullServerHarness exposes the loopback server plus the repo/DSN the tests
+// need to assert outbox/audit state (AC-3/AC-5).
+type fullServerHarness struct {
+	ts   *httptest.Server
+	repo repository.Repository
+	dsn  string
+}
+
 // startFullServer builds a production-shaped server with SQLite + local storage,
-// no auth (MVP mode), no AI, all protocols mounted.
+// no auth (MVP mode), no AI, all protocols mounted, and the event-outbox relay
+// running with default options (always-on, production shape).
 func startFullServer(t *testing.T) *httptest.Server {
+	return startFullServerWithRelay(t, &events.EventOutboxRelayOptions{}).ts
+}
+
+// startFullServerWithRelay builds the same server but lets the caller inject
+// the relay options (short poll, AuditSink) — the AC-3/AC-5 injection point
+// (the harness constructs the relay directly; no env-var indirection).
+func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOptions) *fullServerHarness {
 	t.Helper()
 	ctx := context.Background()
 
-	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "x.db"))
+	dsn := "file:" + filepath.Join(t.TempDir(), "x.db")
+	repo, err := repository.Open(ctx, "sqlite", dsn)
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
 	}
@@ -100,7 +122,13 @@ func startFullServer(t *testing.T) *httptest.Server {
 
 	ts := httptest.NewServer(finalHandler)
 	t.Cleanup(ts.Close)
-	return ts
+	if relayOpts != nil {
+		relay := events.NewEventOutboxRelay(repo, logger, *relayOpts)
+		relayCtx, relayCancel := context.WithCancel(ctx)
+		go relay.Run(relayCtx)
+		t.Cleanup(relayCancel)
+	}
+	return &fullServerHarness{ts: ts, repo: repo, dsn: dsn}
 }
 
 func httpPut(url, contentType, body string) (*http.Response, error) {
@@ -623,4 +651,286 @@ func TestFullServer_ConcurrentCRUD(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// ── AC-3: durable_async — DELETE never waits for L2 delivery ────────────────
+
+// TestDeleteResponse_DoesNotBlockOnDelivery is signal-based, not wall-clock: a
+// synchronous implementation cannot return the DELETE response while the L2
+// target is still blocked (its POST would hang until the 5s relay timeout), so
+// the 4s hang-guard (strictly below the 5s timeout) is a deterministic
+// discriminator. After the response, the outbox fact must be pending/inflight
+// (delivered is unreachable while the target blocks), and the audit_log row
+// must already exist (L0 is never affected by delivery, F4).
+func TestDeleteResponse_DoesNotBlockOnDelivery(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var mu sync.Mutex
+	var posts int
+
+	l2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // block the L2 POST until the test releases it
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		posts++
+		mu.Unlock()
+		w.Header().Set("X-Audit-Fact-Id", r.Header.Get("X-Audit-Fact-Id"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	// Cleanup order (LIFO): release → l2.Close → relay cancel → ts.Close.
+	// close(release) MUST run before l2.Close so the in-flight POST completes
+	// instead of leaking a goroutine under -race (AC-3 ⑤).
+	t.Cleanup(l2.Close)
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	sink, err := events.NewAuditSinkL2(l2.URL, map[string]string{"default": "e2e-l2-token-0123456789"},
+		&http.Client{Timeout: 5 * time.Second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startFullServerWithRelay(t, &events.EventOutboxRelayOptions{
+		PollInterval: 50 * time.Millisecond, BatchSize: 32,
+		ClaimTTL: 30 * time.Second, HTTPTimeout: 5 * time.Second,
+		MaxAttempts: 3, AuditSink: sink,
+	})
+	ts := h.ts
+
+	key := "ac3-blocked.txt"
+	if resp, err := httpPut(ts.URL+"/v1/files/"+key, "text/plain", "body"); err != nil || resp.StatusCode >= 300 {
+		t.Fatalf("PUT: status=%v err=%v", resp.StatusCode, err)
+	} else {
+		resp.Body.Close()
+	}
+	obj, err := h.repo.GetObject(context.Background(), "default", "default", key)
+	if err != nil {
+		t.Fatalf("get object: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/files/"+key+"?hard=1", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- err
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			done <- fmt.Errorf("DELETE status = %d, want 204", resp.StatusCode)
+			return
+		}
+		done <- nil
+	}()
+
+	// The L2 target is still blocked here: a synchronous implementation
+	// cannot have returned the response (its POST would hang past the 5s
+	// relay timeout; our guard is 4s < 5s, so the discriminator is exact).
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DELETE failed: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("DELETE response blocked behind L2 delivery (durable_async violated)")
+	}
+
+	// The outbox fact must not be delivered while the target is blocked;
+	// pending (not yet claimed) and inflight (claimed, POST in progress) are
+	// both legal and race-free — delivered is unreachable.
+	status := outboxStatus(t, h.dsn, obj.ID, "vault.file.deleted@1.1")
+	if status != "pending" && status != "inflight" {
+		t.Fatalf("outbox status = %q, want pending or inflight while target blocked", status)
+	}
+	assertAuditRowFor(t, h.repo, "default", "hard")
+
+	// Recovery: release the target; the in-flight POST completes and the relay
+	// completes the fact (in-flight POST ≤5s + 50ms poll + 1s±25% backoff →
+	// ~15s bound).
+	releaseOnce.Do(func() { close(release) })
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if outboxStatus(t, h.dsn, obj.ID, "vault.file.deleted@1.1") == "delivered" {
+			mu.Lock()
+			got := posts
+			mu.Unlock()
+			if got < 1 {
+				t.Fatalf("L2 received %d POSTs, want ≥1", got)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("fact never reached delivered after target recovery")
+}
+
+// ── AC-5: composition — bound tenant delivers, unbound tenant degrades ──────
+
+func TestComposition_AuditSinkL2BoundTenant(t *testing.T) {
+	var mu sync.Mutex
+	var bodies [][]byte
+	l2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, body)
+		mu.Unlock()
+		w.Header().Set("X-Audit-Fact-Id", r.Header.Get("X-Audit-Fact-Id"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(l2.Close)
+	sink, err := events.NewAuditSinkL2(l2.URL, map[string]string{"t1": "e2e-l2-t1-token-0123456789"},
+		&http.Client{Timeout: 5 * time.Second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startFullServerWithRelay(t, &events.EventOutboxRelayOptions{
+		PollInterval: 50 * time.Millisecond, BatchSize: 32,
+		ClaimTTL: 30 * time.Second, HTTPTimeout: 5 * time.Second,
+		MaxAttempts: 3, AuditSink: sink,
+	})
+	ts := h.ts
+	ctx := context.Background()
+
+	// ② bound tenant t1: PUT → DELETE → L2 receives exactly one POST with the
+	// AC-4 envelope; audit_log has the t1 row.
+	putWithTenant(t, ts, "t1", "ac5/t1.txt")
+	t1obj, err := h.repo.GetObject(ctx, "t1", "default", "ac5/t1.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteWithTenant(t, ts, "t1", "ac5/t1.txt", true)
+	waitForBodies(t, func() int { mu.Lock(); defer mu.Unlock(); return len(bodies) }, 1, 5*time.Second)
+	mu.Lock()
+	body := string(bodies[0])
+	mu.Unlock()
+	if !strings.Contains(body, `"event_type":"vault.file.deleted@1.1"`) ||
+		!strings.Contains(body, `"tenant":"t1"`) ||
+		!strings.Contains(body, `"object_id":`+fmt.Sprintf("%d", t1obj.ID)) {
+		t.Errorf("L2 payload missing AC-4 identity: %s", body)
+	}
+	assertAuditRowFor(t, h.repo, "t1", "hard")
+
+	// ③ unbound tenant t2: PUT → DELETE → L2 receives no POST; audit_log still
+	// has the t2 row (L0 is per-tenant always-on).
+	putWithTenant(t, ts, "t2", "ac5/t2.txt")
+	deleteWithTenant(t, ts, "t2", "ac5/t2.txt", true)
+	time.Sleep(400 * time.Millisecond) // several relay polls at 50ms
+	mu.Lock()
+	got := len(bodies)
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("L2 received %d POSTs after unbound delete, want 1 (t2 must not deliver)", got)
+	}
+	assertAuditRowFor(t, h.repo, "t2", "hard")
+
+	// ④ no-L2 control server: delete still 2xx + audit row, and the always-on
+	// relay completes the deleted@1.1 fact (degraded record-retention, C3).
+	h2 := startFullServerWithRelay(t, &events.EventOutboxRelayOptions{})
+	putWithTenant(t, h2.ts, "default", "ac5/control.txt")
+	control, err := h2.repo.GetObject(ctx, "default", "default", "ac5/control.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteWithTenant(t, h2.ts, "default", "ac5/control.txt", true)
+	assertAuditRowFor(t, h2.repo, "default", "hard")
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if outboxStatus(t, h2.dsn, control.ID, "vault.file.deleted@1.1") == "delivered" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("control server fact never completed by the always-on relay")
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+func putWithTenant(t *testing.T, ts *httptest.Server, tenant, key string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/files/"+key, strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	if tenant != "" {
+		req.Header.Set(middleware.TenantHeader, tenant)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		t.Fatalf("PUT %s: status %d", key, resp.StatusCode)
+	}
+}
+
+func deleteWithTenant(t *testing.T, ts *httptest.Server, tenant, key string, hard bool) {
+	t.Helper()
+	hardQuery := ""
+	if hard {
+		hardQuery = "?hard=1"
+	}
+	req, err := http.NewRequest(http.MethodDelete, ts.URL+"/v1/files/"+key+hardQuery, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tenant != "" {
+		req.Header.Set(middleware.TenantHeader, tenant)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE %s (tenant=%s): status %d, want 204", key, tenant, resp.StatusCode)
+	}
+}
+
+// outboxStatus reads one outbox fact's status through a raw SQLite connection
+// (the Repository interface exposes no status reader; the relay owns claims).
+func outboxStatus(t *testing.T, dsn string, originID int64, eventType string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var status string
+	if err := db.QueryRow(`SELECT status FROM event_outbox
+WHERE origin_id=? AND event_type=? ORDER BY id DESC LIMIT 1`, originID, eventType).Scan(&status); err != nil {
+		t.Fatalf("query outbox status: %v", err)
+	}
+	return status
+}
+
+// assertAuditRowFor asserts a file.delete audit row exists for the tenant with
+// the expected detail (newest first).
+func assertAuditRowFor(t *testing.T, repo repository.Repository, tenant, detail string) {
+	t.Helper()
+	rows, err := repo.ListAudit(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Action == repository.AuditActionFileDelete && row.TenantID == tenant {
+			if row.Detail != detail {
+				t.Errorf("audit detail = %q, want %q", row.Detail, detail)
+			}
+			return
+		}
+	}
+	t.Fatalf("no file.delete audit row for tenant %s", tenant)
+}
+
+func waitForBodies(t *testing.T, count func() int, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if count() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("L2 received %d POSTs, want %d", count(), want)
 }

@@ -29,7 +29,9 @@ type Repository interface {
 	ListObjectVersionKeys(ctx context.Context, tenant, bucket, prefix, marker string, limit int) ([]string, string, bool, error)
 	SoftDeleteObject(ctx context.Context, tenant, bucket, key string) error
 	SoftDeleteObjectByID(ctx context.Context, id int64) error
+	SoftDeleteObjectWithEvent(ctx context.Context, tenant, bucket, key string, entry AuditEntry, facts []OutboxFact) error
 	HardDeleteObject(ctx context.Context, tenant, bucket, key string) error
+	HardDeleteObjectWithEvent(ctx context.Context, tenant, bucket, key string, entry AuditEntry, facts []OutboxFact) error
 	HardDeleteObjectByID(ctx context.Context, id int64) error
 	DeleteObjectVersion(ctx context.Context, tenant, bucket, key, versionID string) error
 	RestoreObject(ctx context.Context, tenant, bucket, key string) error
@@ -98,6 +100,13 @@ type Repository interface {
 	ListEventsAfter(ctx context.Context, tenant string, afterID int64, limit int) ([]Event, error)
 	NextUnconsumedEvents(ctx context.Context, limit int) ([]Event, error)
 	MarkEventConsumed(ctx context.Context, id int64) error
+
+	// ── Event outbox (transactional delete facts + relay) ──
+	ClaimEventOutbox(ctx context.Context, owner, token string, limit int, ttl time.Duration) ([]EventOutboxRow, error)
+	CompleteEventOutbox(ctx context.Context, id int64, owner, token string) error
+	RetryEventOutbox(ctx context.Context, id int64, owner, token, lastErr string, next time.Time, maxAttempts int) error
+	PruneEventOutbox(ctx context.Context, deliveredBefore, failedBefore time.Time) (int64, error)
+	HasEventOutboxFact(ctx context.Context, originID int64, eventType OutboxEventType) (bool, error)
 
 	// ── AI Chunks ──
 	DeleteChunksForObject(ctx context.Context, objectID int64) error

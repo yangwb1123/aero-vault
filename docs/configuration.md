@@ -346,6 +346,17 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 | `EVENTS_TRANSPORT` | _(empty = in-process)_ | Cross-instance event transport: `postgres` (Postgres `LISTEN`/`NOTIFY`, requires `EVENTS_TRANSPORT_DSN`). Empty keeps the default in-process fan-out. |
 | `EVENTS_TRANSPORT_DSN` | _(empty)_ | Postgres DSN for the `postgres` event transport (and for the `aero_key_invalidate` cross-replica key-invalidation channel). |
 
+## Deletion transactional outbox
+
+File delete (`FileService.Delete`, hard and soft) commits the metadata delete and two versioned event facts (`vault.file.deleted@1.1` / `vault.file.notify@1.1`) in **one transaction**; the always-on relay drains them (claim → deliver → complete). `notify@1.1` facts are POSTed byte-exact to matching bucket-notification targets; `deleted@1.1` facts are durable lifecycle records that are completed without local re-broadcast. Delivery is exactly-once only after `complete`; the deliver→complete window is at-least-once (S3-equivalent) — receivers must be idempotent. |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EVENT_OUTBOX_POLL_INTERVAL_MILLIS` | `1000` | Relay claim poll interval (`1..60000`). |
+| `EVENT_OUTBOX_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
+| `EVENT_OUTBOX_CLAIM_TTL_SECONDS` | `30` | Fenced delivery lease; must exceed twice `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` so a slow target plus lease expiry cannot cause concurrent duplicate POSTs without any crash (`1..600`). Worst-case in-flight time per fact is `targets×timeout` — raise the TTL when a rule targets more than 3 endpoints at the default timeout. |
+| `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` | `5` | Per-target HTTP POST timeout (`1..29`). |
+| `EVENT_OUTBOX_MAX_ATTEMPTS` | `10` | Delivery attempts before a fact becomes terminal `failed` (`1..1000`); failed rows are pruned after 7 days, delivered rows after 24h. |
+
 ## Background reconcile / lifecycle
 
 | Variable | Default | Description |

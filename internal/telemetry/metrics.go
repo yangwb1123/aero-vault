@@ -46,6 +46,14 @@ var (
 	mSQLQueryCount          metric.Int64Counter
 	mNotifDelivered         metric.Int64Counter
 	mNotifFailed            metric.Int64Counter
+	mEventOutboxDelivered   metric.Int64Counter
+	mEventOutboxRetried     metric.Int64Counter
+	mEventOutboxFailed      metric.Int64Counter
+	mEventOutboxClaimLost   metric.Int64Counter
+	mEventOutboxPruned      metric.Int64Counter
+	mEventOutboxL2Delivered metric.Int64Counter
+	mEventOutboxL2Unbound   metric.Int64Counter
+	mEventOutboxL2Rejected  metric.Int64Counter
 )
 
 func initDomain() {
@@ -80,6 +88,14 @@ func initDomain() {
 		mSQLQueryCount, _ = m.Int64Counter("sql.query_total")
 		mNotifDelivered, _ = m.Int64Counter("notifications.delivered_total")
 		mNotifFailed, _ = m.Int64Counter("notifications.failed_total")
+		mEventOutboxDelivered, _ = m.Int64Counter("event_outbox.delivered_total")
+		mEventOutboxRetried, _ = m.Int64Counter("event_outbox.retried_total")
+		mEventOutboxFailed, _ = m.Int64Counter("event_outbox.failed_total")
+		mEventOutboxClaimLost, _ = m.Int64Counter("event_outbox.claim_lost_total")
+		mEventOutboxPruned, _ = m.Int64Counter("event_outbox.pruned_total")
+		mEventOutboxL2Delivered, _ = m.Int64Counter("event_outbox.l2_delivered_total")
+		mEventOutboxL2Unbound, _ = m.Int64Counter("event_outbox.l2_unbound_total")
+		mEventOutboxL2Rejected, _ = m.Int64Counter("event_outbox.l2_rejected_total")
 	})
 }
 
@@ -102,6 +118,60 @@ func IncNotificationDelivered(ctx context.Context, target string) {
 func IncNotificationDeliveryFailed(ctx context.Context, target string) {
 	initDomain()
 	mNotifFailed.Add(ctx, 1, metric.WithAttributes(attribute.String("target", target)))
+}
+
+// IncEventOutboxDelivered counts one event outbox fact completed by the relay.
+func IncEventOutboxDelivered(ctx context.Context) {
+	initDomain()
+	mEventOutboxDelivered.Add(ctx, 1)
+}
+
+// IncEventOutboxRetried counts one event outbox fact rescheduled for retry.
+func IncEventOutboxRetried(ctx context.Context) {
+	initDomain()
+	mEventOutboxRetried.Add(ctx, 1)
+}
+
+// IncEventOutboxFailed counts one event outbox fact reaching its terminal
+// failed state (attempts >= max).
+func IncEventOutboxFailed(ctx context.Context) {
+	initDomain()
+	mEventOutboxFailed.Add(ctx, 1)
+}
+
+// IncEventOutboxClaimLost counts one stale complete/retry fencing failure
+// (lease expired mid-flight or owner/token mismatch).
+func IncEventOutboxClaimLost(ctx context.Context) {
+	initDomain()
+	mEventOutboxClaimLost.Add(ctx, 1)
+}
+
+// IncEventOutboxPruned counts outbox rows removed by the periodic prune.
+func IncEventOutboxPruned(ctx context.Context, n int64) {
+	initDomain()
+	mEventOutboxPruned.Add(ctx, n)
+}
+
+// IncEventOutboxL2Delivered counts one deleted@1.1 fact acknowledged by the
+// L2 audit sink (2xx + echo receipt, D5).
+func IncEventOutboxL2Delivered(ctx context.Context) {
+	initDomain()
+	mEventOutboxL2Delivered.Add(ctx, 1)
+}
+
+// IncEventOutboxL2Unbound counts one deleted@1.1 fact completed because the
+// tenant had no L2 binding (C3 — distinct from rejected, so token rotation
+// is observable; D7).
+func IncEventOutboxL2Unbound(ctx context.Context) {
+	initDomain()
+	mEventOutboxL2Unbound.Add(ctx, 1)
+}
+
+// IncEventOutboxL2Rejected counts one deleted@1.1 fact failed immediately on
+// L2 credential rejection (401/403, H2).
+func IncEventOutboxL2Rejected(ctx context.Context) {
+	initDomain()
+	mEventOutboxL2Rejected.Add(ctx, 1)
 }
 
 // RecordAIUsage records token/cost domain metrics for one AI (chat) call,

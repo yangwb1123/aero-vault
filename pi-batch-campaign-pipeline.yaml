@@ -37,6 +37,8 @@ stages:
     max_roles_per_iteration: 3
     relevance_enabled: true
     relevance_min_score: 2
+    # 审查角色要读大量代码；900s 默认会超时（round 2 access 方向即因此失败）
+    meta_timeout: 2400
 
   - name: design_gate
     from_outputs:

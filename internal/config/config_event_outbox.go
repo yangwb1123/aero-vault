@@ -1,0 +1,78 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+)
+
+// EventOutboxConfig configures the deletion transactional-outbox relay
+// (cmd/server startEventOutboxRelay). Defaults mirror the billing/audit
+// outbox precedents; the relay always starts (core deletion atomicity is not
+// gated) and is a silent no-op without notification rules.
+type EventOutboxConfig struct {
+	PollMilliseconds   int // EVENT_OUTBOX_POLL_INTERVAL_MILLIS
+	BatchSize          int // EVENT_OUTBOX_BATCH_SIZE
+	ClaimTTLSeconds    int // EVENT_OUTBOX_CLAIM_TTL_SECONDS
+	HTTPTimeoutSeconds int // EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS
+	MaxAttempts        int // EVENT_OUTBOX_MAX_ATTEMPTS
+}
+
+func loadEventOutboxConfig() EventOutboxConfig {
+	return EventOutboxConfig{
+		PollMilliseconds:   getEnvInt("EVENT_OUTBOX_POLL_INTERVAL_MILLIS", 1000),
+		BatchSize:          getEnvInt("EVENT_OUTBOX_BATCH_SIZE", 32),
+		ClaimTTLSeconds:    getEnvInt("EVENT_OUTBOX_CLAIM_TTL_SECONDS", 30),
+		HTTPTimeoutSeconds: getEnvInt("EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS", 5),
+		MaxAttempts:        getEnvInt("EVENT_OUTBOX_MAX_ATTEMPTS", 10),
+	}
+}
+
+// withDefaults fills zero fields with the billing-mirrored defaults, so a
+// hand-built zero config validates like the env-loaded one (Load always
+// populates every field).
+func (c EventOutboxConfig) withDefaults() EventOutboxConfig {
+	if c.PollMilliseconds == 0 {
+		c.PollMilliseconds = 1000
+	}
+	if c.BatchSize == 0 {
+		c.BatchSize = 32
+	}
+	if c.ClaimTTLSeconds == 0 {
+		c.ClaimTTLSeconds = 30
+	}
+	if c.HTTPTimeoutSeconds == 0 {
+		c.HTTPTimeoutSeconds = 5
+	}
+	if c.MaxAttempts == 0 {
+		c.MaxAttempts = 10
+	}
+	return c
+}
+
+// Validate enforces the audit-governance lease rule (ClaimTTL > 2×HTTPTimeout)
+// so a slow target plus an expired lease cannot produce concurrent duplicate
+// POSTs with no crash at all (concurrency-reviewer blocker, D7). The
+// documented in-flight bound is targets×timeout < TTL; default TTL 30s covers
+// ≤3 sequential POSTs at the 5s default timeout.
+func (c EventOutboxConfig) Validate() error {
+	if c.PollMilliseconds <= 0 || c.PollMilliseconds > 60_000 {
+		return errors.New("EVENT_OUTBOX_POLL_INTERVAL_MILLIS must be within 1..60000")
+	}
+	if c.BatchSize <= 0 || c.BatchSize > 500 {
+		return errors.New("EVENT_OUTBOX_BATCH_SIZE must be within 1..500")
+	}
+	if c.HTTPTimeoutSeconds <= 0 || c.HTTPTimeoutSeconds > 29 {
+		return errors.New("EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS must be within 1..29")
+	}
+	if c.ClaimTTLSeconds <= 2*c.HTTPTimeoutSeconds {
+		return fmt.Errorf("EVENT_OUTBOX_CLAIM_TTL_SECONDS must exceed 2×EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS (%d×2=%d)",
+			c.HTTPTimeoutSeconds, 2*c.HTTPTimeoutSeconds)
+	}
+	if c.ClaimTTLSeconds > 600 {
+		return errors.New("EVENT_OUTBOX_CLAIM_TTL_SECONDS must not exceed 600")
+	}
+	if c.MaxAttempts <= 0 || c.MaxAttempts > 1000 {
+		return errors.New("EVENT_OUTBOX_MAX_ATTEMPTS must be within 1..1000")
+	}
+	return nil
+}
