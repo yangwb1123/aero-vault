@@ -4,10 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/antivirus"
+	"github.com/aero-vault/aero-vault/internal/auditgovernance"
 	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
@@ -102,11 +104,20 @@ func buildPrometheus(cfg *config.Config, logger *slog.Logger) http.Handler {
 	return h
 }
 
-func registerGauges(repo repository.Repository) {
+func registerGauges(repo repository.Repository, auditRuntime *auditgovernance.Runtime) {
 	telemetry.RegisterQueueDepthGauge(func(ctx context.Context) int64 {
 		n, _ := repo.CountJobsByStatus(ctx, "pending")
 		return int64(n)
 	})
+	if auditRuntime != nil {
+		telemetry.RegisterAuditGovernanceBacklogAgeGauge(func(ctx context.Context) int64 {
+			age, ok, err := auditRuntime.BacklogAge(ctx)
+			if err != nil || !ok {
+				return 0
+			}
+			return int64(age.Seconds())
+		})
+	}
 	telemetry.RegisterStorageGauges(func(ctx context.Context) []telemetry.TenantStorage {
 		qs, _ := repo.ListTenantQuotas(ctx)
 		out := make([]telemetry.TenantStorage, 0, len(qs))
@@ -136,6 +147,9 @@ func buildEmbedder(cfg *config.Config, logger *slog.Logger) ai.Embedder {
 func buildScanner(cfg *config.Config, logger *slog.Logger) antivirus.Scanner {
 	if cfg.Antivirus.Provider == "http" && cfg.Antivirus.Endpoint != "" {
 		logger.Info("antivirus: http scanner", "endpoint", cfg.Antivirus.Endpoint)
+		if cfg.Antivirus.APIKey != "" && !strings.HasPrefix(strings.ToLower(cfg.Antivirus.Endpoint), "https://") {
+			logger.Warn("antivirus: AV_API_KEY is sent over a non-https endpoint", "endpoint", cfg.Antivirus.Endpoint)
+		}
 		return antivirus.NewHTTPScanner(cfg.Antivirus.Endpoint, cfg.Antivirus.APIKey)
 	}
 	logger.Info("antivirus: built-in signature scanner")

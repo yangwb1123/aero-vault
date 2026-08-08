@@ -1,0 +1,68 @@
+name: integration-pg (opt-in)
+
+# Opt-in runtime verification of the Postgres-backed adapters and the
+# -tags=integration suite (G2b/G2c: dual-dialect outbox SQL, the
+# FOR UPDATE / SKIP LOCKED claim path). Triggered MANUALLY via
+# workflow_dispatch only — never on push/PR, so the required CI gate stays
+# zero-Docker (SQLite + local FS, per AGENTS.md engineering constraints).
+#
+# Loud-skip contract: if the PG service is unreachable the job FAILS
+# (zero-SKIP assertion below) instead of silently passing an all-skip run —
+# `t.Skipf` probe skips are exit-code-0 by design (visible as `--- SKIP`
+# lines only under `-v`), so a misconfigured DSN must never yield a green
+# job. Design ref: internal-integration-dual-backend-outbox-suite §7.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  integration-pg:
+    name: postgres integration suite (-tags=integration)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same image as local `make test-integration`.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: aero
+          POSTGRES_PASSWORD: aero
+          POSTGRES_DB: aero
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aero -d aero"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      AERO_PG_DSN: postgres://aero:aero@localhost:5432/aero?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compile gate (type-checks -tags=integration test files)
+        # Same zero-Docker gate as `make check`'s vet-integration step.
+        run: go vet -tags=integration ./...
+
+      - name: PG integration suite (loud skip => job failure)
+        run: |
+          set -o pipefail
+          go test -tags=integration ./internal/integration/ -v -count=1 \
+            -run 'TestPostgres|TestPg' 2>&1 | tee /tmp/pg-tests.log
+          rc=${PIPESTATUS[0]}
+          skips=$(grep -c -- '--- SKIP' /tmp/pg-tests.log || true)
+          if [ "${skips}" -ne 0 ]; then
+            echo "::error::${skips} PG test(s) SKIPPED — service unreachable" \
+              "or DSN misconfigured; refusing silent all-skip green."
+            exit 1
+          fi
+          exit "${rc}"

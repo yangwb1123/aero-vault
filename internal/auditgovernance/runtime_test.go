@@ -114,11 +114,93 @@ func jsonNewDecoder(request *http.Request) requestJSONDecoder {
 	return json.NewDecoder(request.Body)
 }
 
+func TestRuntimeConflictingReceiptIsTerminalWithRetention(t *testing.T) {
+	// Contract A: a conflict:true receipt is terminal-with-retention — the
+	// relay fails the fact (never re-claims, never re-POSTs) and keeps the
+	// row until the retention prune. Bounded-backoff retry forever is the
+	// behavior this pins against.
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer","expires_in":60}`))
+			return
+		}
+		posts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"receipt":{"event_id":"x","tenant_id":"acme","status":"ledgered","accepted_at":"2026-08-04T00:00:00Z","conflict":true}}`))
+	}))
+	defer server.Close()
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "conflict.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := repo.(Store)
+	runtime, err := New(runtimeConfig(server.URL), store,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	wrapped := WrapRepository(repo, runtime)
+	if err := wrapped.RecordAudit(ctx, repository.AuditEntry{TenantID: "acme", Action: "tenant.status"}); err != nil {
+		t.Fatalf("record audit: %v", err)
+	}
+	runtime.Start(ctx)
+	deadline := time.Now().Add(3 * time.Second)
+	for posts.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("first POST never happened: posts=%d", posts.Load())
+	}
+	// Terminal: further poll cycles must not re-POST the conflicting fact.
+	time.Sleep(5 * time.Millisecond)
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	runtime.Close()
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("conflicting fact re-POSTed %d times, want exactly 1 (terminal)", got)
+	}
+	// Terminal rows are never re-claimed and are not pending backlog.
+	if again, err := store.ClaimAuditGovernance(ctx, "observer", "token", 1, 10, time.Minute); err != nil || len(again) != 0 {
+		t.Fatalf("conflicting fact reclaimable: len=%d err=%v", len(again), err)
+	}
+	if _, ok, err := store.OldestPendingAuditGovernance(ctx); err != nil || ok {
+		t.Fatalf("conflicting fact counts as pending ok=%v err=%v", ok, err)
+	}
+	// Retention: the failed row survives until the retention prune, then is
+	// removed (terminal-with-retention).
+	if n, err := store.CleanupFailedAuditGovernance(ctx, time.Now().Add(-time.Hour), 10); err != nil || n != 0 {
+		t.Fatalf("failed row pruned before retention window: n=%d err=%v", n, err)
+	}
+	if n, err := store.CleanupFailedAuditGovernance(ctx, time.Now().Add(time.Hour), 10); err != nil || n != 1 {
+		t.Fatalf("failed row not pruned after retention window: n=%d err=%v", n, err)
+	}
+}
+
 func TestBoundedBackoffIsDeterministicAndCapped(t *testing.T) {
 	first := boundedBackoff("fact-1", 20, time.Second, 5*time.Second)
 	second := boundedBackoff("fact-1", 20, time.Second, 5*time.Second)
 	if first != second || first < 500*time.Millisecond || first > 5*time.Second {
 		t.Fatalf("backoff first=%v second=%v", first, second)
+	}
+	// Contract pin (REQ-5.2): the 300 s default cap
+	// (config_audit_governance.go:65) with 20 attempts — the doubling snaps
+	// to the max (8 doublings: 256 s > max/2) and the ±25 % jitter clamps to
+	// [225 s, 300 s], so > 200 s fails a broken doubling chain, not just a
+	// missing cap.
+	first = boundedBackoff("fact-1", 20, time.Second, 300*time.Second)
+	second = boundedBackoff("fact-1", 20, time.Second, 300*time.Second)
+	if first != second || first <= 200*time.Second || first > 300*time.Second {
+		t.Fatalf("300s-cap backoff first=%v second=%v", first, second)
 	}
 }
 
@@ -324,5 +406,93 @@ func TestRelayLogsNeverExposeRawFactInputs(t *testing.T) {
 		if strings.Contains(logs.String(), forbidden) {
 			t.Fatalf("relay log leaked %q: %s", forbidden, logs.String())
 		}
+	}
+}
+
+// TestRuntimeReadyDegradesOnBacklogLag pins B3-2 (D1): a pending backlog
+// beyond maxLag makes Ready() report degraded (nil) instead of failing
+// /readyz, while BacklogAge exposes the age for the 450s alert gauge.
+func TestRuntimeReadyDegradesOnBacklogLag(t *testing.T) {
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "ready.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store, ok := repo.(Store)
+	if !ok {
+		t.Fatal("repo is not an audit governance store")
+	}
+	cfg := runtimeConfig("http://127.0.0.1:1")
+	cfg.MaxLagSeconds = 4 // default; seeded fact is 2h old, far beyond maxLag
+	// New() applies the configured acme binding (revision 1) internally.
+	runtime, err := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed one pending fact that will never be delivered (server down). The
+	// backlog age is measured from the outbox row's created_at (insert
+	// time), so the test waits past maxLag (4s) to cross the degraded
+	// threshold.
+	if _, err := store.InsertEventWithGovernance(ctx, repository.Event{
+		TenantID: "acme", Bucket: "b", Key: "k", Type: repository.EventCreated,
+		CreatedAt: time.Now().UTC(),
+	}, repository.AuditGovernanceFact{SourceID: "acme", TenantID: "acme",
+		OriginKind: repository.AuditOriginFile, FactKind: "file",
+		Action: "file.create", OccurredAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(4500 * time.Millisecond)
+	age, ok, err := runtime.BacklogAge(ctx)
+	if err != nil || !ok {
+		t.Fatalf("BacklogAge ok=%v err=%v, want pending backlog", ok, err)
+	}
+	if age < 4*time.Second {
+		t.Fatalf("BacklogAge=%v, want > maxLag (4s)", age)
+	}
+	if err := runtime.Ready(ctx); err != nil {
+		t.Fatalf("Ready must degrade (nil) on maxLag, got %v", err)
+	}
+	// Draining still fails readiness (unchanged gate).
+	if err := store.ApplyAuditGovernanceBindings(ctx, 2, "acme-v2", []repository.AuditGovernanceBindingState{
+		{TenantID: "acme", State: repository.AuditGovernanceBindingDraining},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Ready(ctx); err == nil {
+		t.Fatal("Ready must fail while a binding is draining")
+	}
+}
+
+// TestRuntimeBacklogAgeZeroWhenNoPending pins the B3-1 interplay: terminal
+// rows are excluded from the backlog, so a fully dead-lettered backlog
+// reports BacklogAge ok=false (zero gauge) and never blocks readiness.
+func TestRuntimeBacklogAgeZeroWhenNoPending(t *testing.T) {
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "ready2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store, ok := repo.(Store)
+	if !ok {
+		t.Fatal("repo is not an audit governance store")
+	}
+	cfg := runtimeConfig("http://127.0.0.1:1")
+	runtime, err := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := runtime.BacklogAge(ctx); err != nil || ok {
+		t.Fatalf("empty backlog: ok=%v err=%v", ok, err)
+	}
+	if err := runtime.Ready(ctx); err != nil {
+		t.Fatalf("Ready on empty backlog: %v", err)
 	}
 }

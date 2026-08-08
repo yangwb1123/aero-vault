@@ -54,6 +54,10 @@ var (
 	mEventOutboxL2Delivered metric.Int64Counter
 	mEventOutboxL2Unbound   metric.Int64Counter
 	mEventOutboxL2Rejected  metric.Int64Counter
+	mAuditGovRelayAttempted metric.Int64Counter
+	mAuditGovRelayDelivered metric.Int64Counter
+	mAuditGovRelayFailed    metric.Int64Counter
+	mAuditGovRelayDead      metric.Int64Counter
 )
 
 func initDomain() {
@@ -96,6 +100,10 @@ func initDomain() {
 		mEventOutboxL2Delivered, _ = m.Int64Counter("event_outbox.l2_delivered_total")
 		mEventOutboxL2Unbound, _ = m.Int64Counter("event_outbox.l2_unbound_total")
 		mEventOutboxL2Rejected, _ = m.Int64Counter("event_outbox.l2_rejected_total")
+		mAuditGovRelayAttempted, _ = m.Int64Counter("audit_governance.relay_attempted_total")
+		mAuditGovRelayDelivered, _ = m.Int64Counter("audit_governance.relay_delivered_total")
+		mAuditGovRelayFailed, _ = m.Int64Counter("audit_governance.relay_failed_total")
+		mAuditGovRelayDead, _ = m.Int64Counter("audit_governance.relay_dead_total")
 	})
 }
 
@@ -172,6 +180,36 @@ func IncEventOutboxL2Unbound(ctx context.Context) {
 func IncEventOutboxL2Rejected(ctx context.Context) {
 	initDomain()
 	mEventOutboxL2Rejected.Add(ctx, 1)
+}
+
+// IncAuditGovernanceRelayAttempted counts one audit-governance delivery
+// attempt: a claimed fact processed by the relay, including retries.
+func IncAuditGovernanceRelayAttempted(ctx context.Context) {
+	initDomain()
+	mAuditGovRelayAttempted.Add(ctx, 1)
+}
+
+// IncAuditGovernanceRelayDelivered counts one durable completion: receipt
+// accepted AND the row completed (fires only after CompleteAuditGovernance
+// returns nil — event_outbox placement precedent).
+func IncAuditGovernanceRelayDelivered(ctx context.Context) {
+	initDomain()
+	mAuditGovRelayDelivered.Add(ctx, 1)
+}
+
+// IncAuditGovernanceRelayFailed counts one transient failure rescheduled for
+// retry (retryFact; analog of event_outbox.retried_total).
+func IncAuditGovernanceRelayFailed(ctx context.Context) {
+	initDomain()
+	mAuditGovRelayFailed.Add(ctx, 1)
+}
+
+// IncAuditGovernanceRelayDead counts one terminal-with-retention failure
+// (failFact; dead-letter class, contract naming — the repo column is
+// failed_at_ns, a documented deviation owned by the T-3 sibling).
+func IncAuditGovernanceRelayDead(ctx context.Context) {
+	initDomain()
+	mAuditGovRelayDead.Add(ctx, 1)
 }
 
 // RecordAIUsage records token/cost domain metrics for one AI (chat) call,
@@ -309,6 +347,19 @@ func RegisterWebhookQueueDepthGauge(fn func(context.Context) map[string]int64) {
 			for url, depth := range fn(ctx) {
 				o.Observe(depth, metric.WithAttributes(attribute.String("url", url)))
 			}
+			return nil
+		}))
+}
+
+// RegisterAuditGovernanceBacklogAgeGauge registers an observable gauge
+// (audit_governance_backlog_age_seconds) whose value is read from fn on each
+// scrape — the B3-2 degraded-alert source (oldest pending fact age; alert at
+// maxLag×0.5, default 450s).
+func RegisterAuditGovernanceBacklogAgeGauge(fn func(context.Context) int64) {
+	m := otel.Meter("aero-vault/domain")
+	_, _ = m.Int64ObservableGauge("audit_governance.backlog_age_seconds", metric.WithInt64Callback(
+		func(ctx context.Context, o metric.Int64Observer) error {
+			o.Observe(fn(ctx))
 			return nil
 		}))
 }

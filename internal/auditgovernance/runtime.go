@@ -41,6 +41,7 @@ type Runtime struct {
 	cleanupBatch   int
 	nextCleanup    time.Time
 	transport      *httpTransportCloser
+	onRetry        func(delay time.Duration)
 	startOnce      sync.Once
 	stopOnce       sync.Once
 	stop           chan struct{}
@@ -142,6 +143,22 @@ func (r *Runtime) Capture(tenant string) bool {
 	return r.states[normalizedTenant(tenant)] == repository.AuditGovernanceBindingActive
 }
 
+// BacklogAge returns the age of the oldest pending (non-terminal) fact for
+// bound tenants. ok=false means no pending facts. B3-2: the value feeds the
+// audit_governance_backlog_age_seconds gauge that drives the degraded alert
+// (maxLag×0.5); terminal rows are excluded by the store query, so a fully
+// dead-lettered backlog reports zero backlog and never blocks readiness.
+func (r *Runtime) BacklogAge(ctx context.Context) (time.Duration, bool, error) {
+	oldest, ok, err := r.store.OldestPendingAuditGovernance(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		return 0, false, nil
+	}
+	return time.Since(oldest), true, nil
+}
+
 func (r *Runtime) Ready(ctx context.Context) error {
 	draining, err := r.store.HasPendingDrainingAuditGovernance(ctx)
 	if err != nil {
@@ -150,12 +167,17 @@ func (r *Runtime) Ready(ctx context.Context) error {
 	if draining {
 		return errors.New("audit governance binding drain is in progress")
 	}
-	oldest, ok, err := r.store.OldestPendingAuditGovernance(ctx)
+	// B3-2 (D1): a backlog beyond maxLag is a degraded condition, not a
+	// readiness failure — /readyz stays 200 (no restart loop) and the
+	// backlog-age gauge (alert threshold maxLag×0.5) drives operator
+	// attention. Store errors remain fail-closed readiness failures.
+	age, ok, err := r.BacklogAge(ctx)
 	if err != nil {
 		return errors.New("audit governance backlog lookup failed")
 	}
-	if ok && time.Since(oldest) > r.maxLag {
-		return errors.New("audit governance backlog exceeds maximum lag")
+	if ok && age > r.maxLag {
+		r.logger.Warn("audit governance relay degraded",
+			"backlog_age", age.String(), "max_lag", r.maxLag.String())
 	}
 	return nil
 }

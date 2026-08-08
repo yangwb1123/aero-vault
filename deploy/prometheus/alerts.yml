@@ -96,6 +96,21 @@ groups:
           summary: "High webhook retry rate"
           description: "Webhook delivery retries exceed 10/15m. Check webhook endpoint availability and network connectivity."
 
+      # IncEventOutboxFailed (internal/telemetry: event_outbox.failed_total):
+      # deleted@1.1 facts reaching terminal 'failed' — L2 401/403 (immediate,
+      # H2) or maxAttempts exhausted (F1). Rows are retained 7d then pruned
+      # (PruneEventOutbox, eventOutboxFailedRetain); the 7d window is the
+      # documented delivery-recovery SLA — beyond it the only durable trace is
+      # the authoritative L0 audit_log row written in the delete transaction.
+      - alert: EventOutboxTerminalFailures
+        expr: sum(rate(event_outbox_failed_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Event outbox facts reached terminal failed state"
+          description: "deleted@1.1 facts hit terminal 'failed' (L2 401/403 or maxAttempts exhausted). Rows are retained 7d (delivery-recovery SLA) then pruned; L0 audit_log remains authoritative. Replay within 7d or accept the gap."
+
       - alert: ScrubFoundCorruptObjects
         expr: sum(increase(scrub_total{status="corrupt"}[1h])) > 0
         for: 0m
@@ -137,3 +152,18 @@ groups:
         annotations:
           summary: "Job queue depth > 1000"
           description: "Pending job backlog exceeded 1000 for 5m. Consider increasing JOBS_WORKERS or setting JOBS_MAX_DEPTH to shed load."
+
+  - name: aero-vault-audit-governance
+    # B3-2 (D1): a stalled audit relay degrades instead of failing /readyz.
+    # The backlog-age gauge (audit_governance_backlog_age_seconds, oldest
+    # pending non-terminal fact) alerts at maxLag×0.5 (default 900s maxLag →
+    # 450s). Terminal (dead-lettered) rows are excluded from the gauge.
+    rules:
+      - alert: AuditGovernanceBacklogDegraded
+        expr: audit_governance_backlog_age_seconds > 450
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit governance relay backlog degraded"
+          description: "Oldest pending audit fact is {{ $value }}s old (> 450s = maxLag×0.5). The sink is likely unavailable; /readyz stays 200 (degraded), check relay_attempted/failed counters and the sink."

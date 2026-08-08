@@ -20,6 +20,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/mcp"
 	"github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/server"
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
@@ -92,6 +93,7 @@ func run() error {
 	svc := service.NewFileService(store, repo, logger).
 		WithEventSink(bus).
 		WithAuthorizer(accessManager).
+		WithDeleteFailOpen(!cfg.Access.DeleteFailClosed).
 		WithTenantStatusEnforcement().
 		WithReadVerification(service.ReadVerificationConfig{
 			Enabled: cfg.Storage.VerifyOnRead,
@@ -149,7 +151,7 @@ func run() error {
 	adminRL.Start(ctx)
 
 	promHandler := buildPrometheus(cfg, logger)
-	registerGauges(repo)
+	registerGauges(repo, auditRuntime)
 
 	aiTimeout := time.Duration(cfg.App.RequestTimeoutSec) * time.Second
 	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, accessManager, oidcHandler, promHandler, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider, runtimeReadiness(billingRuntime, auditRuntime))
@@ -161,7 +163,7 @@ func run() error {
 	} else {
 		concurrencyMW = cl.Middleware()
 	}
-	finalHandler := applyMiddleware(dispatcher, repo, authReg, rl, cfg, logger, concurrencyMW, corsProvider)
+	finalHandler := server.ApplyMiddleware(dispatcher, repo, authReg, rl, cfg, logger, concurrencyMW, corsProvider)
 
 	return runServer(ctx, finalHandler, cfg, logger, bus, shutdownOtel)
 }
@@ -213,6 +215,9 @@ func runMCP() error {
 	bus := events.NewWithBuffer(repo, logger, cfg.Events.SubBufferSize)
 	defer bus.Close()
 	svc := service.NewFileService(store, repo, logger).WithAuthorizer(accessManager).WithEventSink(bus)
+	if !cfg.Access.DeleteFailClosed {
+		svc.WithDeleteFailOpen(true)
+	}
 	if billingRuntime != nil {
 		svc.WithUsageAccountant(billingRuntime)
 	}
