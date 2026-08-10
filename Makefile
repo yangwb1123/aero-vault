@@ -127,7 +127,17 @@ test-race-meta:
 
 .PHONY: test-race-meta
 
-check: fmt vet vet-integration build test test-race-meta cli-check
+# Scoped race detection for the thumbnail decode semaphore (short mode: the
+# deterministic slot-contract tests run; the 8192²×16 aggregate-memory test
+# needs ~1.2 GiB and ~97s under -race, so it stays behind testing.Short()).
+test-race-thumbnail:
+	@echo "[check] data race detection (thumbnail decode semaphore) ..."
+	go test -race -short -count=1 -timeout 120s ./internal/thumbnail/
+	@echo "  OK (no races detected)"
+
+.PHONY: test-race-thumbnail
+
+check: fmt vet vet-integration build test test-race-meta test-race-thumbnail cli-check
 
 .PHONY: dev
 

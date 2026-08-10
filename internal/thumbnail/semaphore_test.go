@@ -18,6 +18,7 @@ package thumbnail
 
 import (
 	"bytes"
+	"errors"
 	"image/color"
 	"runtime"
 	"sync"
@@ -26,6 +27,20 @@ import (
 )
 
 func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
+	// C3: this test needs ~1.2 GiB live heap (16 × 268 MiB worst-case decodes)
+	// and ~97s under -race; it must not run in short/CI-race mode. The
+	// deterministic C2 tests below still pin the semaphore contract there.
+	if testing.Short() {
+		t.Skip("8192²×16 concurrent decode needs ~1.2 GiB; run without -short")
+	}
+
+	// C1 pin: the concurrency constant is part of the memory ceiling contract.
+	// 4 × 268 MiB ≈ 1.1 GiB for PNG RGBA; a silent raise (4→8→16) must fail
+	// this test rather than silently growing the allowed peak.
+	if maxConcurrentDecodes != 4 {
+		t.Fatalf("maxConcurrentDecodes = %d, want 4 (design pin: 4×268MiB ≈ 1.1GiB)", maxConcurrentDecodes)
+	}
+
 	// 8192² uniform NRGBA: tiny compressed fixture, full 268 MiB decode —
 	// the documented worst case exactly at the MaxSourceDim boundary
 	// (pre-check is `> MaxSourceDim`, so 8192 passes).
@@ -77,7 +92,19 @@ func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
 	}()
 
 	close(start)
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(120 * time.Second):
+		// C2 watchdog: a slot leak is a package-global permanent DoS — the
+		// batch would hang forever; fail fast instead of the 10-min go-test
+		// timeout.
+		t.Fatal("watchdog: batch did not complete in 120s — decode slot leak?")
+	}
 	close(stop)
 	sampler.Wait()
 
@@ -95,6 +122,113 @@ func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
 	if limit := uint64(maxConcurrentDecodes)*singleWorstPeak + 64<<20; peak > limit {
 		t.Fatalf("peak live heap %d bytes exceeds semaphore bound %d", peak, limit)
 	}
+	// C1 absolute ceiling: even if the constant were raised, live decode
+	// memory must never approach the 2 GiB design ceiling.
+	if peak > 2<<30 {
+		t.Fatalf("peak live heap %d bytes exceeds absolute 2 GiB ceiling", peak)
+	}
+}
+
+// signalReader blocks on Read until closed; used to prove a Generate call is
+// parked before it touches the input stream, then unblocked so the parked
+// goroutine exits cleanly (no slot/goroutine leak into later tests).
+type signalReader struct {
+	c chan struct{}
+}
+
+func (r *signalReader) Read([]byte) (int, error) {
+	<-r.c
+	return 0, errors.New("reader closed")
+}
+
+func TestSemaphoreBlocksBeforeDecodeConfig(t *testing.T) {
+	// C2 deterministic test 1: with every slot held, a Generate call must
+	// park at acquisition — before DecodeConfig, before any input read.
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		acquireDecodeSlot()
+	}
+	// No defer release here: the slots are released mid-test to unblock the
+	// parked goroutine (below), and the final acquire/release cycle verifies
+	// full recovery. A t.Fatal in the parked-branch leaks slots, which is
+	// fine — the test has already failed and the process exits.
+
+	r := &signalReader{c: make(chan struct{})}
+	entered := make(chan struct{})
+	go func() {
+		// A read from the stream is the first observable effect of the
+		// decode section; if acquisition is correctly placed before the
+		// LimitReader/DecodeConfig, this goroutine never reads while
+		// parked.
+		_, _ = Generate(r, 8, 8)
+		close(entered)
+	}()
+	select {
+	case <-entered:
+		t.Fatal("Generate returned while all slots held — acquisition is not before decode")
+	case <-time.After(200 * time.Millisecond):
+		// parked: correct
+	}
+	// Unblock the parked goroutine: first release the slots so it can enter
+	// the decode section, then close the reader so its first Read fails and
+	// Generate returns (releasing its slot via defer). Wait for a clean
+	// exit so no slot or goroutine leaks into later tests.
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		releaseDecodeSlot()
+	}
+	close(r.c)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked Generate did not exit after reader close — slot leak?")
+	}
+	// The goroutine's deferred release must have returned its slot: all
+	// slots are acquirable again.
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		acquireDecodeSlot()
+	}
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		releaseDecodeSlot()
+	}
+}
+
+func TestSemaphoreReleasesOnError(t *testing.T) {
+	// C2 deterministic test 2: an error path (undecodable input) must return
+	// the slot — otherwise the package degrades to permanent DoS after one
+	// bad request. After Generate fails, all slots must be acquirable.
+	_, err := Generate(bytes.NewReader([]byte("not an image")), 8, 8)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("err = %v, want ErrUnsupported", err)
+	}
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		acquireDecodeSlot()
+	}
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		releaseDecodeSlot()
+	}
+}
+
+// panicReader panics on first read, modelling a reader fault mid-decode.
+type panicReader struct{}
+
+func (panicReader) Read([]byte) (int, error) { panic("boom: reader fault") }
+
+func TestSemaphoreReleasesOnPanic(t *testing.T) {
+	// C2 deterministic test 3: the defer-based release must survive a panic
+	// inside the decode section; a leaked slot would wedge the package.
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic from reader")
+		}
+		// Panic recovered: Generate's deferred release has run; every slot
+		// must now be acquirable (no leak).
+		for i := 0; i < maxConcurrentDecodes; i++ {
+			acquireDecodeSlot()
+		}
+		for i := 0; i < maxConcurrentDecodes; i++ {
+			releaseDecodeSlot()
+		}
+	}()
+	_, _ = Generate(panicReader{}, 8, 8)
 }
 
 // calibrateSingleWorstPeak runs three sequential single Generate calls on
