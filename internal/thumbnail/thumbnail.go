@@ -55,11 +55,13 @@ const (
 	// the inputs that make the endpoint a memory-DoS sink, and the output is
 	// capped at HardMax anyway.
 	//
-	// Note: the 268 MiB worst case is per request, and MAX_INFLIGHT_REQUESTS /
-	// PER_TENANT_CONCURRENCY_MAX both default to 0 (unlimited concurrency) —
-	// aggregate memory pressure is bounded only by operator-set concurrency
-	// and rate limits. Tighten those knobs, or lower this constant, if the
-	// endpoint shows aggregate pressure.
+	// Note: the worst cases above are per request. Aggregate in-flight decode
+	// memory is capped by the package-level semaphore maxConcurrentDecodes:
+	// at most maxConcurrentDecodes Generate calls hold their allocation-bearing
+	// section at once, so live decode allocation across all calls is bounded
+	// by maxConcurrentDecodes × per-request worst case (≈ 1.1 GiB PNG RGBA;
+	// ≈ 4.4 GiB progressive JPEG at the current constant) regardless of
+	// MAX_INFLIGHT_REQUESTS / PER_TENANT_CONCURRENCY_MAX / rate limits.
 	MaxSourceDim = 8192
 
 	// MaxSourceBytes caps the compressed input consumed per Generate call.
@@ -83,6 +85,26 @@ const (
 	// metadata can no longer be thumbnailed.
 	MaxMetadataBytes = 8 << 20
 )
+
+// maxConcurrentDecodes caps how many Generate calls may be inside their
+// allocation-bearing section (DecodeConfig through jpeg.Encode) at once.
+// Aggregate live decode memory is therefore bounded by
+// maxConcurrentDecodes × per-request worst case (≈ 4 × 268 MiB ≈ 1.1 GiB for
+// PNG RGBA; ≈ 4 × ~1.1 GiB ≈ 4.4 GiB for progressive JPEG at MaxSourceDim)
+// regardless of MAX_INFLIGHT_REQUESTS / PER_TENANT_CONCURRENCY_MAX / rate
+// limits. Waiters hold only a stream reader and allocate nothing.
+const maxConcurrentDecodes = 4
+
+// decodeSlots is the package-level blocking semaphore backing
+// maxConcurrentDecodes (buffered-channel idiom; cf. middleware.ConcurrencyLimiter).
+var decodeSlots = make(chan struct{}, maxConcurrentDecodes)
+
+// acquireDecodeSlot blocks until a slot is free. The caller must pair it with
+// releaseDecodeSlot (defer), which runs on both normal return and panic.
+func acquireDecodeSlot() { decodeSlots <- struct{}{} }
+
+// releaseDecodeSlot returns a slot acquired by acquireDecodeSlot.
+func releaseDecodeSlot() { <-decodeSlots }
 
 // limitedBuffer is an io.Writer that accepts writes while the total bytes
 // accepted stay within max, then fails every further write with
@@ -125,6 +147,13 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 	if maxH > HardMax {
 		maxH = HardMax
 	}
+
+	// Aggregate bound: at most maxConcurrentDecodes Generate calls may hold
+	// the allocation-bearing section below (config scan, decode, scale,
+	// composite, encode) at once. Held for the entire section so the bound
+	// is airtight; waiters allocate nothing.
+	acquireDecodeSlot()
+	defer releaseDecodeSlot()
 
 	// Bound the compressed input consumed per call; this also governs the
 	// DecodeConfig reads below so no caller can drive unbounded reads.
