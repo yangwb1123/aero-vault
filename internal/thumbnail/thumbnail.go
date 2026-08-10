@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"errors"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"io"
 
@@ -159,12 +161,31 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 		return nil, ErrUnsupported
 	}
 	dst := scale(src, maxW, maxH)
+	dst = compositeOnWhite(dst) // JPEG has no alpha; flatten transparency before encode.
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// compositeOnWhite returns img unchanged when it is fully opaque; otherwise it
+// returns an opaque copy of img composited onto a white background. JPEG has no
+// alpha channel, so transparency must be flattened before encoding: the generic
+// encoder path serializes premultiplied RGBA() values verbatim, which renders
+// transparent regions black (or darkened). Skipping the composite for opaque
+// images is required, not an optimization: it keeps opaque-source output
+// byte-identical to the pre-fix encoder path.
+func compositeOnWhite(img image.Image) image.Image {
+	if o, ok := img.(interface{ Opaque() bool }); ok && o.Opaque() {
+		return img
+	}
+	b := img.Bounds()
+	out := image.NewRGBA(b)
+	draw.Draw(out, b, image.NewUniform(color.White), image.Point{}, draw.Src)
+	draw.Draw(out, b, img, b.Min, draw.Over)
+	return out
 }
 
 // scale downsamples src to fit within maxW×maxH using bilinear interpolation,
