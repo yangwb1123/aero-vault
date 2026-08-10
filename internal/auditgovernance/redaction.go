@@ -44,6 +44,13 @@ func (r *redactor) tenantSourceID(tenant string) (string, error) {
 	if tenant == "" || tenant != strings.TrimSpace(tenant) {
 		return "", ErrInvalidConfig
 	}
+	// The fact-ID frame (audit_governance_factid.go) is NUL-separated and
+	// unambiguous only if no field carries a control character. tenant is the
+	// only unconstrained frame field — reject C0 controls (incl. NUL) + DEL
+	// so the framing's injectivity never depends on the tenant input.
+	if strings.IndexFunc(tenant, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return "", ErrInvalidConfig
+	}
 	value := r.digest(tenant, "source-system", tenant)
 	return SourcePrefix + "." + strings.TrimPrefix(value, "hmac-sha256:"), nil
 }

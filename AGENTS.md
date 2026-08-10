@@ -137,7 +137,7 @@ RequestID → BucketCORS → CORS → SecureHeaders → MaxBodySize
 
 **Web UI `/ui`（`WEBUI_ENABLED`，默认开）：** 内嵌 vanilla-JS SPA，5 tab（search/detail/lineage/chat/access）+ 拖拽/文件上传 + SSE chat 流式 + 文件生命周期/分享/公开图片/部门/ACL/备份管理；tenant/apikey 存 localStorage。
 
-**Ops：** `/healthz` `/readyz` · `/metrics`(**`PROMETHEUS_ENABLED`，默认关**；域指标 ~32 个 + HTTP + gauges，实时清单 `grep internal/telemetry`) · OTLP 推送(`OTEL_EXPORTER_OTLP_ENDPOINT`)。`deploy/`：2 个 Grafana 仪表盘（AI/Ops 12 panel + HTTP/runtime 17 panel）、`deploy/prometheus/alerts.yml` 共 12 条告警（http/latency/ai-cost/integrity 四组）。
+**Ops：** `/healthz` `/readyz` · `/metrics`(**`PROMETHEUS_ENABLED`，默认关**；域指标 ~32 个 + HTTP + gauges，实时清单 `grep internal/telemetry`) · OTLP 推送(`OTEL_EXPORTER_OTLP_ENDPOINT`)。`deploy/`：2 个 Grafana 仪表盘（AI/Ops 13 panel + HTTP/runtime 17 panel）、`deploy/prometheus/alerts.yml` 共 16 条告警（http/ai-cost/integrity/ai-latency/ai-search/audit-governance 六组）。
 
 ---
 
@@ -162,6 +162,7 @@ RequestID → BucketCORS → CORS → SecureHeaders → MaxBodySize
 | Indexer 跳过对象 | `IncIndexerSkip(reason∈{unsupported,error,empty})`；非致命 |
 | ChunkCleaner 孤儿清理失败 | 硬删除路径同步调用；失败 warn log，**不阻断删除** |
 | Reranker 失败 | 降级为原始排序 + warn；不向调用方报错 |
+| hybrid 检索单模态失败 | 降级为健康模态结果（BM25-only / vector-only）+ warn + `ai_search_degraded_total` 计数；**200 响应无降级标记——计数器 + SearchDegraded 告警（alerts.yml `aero-vault-ai-search` 组）是唯一可见面** |
 | AI 日费用超限 | `/chat` → 402 `BudgetExceeded`；`/chat/stream` → SSE error 帧（Agent 不检查费用） |
 | 对象损坏/WORM/legal-hold | scrub 标记 `corrupt` → Get/Stat 返回 `ErrObjectCorrupt`；WORM `locked_until` 或 legal hold 未释放 → 拒绝覆盖/硬删 |
 

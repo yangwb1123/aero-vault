@@ -11,22 +11,28 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	_ "modernc.org/sqlite"
 
+	"github.com/aero-vault/aero-vault/internal/access"
+
 	"github.com/aero-vault/aero-vault/internal/api/rest"
 	"github.com/aero-vault/aero-vault/internal/api/s3compat"
 	dav "github.com/aero-vault/aero-vault/internal/api/webdav"
 	"github.com/aero-vault/aero-vault/internal/auth"
+	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/events"
 	"github.com/aero-vault/aero-vault/internal/mcp"
 	"github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/server"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 	"github.com/aero-vault/aero-vault/internal/webui"
@@ -51,7 +57,35 @@ func startFullServer(t *testing.T) *httptest.Server {
 // the relay options (short poll, AuditSink) — the AC-3/AC-5 injection point
 // (the harness constructs the relay directly; no env-var indirection).
 func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOptions) *fullServerHarness {
+	return startFullServerOpts(t, relayOpts, "")
+}
+
+// startFullServerWithAuthAndRelay is the AC-4 harness: same server shape with
+// an enabled auth registry (token:tenant:scope+scope format) so requireAdmin
+// and the write-scope gate are real, not vacuous (auth.Parse("") disables the
+// registry and requireAdmin returns true unconditionally).
+func startFullServerWithAuthAndRelay(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string) *fullServerHarness {
+	return startFullServerOpts(t, relayOpts, authKeys)
+}
+
+// startFullServerOpts is the shared body behind the three constructors. All
+// existing call sites go through startFullServerWithRelay/startFullServer and
+// are unaffected (authKeys "" keeps the registry disabled). The production
+// default config (MaxBodySize 0, empty CORS) keeps existing tests unchanged.
+func startFullServerOpts(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string) *fullServerHarness {
+	return startFullServerWithConfig(t, relayOpts, authKeys, &config.Config{})
+}
+
+// startFullServerWithConfig is the configurable harness body: the same
+// production-shaped server, but with an explicit config so tests can exercise
+// the middleware chain rings that the default config leaves inert (MaxBodySize,
+// CORS). cfg is required — a nil config would nil-dereference inside
+// server.ApplyMiddleware, so fail fast in the test.
+func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string, cfg *config.Config) *fullServerHarness {
 	t.Helper()
+	if cfg == nil {
+		t.Fatal("cfg required")
+	}
 	ctx := context.Background()
 
 	dsn := "file:" + filepath.Join(t.TempDir(), "x.db")
@@ -70,9 +104,27 @@ func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOp
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.NewFileService(store, repo, logger)
+	svc := service.NewFileService(store, repo, logger).WithAuthorizer(allowAllProvider{})
+	// Production bus shape (mirrors cmd/server/main.go:215 + workers.go:141-147):
+	// the service sinks lifecycle events into the Bus and the Notifier delivers
+	// them per bucket notification rules. Existing tests are unaffected — with
+	// no rules GetBucketNotifications returns empty and the notifier no-ops
+	// (notifier.deliver early-returns). Without this wiring the D2 dedupe
+	// (notifier.deliver's HasEventOutboxFact skip) would be dead code in tests.
+	// Teardown order (LIFO): bus.Close → notifCancel → relayCancel → ts.Close →
+	// repo.Close. bus.Close closes the subscriber channel first, so the notifier
+	// goroutine exits on the closed channel; repo.Close runs last, so no
+	// goroutine touches a closed DB handle.
+	bus := events.New(repo, logger)
+	svc.WithEventSink(bus)
+	notif := events.NewNotifier(repo, logger)
+	notifCtx, notifCancel := context.WithCancel(ctx)
+	sub, _ := bus.Subscribe()
+	go notif.Run(notifCtx, sub)
+	t.Cleanup(notifCancel)
+	t.Cleanup(bus.Close)
 
-	authReg, _ := auth.Parse("")
+	authReg, _ := auth.Parse(authKeys)
 	authReg.WithPutPresigner(auth.NewPutPresigner("integration-presign-secret-32-bytes"))
 	var rl, aiRL *middleware.RateLimiter
 
@@ -92,7 +144,7 @@ func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOp
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
 	r.Mount("/v1", rest.NewRouter(svc, repo, nil, nil, nil, nil, authReg, logger, false, aiRL, nil, 0, false))
-	r.Mount("/s3", s3compat.NewRouter(svc, logger))
+	r.Mount("/s3", s3compat.NewRouter(svc, logger, nil))
 
 	mcpServer := mcp.NewServer(svc, repo, nil, "default", logger)
 	r.Method(http.MethodPost, "/mcp", mcp.HTTPHandler(mcpServer))
@@ -107,18 +159,15 @@ func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOp
 		r.ServeHTTP(w, req)
 	})
 
-	var finalHandler http.Handler = dispatcher
-	for _, m := range []func(http.Handler) http.Handler{
-		middleware.AccessLog(logger),
-		middleware.Recoverer(logger),
-		rl.Middleware(),
-		middleware.Tenant,
-		authReg.Middleware(),
-		middleware.CORS(middleware.CORSConfig{}),
-		middleware.RequestID,
-	} {
-		finalHandler = m(finalHandler)
-	}
+	// The harness mounts the same 12-ring chain as production: both call
+	// server.ApplyMiddleware, so the chain cannot drift (FR-1/AC-1). The
+	// deliberate differences from production are: nil rate limiter (pass-through),
+	// NewConcurrencyLimiter(0) (pass-through), nil bucket-CORS provider
+	// (pass-through), and the tenant ring now performs the same TenantWithStatus
+	// lookup as production (the one intentional harness behavior change: disabled
+	// tenants get 403).
+	finalHandler := server.ApplyMiddleware(dispatcher, repo, authReg, rl, cfg, logger,
+		middleware.NewConcurrencyLimiter(0).Middleware(), nil /* corsProvider */)
 
 	ts := httptest.NewServer(finalHandler)
 	t.Cleanup(ts.Close)
@@ -399,8 +448,17 @@ func TestFullServer_OpenAPI(t *testing.T) {
 	}
 }
 
+// TestFullServer_CORS (AC-5) exercises the CORS ring at the 12-ring composition
+// level: preflight 204 echo + Vary: Origin, disallowed-origin 403 deny, and the
+// non-preflight echo path, plus the chain's ExposeHeaders append. The old
+// `_ = resp.Header.Get(...)` no-op assertion is gone — every header read is
+// asserted.
 func TestFullServer_CORS(t *testing.T) {
-	ts := startFullServer(t)
+	ts := startFullServerWithConfig(t, &events.EventOutboxRelayOptions{}, "",
+		&config.Config{CORS: config.CORSCfg{AllowedOrigins: []string{"http://example.com"}}}).ts
+
+	// Allowed-origin preflight → 204, echo ACAO, Vary: Origin, Expose-Headers
+	// (X-Request-ID is not CORS-safelisted, so the chain must expose it).
 	req, _ := http.NewRequest(http.MethodOptions, ts.URL+"/v1/files", nil)
 	req.Header.Set("Origin", "http://example.com")
 	req.Header.Set("Access-Control-Request-Method", "GET")
@@ -409,7 +467,52 @@ func TestFullServer_CORS(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	_ = resp.Header.Get("Access-Control-Allow-Origin")
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("preflight allowed origin: got %d, want 204", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "http://example.com" {
+		t.Fatalf("ACAO: got %q, want %q", got, "http://example.com")
+	}
+	if got := resp.Header.Get("Vary"); got != "Origin" {
+		t.Fatalf("Vary: got %q, want %q", got, "Origin")
+	}
+	expose := resp.Header.Get("Access-Control-Expose-Headers")
+	if !strings.Contains(expose, "X-Request-ID") {
+		t.Fatalf("Access-Control-Expose-Headers %q missing X-Request-ID", expose)
+	}
+
+	// Disallowed-origin preflight → 403 deny path.
+	req, _ = http.NewRequest(http.MethodOptions, ts.URL+"/v1/files", nil)
+	req.Header.Set("Origin", "http://evil.example")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("preflight disallowed origin: got %d, want 403", resp.StatusCode)
+	}
+
+	// Non-preflight GET with allowed origin → ACAO echo + Vary: Origin on the
+	// normal response path (ring-order interaction: CORS sits outside auth/
+	// tenant, so the echo must reach the client regardless of auth state).
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/v1/files", nil)
+	req.Header.Set("Origin", "http://example.com")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/files: got %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "http://example.com" {
+		t.Fatalf("GET ACAO: got %q, want %q", got, "http://example.com")
+	}
+	if got := resp.Header.Get("Vary"); got != "Origin" {
+		t.Fatalf("GET Vary: got %q, want %q", got, "Origin")
+	}
 }
 
 func TestFullServer_ProtocolInterop(t *testing.T) {
@@ -744,8 +847,8 @@ func TestDeleteResponse_DoesNotBlockOnDelivery(t *testing.T) {
 	assertAuditRowFor(t, h.repo, "default", "hard")
 
 	// Recovery: release the target; the in-flight POST completes and the relay
-	// completes the fact (in-flight POST ≤5s + 50ms poll + 1s±25% backoff →
-	// ~15s bound).
+	// completes the fact (in-flight POST ≤5s + 50ms poll + ≤1s backoff
+	// (downward-only jitter [0.75, 1.0)s of 1s) → ~15s bound).
 	releaseOnce.Do(func() { close(release) })
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -842,6 +945,320 @@ func TestComposition_AuditSinkL2BoundTenant(t *testing.T) {
 	t.Fatal("control server fact never completed by the always-on relay")
 }
 
+// ── AC-4b = G1: REST DELETE → both facts delivered, byte-exact, exactly-once ─
+
+// TestComposition_DeleteDeliversBothFacts (AC-4b = G1) proves the full
+// composition end to end: a REST hard DELETE commits both outbox facts
+// (deleted@1.1 + notify@1.1), the relay delivers the notify@1.1 payload to
+// the notification target byte-exact (verbatim invariant — never re-derived
+// at delivery time) and the deleted@1.1 fact to the L2 audit sink exactly
+// once each, and no bus-path duplicate (D2) lands on the target. The harness
+// wires the production bus+notifier shape (workers.go:141-147), so a D2
+// regression (removing the notifier.go:67-81 skip) puts the legacy
+// buildS3Event body on the target too and len(bodies)==2 fails loudly here.
+func TestComposition_DeleteDeliversBothFacts(t *testing.T) {
+	// notify target: the relay POSTs the @1.1 envelope verbatim.
+	var nMu sync.Mutex
+	var nBodies [][]byte
+	notify := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		nMu.Lock()
+		nBodies = append(nBodies, body)
+		nMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(notify.Close)
+
+	// L2: deleted@1.1 audit sink (needs the X-Audit-Fact-Id echo receipt).
+	var l2Mu sync.Mutex
+	var l2Bodies [][]byte
+	l2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		l2Mu.Lock()
+		l2Bodies = append(l2Bodies, body)
+		l2Mu.Unlock()
+		w.Header().Set("X-Audit-Fact-Id", r.Header.Get("X-Audit-Fact-Id"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(l2.Close)
+
+	sink, err := events.NewAuditSinkL2(l2.URL, map[string]string{"default": "e2e-l2-token-0123456789"},
+		&http.Client{Timeout: 5 * time.Second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startFullServerWithRelay(t, &events.EventOutboxRelayOptions{
+		PollInterval: 50 * time.Millisecond, BatchSize: 32,
+		ClaimTTL: 30 * time.Second, HTTPTimeout: 5 * time.Second,
+		MaxAttempts: 10, AuditSink: sink,
+	})
+
+	// FM-7: the rule must exist BEFORE the DELETE. deliverNotify completes
+	// silently with zero matching rules; a late insert would deliver 0 POSTs
+	// with status 'delivered' and the len==1 guard below would fail loudly.
+	setDeleteRule(t, h.repo, notify.URL)
+
+	key := "k"
+	putWithTenant(t, h.ts, "default", key)
+	obj, err := h.repo.GetObject(context.Background(), "default", "default", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteWithTenant(t, h.ts, "default", key, true)
+	assertAuditRowFor(t, h.repo, "default", "hard")
+
+	// Both facts reach delivered ≤15s (healthy ~1-2s: next 50ms poll + local
+	// POSTs). A POST completes before its fact completes, so when the status
+	// flips the counters are already settled.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if outboxStatus(t, h.dsn, obj.ID, "vault.file.deleted@1.1") == "delivered" &&
+			outboxStatus(t, h.dsn, obj.ID, "vault.file.notify@1.1") == "delivered" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if time.Now().After(deadline) {
+		t.Fatalf("facts never reached delivered: deleted=%q notify=%q",
+			outboxStatus(t, h.dsn, obj.ID, "vault.file.deleted@1.1"),
+			outboxStatus(t, h.dsn, obj.ID, "vault.file.notify@1.1"))
+	}
+
+	// Exactly-once, absolute (a3): the counters must equal 1 at the moment
+	// both facts are delivered — a duplicate that landed before the snapshot
+	// cannot be masked by a relative "unchanged" comparison. Guard len==1
+	// before touching nBody[0]: a 0-body read would panic, a 2-body read must
+	// Fatal, not compare.
+	nMu.Lock()
+	nGot := len(nBodies)
+	nBody := append([][]byte(nil), nBodies...)
+	nMu.Unlock()
+	l2Mu.Lock()
+	l2Got := len(l2Bodies)
+	l2Mu.Unlock()
+	if nGot != 1 {
+		t.Fatalf("notify target received %d POSTs, want exactly 1 (D2 bus-path duplicate or relay redelivery)\n%s", nGot, dumpBodies(nBody))
+	}
+	if l2Got != 1 {
+		t.Fatalf("L2 received %d POSTs, want exactly 1", l2Got)
+	}
+
+	// Byte-exact egress (D-3): the wire body IS the stored payload (the relay
+	// POSTs the row verbatim; no SQL statement ever mutates payload after
+	// insert).
+	rowPayload := outboxPayload(t, h.dsn, obj.ID, "vault.file.notify@1.1")
+	if !bytes.Equal(nBody[0], rowPayload) {
+		t.Fatalf("notify wire body != stored payload (relay re-derived/transformed):\n wire: %s\n  row: %s",
+			nBody[0], rowPayload)
+	}
+	// Ground-truth content pins (a1): the row↔wire comparison cannot witness
+	// wrong content produced by BuildNotifyFact (a mirror of garbage is still
+	// byte-equal) — pin the received body against test-known constants.
+	assertNotifyContent(t, nBody[0], key)
+
+	// L2 envelope identity (AC-4a pattern).
+	l2Mu.Lock()
+	l2Body := string(l2Bodies[0])
+	l2Mu.Unlock()
+	if !strings.Contains(l2Body, `"event_type":"vault.file.deleted@1.1"`) ||
+		!strings.Contains(l2Body, `"tenant":"default"`) ||
+		!strings.Contains(l2Body, `"object_id":`+fmt.Sprintf("%d", obj.ID)) {
+		t.Errorf("L2 payload missing AC-4 identity: %s", l2Body)
+	}
+
+	// No-dup window: fixed 5s (≥5× PollInterval; -race/loaded-CI headroom).
+	// complete is state-based (the claim predicate excludes 'delivered'), so a
+	// relay-side redelivery is impossible; the window guards the D2 bus path
+	// (in-process ms latency) and any claim-predicate regression. State
+	// witness: the rows must still be delivered, not just the counters quiet.
+	time.Sleep(5 * time.Second)
+	nMu.Lock()
+	nAfter := len(nBodies)
+	nMu.Unlock()
+	l2Mu.Lock()
+	l2After := len(l2Bodies)
+	l2Mu.Unlock()
+	if nAfter != 1 || l2After != 1 {
+		t.Fatalf("duplicate delivery after complete: notify %d→%d, L2 %d→%d", nGot, nAfter, l2Got, l2After)
+	}
+	if outboxStatus(t, h.dsn, obj.ID, "vault.file.deleted@1.1") != "delivered" ||
+		outboxStatus(t, h.dsn, obj.ID, "vault.file.notify@1.1") != "delivered" {
+		t.Fatal("facts left delivered state after the no-dup window")
+	}
+}
+
+// ── AC-4c = G2: mid-claim restart redelivers once ──────────────────────────
+
+// TestComposition_MidClaimRestartRedeliversOnce (AC-4c = G2): facts committed
+// by server A on DSN file D stay 'pending' after A's repo closes (A's relay
+// polls every 1h — dormant by construction); a second live relay on the same
+// DB file reclaims and delivers each exactly once; complete rows never
+// re-deliver. This is the process-crash/restart composition (D-4: the crash
+// window is modeled as pending rows — claim-lost redelivery is unit-proven).
+func TestComposition_MidClaimRestartRedeliversOnce(t *testing.T) {
+	// notify target: 500 until it has observed its first request, then 200.
+	// Flip-on-observation (count-based, atomic — never a wall-clock sleep) is
+	// scheduler-proof: attempt 1 is always the 500, attempt 2 the 200, so the
+	// totals are deterministic (2 POSTs: 1×500 + 1×200; 1×2xx).
+	var notifyTotal atomic.Int64
+	var notify2xx atomic.Int64
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if notifyTotal.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		notify2xx.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(flaky.Close)
+
+	var l2Total atomic.Int64
+	l2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		l2Total.Add(1)
+		w.Header().Set("X-Audit-Fact-Id", r.Header.Get("X-Audit-Fact-Id"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(l2.Close)
+
+	sink, err := events.NewAuditSinkL2(l2.URL, map[string]string{"default": "e2e-l2-token-0123456789"},
+		&http.Client{Timeout: 5 * time.Second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Server A: NO relay (relayOpts nil → the harness skips it). The DELETE
+	// commits rows that stay 'pending' BY CONSTRUCTION — the crash-window model
+	// without the NewTimer(0) first-round race, provably deterministic. (The
+	// alternative — PollInterval=time.Hour — leaves a formal race: if A's
+	// first round were ever starved past the DELETE commit it would claim; the
+	// pending poll below then fails loudly instead of passing spuriously.)
+	// ClaimTTL=30s / HTTPTimeout=5s honors the C-6 invariant (ClaimTTL >
+	// 2×HTTP_TIMEOUT) that the programmatic constructor would otherwise bypass.
+	hA := startFullServerWithRelay(t, nil)
+	setDeleteRule(t, hA.repo, flaky.URL)
+
+	key := "k"
+	putWithTenant(t, hA.ts, "default", key)
+	obj, err := hA.repo.GetObject(context.Background(), "default", "default", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteWithTenant(t, hA.ts, "default", key, true)
+
+	// Both facts must be stuck 'pending' — loudly, not silently: if A's first
+	// round were ever starved past the DELETE commit it would claim (deleted →
+	// delivered) and this poll fails instead of passing spuriously.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if outboxStatus(t, hA.dsn, obj.ID, "vault.file.deleted@1.1") == "pending" &&
+			outboxStatus(t, hA.dsn, obj.ID, "vault.file.notify@1.1") == "pending" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if time.Now().After(deadline) {
+		t.Fatalf("facts not pending after A's delete: deleted=%q notify=%q",
+			outboxStatus(t, hA.dsn, obj.ID, "vault.file.deleted@1.1"),
+			outboxStatus(t, hA.dsn, obj.ID, "vault.file.notify@1.1"))
+	}
+
+	// D2 witness: while A is alive (dormant 1h relay + D2-skipped notifier),
+	// NOTHING may reach the notify target or L2. A bus-path duplicate would
+	// land within ms of the DELETE; without this check a D2 regression would
+	// be masked here — A's stray POST would consume the 500 flip and B's
+	// first attempt would read 200, making every counter assertion pass.
+	time.Sleep(300 * time.Millisecond)
+	if got := notifyTotal.Load(); got != 0 {
+		t.Fatalf("notify target received %d POSTs while A was alive (D2 skip regression?)", got)
+	}
+	if got := l2Total.Load(); got != 0 {
+		t.Fatalf("L2 received %d POSTs while A was alive (relay must be dormant)", got)
+	}
+
+	// "Stop server A": close its repo handle. A has NO relay goroutine
+	// (relayOpts nil → harness never started one), so closing the repo is a
+	// COMPLETE stop — no dormant relay can touch the closed DB. (The harness's
+	// own cleanup re-closes the repo later; database/sql Close is idempotent.)
+	if err := hA.repo.Close(); err != nil {
+		t.Fatalf("close server A repo: %v", err)
+	}
+
+	// Server B: a second live relay on the SAME DB file (shared-DSN restart).
+	// WAL is a file-header property, so B's handle and the raw outboxStatus
+	// conns inherit it (single writer B + concurrent snapshot readers).
+	// Migrate is an idempotent version-skip on the already-migrated file (I2).
+	bRepo, err := repository.Open(context.Background(), "sqlite", hA.dsn)
+	if err != nil {
+		t.Fatalf("open shared DSN: %v", err)
+	}
+	if err := bRepo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate shared DSN: %v", err)
+	}
+	bLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	relayB := events.NewEventOutboxRelay(bRepo, bLogger, events.EventOutboxRelayOptions{
+		PollInterval: 50 * time.Millisecond, BatchSize: 32,
+		ClaimTTL: 30 * time.Second, HTTPTimeout: 5 * time.Second,
+		MaxAttempts: 10, AuditSink: sink,
+	})
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	go relayB.Run(relayCtx)
+	// One combined cleanup: relay-cancel strictly precedes repo-close (two
+	// separate cleanups could close the DB while the relay still polls).
+	t.Cleanup(func() { relayCancel(); _ = bRepo.Close() })
+
+	// B reclaims the pending rows: deleted@1.1 → L2 (200+echo) → delivered on
+	// the first claim; notify@1.1 → 500 (flip) → backoff [0.75,1.0]s → 200 →
+	// delivered. Exactly-once counters are 2xx-scoped (all-request counting
+	// would depend on the retry schedule).
+	deadline = time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if outboxStatus(t, hA.dsn, obj.ID, "vault.file.deleted@1.1") == "delivered" &&
+			outboxStatus(t, hA.dsn, obj.ID, "vault.file.notify@1.1") == "delivered" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if time.Now().After(deadline) {
+		t.Fatalf("facts never delivered after restart: deleted=%q notify=%q",
+			outboxStatus(t, hA.dsn, obj.ID, "vault.file.deleted@1.1"),
+			outboxStatus(t, hA.dsn, obj.ID, "vault.file.notify@1.1"))
+	}
+	if got := l2Total.Load(); got != 1 {
+		t.Fatalf("L2 POSTs = %d, want exactly 1", got)
+	}
+	if got := notify2xx.Load(); got != 1 {
+		t.Fatalf("notify 2xx POSTs = %d, want exactly 1", got)
+	}
+	if got := notifyTotal.Load(); got != 2 {
+		t.Fatalf("notify total POSTs = %d, want 2 (1×500 + 1×200)", got)
+	}
+
+	// Post-restart no-dup: ≥10 poll cycles (1s) with counters AND row status
+	// unchanged (state witness — immune to counter timing).
+	time.Sleep(time.Second)
+	if got := l2Total.Load(); got != 1 {
+		t.Fatalf("duplicate L2 POST after complete: %d", got)
+	}
+	if got := notify2xx.Load(); got != 1 {
+		t.Fatalf("duplicate notify POST after complete: %d", got)
+	}
+	if outboxStatus(t, hA.dsn, obj.ID, "vault.file.deleted@1.1") != "delivered" ||
+		outboxStatus(t, hA.dsn, obj.ID, "vault.file.notify@1.1") != "delivered" {
+		t.Fatalf("delivered rows regressed after no-dup window")
+	}
+}
+
+// dumpBodies renders captured POST bodies for fail-loud diagnostics.
+func dumpBodies(bodies [][]byte) string {
+	var sb strings.Builder
+	for i, b := range bodies {
+		sb.WriteString(fmt.Sprintf("  body[%d]: %s\n", i, b))
+	}
+	return sb.String()
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 func putWithTenant(t *testing.T, ts *httptest.Server, tenant, key string) {
@@ -904,6 +1321,82 @@ WHERE origin_id=? AND event_type=? ORDER BY id DESC LIMIT 1`, originID, eventTyp
 	return status
 }
 
+// setDeleteRule installs a bucket notification rule for tenant/bucket
+// default/default (same shape as the relay unit fixtures). The FM-7 ordering
+// constraint — the rule must exist BEFORE the delete — is the caller's
+// responsibility.
+func setDeleteRule(t *testing.T, repo repository.Repository, url string) {
+	t.Helper()
+	if err := repo.SetBucketNotifications(context.Background(), "default", "default", []repository.NotificationRule{{
+		ID:          "rule-1",
+		Events:      []string{"s3:ObjectRemoved:Delete"},
+		EndpointURL: url,
+	}}); err != nil {
+		t.Fatalf("set notifications: %v", err)
+	}
+}
+
+// outboxPayload reads one outbox fact's stored payload (origin_id-scoped, as
+// outboxStatus does) — the byte-exact comparison witness for relay egress.
+func outboxPayload(t *testing.T, dsn string, originID int64, eventType string) []byte {
+	t.Helper()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var payload []byte
+	if err := db.QueryRow(`SELECT payload FROM event_outbox
+WHERE origin_id=? AND event_type=? ORDER BY id DESC LIMIT 1`, originID, eventType).Scan(&payload); err != nil {
+		t.Fatalf("query outbox payload: %v", err)
+	}
+	return payload
+}
+
+// sequencerHexRe pins the S3-sequencer shape produced by newSequencer at emit
+// time (crypto/rand 16 bytes → 32 hex chars).
+var sequencerHexRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// assertNotifyContent pins a received notify@1.1 body against test-known
+// constants. The row↔wire byte comparison cannot witness content-correctness
+// bugs in BuildNotifyFact (a mirror of garbage is still byte-equal); these
+// pins close that loop independently of the stored row.
+func assertNotifyContent(t *testing.T, body []byte, key string) {
+	t.Helper()
+	var got struct {
+		SchemaVersion string `json:"schema_version"`
+		EventType     string `json:"event_type"`
+		Tenant        string `json:"tenant"`
+		Bucket        string `json:"bucket"`
+		Key           string `json:"key"`
+		Records       []struct {
+			EventName string `json:"eventName"`
+			S3        struct {
+				Object struct {
+					Key       string `json:"key"`
+					Sequencer string `json:"sequencer"`
+				} `json:"object"`
+			} `json:"s3"`
+		} `json:"records"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("notify body is not JSON: %v", err)
+	}
+	if got.SchemaVersion != "1.1" || got.EventType != "vault.file.notify@1.1" ||
+		got.Tenant != "default" || got.Bucket != "default" || got.Key != key {
+		t.Fatalf("notify envelope identity mismatch: schema=%q type=%q tenant=%q bucket=%q key=%q",
+			got.SchemaVersion, got.EventType, got.Tenant, got.Bucket, got.Key)
+	}
+	if len(got.Records) != 1 || got.Records[0].EventName != "s3:ObjectRemoved:Delete" ||
+		got.Records[0].S3.Object.Key != key {
+		t.Fatalf("notify records mismatch: %+v", got.Records)
+	}
+	if !sequencerHexRe.MatchString(got.Records[0].S3.Object.Sequencer) {
+		t.Fatalf("notify sequencer %q does not match ^[0-9a-f]{32}$ (newSequencer shape)",
+			got.Records[0].S3.Object.Sequencer)
+	}
+}
+
 // assertAuditRowFor asserts a file.delete audit row exists for the tenant with
 // the expected detail (newest first).
 func assertAuditRowFor(t *testing.T, repo repository.Repository, tenant, detail string) {
@@ -933,4 +1426,14 @@ func waitForBodies(t *testing.T, count func() int, want int, timeout time.Durati
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("L2 received %d POSTs, want %d", count(), want)
+}
+
+// allowAllProvider is the CI-baseline test double injected into the full-server
+// harness: it preserves the pre-fail-closed baseline (all actions allowed) for
+// integration tests exercising non-authz behavior. The fail-closed delete gate
+// is covered by dedicated service/rest tests.
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
 }

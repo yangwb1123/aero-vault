@@ -390,6 +390,145 @@ func TestEventOutboxPrune(t *testing.T) {
 	assertDeliveredRows(t, repo, 0)
 }
 
+// ── CountEventOutbox (D6: startup backlog visibility) ──────────────────────
+
+func TestEventOutboxCount(t *testing.T) {
+	ctx := context.Background()
+	repo := openEventOutboxTestStore(t)
+
+	// Empty store: 0 rows.
+	n, err := repo.CountEventOutbox(ctx)
+	if err != nil {
+		t.Fatalf("count empty outbox: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("empty outbox count = %d, want 0", n)
+	}
+
+	// One delete transaction writes exactly 2 facts (deleted@1.1 + notify@1.1).
+	obj := seedOutboxObject(t, repo, "t1", "b1", "k1")
+	if err := repo.HardDeleteObjectWithEvent(ctx, "t1", "b1", "k1", AuditEntry{}, validDeleteFacts(obj, "t1")); err != nil {
+		t.Fatal(err)
+	}
+	n, err = repo.CountEventOutbox(ctx)
+	if err != nil {
+		t.Fatalf("count outbox: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("outbox count = %d, want 2", n)
+	}
+
+	// Prune removes rows, and the count follows (status-independent total).
+	claimed, err := repo.ClaimEventOutbox(ctx, "owner", "token", 10, time.Minute)
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claim: len=%d err=%v", len(claimed), err)
+	}
+	for _, fact := range claimed {
+		if err := repo.CompleteEventOutbox(ctx, fact.ID, "owner", "token"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := backdateEventOutboxDelivered(t, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.PruneEventOutbox(ctx, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n, err = repo.CountEventOutbox(ctx); err != nil {
+		t.Fatalf("count after prune: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("outbox count after prune = %d, want 0", n)
+	}
+}
+
+// ── SoftDeleteObjectByIDWithEvent (quarantine producer, FR-1) ──────────────
+
+// TestSoftDeleteObjectByIDWithEvent_OneTx covers the by-ID WithEvent variant:
+// the soft delete, the audit row and both outbox facts commit in one
+// transaction and roll back together (AC-1).
+func TestSoftDeleteObjectByIDWithEvent_OneTx(t *testing.T) {
+	ctx := context.Background()
+	entry := AuditEntry{Actor: "system:antivirus", Action: AuditActionFileDelete, Target: "b1/k1", TenantID: "t1", Detail: "av_infected"}
+
+	t.Run("soft delete by id commits audit row and facts together", func(t *testing.T) {
+		repo := openEventOutboxTestStore(t)
+		obj := seedOutboxObject(t, repo, "t1", "b1", "k1")
+		if err := repo.SoftDeleteObjectByIDWithEvent(ctx, obj.ID, entry, validDeleteFacts(obj, "t1")); err != nil {
+			t.Fatalf("soft delete by id with event: %v", err)
+		}
+		got, err := repo.GetObjectByID(ctx, obj.ID)
+		if err != nil {
+			t.Fatalf("soft-deleted row must remain readable by id: %v", err)
+		}
+		if got.DeletedAt == nil {
+			t.Fatal("deleted_at not set")
+		}
+		rows, err := listEventOutbox(t, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("event_outbox has %d rows, want 2", len(rows))
+		}
+		for _, row := range rows {
+			if row.OriginID != obj.ID || row.Status != "pending" {
+				t.Errorf("fact row = %+v, want origin %d pending", row, obj.ID)
+			}
+		}
+		assertAuditRows(t, repo, entry)
+	})
+
+	t.Run("forced rollback: invalid fact leaves object, outbox, and audit untouched", func(t *testing.T) {
+		repo := openEventOutboxTestStore(t)
+		obj := seedOutboxObject(t, repo, "t2", "b2", "k2")
+		bad := []OutboxFact{
+			{EventType: EventTypeFileDeleted11, OriginID: obj.ID, TenantID: "t2",
+				Payload: []byte(`{"schema_version":"2.0","event_type":"vault.file.deleted@1.1"}`)},
+		}
+		err := repo.SoftDeleteObjectByIDWithEvent(ctx, obj.ID, entry, bad)
+		if err == nil {
+			t.Fatal("expected validation error, got nil")
+		}
+		got, err := repo.GetObjectByID(ctx, obj.ID)
+		if err != nil {
+			t.Fatalf("object row must survive rollback: %v", err)
+		}
+		if got.DeletedAt != nil {
+			t.Fatal("object must not be soft-deleted on validation failure")
+		}
+		assertOutboxRows(t, repo, 0)
+		assertAuditRows(t, repo, AuditEntry{}) // zero rows
+	})
+
+	t.Run("zero-row double delete rolls back with ErrNotFound and no phantom rows", func(t *testing.T) {
+		repo := openEventOutboxTestStore(t)
+		obj := seedOutboxObject(t, repo, "t3", "b3", "k3")
+		if err := repo.SoftDeleteObjectByIDWithEvent(ctx, obj.ID, entry, validDeleteFacts(obj, "t3")); err != nil {
+			t.Fatalf("first delete: %v", err)
+		}
+		err := repo.SoftDeleteObjectByIDWithEvent(ctx, obj.ID, entry, validDeleteFacts(obj, "t3"))
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("second delete = %v, want ErrNotFound", err)
+		}
+		assertOutboxRows(t, repo, 2) // unchanged: no duplicate facts
+		assertAuditRows(t, repo, entry)
+	})
+
+	t.Run("missing id returns ErrNotFound with no phantom rows", func(t *testing.T) {
+		repo := openEventOutboxTestStore(t)
+		err := repo.SoftDeleteObjectByIDWithEvent(ctx, 999, entry, []OutboxFact{
+			{EventType: EventTypeFileDeleted11, OriginID: 999, TenantID: "t4",
+				Payload: []byte(`{"schema_version":"1.1"}`)},
+		})
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("missing id = %v, want ErrNotFound", err)
+		}
+		assertOutboxRows(t, repo, 0)
+		assertAuditRows(t, repo, AuditEntry{})
+	})
+}
+
 // ── HasEventOutboxFact (D2) ─────────────────────────────────────────────────
 
 func TestHasEventOutboxFact(t *testing.T) {
@@ -579,4 +718,116 @@ func assertDeliveredRows(t *testing.T, repo Repository, want int) {
 	if n != want {
 		t.Fatalf("event_outbox_delivered has %d rows, want %d", n, want)
 	}
+}
+
+// ── AC-2: per-type outbox assertions (event_type filter) ────────────────────
+
+// countEventOutboxByType counts event_outbox rows for one origin + event type
+// through the in-package sqlStore cast (the Repository interface exposes no
+// read-only count — HasEventOutboxFact is bool-only).
+func countEventOutboxByType(t *testing.T, repo Repository, originID int64, eventType OutboxEventType) int {
+	t.Helper()
+	store, ok := repo.(*sqlStore)
+	if !ok {
+		t.Fatalf("repo is %T, want *sqlStore", repo)
+	}
+	var n int
+	if err := store.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM event_outbox WHERE origin_id=$1 AND event_type=$2`,
+		originID, string(eventType)).Scan(&n); err != nil {
+		t.Fatalf("count outbox rows: %v", err)
+	}
+	return n
+}
+
+// outboxPayloadByType returns the newest payload for one origin + event type.
+func outboxPayloadByType(t *testing.T, repo Repository, originID int64, eventType OutboxEventType) string {
+	t.Helper()
+	store, ok := repo.(*sqlStore)
+	if !ok {
+		t.Fatalf("repo is %T, want *sqlStore", repo)
+	}
+	var payload string
+	err := store.db.QueryRowContext(context.Background(),
+		`SELECT payload FROM event_outbox WHERE origin_id=$1 AND event_type=$2 ORDER BY id DESC LIMIT 1`,
+		originID, string(eventType)).Scan(&payload)
+	if err != nil {
+		t.Fatalf("read outbox payload: %v", err)
+	}
+	return payload
+}
+
+// TestDeleteObjectWithEvent_EventTypeFilteredRows pins the AC-2 shape at the
+// shared repository seam: one delete writes exactly one deleted@1.1 and one
+// notify@1.1 fact (the unfiltered table count is 2 — the event_type filter is
+// therefore required for "exactly one"), both pending, with schema_version 1.1
+// payloads. Admin and REST entries share this path (svc.Delete, D8).
+func TestDeleteObjectWithEvent_EventTypeFilteredRows(t *testing.T) {
+	ctx := context.Background()
+	repo := openEventOutboxTestStore(t)
+	obj := seedOutboxObject(t, repo, "acme", "default", "docs/a.txt")
+	if err := repo.HardDeleteObjectWithEvent(ctx, "acme", "default", "docs/a.txt", AuditEntry{}, validDeleteFacts(obj, "acme")); err != nil {
+		t.Fatalf("hard delete with event: %v", err)
+	}
+	if got := countEventOutboxByType(t, repo, obj.ID, EventTypeFileDeleted11); got != 1 {
+		t.Errorf("deleted@1.1 rows = %d, want exactly 1", got)
+	}
+	if got := countEventOutboxByType(t, repo, obj.ID, EventTypeFileNotify11); got != 1 {
+		t.Errorf("notify@1.1 rows = %d, want exactly 1", got)
+	}
+	assertOutboxRows(t, repo, 2) // unfiltered total proves the filter is required
+
+	rows, err := listEventOutbox(t, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Status != "pending" {
+			t.Errorf("fact %s status = %q, want pending", row.EventType, row.Status)
+		}
+	}
+	for _, et := range []OutboxEventType{EventTypeFileDeleted11, EventTypeFileNotify11} {
+		var doc struct {
+			SchemaVersion string `json:"schema_version"`
+			EventType     string `json:"event_type"`
+		}
+		if err := json.Unmarshal([]byte(outboxPayloadByType(t, repo, obj.ID, et)), &doc); err != nil {
+			t.Fatalf("payload %s not JSON: %v", et, err)
+		}
+		if doc.SchemaVersion != "1.1" {
+			t.Errorf("%s schema_version = %q, want 1.1", et, doc.SchemaVersion)
+		}
+		if doc.EventType != string(et) {
+			t.Errorf("%s event_type = %q, want %q", et, doc.EventType, et)
+		}
+	}
+}
+
+// TestHardDeleteAuditInsertFailure_RollsBack pins F8 atomicity at the shared
+// seam: when the audit INSERT fails inside the delete transaction, the object
+// row, outbox facts, and audit row roll back together. The injection is an
+// in-package ALTER TABLE rename on the store's own connection.
+func TestHardDeleteAuditInsertFailure_RollsBack(t *testing.T) {
+	ctx := context.Background()
+	repo := openEventOutboxTestStore(t)
+	store, ok := repo.(*sqlStore)
+	if !ok {
+		t.Fatalf("repo is %T, want *sqlStore", repo)
+	}
+	obj := seedOutboxObject(t, repo, "t1", "b1", "k1")
+	if _, err := store.db.ExecContext(ctx, `ALTER TABLE audit_log RENAME TO audit_log_bak`); err != nil {
+		t.Fatalf("rename audit_log: %v", err)
+	}
+	err := repo.HardDeleteObjectWithEvent(ctx, "t1", "b1", "k1", AuditEntry{}, validDeleteFacts(obj, "t1"))
+	if err == nil {
+		t.Fatal("expected delete to fail on audit insert, got nil")
+	}
+	if _, err := store.db.ExecContext(ctx, `ALTER TABLE audit_log_bak RENAME TO audit_log`); err != nil {
+		t.Fatalf("rename audit_log back: %v", err)
+	}
+	if _, err := repo.GetObject(ctx, "t1", "b1", "k1"); err != nil {
+		t.Fatalf("object must survive audit failure (rollback), got %v", err)
+	}
+	assertOutboxRows(t, repo, 0)
+	assertAuditRows(t, repo, AuditEntry{})
 }

@@ -148,6 +148,10 @@ auditGovernance:
   bindingsConfigMap: ""
   bindingsKey: "bindings.json"
   mountPath: "/etc/aero-vault/audit-governance-bindings.json"
+  # Disable flow only: allow an empty bindings manifest to apply a drain.
+  # Error if set with a non-empty manifest; clear it (and remove the empty
+  # manifest) after disabling.
+  drain: false
 
 # Extra raw env entries (full container env syntax: name+value or name+valueFrom).
 extraEnv: []

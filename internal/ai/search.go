@@ -4,11 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
+
+// recordSearchDegraded reports degraded hybrid-search fallbacks. It's a
+// package var so tests can observe reasons without a metrics reader.
+var recordSearchDegraded = telemetry.IncSearchDegraded
 
 // Search is the user-facing semantic-search service. It embeds the query,
 // asks the repository for nearest chunks, optionally merges in BM25 results,
@@ -173,7 +178,7 @@ func (s *Search) searchVector(ctx context.Context, req Request) ([]ranked, error
 	if len(vecs) == 0 {
 		return nil, fmt.Errorf("embedder returned no vectors")
 	}
-	hits, err := s.vindex.SearchVectors(ctx, req.Tenant, req.Bucket, vecs[0], req.K*2)
+	hits, err := s.vindex.SearchVectors(ctx, req.Tenant, req.Bucket, vecs[0], min(req.K*2, 100))
 	if err != nil {
 		return nil, fmt.Errorf("search chunks: %w", err)
 	}
@@ -302,32 +307,90 @@ func (s *Search) applyRerankOrTrim(ctx context.Context, query string, out []Hit,
 
 func (s *Search) searchAndMerge(ctx context.Context, req Request, mode string) ([]ranked, error) {
 	var vecHits []ranked
+	var vecErr error
 	if mode == "vector" || mode == "hybrid" {
-		var err error
-		vecHits, err = s.searchVector(ctx, req)
-		if err != nil {
-			return nil, err
-		}
+		vecHits, vecErr = s.searchVector(ctx, req)
 	}
 	var bm25Hits []ranked
+	var lexErr error
 	if mode == "bm25" || mode == "hybrid" {
-		var err error
-		bm25Hits, err = s.searchLexical(ctx, req)
-		if err != nil {
-			return nil, err
-		}
+		bm25Hits, lexErr = s.searchLexical(ctx, req)
 	}
 	var merged []ranked
 	switch mode {
 	case "vector":
+		if vecErr != nil {
+			return nil, vecErr // pure mode: error stays visible (FR-3)
+		}
 		merged = vecHits
 	case "bm25":
+		if lexErr != nil {
+			return nil, lexErr // pure mode: error stays visible (FR-3)
+		}
 		merged = bm25Hits
 	case "hybrid":
-		merged = rrfMerge(vecHits, bm25Hits)
+		switch {
+		case ctx.Err() != nil:
+			// Deadline already fired: the healthy half could not have completed
+			// on the same ctx, so degrading would mask the root cause. Return
+			// the failing half's wrapped error (phase preserved; errors.Is(err,
+			// context.DeadlineExceeded) still holds) — bare ctx.Err() only when
+			// both halves succeeded before the deadline (F11 race window).
+			if vecErr != nil {
+				return nil, vecErr
+			}
+			if lexErr != nil {
+				return nil, lexErr
+			}
+			return nil, ctx.Err()
+		case vecErr != nil && lexErr != nil:
+			return nil, vecErr // both halves failed: no healthy half to degrade to
+		case vecErr != nil:
+			reason := degradeReason(vecErr)
+			s.warnDegrade(reason, vecErr)
+			recordSearchDegraded(ctx, reason)
+			merged = bm25Hits // BM25-only (no fusion)
+		case lexErr != nil:
+			s.warnDegrade("lexical", lexErr)
+			recordSearchDegraded(ctx, "lexical")
+			merged = vecHits // vector-only (no fusion)
+		default:
+			merged = rrfMerge(vecHits, bm25Hits) // only fusion path; identical to today
+		}
 	}
 	merged = trimToOverK(merged, req.K*3)
 	return merged, nil
+}
+
+// warnDegrade logs the hybrid-fallback warn for a failed modality. Message
+// substrings are pinned by tests (FR-1): "embed failed" / "vector index
+// failed" / "lexical search failed".
+func (s *Search) warnDegrade(reason string, err error) {
+	switch reason {
+	case "embed":
+		s.logger.Warn("embed failed; falling back to lexical results", "err", err)
+	case "lexical":
+		s.logger.Warn("lexical search failed; falling back to vector results", "err", err)
+	default:
+		s.logger.Warn("vector index failed; falling back to lexical results", "err", err)
+	}
+}
+
+// degradeReason classifies a vector-half failure for the degraded counter.
+// Anchored on searchVector's stable wrapper prefixes ("embed query:" /
+// "search chunks:"); drift falls back to "vector" and is caught JOINTLY by
+// D-AC-6 (literal + emission-side pins) and AC-1 (end-to-end
+// reasons==["embed"]): classifier drift → D-AC-6 red; wrapper drift → AC-1
+// red; both changed → pins move with the change (correct procedure).
+func degradeReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case strings.HasPrefix(err.Error(), "embed query:"):
+		return "embed"
+	default:
+		return "vector" // "search chunks:" or any prefix drift
+	}
 }
 
 func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {

@@ -221,10 +221,29 @@ func newPolicyTestServer(t *testing.T) (*httptest.Server, *service.FileService) 
 		t.Fatalf("storage: %v", err)
 	}
 	svc := service.NewFileService(store, repo, nil)
-	srv := httptest.NewServer(NewRouter(svc, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, nil))
 	t.Cleanup(func() {
 		srv.Close()
 		_ = repo.Close()
 	})
 	return srv, svc
+}
+
+// Direct format-lock on s3ResourceARN: the REST /v1 adapter mirrors this
+// builder byte-for-byte (bucket-policy-rest-resource-v1 AC-5), so a drift here
+// would silently diverge the two protocols' policy verdicts.
+func TestS3ResourceARNFormat(t *testing.T) {
+	tests := []struct {
+		bucket, key, want string
+	}{
+		{"bucket", "", "arn:aws:s3:::bucket"},
+		{"bucket", "a/b", "arn:aws:s3:::bucket/a/b"},
+		{"bucket", "a", "arn:aws:s3:::bucket/a"},
+		{"my-bucket", "dir/with space.txt", "arn:aws:s3:::my-bucket/dir/with space.txt"},
+	}
+	for _, tt := range tests {
+		if got := s3ResourceARN(tt.bucket, tt.key); got != tt.want {
+			t.Errorf("s3ResourceARN(%q, %q) = %q, want %q", tt.bucket, tt.key, got, tt.want)
+		}
+	}
 }

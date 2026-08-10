@@ -64,6 +64,15 @@ func (h *Handler) authorizeS3Request(w http.ResponseWriter, r *http.Request) boo
 			return false
 		}
 	}
+	// FR-2: fail-closed vault.file.delete gate — object-level DELETE only.
+	// Runs before any delete-path service call; the bucket-policy
+	// GetBucketConfig lookups above are read-only and precede by design (R1).
+	if key != "" && action == "s3:DeleteObject" {
+		if !h.authorizeDelete(r.Context(), mw.TenantFrom(r.Context()), bucket, key) {
+			writeS3Error(w, r, service.ErrForbidden)
+			return false
+		}
+	}
 	return true
 }
 

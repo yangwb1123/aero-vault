@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
 // An unrecognized search mode is rejected with an error rather than silently
@@ -59,5 +61,58 @@ func TestIndexer_NilEmbedderErrors(t *testing.T) {
 	}
 	if err := ix.IndexObjectByID(context.Background(), 1); err == nil {
 		t.Fatal("IndexObjectByID with nil embedder should error")
+	}
+}
+
+// recordingVectorIndex records every requested limit so tests can assert the
+// over-retrieval factor Search asks of the backend.
+type recordingVectorIndex struct {
+	limits []int
+	hits   []repository.SearchHit
+}
+
+func (r *recordingVectorIndex) SearchVectors(_ context.Context, _, _ string, _ []float32, limit int) ([]repository.SearchHit, error) {
+	r.limits = append(r.limits, limit)
+	return r.hits, nil
+}
+
+// TestSearchVectorLimit pins the over-retrieval cap: Search validates K<=100
+// then requests K*2 candidates, which for K=60 is 120 — beyond the 100-cap
+// every retrieval backend clamps to (silently truncating to 10 before embed-
+// model filtering). The requested limit must stay in [K,100] and the query
+// must still deliver exactly K hits.
+func TestSearchVectorLimit(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t)
+	emb := NewHashEmbedder(64)
+	stub := &recordingVectorIndex{}
+	for i := 0; i < 60; i++ {
+		stub.hits = append(stub.hits, repository.SearchHit{
+			Score: 0.99 - float32(i)*0.001,
+			Chunk: repository.Chunk{ID: int64(i + 1), ObjectID: 1, Bucket: testBucket,
+				ObjectKey: "k.txt", Seq: 0, Content: "c", EmbedModel: emb.Name()},
+		})
+	}
+	s := NewSearch(env.repo, emb, nil).WithVectorIndex(stub)
+
+	for _, mode := range []string{"vector", "hybrid"} {
+		s2 := s
+		if mode == "hybrid" {
+			s2 = s.WithBM25(NewBM25()) // empty index: lexical half contributes nothing
+		}
+		hits, err := s2.Query(ctx, Request{Tenant: testTenant, Bucket: testBucket, Query: "x", K: 60, Mode: mode})
+		if err != nil {
+			t.Fatalf("%s query: %v", mode, err)
+		}
+		if len(stub.limits) == 0 {
+			t.Fatalf("%s: vector index never consulted", mode)
+		}
+		got := stub.limits[len(stub.limits)-1]
+		if got < 60 || got > 100 {
+			t.Errorf("%s: requested limit=%d, want in [60,100] (pre-fix value was 120)", mode, got)
+		}
+		if len(hits) != 60 {
+			t.Errorf("%s: got %d hits, want exactly 60 (pre-fix truncation made this <=10 on every backend)", mode, len(hits))
+		}
 	}
 }

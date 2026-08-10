@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
@@ -59,8 +62,16 @@ func (c *captureTarget) bodiesCopy() [][]byte {
 
 func openRelayTestRepo(t *testing.T) repository.Repository {
 	t.Helper()
+	return openRelayTestRepoAt(t, "file:"+filepath.Join(t.TempDir(), "relay.db"))
+}
+
+// openRelayTestRepoAt opens a relay repo at an explicit DSN so tests can open
+// a second raw SQL connection to the same file (backdate timestamps for
+// prune-horizon tests).
+func openRelayTestRepoAt(t *testing.T, dsn string) repository.Repository {
+	t.Helper()
 	ctx := context.Background()
-	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "relay.db"))
+	repo, err := repository.Open(ctx, "sqlite", dsn)
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
 	}
@@ -69,6 +80,24 @@ func openRelayTestRepo(t *testing.T) repository.Repository {
 		t.Fatalf("migrate: %v", err)
 	}
 	return repo
+}
+
+// backdateEventOutboxAt backdates one timestamp column on every event_outbox
+// row for the given origin, via a raw SQLite connection to the same file
+// (mirrors backdateEventOutboxDelivered in package repository — the
+// Repository interface exposes no timestamp mutation). column must be a
+// fixed constant.
+func backdateEventOutboxAt(t *testing.T, dsn, column string, originID int64, when time.Time) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE event_outbox SET `+column+`=$1 WHERE origin_id=$2`, when.UTC().UnixNano(), originID); err != nil {
+		t.Fatalf("backdate %s: %v", column, err)
+	}
 }
 
 func seedRelayObject(t *testing.T, repo repository.Repository, key string) repository.Object {
@@ -293,7 +322,8 @@ func TestOutboxRelay_DeletedFactCompletesWithoutDelivery(t *testing.T) {
 	}
 }
 
-// ── backoff bounds (billingBackoff shape: 1s base, 2×, 5min cap, ±25%) ──────
+// ── backoff bounds (billingBackoff shape: 1s base, 2×, 5min cap; jitter is
+// downward-only [0.75, 1.0)×base — webhook.go jitter, not ±25%, D-7) ────────
 
 func TestEventOutboxBackoffBounds(t *testing.T) {
 	expect := []struct {
@@ -309,9 +339,10 @@ func TestEventOutboxBackoffBounds(t *testing.T) {
 	}
 	for _, tc := range expect {
 		delay := eventOutboxBackoff(tc.attempt)
-		min, max := tc.baseMillis*3/4, tc.baseMillis*5/4
+		// jitter(d) ∈ [0.75, 1.0)×d: n ∈ [0, d/2) → d - d/4 + n/2 ∈ [0.75d, d).
+		min, max := tc.baseMillis*3/4, tc.baseMillis-1
 		if delay.Milliseconds() < min || delay.Milliseconds() > max {
-			t.Errorf("attempt %d: delay = %v, want within [%dms, %dms] (±25%% of %dms)",
+			t.Errorf("attempt %d: delay = %v, want within [%dms, %dms) (downward-only jitter of %dms)",
 				tc.attempt, delay, min, max, tc.baseMillis)
 		}
 	}
@@ -562,6 +593,62 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 		}
 	})
 
+	t.Run("receiver contract: 2xx without echo on a lease-loss re-POST does not complete", func(t *testing.T) {
+		// Receiver contract (B): the L2 receiver must echo X-Audit-Fact-Id on
+		// EVERY 2xx, including re-POSTs after lease loss. A receiver that
+		// echoes only the first POST silently drops the at-least-once window —
+		// this test pins that the relay requires the echo on the re-POST too.
+		repo := openRelayTestRepo(t)
+		obj := seedRelayObject(t, repo, "l2/receipt-contract.txt")
+		payload := fixedDeletedPayload(obj)
+		seedDeletedFact(t, repo, obj, payload)
+		target := &l2SinkTarget{echo: true}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// First POST echoes; every later 2xx (the lease-loss re-POST) does not.
+			if target.count() >= 1 {
+				target.mu.Lock()
+				target.echo = false
+				target.mu.Unlock()
+			}
+			target.handler(w, r)
+		}))
+		defer srv.Close()
+		sink, err := NewAuditSinkL2(srv.URL, map[string]string{"default": l2TestToken}, &http.Client{Timeout: 5 * time.Second}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		relay := NewEventOutboxRelay(repo, nil, EventOutboxRelayOptions{
+			PollInterval: time.Hour, BatchSize: 32, ClaimTTL: 50 * time.Millisecond,
+			MaxAttempts: 3, AuditSink: sink,
+		})
+		target.delay = 100 * time.Millisecond // first POST crosses the lease
+
+		relay.deliverBatch(ctx)
+		waitForTarget(t, target, 1, 5*time.Second)
+		target.delay = 0
+		// Lease-loss re-POST arrives as 2xx WITHOUT echo → must NOT complete;
+		// backoff is scheduled (not immediately reclaimable).
+		relay.deliverBatch(ctx)
+		waitForTarget(t, target, 2, 5*time.Second)
+		bodies, factIDs, _ := target.snapshot()
+		if string(bodies[0]) != string(bodies[1]) || factIDs[0] != factIDs[1] {
+			t.Errorf("re-POST changed payload or X-Audit-Fact-Id (dedupe key must be stable)")
+		}
+		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token", 10, time.Minute); err != nil || len(pending) != 0 {
+			t.Fatalf("echo-less re-POST completed the fact: len=%d err=%v", len(pending), err)
+		}
+		// Receiver contract restored: echo on the re-POST lets the fact complete.
+		target.mu.Lock()
+		target.echo = true
+		target.mu.Unlock()
+		time.Sleep(2600 * time.Millisecond) // attempt 2 backoff = 2s ± jitter
+		relay.deliverBatch(ctx)
+		waitForTarget(t, target, 3, 5*time.Second)
+		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token-2", 10, time.Minute); err != nil || len(pending) != 0 {
+			t.Fatalf("fact not completed once echo returned on re-POST: len=%d err=%v", len(pending), err)
+		}
+	})
+
 	t.Run("unbound tenant: zero POSTs, fact still completed (C3)", func(t *testing.T) {
 		repo := openRelayTestRepo(t)
 		obj := seedRelayObject(t, repo, "l2/unbound.txt")
@@ -632,3 +719,142 @@ func TestOutboxRelay_L2UnauthorizedFailsImmediately(t *testing.T) {
 	}
 }
 
+// ── AC-4: prune uses the configured retention horizons (F5/F8) ──────────────
+
+// TestOutboxRelay_PruneUsesConfiguredRetention seeds delivered and
+// terminal-failed facts at ages straddling configured horizons (DeliveredRetain
+// 1h / FailedRetain 2h) and pins that prune() removes exactly the rows beyond
+// each horizon — not the hardcoded 24h/7d constants, not everything older than
+// "now". A second prune() removes nothing (relay-level idempotency, F8).
+func TestOutboxRelay_PruneUsesConfiguredRetention(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "prune.db")
+	repo := openRelayTestRepoAt(t, dsn)
+	now := time.Now().UTC()
+
+	// a: delivered, beyond the 1h horizon (3h old) → pruned.
+	// b: terminal-failed, beyond the 2h horizon (3h old) → pruned.
+	// c: delivered, inside the 1h horizon (30min old) → kept.
+	// d: terminal-failed, inside the 2h horizon (90min old) → kept.
+	a := seedRelayObject(t, repo, "prune/a-delivered-old.txt")
+	b := seedRelayObject(t, repo, "prune/b-failed-old.txt")
+	c := seedRelayObject(t, repo, "prune/c-delivered-recent.txt")
+	d := seedRelayObject(t, repo, "prune/d-failed-recent.txt")
+	for _, obj := range []repository.Object{a, b, c, d} {
+		seedRelayFacts(t, repo, obj)
+	}
+	claimed, err := repo.ClaimEventOutbox(ctx, "owner", "token", 10, time.Minute)
+	if err != nil || len(claimed) != 8 {
+		t.Fatalf("claim: len=%d err=%v", len(claimed), err)
+	}
+	for _, fact := range claimed {
+		switch fact.OriginID {
+		case a.ID, c.ID:
+			if err := repo.CompleteEventOutbox(ctx, fact.ID, "owner", "token"); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+		case b.ID, d.ID:
+			// Terminal failed: claim already incremented attempts to 1, so
+			// maxAttempts=1 lands the fact in 'failed' immediately.
+			if err := repo.RetryEventOutbox(ctx, fact.ID, "owner", "token", "boom", now, 1); err != nil {
+				t.Fatalf("fail: %v", err)
+			}
+		}
+	}
+	backdateEventOutboxAt(t, dsn, "delivered_at_ns", a.ID, now.Add(-3*time.Hour))
+	backdateEventOutboxAt(t, dsn, "created_at_ns", b.ID, now.Add(-3*time.Hour))
+	backdateEventOutboxAt(t, dsn, "delivered_at_ns", c.ID, now.Add(-30*time.Minute))
+	backdateEventOutboxAt(t, dsn, "created_at_ns", d.ID, now.Add(-90*time.Minute))
+
+	relay := NewEventOutboxRelay(repo, nil, EventOutboxRelayOptions{
+		PollInterval: time.Hour, BatchSize: 32, ClaimTTL: 30 * time.Second, MaxAttempts: 3,
+		DeliveredRetain: time.Hour, FailedRetain: 2 * time.Hour,
+	})
+	relay.prune()
+
+	// Exactly the two 3h-old rows are beyond their horizons. If prune had
+	// fallen back to the 24h/7d constants it would remove 0; if the horizons
+	// collapsed to "now" it would remove all 4. removed==2 pins the
+	// configured horizons; count==4 pins that the recent rows were kept.
+	n, err := repo.CountEventOutbox(ctx)
+	if err != nil {
+		t.Fatalf("count after prune: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("event_outbox has %d rows after prune, want 4 (only the 3h-old rows pruned)", n)
+	}
+	// Relay-level idempotency: a second prune removes nothing (F8).
+	relay.prune()
+	if n, err = repo.CountEventOutbox(ctx); err != nil {
+		t.Fatalf("count after second prune: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("second prune removed rows: %d remain, want 4", n)
+	}
+}
+
+// ── AC-4: zero retention options fall back to the 24h/7d constants (F5) ─────
+
+// TestOutboxRelay_ZeroRetentionFallsBackToDefaults seeds rows at ages
+// straddling the package constants (25h/23h delivered, 8d/6d failed) and pins
+// that a relay built with zero retains prunes exactly the rows beyond 24h and
+// 7d — byte-for-byte the shipped behavior. If the fallback were 0 (cutoff
+// "now") prune would remove all 4; if it were 1h it would remove 3; removed
+// == 2 pins 24h/168h exactly.
+func TestOutboxRelay_ZeroRetentionFallsBackToDefaults(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "zero-prune.db")
+	repo := openRelayTestRepoAt(t, dsn)
+	now := time.Now().UTC()
+
+	keys := []string{"z/d-25h.txt", "z/d-23h.txt", "z/f-8d.txt", "z/f-6d.txt"}
+	objs := make(map[string]repository.Object, len(keys))
+	for _, key := range keys {
+		objs[key] = seedRelayObject(t, repo, key)
+		seedRelayFacts(t, repo, objs[key])
+	}
+	claimed, err := repo.ClaimEventOutbox(ctx, "owner", "token", 10, time.Minute)
+	if err != nil || len(claimed) != 8 {
+		t.Fatalf("claim: len=%d err=%v", len(claimed), err)
+	}
+	for _, fact := range claimed {
+		switch fact.OriginID {
+		case objs["z/d-25h.txt"].ID, objs["z/d-23h.txt"].ID:
+			if err := repo.CompleteEventOutbox(ctx, fact.ID, "owner", "token"); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+		case objs["z/f-8d.txt"].ID, objs["z/f-6d.txt"].ID:
+			if err := repo.RetryEventOutbox(ctx, fact.ID, "owner", "token", "boom", now, 1); err != nil {
+				t.Fatalf("fail: %v", err)
+			}
+		}
+	}
+	backdateEventOutboxAt(t, dsn, "delivered_at_ns", objs["z/d-25h.txt"].ID, now.Add(-25*time.Hour))
+	backdateEventOutboxAt(t, dsn, "delivered_at_ns", objs["z/d-23h.txt"].ID, now.Add(-23*time.Hour))
+	backdateEventOutboxAt(t, dsn, "created_at_ns", objs["z/f-8d.txt"].ID, now.Add(-8*24*time.Hour))
+	backdateEventOutboxAt(t, dsn, "created_at_ns", objs["z/f-6d.txt"].ID, now.Add(-6*24*time.Hour))
+
+	// Zero retains: NewEventOutboxRelay must fall back to the constants.
+	relay := NewEventOutboxRelay(repo, nil, EventOutboxRelayOptions{
+		PollInterval: time.Hour, BatchSize: 32, ClaimTTL: 30 * time.Second, MaxAttempts: 3,
+	})
+	if relay.deliveredRetain != eventOutboxDeliveredRetain {
+		t.Errorf("deliveredRetain = %v, want %v", relay.deliveredRetain, eventOutboxDeliveredRetain)
+	}
+	if relay.failedRetain != eventOutboxFailedRetain {
+		t.Errorf("failedRetain = %v, want %v", relay.failedRetain, eventOutboxFailedRetain)
+	}
+	relay.prune()
+
+	n, err := repo.CountEventOutbox(ctx)
+	if err != nil {
+		t.Fatalf("count after prune: %v", err)
+	}
+	// Two origins pruned × 2 facts each = 4 rows; two origins kept = 4 rows.
+	// If the fallback were 0 (cutoff "now") prune would remove all 8; if it
+	// were 1h it would remove 6 (the 23h-delivered origin too). remain==4
+	// pins 24h/168h exactly.
+	if n != 4 {
+		t.Fatalf("event_outbox has %d rows after prune, want 4 (25h-delivered + 8d-failed origins pruned, 23h/6d kept)", n)
+	}
+}

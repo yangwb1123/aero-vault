@@ -140,6 +140,51 @@ func TestGroup_GoStarted(t *testing.T) {
 	g.Shutdown(context.Background(), 5*time.Second)
 }
 
+func TestGroup_GoStarted_PanicBeforeReady(t *testing.T) {
+	g := NewGroup(context.Background(), quietLogger())
+
+	done := make(chan struct{})
+	go func() {
+		g.GoStarted("panic-before-ready", func(ctx context.Context, ready chan<- struct{}) {
+			panic("test panic before ready")
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GoStarted hung after fn panicked before signalling ready")
+	}
+
+	g.Shutdown(context.Background(), 5*time.Second)
+}
+
+func TestGroup_GoStarted_NeverSignalsCancelled(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	g := NewGroup(parent, quietLogger())
+
+	done := make(chan struct{})
+	go func() {
+		g.GoStarted("never-signals", func(ctx context.Context, ready chan<- struct{}) {
+			<-ctx.Done() // Never closes ready; exits when the context cancels.
+		})
+		close(done)
+	}()
+
+	// Prove the worker is really parked before cancelling.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GoStarted hung after root context cancellation with no readiness signal")
+	}
+
+	g.Shutdown(context.Background(), 5*time.Second)
+}
+
 func TestGroup_PanicRecovery(t *testing.T) {
 	g := NewGroup(context.Background(), quietLogger())
 

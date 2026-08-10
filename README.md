@@ -199,6 +199,7 @@ The most common knobs:
 | `AUDIT_GOVERNANCE_ENABLED` | `false` | Relay durable redacted facts to Snaplink Audit Governance; see [Audit Governance integration](docs/snaplink-audit-governance.md). |
 | `AUDIT_GOVERNANCE_HMAC_KEY` | _(required when enabled)_ | Dedicated key for irreversible, tenant-scoped audit pseudonyms; do not reuse OAuth credentials. |
 | `ACCESS_CONTROL_ENABLED` | `false` | Enable ownership, departments, resource ACLs, shares, and public assets. |
+| `ACCESS_DELETE_FAIL_CLOSED` | `true` | Fail-closed delete gate: with access control disabled, deletes through the service gate (REST/WebDAV/admin/MCP/quarantine) are denied unless explicitly set `false` (legacy allow). Does not affect the S3 gateway, which always denies deletes without access control. |
 | `S3_SIGV4_CREDENTIALS` | _(off)_ | `accessKey:secretKey:tenant[:scope+scope],...` for the S3 endpoint. |
 | `PROMETHEUS_ENABLED` | `false` | Expose `/metrics`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | OTLP/HTTP endpoint, e.g. `http://localhost:4318`. |

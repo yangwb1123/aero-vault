@@ -598,3 +598,16 @@
 2026-08-06 09:31:12,741 [INFO] LOCK: waiting for holder (pid=1054830, age=831.9m); 77s left
 2026-08-06 09:31:42,769 [INFO] LOCK: waiting for holder (pid=1054830, age=832.4m); 47s left
 2026-08-06 09:32:12,788 [INFO] LOCK: waiting for holder (pid=1054830, age=832.9m); 17s left
+2026-08-07 12:48:55,267 [INFO] 
+2026-08-07 12:48:55,267 [INFO] ============================================================
+2026-08-07 12:48:55,267 [INFO] ROUND 1 of 1
+2026-08-07 12:48:55,268 [INFO] ============================================================
+2026-08-07 12:48:55,268 [WARNING] RESIDUE: stale start marker 8895222517c6869a.start in /home/u1/aero-vault (previous run was killed); regenerating
+2026-08-07 12:48:55,268 [WARNING] RESIDUE: stale start marker 9275c9ffb264e87d.start in /home/u1/aero-vault (previous run was killed); regenerating
+2026-08-07 12:48:55,270 [WARNING] referenced file not found: docs/campaigns/docs/campaigns/implementation-gate.md
+2026-08-07 12:48:55,270 [INFO] -- [1/1] --
+2026-08-07 12:48:55,273 [INFO] >>  pi -p 已批准的审计契约 v2 包（GATE PASSED）进入实施阶段。阅读批次清单： @docs/campaigns/implementation-gate.md ...  [model=default]  [timeout=900s]  [dir=/home/u1/aero-vault]
+2026-08-07 12:55:24,475 [INFO] OK  done  [389.2s]  [output=docs/proposals/audit-contract-batch-aero-vault.md]
+2026-08-07 12:55:24,498 [INFO] VALIDATE: python3 /home/u1/ai-batch-runner/scripts/check-no-refusal.py /home/u1/aero-vault/docs/proposals/audit-contract-batch-aero-vault.md.1s3dwtui.tmp
+2026-08-07 12:55:25,258 [INFO] WROTE /home/u1/aero-vault/docs/proposals/audit-contract-batch-aero-vault.md (validated)
+2026-08-07 12:55:25,285 [INFO] All tasks passed in round 1

@@ -153,17 +153,57 @@ groups:
           summary: "Job queue depth > 1000"
           description: "Pending job backlog exceeded 1000 for 5m. Consider increasing JOBS_WORKERS or setting JOBS_MAX_DEPTH to shed load."
 
+  - name: aero-vault-ai-search
+    # D1 drill: a failed hybrid-search modality degrades to single-modality
+    # results (200 from the healthy half) instead of 500 — a degrade the 5xx
+    # alerts can no longer see. The counter is the only visibility contract:
+    # rate > 0 for 5m means the embedder / vector backend / lexical backend
+    # has been failing (HTTP 200 still served; root cause in warn logs
+    # "embed query:" / "search chunks:" / "lexical search:"). `> 0 for 5m`
+    # matches the EventBusDropping idiom — a flapping embedder alerting on
+    # every blip is correct behavior, not noise.
+    rules:
+      - alert: SearchDegraded
+        expr: sum by (reason) (rate(ai_search_degraded_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hybrid search degraded to single-modality results (reason={{ $labels.reason }})"
+          description: "reason=embed → embedding provider failed; reason=vector → vector index backend (pgvector/Qdrant) failed; reason=lexical → lexical backend (pgFTS) failed. HTTP 200 still served from the healthy half. Root cause in warn logs: 'embed query:'/'search chunks:'/'lexical search:'."
+
   - name: aero-vault-audit-governance
     # B3-2 (D1): a stalled audit relay degrades instead of failing /readyz.
-    # The backlog-age gauge (audit_governance_backlog_age_seconds, oldest
-    # pending non-terminal fact) alerts at maxLag×0.5 (default 900s maxLag →
-    # 450s). Terminal (dead-lettered) rows are excluded from the gauge.
+    # Two signals feed the alert: the backlog-age gauge
+    # (audit_governance_backlog_age_seconds, oldest pending non-terminal fact;
+    # 450s = maxLag default 900 × 0.5 early warning) and the degraded flag
+    # (audit_governance_degraded, cache-fed 0/1: lag > configured maxLag or
+    # relay-store probe timeout — age unknown → 0). The OR is deliberate: a
+    # probe timeout records age 0, so the age arm alone would reset `for: 10m`
+    # on every timeout sample; the degraded arm keeps accumulation true until a
+    # genuinely healthy probe (age ≤ 450 AND degraded=0) — no starvation reset.
     rules:
       - alert: AuditGovernanceBacklogDegraded
-        expr: audit_governance_backlog_age_seconds > 450
+        expr: audit_governance_backlog_age_seconds > 450 OR audit_governance_degraded == 1
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Audit governance relay backlog degraded"
-          description: "Oldest pending audit fact is {{ $value }}s old (> 450s = maxLag×0.5). The sink is likely unavailable; /readyz stays 200 (degraded), check relay_attempted/failed counters and the sink."
+          description: "Oldest pending audit fact exceeded the 450s early warning (maxLag default 900 × 0.5), or the relay store probe degraded (degraded=1: lag > configured maxLag, or store probe timeout — age unknown). /readyz stays 200 (degraded); check relay_attempted/failed counters and the sink."
+
+      # Fail-closed activation gate companion: an enabled relay with zero
+      # bound tenants is never a healthy steady state — the empty-manifest
+      # boot is refused unless AUDIT_GOVERNANCE_DRAIN was set, so a present
+      # bound_tenants series at 0 means the drain transition (legit disable
+      # flow, draining=1) or a stale flag + empty manifest replay (draining=0
+      # — the silent-off condition). The pair is the only positive signal;
+      # annotations direct the operator to audit_governance_draining.
+      - alert: AuditGovernanceEnabledUnbound
+        expr: audit_governance_bound_tenants == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit governance relay enabled with zero bound tenants"
+          description: "An enabled audit governance relay reports no bound tenants for 10m. audit_governance_draining==1: in-progress drain transition (disable flow step 2 — complete with ENABLED=false and clear AUDIT_GOVERNANCE_DRAIN + the empty manifest). audit_governance_draining==0: stale AUDIT_GOVERNANCE_DRAIN with an empty manifest replay — clear the flag and remove the manifest, or restore bindings at a higher revision."

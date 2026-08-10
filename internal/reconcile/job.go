@@ -105,7 +105,7 @@ func (j *Job) maybeSweep(ctx context.Context) {
 // (DB row without a blob) and orphan blobs (blob without a DB row).
 func (j *Job) sweep(ctx context.Context) {
 	start := time.Now()
-	var scanned, orphanRows, orphanBlobs, deletedBlobs int
+	var scanned, orphanRows, orphanBlobs, deletedBlobs, scrubCorrupt int
 	for _, t := range j.tenants {
 		sc, or := j.sweepOrphanRows(ctx, t)
 		ob, db := j.sweepOrphanBlobs(ctx, t)
@@ -113,8 +113,9 @@ func (j *Job) sweep(ctx context.Context) {
 		orphanRows += or
 		orphanBlobs += ob
 		deletedBlobs += db
-		scrubScanned, _ := j.scrubAll(ctx, t, j.scrub)
+		scrubScanned, corrupt := j.scrubAll(ctx, t, j.scrub)
 		scanned += scrubScanned
+		scrubCorrupt += corrupt
 	}
 	telemetry.RecordReconcileBlobs(ctx, orphanBlobs, deletedBlobs)
 	j.logger.Info("reconcile sweep done",
@@ -122,6 +123,7 @@ func (j *Job) sweep(ctx context.Context) {
 		"orphan_rows", orphanRows,
 		"orphan_blobs", orphanBlobs,
 		"orphan_blobs_deleted", deletedBlobs,
+		"scrub_corrupt", scrubCorrupt,
 		"delete_enabled", j.deleteOrphanBlobs,
 		"duration_ms", time.Since(start).Milliseconds())
 }

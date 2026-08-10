@@ -1,11 +1,60 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 )
+
+// ErrBodyTooLarge is returned by the wrapped request-body reader when a
+// chunked/unknown-length body exceeds maxBytes. Unlike a clean EOF it is
+// distinguishable from a body that ends exactly at the limit; adapters map
+// it to 413 (RequestEntityTooLarge).
+var ErrBodyTooLarge = errors.New("request body exceeds maximum allowed size")
+
+// limitErrReader is a drop-in replacement for io.LimitReader that does not
+// silently truncate: when the underlying reader still yields bytes past the
+// limit it returns ErrBodyTooLarge instead of a clean EOF, so downstream
+// adapters can reject the request rather than storing a truncated object.
+//
+// A body that ends exactly at the limit is indistinguishable from truncation
+// without reading one byte past the cap, so Read peeks at byte limit+1 to
+// decide: underlying byte present → ErrBodyTooLarge; underlying EOF → clean
+// EOF. Transport-level errors (client abort, etc.) pass through untouched.
+type limitErrReader struct {
+	r     io.Reader
+	limit int64
+	n     int64
+}
+
+func (l *limitErrReader) Read(p []byte) (int, error) {
+	if len(p) == 0 { // io.Reader contract: (0, nil), consume nothing.
+		return 0, nil
+	}
+	if l.n >= l.limit {
+		// Peek one byte past the cap to distinguish "exactly at limit"
+		// (clean EOF) from "truncated" (sentinel). The peeked byte is
+		// discarded — the request is already rejected.
+		var one [1]byte
+		for { // Tolerate underlying (0, nil) empty reads (allowed, discouraged).
+			n, err := l.r.Read(one[:])
+			if n > 0 {
+				return 0, ErrBodyTooLarge
+			}
+			if err != nil {
+				return 0, err
+			}
+		}
+	}
+	if int64(len(p)) > l.limit-l.n {
+		p = p[:l.limit-l.n]
+	}
+	n, err := l.r.Read(p)
+	l.n += int64(n)
+	return n, err
+}
 
 // MaxBodySize limits the request body to maxBytes. If the Content-Length header
 // exceeds the limit the request is rejected immediately (without reading any
@@ -26,9 +75,12 @@ func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 					http.StatusRequestEntityTooLarge)
 				return
 			}
-			// Wrap the body with a LimitReader that silently stops at maxBytes.
-			// The handler / decoder will see an early EOF when the body is longer.
-			r.Body = io.NopCloser(io.LimitReader(r.Body, maxBytes))
+			// Wrap the body with a limit reader that surfaces an explicit
+			// ErrBodyTooLarge when an unknown-length (chunked) body exceeds
+			// maxBytes — a clean io.EOF at the cap would silently truncate
+			// the upload and let a corrupt object be stored (adapters map
+			// the sentinel to 413).
+			r.Body = io.NopCloser(&limitErrReader{r: r.Body, limit: maxBytes})
 			next.ServeHTTP(w, r)
 		})
 	}

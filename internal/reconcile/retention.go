@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -143,7 +144,11 @@ func (r *RetentionJob) purgeOneSoftDeleted(ctx context.Context, obj repository.O
 		return false
 	}
 	if err := hardDeleteKey(ctx, r.repo, r.store, r.chunkCleaner, obj, r.logger); err != nil {
-		r.logger.Warn("retention hard delete", "key", obj.Key, "err", err)
+		if errors.Is(err, errKeyProtected) {
+			r.logger.Warn("retention hard delete skipped: protected", "key", obj.Key)
+		} else {
+			r.logger.Warn("retention hard delete", "key", obj.Key, "err", err)
+		}
 		return false
 	}
 	return true

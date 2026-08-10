@@ -100,9 +100,9 @@ func (c *Client) cmdRemove(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr, "HTTP %d\n", resp.StatusCode)
+		fmt.Fprintln(os.Stderr, renderError(resp))
 		return 1
 	}
 	return 0

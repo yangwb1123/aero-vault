@@ -9,9 +9,13 @@ import (
 	"time"
 )
 
+// first_attempt_at_ns is appended LAST so both claim RETURNING lists follow
+// auditGovernanceCols automatically; the scan reads it into FirstAttemptAt
+// (read-back only — never written by callers, set solely by the claim anchor
+// CASE WHEN).
 const auditGovernanceCols = `id,tenant_id,origin_kind,origin_id,fact_kind,actor_digest,
 action,target_digest,request_id,detail_sha256,object_size_bytes,storage_backend,
-occurred_at_ns,attempts,claim_owner,claim_token,lease_expires_at_ns`
+occurred_at_ns,attempts,claim_owner,claim_token,lease_expires_at_ns,first_attempt_at_ns`
 
 func (s *sqlStore) ClaimAuditGovernance(
 	ctx context.Context, owner, token string, revision uint64, limit int, ttl time.Duration,
@@ -32,16 +36,28 @@ func (s *sqlStore) claimAuditGovernancePostgres(
 	ctx context.Context, owner, token string, revision uint64, limit int, ttl time.Duration,
 ) ([]AuditGovernanceFact, error) {
 	now := time.Now().UTC()
+	// The cumulative-window anchor is set once, atomically, in this fenced
+	// claim: CASE WHEN first_attempt_at_ns=0 THEN $4 keeps the FIRST claim
+	// time across lease re-claims and ack-lost re-claims (idempotent — later
+	// claims are no-ops on the column). Placeholder numbering is ascending in
+	// TEXTUAL order (SET before WHERE): rebind rewrites every $N to ? in text
+	// order ignoring the numeric values (I1), so the arg list below must line
+	// up positionally — the anchor gets its own argument and no placeholder is
+	// reused. The anchor argument is DB-now; the decision later compares
+	// relay-now against it, and a zero/negative elapsed (clock ahead,
+	// anchor-loss) is never terminal (safe direction).
 	query := `UPDATE audit_governance_outbox SET attempts=attempts+1,claim_owner=$1,
-claim_token=$2,lease_expires_at_ns=$3 WHERE id IN (
+claim_token=$2,lease_expires_at_ns=$3,
+first_attempt_at_ns=CASE WHEN first_attempt_at_ns=0 THEN $4 ELSE first_attempt_at_ns END
+WHERE id IN (
  SELECT o.id FROM audit_governance_outbox o JOIN audit_governance_bindings b
- ON b.tenant_id=o.tenant_id WHERE o.delivered_at_ns=0
- AND o.available_at_ns <= $4 AND o.lease_expires_at_ns <= $5
- AND b.revision=$6
- ORDER BY o.available_at_ns,o.created_at_ns,o.id LIMIT $7 FOR UPDATE OF o SKIP LOCKED)
+ ON b.tenant_id=o.tenant_id WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0
+ AND o.available_at_ns <= $5 AND o.lease_expires_at_ns <= $6
+ AND b.revision=$7
+ ORDER BY o.available_at_ns,o.created_at_ns,o.id LIMIT $8 FOR UPDATE OF o SKIP LOCKED)
 RETURNING ` + auditGovernanceCols
 	rows, err := s.db.QueryContext(ctx, query, owner, token, now.Add(ttl).UnixNano(),
-		now.UnixNano(), now.UnixNano(), revision, limit)
+		now.UnixNano(), now.UnixNano(), now.UnixNano(), revision, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +75,8 @@ func (s *sqlStore) claimAuditGovernanceSQLite(
 	now := time.Now().UTC()
 	rows, err := tx.QueryContext(ctx, s.rebind(`SELECT o.id FROM audit_governance_outbox o
 JOIN audit_governance_bindings b ON b.tenant_id=o.tenant_id
-WHERE o.delivered_at_ns=0 AND o.available_at_ns <= $1 AND o.lease_expires_at_ns <= $2
+WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0 AND o.available_at_ns <= $1
+AND o.lease_expires_at_ns <= $2
 AND b.revision=$3
 ORDER BY o.available_at_ns,o.created_at_ns,o.id LIMIT $4`),
 		now.UnixNano(), now.UnixNano(), revision, limit)
@@ -82,11 +99,18 @@ func (s *sqlStore) claimAuditGovernanceIDs(
 ) ([]AuditGovernanceFact, error) {
 	facts := make([]AuditGovernanceFact, 0, len(ids))
 	for _, id := range ids {
+		// Anchor semantics identical to the Postgres claim: CASE WHEN sets the
+		// anchor only on the first claim — idempotent across lease/ack-lost
+		// re-claims. Placeholders ascend in textual order (SET $1..$4, WHERE
+		// $5..$7) so rebind's positional rewrite and the arg list below stay
+		// in lockstep — each occurrence is a fresh placeholder (I1).
 		row := tx.QueryRowContext(ctx, s.rebind(`UPDATE audit_governance_outbox
-SET attempts=attempts+1,claim_owner=$1,claim_token=$2,lease_expires_at_ns=$3
-WHERE id=$4 AND delivered_at_ns=0 AND available_at_ns <= $5 AND lease_expires_at_ns <= $6
-RETURNING `+auditGovernanceCols), owner, token, now.Add(ttl).UnixNano(), id,
-			now.UnixNano(), now.UnixNano())
+SET attempts=attempts+1,claim_owner=$1,claim_token=$2,lease_expires_at_ns=$3,
+first_attempt_at_ns=CASE WHEN first_attempt_at_ns=0 THEN $4 ELSE first_attempt_at_ns END
+WHERE id=$5 AND delivered_at_ns=0 AND failed_at_ns=0
+AND available_at_ns <= $6 AND lease_expires_at_ns <= $7
+RETURNING `+auditGovernanceCols), owner, token, now.Add(ttl).UnixNano(),
+			now.UnixNano(), id, now.UnixNano(), now.UnixNano())
 		fact, err := scanAuditGovernanceRow(row)
 		if err == nil {
 			facts = append(facts, fact)
@@ -112,12 +136,13 @@ func scanAuditGovernanceRows(rows *sql.Rows) ([]AuditGovernanceFact, error) {
 
 func scanAuditGovernanceRow(row rowScanner) (AuditGovernanceFact, error) {
 	var fact AuditGovernanceFact
-	var occurred, lease int64
+	var occurred, lease, firstAttempt int64
 	err := row.Scan(&fact.ID, &fact.TenantID, &fact.OriginKind, &fact.OriginID,
 		&fact.FactKind, &fact.ActorDigest, &fact.Action, &fact.TargetDigest,
 		&fact.RequestID, &fact.DetailSHA256, &fact.ObjectSizeBytes, &fact.StorageBackend,
-		&occurred, &fact.Attempts, &fact.ClaimOwner, &fact.ClaimToken, &lease)
+		&occurred, &fact.Attempts, &fact.ClaimOwner, &fact.ClaimToken, &lease, &firstAttempt)
 	fact.OccurredAt, fact.LeaseExpiresAt = timeFromUnixNano(occurred), timeFromUnixNano(lease)
+	fact.FirstAttemptAt = timeFromUnixNano(firstAttempt)
 	return fact, err
 }
 
@@ -141,8 +166,30 @@ func (s *sqlStore) RetryAuditGovernance(
 	now := time.Now().UTC().UnixNano()
 	result, err := s.db.ExecContext(ctx, s.rebind(`UPDATE audit_governance_outbox
 SET available_at_ns=$1,claim_owner='',claim_token='',lease_expires_at_ns=0,last_error=$2
-WHERE id=$3 AND delivered_at_ns=0 AND claim_owner=$4 AND claim_token=$5
+WHERE id=$3 AND delivered_at_ns=0 AND failed_at_ns=0 AND claim_owner=$4 AND claim_token=$5
 AND lease_expires_at_ns > $6`), next.UTC().UnixNano(), strings.TrimSpace(lastErr),
+		id, owner, token, now)
+	return requireGovernanceClaim(result, err)
+}
+
+// FailAuditGovernance lands a claimed fact in the terminal failed state
+// (conflict:true receipts and similar permanent rejections): the row is never
+// re-claimed (claim predicates require failed_at_ns=0), the last_error is
+// retained for diagnosis, and CleanupFailedAuditGovernance prunes it after
+// the retention window (terminal-with-retention, mirroring the events outbox
+// 'failed' status). Fenced by the same owner+token+live-lease identity as
+// complete/retry.
+func (s *sqlStore) FailAuditGovernance(
+	ctx context.Context, id, owner, token, lastErr string,
+) error {
+	if len(lastErr) > 512 {
+		lastErr = lastErr[:512]
+	}
+	now := time.Now().UTC().UnixNano()
+	result, err := s.db.ExecContext(ctx, s.rebind(`UPDATE audit_governance_outbox
+SET failed_at_ns=$1,claim_owner='',claim_token='',lease_expires_at_ns=0,last_error=$2
+WHERE id=$3 AND delivered_at_ns=0 AND failed_at_ns=0 AND claim_owner=$4 AND claim_token=$5
+AND lease_expires_at_ns > $6`), now, strings.TrimSpace(lastErr),
 		id, owner, token, now)
 	return requireGovernanceClaim(result, err)
 }
@@ -167,7 +214,8 @@ func (s *sqlStore) OldestPendingAuditGovernance(
 	var value sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT MIN(o.created_at_ns)
 FROM audit_governance_outbox o JOIN audit_governance_bindings b
- ON b.tenant_id=o.tenant_id WHERE o.delivered_at_ns=0`).Scan(&value)
+ ON b.tenant_id=o.tenant_id
+WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0`).Scan(&value)
 	if err != nil || !value.Valid {
 		return time.Time{}, false, err
 	}
@@ -179,6 +227,6 @@ func (s *sqlStore) HasPendingDrainingAuditGovernance(ctx context.Context) (bool,
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
  SELECT 1 FROM audit_governance_outbox o JOIN audit_governance_bindings b
   ON b.tenant_id=o.tenant_id
- WHERE o.delivered_at_ns=0 AND b.state='draining')`).Scan(&exists)
+ WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0 AND b.state='draining')`).Scan(&exists)
 	return exists, err
 }

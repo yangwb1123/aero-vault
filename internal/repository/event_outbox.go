@@ -177,6 +177,55 @@ func (s *sqlStore) SoftDeleteObjectWithEvent(
 	return tx.Commit()
 }
 
+// SoftDeleteObjectByIDWithEvent performs the SoftDeleteObjectByID transaction
+// (SELECT by id, UPDATE deleted_at, ErrNotFound on zero rows, access-state
+// cleanup) and inserts the audit_log row (FR-1) plus every outbox fact in the
+// same transaction. Unlike the keyed variants, validation runs inside the
+// transaction (D-2): a malformed fact rolls the whole delete back — no soft
+// delete, no audit row, no phantom outbox rows.
+func (s *sqlStore) SoftDeleteObjectByIDWithEvent(
+	ctx context.Context, id int64, entry AuditEntry, facts []OutboxFact,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := validateOutboxFacts(facts); err != nil {
+		return err
+	}
+	var tenant, bucket, key string
+	if err := tx.QueryRowContext(ctx, s.rebind(
+		`SELECT tenant_id, bucket, key FROM objects WHERE id=$1 AND deleted_at IS NULL`,
+	), id).Scan(&tenant, &bucket, &key); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	res, err := tx.ExecContext(
+		ctx,
+		s.rebind(`UPDATE objects SET deleted_at=$1 WHERE id=$2 AND deleted_at IS NULL`),
+		time.Now().UTC().Format(time.RFC3339Nano), id,
+	)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	if err := deleteObjectAccessState(ctx, s, tx, tenant, bucket, key); err != nil {
+		return err
+	}
+	if err := insertAuditEntry(ctx, s, tx, entry); err != nil {
+		return err
+	}
+	if err := insertOutboxFacts(ctx, s, tx, facts); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func insertOutboxFacts(ctx context.Context, store *sqlStore, exec governanceExecutor, facts []OutboxFact) error {
 	now := time.Now().UTC().UnixNano()
 	for _, fact := range facts {
@@ -391,6 +440,16 @@ func (s *sqlStore) HasEventOutboxFact(ctx context.Context, originID int64, event
  SELECT 1 FROM event_outbox WHERE origin_id=$1 AND event_type=$2)`,
 		originID, string(eventType)).Scan(&exists)
 	return exists, err
+}
+
+// CountEventOutbox returns the total event_outbox row count (any status).
+// Used only by the relay startup log (D6): while the relay is disabled this
+// is the only outbox depth signal that exists. Dialect-neutral by
+// construction — zero placeholders, so no rebind is needed (I1 unaffected).
+func (s *sqlStore) CountEventOutbox(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM event_outbox`).Scan(&n)
+	return n, err
 }
 
 func scanEventOutboxRows(rows *sql.Rows) ([]EventOutboxRow, error) {

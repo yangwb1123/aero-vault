@@ -15,6 +15,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/api/rest"
 	"github.com/aero-vault/aero-vault/internal/api/s3compat"
 	dav "github.com/aero-vault/aero-vault/internal/api/webdav"
+	"github.com/aero-vault/aero-vault/internal/auditgovernance"
 	"github.com/aero-vault/aero-vault/internal/auth"
 	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/events"
@@ -23,7 +24,6 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
-	"github.com/aero-vault/aero-vault/internal/telemetry"
 	"github.com/aero-vault/aero-vault/internal/webui"
 	"log/slog"
 )
@@ -31,6 +31,26 @@ import (
 type readinessChecker interface {
 	Ready(context.Context) error
 }
+
+// degradedChecker is the additive readiness-degradation surface: a checker
+// that also reports a degraded condition (with the recorded backlog age)
+// lets /readyz answer 200 with a degraded marker instead of 503 — the D1
+// "degrade, never evict" contract. billing.Runtime (no Degraded) does not
+// implement it and contributes false/0 through the group.
+type degradedChecker interface {
+	Degraded() bool
+	BacklogAge() time.Duration
+}
+
+// readyzProbeTimeout bounds the /readyz probes independently of
+// STORAGE_READ_TIMEOUT (30s default) and REQUEST_TIMEOUT_SECONDS (120s
+// default): a wedged object store or database must not hold the readiness
+// endpoint for tens of seconds per probe, defeating LB/orchestrator
+// failover. The same 2s budget bounds repo.Ping (H2), the storage probe,
+// and the extra readiness group (billing/audit-governance store queries).
+// Worst-case degraded-path latency = ping 2s + storage 2s + audit probes 2s
+// = 6s < the helm readinessProbe timeoutSeconds: 10 (deployment.yaml).
+const readyzProbeTimeout = 2 * time.Second
 
 type readinessGroup []readinessChecker
 
@@ -43,21 +63,62 @@ func (g readinessGroup) Ready(ctx context.Context) error {
 	return nil
 }
 
+// Degraded reports OR over the members that implement degradedChecker
+// (false when none do — billing contributes false, an empty group false).
+func (g readinessGroup) Degraded() bool {
+	for _, checker := range g {
+		if dc, ok := checker.(degradedChecker); ok && dc.Degraded() {
+			return true
+		}
+	}
+	return false
+}
+
+// BacklogAge reports the max backlog age over the members that implement
+// degradedChecker (0 when none do).
+func (g readinessGroup) BacklogAge() time.Duration {
+	var max time.Duration
+	for _, checker := range g {
+		if dc, ok := checker.(degradedChecker); ok {
+			if age := dc.BacklogAge(); age > max {
+				max = age
+			}
+		}
+	}
+	return max
+}
+
 func readyzHandler(
 	repo repository.Repository, store storage.Storage, extra readinessChecker,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		if err := repo.Ping(req.Context()); err != nil {
+		// H2: bound repo.Ping the same way as the storage probe — a wedged
+		// database must not hold /readyz beyond the probe budget either.
+		pingCtx, pingCancel := context.WithTimeout(req.Context(), readyzProbeTimeout)
+		defer pingCancel()
+		if err := repo.Ping(pingCtx); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if _, err := store.Stat(req.Context(), "@healthz/probe"); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		probeCtx, cancel := context.WithTimeout(req.Context(), readyzProbeTimeout)
+		defer cancel()
+		if _, err := store.Stat(probeCtx, "@healthz/probe"); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		if extra != nil {
-			if err := extra.Ready(req.Context()); err != nil {
+			if err := extra.Ready(probeCtx); err != nil {
 				http.Error(w, "runtime dependency unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			// D1: a degraded extra (lag > maxLag, or a store probe timeout —
+			// age unknown → 0) is still 200 with the marker body; the
+			// healthy path below stays byte-identical. Written via a literal
+			// template, not json.Marshal, to keep the healthy pin trivial.
+			if dc, ok := extra.(degradedChecker); ok && dc.Degraded() {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, `{"ok":true,"degraded":true,"backlog_age_seconds":%d}`, int64(dc.BacklogAge().Seconds()))
 				return
 			}
 		}
@@ -78,6 +139,17 @@ func buildDispatcher(r *chi.Mux, davH http.Handler, cfg *config.Config) http.Han
 		}
 		r.ServeHTTP(w, req)
 	})
+}
+
+// mcpScopeGate enforces the audit-governance scope on the HTTP /mcp mount
+// before MCP dispatch (REQ-1/REQ-2): every principal reaching MCP tools must
+// hold write AND audit:event:write, or admin (Key.Has implies); audit-only
+// keys are rejected by the ring's checkScope (missing scope: write) earlier.
+// Registry disabled → pass-through (I5 baseline TestFullServer_MCP). Single
+// wiring point shared with cmd/server/governance_mcp_scope_e2e_test.go —
+// mount and test cannot drift.
+func mcpScopeGate(authReg *auth.Registry) func(http.Handler) http.Handler {
+	return authReg.Require(auth.Scope(auditgovernance.RequiredScope))
 }
 
 func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider, extraReady readinessChecker) http.Handler {
@@ -117,13 +189,13 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 		r.Head("/public/assets/*", publicAccess.Asset)
 	}
 	if cfg.S3Compat.Prefix != "" {
-		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger))
+		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger, accessManager))
 	}
 	mcpServer := mcp.NewServer(svc, repo, search, "default", logger)
 	if chat != nil {
 		mcpServer.WithChat(chat)
 	}
-	r.Method(http.MethodPost, "/mcp", mcp.HTTPHandler(mcpServer))
+	r.Method(http.MethodPost, "/mcp", mcpScopeGate(authReg)(mcp.HTTPHandler(mcpServer)))
 	if cfg.WebUI.Enabled {
 		r.Get("/", redirectWebUI)
 		r.Get("/favicon.ico", webui.Favicon)
@@ -138,39 +210,6 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 
 func redirectWebUI(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/ui/", http.StatusFound)
-}
-
-func applyMiddleware(handler http.Handler, repo repository.Repository, authReg *auth.Registry, rl *middleware.RateLimiter, cfg *config.Config, logger *slog.Logger, concurrencyMW func(http.Handler) http.Handler, corsProvider middleware.BucketCORSProvider) http.Handler {
-	tenantMW := middleware.TenantWithStatus(func(ctx context.Context, tenant string) (string, bool, error) {
-		record, found, err := repo.GetTenant(ctx, tenant)
-		return record.Status, found, err
-	})
-	chain := []struct {
-		name string
-		mw   func(http.Handler) http.Handler
-	}{
-		{"access_log", middleware.AccessLog(logger)},
-		{"concurrency", concurrencyMW},
-		{"recoverer", middleware.Recoverer(logger)},
-		{"otel", telemetry.HTTPMiddleware("aero-vault")},
-		{"rate_limit", rl.Middleware()},
-		{"tenant", tenantMW},
-		{"auth", authReg.Middleware()},
-		{"max_body", middleware.MaxBodySize(int64(cfg.App.MaxBodySize))},
-		{"secure_headers", middleware.SecureHeaders()},
-		{"cors", middleware.CORS(middleware.CORSConfig{
-			AllowedOrigins: cfg.CORS.AllowedOrigins,
-			AllowedHeaders: cfg.CORS.AllowedHeaders,
-			AllowedMethods: cfg.CORS.AllowedMethods,
-			ExposeHeaders:  append([]string{"ETag", "Idempotency-Replayed", "Retry-After", "X-Request-ID", "X-Version-Id"}, cfg.CORS.ExposeHeaders...),
-		})},
-		{"cors_bucket", middleware.BucketCORS(corsProvider)},
-		{"request_id", middleware.RequestID},
-	}
-	for _, link := range chain {
-		handler = telemetry.WithMiddlewareTiming(link.name, link.mw)(handler)
-	}
-	return handler
 }
 
 func runServer(ctx context.Context, handler http.Handler, cfg *config.Config, logger *slog.Logger, bus *events.Bus, shutdownOtel func(context.Context) error) error {

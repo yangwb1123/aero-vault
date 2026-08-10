@@ -200,6 +200,7 @@ func init() {
 		{Method: "POST", Path: "/v1/admin/jobs/{id}/retry", Summary: "Retry failed job", Tag: "admin", AdminOnly: true, Status: 200},
 		{Method: "GET", Path: "/v1/admin/webhook-failures", Summary: "List webhook failures", Tag: "admin", AdminOnly: true, Status: 200},
 		{Method: "GET", Path: "/v1/admin/audit", Summary: "List audit log", Tag: "admin", AdminOnly: true, Status: 200},
+		{Method: "DELETE", Path: "/v1/admin/files/{tenant}/{key}", Summary: "Delete a file in any tenant (admin)", Tag: "admin", AdminOnly: true, Status: 204},
 		{Method: "POST", Path: "/v1/admin/departments", Summary: "Create a department", Tag: "admin", AdminOnly: true, Body: `{"name":"engineering","parent_id":""}`, Status: 201},
 		{Method: "GET", Path: "/v1/admin/departments", Summary: "List departments", Tag: "admin", AdminOnly: true, Status: 200},
 		{Method: "GET", Path: "/v1/admin/departments/{id}", Summary: "Get department and members", Tag: "admin", AdminOnly: true, Status: 200},
@@ -348,6 +349,7 @@ func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.
 		r.Put("/admin/tenants/{tenant}/status", adm.SetTenantStatus)
 		r.Get("/admin/audit", adm.ListAudit)
 		r.Get("/admin/config", adm.GetConfig)
+		r.Delete("/admin/files/{tenant}/*", adm.DeleteFile)
 		if h.access != nil {
 			r.Post("/admin/departments", h.CreateDepartment)
 			r.Get("/admin/departments", h.ListDepartments)

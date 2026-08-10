@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -242,6 +243,208 @@ func TestRuntimeRejectsRemovedBindingWithOpaqueBacklogReference(t *testing.T) {
 	}
 }
 
+// TestRuntimeNewRejectsEmptyBindingsBeforeStoreIO pins AC-4.2: the
+// fail-closed gate fires inside New's cfg.Validate() (runtime.go, before any
+// store I/O) — a control revision of 0 on the migrated singleton proves
+// applyDesiredBindings never ran. The probe: applying revision 1 directly
+// succeeds only while control is still 0; a silent DELETE-all apply would
+// have bumped control to 1 and drift-rejected the probe.
+func TestRuntimeNewRejectsEmptyBindingsBeforeStoreIO(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "gate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := repo.(Store)
+	cfg := runtimeConfig(server.URL)
+	cfg.Bindings = nil
+	_, err = New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "bindings") {
+		t.Fatalf("empty desired bindings accepted by New, err=%v", err)
+	}
+	probe := []repository.AuditGovernanceBindingState{{
+		TenantID: "acme", State: repository.AuditGovernanceBindingActive,
+	}}
+	if err := store.ApplyAuditGovernanceBindings(ctx, 1, "probe-digest", probe); err != nil {
+		t.Fatalf("control revision != 0 after rejected New (apply must not have run): %v", err)
+	}
+	if safe, err := store.AuditGovernanceCanDisable(ctx); err != nil || safe {
+		t.Fatalf("applied probe not visible: safe=%v err=%v", safe, err)
+	}
+}
+
+// TestRuntimeDrainAppliesEmptyDesiredAndExposesMode pins AC-4.3's positive
+// drain path and rule-3 observability: a drain boot (Drain=true + empty
+// manifest, strictly higher revision) applies the DELETE-all and builds a
+// Runtime whose Draining()/BoundTenants()/AppliedDigest() accessors describe
+// the zero-tenant transition — the input to the WARN log and the
+// bound_tenants/draining gauges. The rollback probe proves the apply bumped
+// control revision past 1.
+func TestRuntimeDrainAppliesEmptyDesiredAndExposesMode(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "drain.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := repo.(Store)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := runtimeConfig(server.URL)
+	runtime, err := New(cfg, store, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Draining() || runtime.BoundTenants() != 1 || runtime.AppliedDigest() == "" {
+		t.Fatalf("healthy boot accessors draining=%v tenants=%d digest=%q",
+			runtime.Draining(), runtime.BoundTenants(), runtime.AppliedDigest())
+	}
+	runtime.Close()
+	cfg.Revision = 2
+	cfg.Drain = true
+	cfg.Bindings = nil
+	runtime, err = New(cfg, store, logger)
+	if err != nil {
+		t.Fatalf("drain boot failed: %v", err)
+	}
+	if !runtime.Draining() || runtime.BoundTenants() != 0 || runtime.AppliedDigest() == "" {
+		t.Fatalf("drain boot accessors draining=%v tenants=%d digest=%q",
+			runtime.Draining(), runtime.BoundTenants(), runtime.AppliedDigest())
+	}
+	// Control revision advanced past 1: a rev-1 apply is now a rollback.
+	if err := store.ApplyAuditGovernanceBindings(ctx, 1, "old-digest", nil); err == nil || !errors.Is(err, repository.ErrAuditGovernanceRevisionRollback) {
+		t.Fatalf("control revision not bumped by drain apply, err=%v", err)
+	}
+	// Drained state is disable-safe: the disabled path can now pass.
+	if safe, err := store.AuditGovernanceCanDisable(ctx); err != nil || !safe {
+		t.Fatalf("post-drain disable safe=%v err=%v", safe, err)
+	}
+}
+
+// TestDrainFlagWithNonEmptyManifestRefusesBoot pins rule 1 at the runtime
+// seam (testing-review row, renamed): a drain flag with a non-empty manifest
+// must refuse boot inside Validate — never a silent no-op — and leave the
+// persisted binding state untouched.
+func TestDrainFlagWithNonEmptyManifestRefusesBoot(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "armed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := repo.(Store)
+	cfg := runtimeConfig(server.URL)
+	if _, err := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Drain = true // non-empty manifest still bound
+	_, err = New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "AUDIT_GOVERNANCE_DRAIN") {
+		t.Fatalf("armed drain flag with non-empty manifest accepted, err=%v", err)
+	}
+	if safe, err := store.AuditGovernanceCanDisable(ctx); err != nil || safe {
+		t.Fatalf("refused boot mutated persisted bindings: safe=%v err=%v", safe, err)
+	}
+}
+
+// TestDrainRequiresStrictlyHigherRevision pins the drain+revision≤control
+// refusal (testing-review row): a drain at the current control revision is a
+// digest drift and must fail, leaving state unchanged. The wrapped error is
+// asserted only as non-nil — the repo sentinel is masked by the generic
+// "binding state initialization failed" wrapper — and the drift probe proves
+// control is still at revision 1 with the original digest.
+func TestDrainRequiresStrictlyHigherRevision(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "rev.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := repo.(Store)
+	cfg := runtimeConfig(server.URL)
+	if _, err := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Drain = true
+	cfg.Bindings = nil
+	cfg.Revision = 1 // not strictly higher than the applied control revision
+	if _, err := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
+		t.Fatal("drain at the current control revision was accepted")
+	}
+	if safe, err := store.AuditGovernanceCanDisable(ctx); err != nil || safe {
+		t.Fatalf("refused drain mutated persisted bindings: safe=%v err=%v", safe, err)
+	}
+	// Control is still revision 1 with the non-empty digest: a rev-1 apply
+	// with a different digest drifts; only the original would pass.
+	probe := []repository.AuditGovernanceBindingState{{
+		TenantID: "acme", State: repository.AuditGovernanceBindingActive,
+	}}
+	if err := store.ApplyAuditGovernanceBindings(ctx, 1, "different-digest", probe); err == nil || !errors.Is(err, repository.ErrAuditGovernanceRevisionDrift) {
+		t.Fatalf("control revision not preserved at 1, err=%v", err)
+	}
+}
+
+// TestDrainRefusesWithOpaqueBacklogReference pins the drain+backlog refusal
+// (testing-review row — the data-loss safety net): a drain with undelivered
+// outbox rows must refuse startup via the existing unbound-backlog guard
+// (never a drain-path bypass), with opaque refs only, and drop nothing.
+func TestDrainRefusesWithOpaqueBacklogReference(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "drainbacklog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := repo.(Store)
+	cfg := runtimeConfig(server.URL)
+	runtime, err := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WrapRepository(repo, runtime).RecordAudit(ctx, repository.AuditEntry{
+		TenantID: "acme", Action: "tenant.status",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Close()
+	cfg.Revision = 2
+	cfg.Drain = true
+	cfg.Bindings = nil
+	_, err = New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "unbound backlog") ||
+		!strings.Contains(err.Error(), "opaque:") || strings.Contains(err.Error(), "acme") {
+		t.Fatalf("drain with pending facts error=%q", err)
+	}
+	if safe, err := store.AuditGovernanceCanDisable(ctx); err != nil || safe {
+		t.Fatalf("refused drain dropped pending facts: safe=%v err=%v", safe, err)
+	}
+}
+
 func TestRuntimeCredentialRotationRequiresHigherRevisionAndUsesNewSecret(t *testing.T) {
 	secrets := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -414,7 +617,8 @@ func TestRelayLogsNeverExposeRawFactInputs(t *testing.T) {
 // /readyz, while BacklogAge exposes the age for the 450s alert gauge.
 func TestRuntimeReadyDegradesOnBacklogLag(t *testing.T) {
 	ctx := context.Background()
-	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "ready.db"))
+	dsn := "file:" + filepath.Join(t.TempDir(), "ready.db")
+	repo, err := repository.Open(ctx, "sqlite", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,8 +639,8 @@ func TestRuntimeReadyDegradesOnBacklogLag(t *testing.T) {
 	}
 	// Seed one pending fact that will never be delivered (server down). The
 	// backlog age is measured from the outbox row's created_at (insert
-	// time), so the test waits past maxLag (4s) to cross the degraded
-	// threshold.
+	// time); backdatePendingFact rewrites it to 8s so the age crosses
+	// maxLag (4s) deterministically — no sleeps.
 	if _, err := store.InsertEventWithGovernance(ctx, repository.Event{
 		TenantID: "acme", Bucket: "b", Key: "k", Type: repository.EventCreated,
 		CreatedAt: time.Now().UTC(),
@@ -445,8 +649,8 @@ func TestRuntimeReadyDegradesOnBacklogLag(t *testing.T) {
 		Action: "file.create", OccurredAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(4500 * time.Millisecond)
-	age, ok, err := runtime.BacklogAge(ctx)
+	backdatePendingFact(t, dsn, 8*time.Second)
+	age, ok, err := runtime.PendingBacklogAge(ctx)
 	if err != nil || !ok {
 		t.Fatalf("BacklogAge ok=%v err=%v, want pending backlog", ok, err)
 	}
@@ -455,6 +659,14 @@ func TestRuntimeReadyDegradesOnBacklogLag(t *testing.T) {
 	}
 	if err := runtime.Ready(ctx); err != nil {
 		t.Fatalf("Ready must degrade (nil) on maxLag, got %v", err)
+	}
+	// Acceptance (a) conjunction (REQ-1 residual): the probe has already
+	// recorded the pair into the cache — Degraded()==true and BacklogAge()>maxLag.
+	if !runtime.Degraded() {
+		t.Fatal("Degraded()=false, want true after maxLag backdate")
+	}
+	if got := runtime.BacklogAge(); got <= 4*time.Second {
+		t.Fatalf("BacklogAge()=%v, want > maxLag (4s)", got)
 	}
 	// Draining still fails readiness (unchanged gate).
 	if err := store.ApplyAuditGovernanceBindings(ctx, 2, "acme-v2", []repository.AuditGovernanceBindingState{
@@ -489,7 +701,7 @@ func TestRuntimeBacklogAgeZeroWhenNoPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := runtime.BacklogAge(ctx); err != nil || ok {
+	if _, ok, err := runtime.PendingBacklogAge(ctx); err != nil || ok {
 		t.Fatalf("empty backlog: ok=%v err=%v", ok, err)
 	}
 	if err := runtime.Ready(ctx); err != nil {

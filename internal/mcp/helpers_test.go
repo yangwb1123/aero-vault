@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
@@ -30,9 +31,20 @@ func newTestServer(t *testing.T, search *ai.Search) (*Server, *service.FileServi
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
 	srv := NewServer(svc, repo, search, "default", nil)
 	return srv, svc, repo
+}
+
+// allowAllProvider is the CI-baseline test double injected into the mcp test
+// helper: it preserves the pre-fail-closed baseline (all actions allowed) for
+// tests exercising MCP behavior other than the delete gate. The default-config
+// (no authorizer) delete denial is covered by TestCallTool_DeleteFile_FailClosed
+// in server_test.go.
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
 }
 
 // seedObject uploads content under tenant/bucket/key via the service.

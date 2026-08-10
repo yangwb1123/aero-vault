@@ -69,6 +69,8 @@ spec:
                 secretKeyRef:
                   name: {{ required "auditGovernance.hmacSecretName is required when enabled" .Values.auditGovernance.hmacSecretName }}
                   key: {{ required "auditGovernance.hmacSecretKey is required when enabled" .Values.auditGovernance.hmacSecretKey }}
+            - name: AUDIT_GOVERNANCE_DRAIN
+              value: {{ .Values.auditGovernance.drain | default false | quote }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
@@ -86,6 +88,7 @@ spec:
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10
+            timeoutSeconds: 10
           startupProbe:
             httpGet:
               path: /healthz

@@ -91,6 +91,47 @@ func buildStorageFrom(ctx context.Context, sc config.StorageConfig) (storage.Sto
 	return storage.NewFromConfig(ctx, fc)
 }
 
+// auditGovernanceBacklogAgeGaugeFn returns the backlog-age gauge callback.
+// D3: the value comes from the run-loop-refreshed cache (Runtime.BacklogAge
+// getter — zero store I/O per scrape; the ctx is never touched: a scrape
+// must never issue a query; REQ-5: a scrape must never block on the store).
+// Freshness ≤ poll interval (default 1s) + /readyz probe cadence. Terminal
+// (dead-lettered) rows are excluded by the store query, so a fully
+// dead-lettered backlog reports 0; a probe timeout also reports 0 (fail-open
+// gauge — the degraded signal is alert-driven, B3-2).
+func auditGovernanceBacklogAgeGaugeFn(rt *auditgovernance.Runtime) func(context.Context) int64 {
+	return func(context.Context) int64 {
+		return int64(rt.BacklogAge().Seconds())
+	}
+}
+
+// auditGovernanceDegradedGaugeFn returns the degraded-flag gauge callback
+// (0/1 from the cache getter; 1 = lag > configured maxLag or store probe
+// timeout/cancel — the F11/F16 alert arm; zero store I/O per scrape).
+func auditGovernanceDegradedGaugeFn(rt *auditgovernance.Runtime) func(context.Context) int64 {
+	return func(ctx context.Context) int64 {
+		if rt.Degraded() {
+			return 1
+		}
+		return 0
+	}
+}
+
+// auditGovernanceDrainGaugesFn returns the drain-mode gauge pair callback
+// (bound tenants, draining 0/1) fed by zero-I/O Runtime accessors — the only
+// positive signal of the drained-but-enabled state (AuditGovernanceEnabledUnbound
+// alert arm; the draining flag discriminates a legit transition from a stale
+// AUDIT_GOVERNANCE_DRAIN replay in annotations).
+func auditGovernanceDrainGaugesFn(rt *auditgovernance.Runtime) func(context.Context) (int64, int64) {
+	return func(ctx context.Context) (int64, int64) {
+		draining := int64(0)
+		if rt.Draining() {
+			draining = 1
+		}
+		return int64(rt.BoundTenants()), draining
+	}
+}
+
 func buildPrometheus(cfg *config.Config, logger *slog.Logger) http.Handler {
 	if !cfg.Telemetry.PrometheusEnabled {
 		return nil
@@ -110,13 +151,9 @@ func registerGauges(repo repository.Repository, auditRuntime *auditgovernance.Ru
 		return int64(n)
 	})
 	if auditRuntime != nil {
-		telemetry.RegisterAuditGovernanceBacklogAgeGauge(func(ctx context.Context) int64 {
-			age, ok, err := auditRuntime.BacklogAge(ctx)
-			if err != nil || !ok {
-				return 0
-			}
-			return int64(age.Seconds())
-		})
+		telemetry.RegisterAuditGovernanceBacklogAgeGauge(auditGovernanceBacklogAgeGaugeFn(auditRuntime))
+		telemetry.RegisterAuditGovernanceDegradedGauge(auditGovernanceDegradedGaugeFn(auditRuntime))
+		telemetry.RegisterAuditGovernanceDrainGauges(auditGovernanceDrainGaugesFn(auditRuntime))
 	}
 	telemetry.RegisterStorageGauges(func(ctx context.Context) []telemetry.TenantStorage {
 		qs, _ := repo.ListTenantQuotas(ctx)

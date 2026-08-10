@@ -20,12 +20,15 @@ import (
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
-// jitterFraction returns duration ±25% random jitter for the given base.
+// jitter returns duration with downward-only jitter in [0.75, 1.0) × d —
+// never above the base: offset ∈ [0, d/2) → d - d/4 + offset/2 ∈ [0.75d, d).
+// Deliberate (D-7): strictly faster than base shrinks the C-5 at-least-once
+// window; TestEventOutboxBackoffBounds pins these exact bounds.
 func jitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return d
 	}
-	// ±25%: [0.75, 1.25] * d
+	// [0.75, 1.0) * d — downward-only, not ±25%.
 	n, err := rand.Int(rand.Reader, big.NewInt(int64(d/2)))
 	if err != nil {
 		return d // fallback: no jitter

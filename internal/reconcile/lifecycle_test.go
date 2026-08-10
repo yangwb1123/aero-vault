@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -697,5 +698,91 @@ func TestLifecycleSweep_ExpiredExpiredLock_HardDeleteProceeds(t *testing.T) {
 	}
 	if _, err := h.repo.GetObject(ctx, tenant, bucket, "old-lock.txt"); err == nil {
 		t.Fatal("expected DB row to be gone after hard delete")
+	}
+}
+
+// ---- AC-2: versioned-bucket lifecycle hard_delete must not nuke non-current versions ----
+
+// TestLifecycleSweep_HardDelete_VersionedBucket_PreservesNonCurrentVersions is
+// AC-2 T-2: expire_action=hard_delete on a versioned bucket with noncurrent_days
+// set preserves non-current version rows and their blobs; only the expired
+// current version is purged.
+func TestLifecycleSweep_HardDelete_VersionedBucket_PreservesNonCurrentVersions(t *testing.T) {
+	ctx := context.Background()
+	h := openTestRepoWithDB(t)
+	store := openTestStore(t)
+	const tenant, bucket, key = "default", "default", "versioned-expire.txt"
+
+	if err := h.repo.CreateBucket(ctx, tenant, bucket); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.repo.SetBucketVersioning(ctx, tenant, bucket, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.repo.SetBucketLifecycle(ctx, tenant, bucket, 1, "hard_delete"); err != nil {
+		t.Fatal(err)
+	}
+	// 30-day noncurrent window; noncurrentCount is stored but never enforced.
+	if err := h.repo.SetBucketNoncurrentVersionLifecycle(ctx, tenant, bucket, 30, 3); err != nil {
+		t.Fatal(err)
+	}
+	k1 := "default/default/" + key + "@v1"
+	k2 := "default/default/" + key + "@v2"
+	v1, err := h.repo.InsertObjectVersion(ctx, repository.Object{
+		TenantID: tenant, Bucket: bucket, Key: key, VersionID: "v1",
+		Backend: "local", StorageKey: k1, Size: 5, ETag: "e1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	putTestBlob(t, store, k1)
+	v2, err := h.repo.InsertObjectVersion(ctx, repository.Object{
+		TenantID: tenant, Bucket: bucket, Key: key, VersionID: "v2",
+		Backend: "local", StorageKey: k2, Size: 5, ETag: "e2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	putTestBlob(t, store, k2)
+	// v1 is now a tombstone whose deleted_at is "now" — inside the 30-day
+	// noncurrent window, so sweepNonCurrentVersions must NOT purge it.
+	// Backdate the current version past the 1-day expire window.
+	h.backdateByID(t, v2.ID, 72*time.Hour)
+
+	NewLifecycle(h.repo, store, time.Minute, newSilentLogger()).sweep(ctx)
+
+	// Assertion A (rows): only the expired current version's row is purged;
+	// the tombstone row survives with its deleted_at untouched.
+	versions, err := h.repo.ListObjectVersions(ctx, tenant, bucket, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 1 {
+		t.Fatalf("expected exactly 1 remaining version, got %d", len(versions))
+	}
+	if !versions[0].VersionTombstone {
+		t.Fatal("remaining version must be the tombstone (non-current)")
+	}
+	if versions[0].DeletedAt == nil {
+		t.Fatal("tombstone deleted_at must be untouched")
+	}
+	// Assertion B (blobs): non-current blob preserved, expired current blob gone.
+	if _, err := store.Stat(ctx, k1); err != nil {
+		t.Fatalf("non-current blob must remain: %v", err)
+	}
+	if _, err := store.Stat(ctx, k2); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expired current blob must be purged, Stat err=%v", err)
+	}
+
+	// Positive control (window semantics not bypassed): once the tombstone's
+	// deleted_at passes the 30-day window, sweepNonCurrentVersions purges it.
+	past := time.Now().UTC().Add(-31 * 24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := h.db.ExecContext(ctx, `UPDATE objects SET deleted_at=? WHERE id=?`, past, v1.ID); err != nil {
+		t.Fatal(err)
+	}
+	NewLifecycle(h.repo, store, time.Minute, newSilentLogger()).sweep(ctx)
+	versions, err = h.repo.ListObjectVersions(ctx, tenant, bucket, key)
+	if err != nil || len(versions) != 0 {
+		t.Fatalf("non-current version past its window must be purged: versions=%+v err=%v", versions, err)
 	}
 }

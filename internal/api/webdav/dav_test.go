@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/api/webdav"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -55,7 +56,7 @@ func newTestServerWithSvc(t *testing.T) (*httptest.Server, *service.FileService)
 	if err != nil {
 		t.Fatalf("storage.NewLocal: %v", err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
 	// Wrap with the Tenant middleware exactly as cmd/server does: the WebDAV
 	// handler reads the tenant from the request context, which that middleware
 	// populates from the X-Aero-Tenant header (defaulting to "default").
@@ -853,7 +854,7 @@ func newRollbackServer(t *testing.T, failOn string) (*httptest.Server, *service.
 		t.Fatalf("storage.NewLocal: %v", err)
 	}
 	store := &deleteFailStorage{Storage: base, failOn: failOn}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
 	h := mw.Tenant(webdav.Handler("/webdav", svc, nil))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -890,4 +891,14 @@ func TestMoveRollbackOnDeleteFailure(t *testing.T) {
 	if _, err := svc.Stat(context.Background(), service.DefaultTenant, service.DefaultBucket, "rollback-src.txt"); err != nil {
 		t.Fatalf("rollback-src.txt should still exist after failed MOVE: %v", err)
 	}
+}
+
+// allowAllProvider is the CI-baseline test double injected into helpers that
+// construct a bare FileService: it preserves the pre-fail-closed baseline
+// (all actions allowed) for tests exercising WebDAV behavior other than the
+// delete gate (which is covered by dedicated T-9/T-9b/T-10 tests).
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
 }

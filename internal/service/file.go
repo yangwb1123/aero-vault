@@ -2,11 +2,11 @@ package service
 
 import (
 	"context"
-	"reflect"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path"
+	"reflect"
 	"strings"
 
 	"github.com/aero-vault/aero-vault/internal/access"
@@ -90,6 +90,7 @@ type FileService struct {
 	chunkCleaner    ChunkCleaner
 	readVerify      ReadVerificationConfig
 	authorizer      access.Authorizer
+	deleteFailOpen  bool
 	tenantStatus    bool
 	usageAccountant UsageAccountant
 }
@@ -111,6 +112,16 @@ func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService 
 		}
 	}
 	s.authorizer = authorizer
+	return s
+}
+
+// WithDeleteFailOpen opts out of the fail-closed delete gate (FR-1): when
+// optOut is true and no authorizer is configured, deletes are allowed again
+// (legacy baseline). The zero value (not called) is fail-closed: ActionDelete
+// with a nil authorizer returns ErrForbidden. Only the antivirus system actor
+// remains exempt (AV quarantine, access.IsSystemDeleteExempt).
+func (s *FileService) WithDeleteFailOpen(optOut bool) *FileService {
+	s.deleteFailOpen = optOut
 	return s
 }
 

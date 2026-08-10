@@ -24,6 +24,11 @@ type Config struct {
 	Enabled       bool
 	DefaultPolicy string
 	ShareSecret   []byte
+	// DeleteFailOpen opts out of the fail-closed delete gate (FR-2): when
+	// true and the manager is disabled, ActionDelete is allowed again
+	// (legacy baseline). The zero value is fail-closed: a disabled manager
+	// denies ActionDelete.
+	DeleteFailOpen bool
 }
 
 type Manager struct {
@@ -194,6 +199,14 @@ func validateACL(entry ACLEntry) error {
 	}
 	if entry.ResourceKind != ResourceBucket && entry.ResourceKind != ResourceFolder && entry.ResourceKind != ResourceObject {
 		return fmt.Errorf("%w: invalid resource_kind", ErrInvalidArgument)
+	}
+	// Defense-in-depth (REQ-2): folder keys participate in prefix matching
+	// (ListApplicableACL), so '%'/'_' must never be stored — they would act
+	// as SQL LIKE wildcards if a LIKE-based clause is ever re-introduced.
+	// Object/bucket keys match exactly and are not restricted. Keys are
+	// already normalized (normalizeACLResource) when this is called.
+	if entry.ResourceKind == ResourceFolder && strings.ContainsAny(entry.Key, "%_") {
+		return fmt.Errorf("%w: folder ACL key %q contains %% or _ (SQL LIKE wildcard metacharacters)", ErrInvalidArgument, entry.Key)
 	}
 	if entry.Effect != EffectAllow && entry.Effect != EffectDeny {
 		return fmt.Errorf("%w: effect must be allow or deny", ErrInvalidArgument)

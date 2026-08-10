@@ -43,6 +43,9 @@ type deletedFact struct {
 	Backend       string `json:"backend"`
 	RequestID     string `json:"request_id"`
 	Actor         string `json:"actor"`
+	// Reason is the deletion reason vocabulary (quarantine uses
+	// "av_infected"). omitempty keeps REST-path goldens byte-identical.
+	Reason string `json:"reason,omitempty"`
 }
 
 // notifyFact is the vault.file.notify@1.1 S3-notification-shaped fact. Its
@@ -61,6 +64,10 @@ type notifyFact struct {
 	RequestID     string         `json:"request_id"`
 	Actor         string         `json:"actor"`
 	Records       []notifyRecord `json:"records"`
+	// Signature carries the antivirus threat name on quarantine
+	// notifications (self-contained payload). omitempty keeps REST-path
+	// goldens byte-identical.
+	Signature string `json:"signature,omitempty"`
 }
 
 type notifyRecord struct {
@@ -97,8 +104,13 @@ type notifyObject struct {
 
 // BuildDeletedFact builds the vault.file.deleted@1.1 fact payload. actor may
 // be empty (anonymous/no-principal contexts are legal — no new identity
-// pipeline is introduced).
-func BuildDeletedFact(obj repository.Object, actor, requestID, tenant string) []byte {
+// pipeline is introduced). reason is optional and appended only when non-empty
+// (additive schema: REST-path goldens stay byte-identical).
+func BuildDeletedFact(obj repository.Object, actor, requestID, tenant string, reason ...string) []byte {
+	reasonValue := ""
+	if len(reason) > 0 {
+		reasonValue = reason[0]
+	}
 	payload, _ := json.Marshal(deletedFact{
 		SchemaVersion: "1.1",
 		EventType:     string(repository.EventTypeFileDeleted11),
@@ -112,6 +124,7 @@ func BuildDeletedFact(obj repository.Object, actor, requestID, tenant string) []
 		Backend:       obj.Backend,
 		RequestID:     requestID,
 		Actor:         actor,
+		Reason:        reasonValue,
 	})
 	return payload
 }
@@ -119,10 +132,15 @@ func BuildDeletedFact(obj repository.Object, actor, requestID, tenant string) []
 // BuildNotifyFact builds the vault.file.notify@1.1 fact payload with a
 // fully self-contained S3 records section (size/etag/versionId/sequencer all
 // captured at emit time — the E7 fix). sequencer is normally produced by
-// newSequencer; tests inject a fixed value.
-func BuildNotifyFact(obj repository.Object, actor, requestID, tenant, sequencer string) []byte {
+// newSequencer; tests inject a fixed value. signature is optional and appended
+// only when non-empty (additive schema: REST-path goldens stay byte-identical).
+func BuildNotifyFact(obj repository.Object, actor, requestID, tenant, sequencer string, signature ...string) []byte {
 	if sequencer == "" {
 		sequencer = newSequencer()
+	}
+	signatureValue := ""
+	if len(signature) > 0 {
+		signatureValue = signature[0]
 	}
 	payload, _ := json.Marshal(notifyFact{
 		SchemaVersion: "1.1",
@@ -157,6 +175,7 @@ func BuildNotifyFact(obj repository.Object, actor, requestID, tenant, sequencer 
 				},
 			},
 		}},
+		Signature: signatureValue,
 	})
 	return payload
 }

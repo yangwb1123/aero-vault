@@ -7,6 +7,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -481,6 +482,280 @@ func TestCmdRemove_HTTPError_Returns1(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// cmdRemove — fail-closed denial rendering (vault.file.delete CLI direction)
+// --------------------------------------------------------------------------
+
+// countingReadCloser wraps a reader and records how many bytes were consumed.
+type countingReadCloser struct {
+	r     io.Reader
+	count int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.count += int64(n)
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error { return nil }
+
+// stubRoundTripper answers every request with a fixed status/body without
+// touching the network; the body reader is kept for consumption assertions.
+type stubRoundTripper struct {
+	status int
+	body   string
+	rc     *countingReadCloser
+}
+
+func (st *stubRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	st.rc = &countingReadCloser{r: strings.NewReader(st.body)}
+	return &http.Response{
+		StatusCode: st.status,
+		Status:     fmt.Sprintf("%d %s", st.status, http.StatusText(st.status)),
+		Header:     make(http.Header),
+		Body:       st.rc,
+		Request:    req,
+	}, nil
+}
+
+// failingReadCloser is a body whose Read always fails (F2/F-E pin).
+type failingReadCloser struct{}
+
+func (failingReadCloser) Read([]byte) (int, error) { return 0, errors.New("read boom") }
+func (failingReadCloser) Close() error             { return nil }
+
+// T1 — AC-1: a 403 denial envelope is rendered with the AuthorizationProvider
+// reason (message verbatim) and the process exits 1; the bare `HTTP 403` line
+// must not appear on the delete path.
+func TestCmdRemove_403Denial_PrintsReasonExits1(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"error":{"code":"AccessDenied","message":"permission vault.file.delete denied for principal alice","request_id":"r-1"}}`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	var code int
+	errOut := captureStderr(t, func() {
+		code = c.cmdRemove([]string{"docs/a.txt"})
+	})
+	if code != 1 {
+		t.Errorf("cmdRemove on 403 = %d; want 1", code)
+	}
+	if !strings.Contains(errOut, "permission vault.file.delete denied for principal alice") {
+		t.Errorf("stderr %q missing denial reason", errOut)
+	}
+	if !strings.Contains(errOut, "HTTP 403 AccessDenied: ") {
+		t.Errorf("stderr %q missing rendered envelope", errOut)
+	}
+	if strings.Contains(errOut, "HTTP 403\n") {
+		t.Errorf("bare status leaked to stderr: %q", errOut)
+	}
+}
+
+// T2 — AC-1: the response body is consumed in full by the shared error path
+// (counting reader wraps the body; the reason is only in the body).
+func TestCmdRemove_403Denial_BodyConsumed(t *testing.T) {
+	st := &stubRoundTripper{status: http.StatusForbidden, body: `{"error":{"code":"AccessDenied","message":"permission vault.file.delete denied for principal alice","request_id":"r-1"}}`}
+	c := &Client{endpoint: "http://stub", http: &http.Client{Transport: st}}
+	var code int
+	errOut := captureStderr(t, func() {
+		code = c.cmdRemove([]string{"k.txt"})
+	})
+	if code != 1 {
+		t.Errorf("cmdRemove = %d; want 1", code)
+	}
+	if st.rc == nil || st.rc.count != int64(len(st.body)) {
+		t.Errorf("response body consumed %d of %d bytes; want the full body", st.rc.count, len(st.body))
+	}
+	if !strings.Contains(errOut, "permission vault.file.delete denied for principal alice") {
+		t.Errorf("stderr %q missing denial reason", errOut)
+	}
+}
+
+// T3 — AC-1: the DELETE request carries the tenant-scoped headers (same
+// pattern as TestDo_SetsAuthAndTenantHeaders, extended to the delete path).
+func TestCmdRemove_403Denial_TenantHeaderAsserted(t *testing.T) {
+	var gotAuth, gotTenant, gotMethod string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotTenant = r.Header.Get("X-Aero-Tenant")
+		gotMethod = r.Method
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	var code int
+	captureStderr(t, func() {
+		code = c.cmdRemove([]string{"docs/a.txt"})
+	})
+	if code != 1 {
+		t.Errorf("cmdRemove = %d; want 1", code)
+	}
+	if gotMethod != "DELETE" {
+		t.Errorf("method = %q; want DELETE", gotMethod)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Errorf("Authorization = %q; want %q", gotAuth, "Bearer test-key")
+	}
+	if gotTenant != "acme" {
+		t.Errorf("X-Aero-Tenant = %q; want %q", gotTenant, "acme")
+	}
+}
+
+// T4 — AC-1/F1: a non-JSON body degrades to rule 2 — a single line, bounded
+// to exactly maxErrorLine bytes ending with "…" (truncation pin, F-A).
+func TestCmdRemove_403Denial_NonJSONBodyDegrades(t *testing.T) {
+	raw := "x\n" + strings.Repeat("y", 700) + "\nz" // collapses to 704 bytes
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, raw)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	var code int
+	errOut := captureStderr(t, func() {
+		code = c.cmdRemove([]string{"docs/a.txt"})
+	})
+	if code != 1 {
+		t.Errorf("cmdRemove = %d; want 1", code)
+	}
+	lines := strings.Split(strings.TrimSuffix(errOut, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stderr must be a single line, got %d lines: %q", len(lines), errOut)
+	}
+	line := lines[0]
+	if !strings.HasPrefix(line, "HTTP 403: ") {
+		t.Errorf("line %q missing HTTP 403: prefix", line)
+	}
+	if len(line) != maxErrorLine {
+		t.Errorf("line length = %d; want %d", len(line), maxErrorLine)
+	}
+	if !strings.HasSuffix(line, "…") {
+		t.Errorf("line %q must end with …", line)
+	}
+}
+
+// T11 — F4 pin: a connection error (closed loopback server) prints the
+// transport error and exits 1; renderError never runs (no response exists).
+func TestCmdRemove_ConnectionError_PrintsErrExits1(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := ts.URL
+	ts.Close() // from here on the loopback dial is refused
+
+	t.Setenv("AERO_ENDPOINT", url)
+	t.Setenv("AERO_API_KEY", "test-key")
+	t.Setenv("AERO_TENANT", "")
+	var code int
+	errOut := captureStderr(t, func() {
+		code = Run([]string{"rm", "k.txt"})
+	})
+	if code != 1 {
+		t.Errorf("Run(rm) on connection error = %d; want 1", code)
+	}
+	if !strings.Contains(errOut, "connection refused") {
+		t.Errorf("stderr %q missing transport error text", errOut)
+	}
+}
+
+// T8 — AC-3: envelope parsing matrix against the REST error contract
+// (docs/api.md), including degradation rules 2/3 and the F-F empty-code
+// format (no double space).
+func TestRenderError_EnvelopeMatrix(t *testing.T) {
+	envelope := func(status int, body string) *http.Response {
+		return &http.Response{
+			StatusCode: status,
+			Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+	}
+	cases := []struct {
+		name string
+		resp *http.Response
+		want string
+	}{
+		{
+			name: "valid envelope with request id",
+			resp: envelope(http.StatusForbidden, `{"error":{"code":"AccessDenied","message":"forbidden: default_deny","request_id":"r-1"}}`),
+			want: "HTTP 403 AccessDenied: forbidden: default_deny (request r-1)",
+		},
+		{
+			name: "old classify message (F6)",
+			resp: envelope(http.StatusForbidden, `{"error":{"code":"AccessDenied","message":"access denied","request_id":""}}`),
+			want: "HTTP 403 AccessDenied: access denied",
+		},
+		{
+			name: "empty request id omits suffix (F5)",
+			resp: envelope(http.StatusForbidden, `{"error":{"code":"AccessDenied","message":"nope"}}`),
+			want: "HTTP 403 AccessDenied: nope",
+		},
+		{
+			name: "code empty message set (F-F)",
+			resp: envelope(http.StatusForbidden, `{"error":{"code":"","message":"only a message"}}`),
+			want: "HTTP 403: only a message",
+		},
+		{
+			name: "message empty code set",
+			resp: envelope(http.StatusForbidden, `{"error":{"code":"AccessDenied","message":""}}`),
+			want: "HTTP 403 AccessDenied: ",
+		},
+		{
+			name: "5xx envelope renders code and message",
+			resp: envelope(http.StatusInternalServerError, `{"error":{"code":"InternalError","message":"storage delete failed","request_id":"r-9"}}`),
+			want: "HTTP 500 InternalError: storage delete failed (request r-9)",
+		},
+		{
+			name: "empty body degrades to bare status (F2 rule 3)",
+			resp: envelope(http.StatusForbidden, ``),
+			want: "HTTP 403",
+		},
+		{
+			name: "json without error field degrades to raw (F3 rule 2)",
+			resp: envelope(http.StatusForbidden, `{"nope":true}`),
+			want: "HTTP 403: {\"nope\":true}",
+		},
+		{
+			name: "empty envelope degrades to raw (F3)",
+			resp: envelope(http.StatusForbidden, `{"error":{}}`),
+			want: "HTTP 403: {\"error\":{}}",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := renderError(tc.resp); got != tc.want {
+				t.Errorf("renderError = %q; want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("read error degrades to bare status (F2/F-E)", func(t *testing.T) {
+		resp := &http.Response{
+			StatusCode: http.StatusForbidden,
+			Status:     "403 Forbidden",
+			Body:       failingReadCloser{},
+		}
+		if got := renderError(resp); got != "HTTP 403" {
+			t.Errorf("renderError with failing body = %q; want HTTP 403", got)
+		}
+	})
+
+	t.Run("non-json body collapses and truncates (F1)", func(t *testing.T) {
+		raw := "x\n" + strings.Repeat("y", 700) + "\nz"
+		resp := envelope(http.StatusForbidden, raw)
+		got := renderError(resp)
+		if strings.ContainsAny(got, "\n\r\t") {
+			t.Errorf("rendered line contains raw whitespace: %q", got)
+		}
+		if len(got) != maxErrorLine || !strings.HasSuffix(got, "…") {
+			t.Errorf("line = %d bytes ending %q; want %d bytes ending …", len(got), got[max(0, len(got)-3):], maxErrorLine)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
 // cmdSearch
 // --------------------------------------------------------------------------
 
@@ -540,6 +815,52 @@ func TestCmdSearch_CustomKAndMode(t *testing.T) {
 	}
 	if m, _ := body["mode"].(string); m != "hybrid" {
 		t.Errorf("mode = %q; want hybrid", m)
+	}
+}
+
+// FR-1/FR-2 — non-numeric or negative -k is rejected with exit code 2 before
+// any HTTP request (AC-2), with the role name in the usage error.
+func TestCmdSearch_NonNumericK_Returns2(t *testing.T) {
+	var hit int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit++
+		fmt.Fprint(w, `[]`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	out := captureStderr(t, func() {
+		if code := c.cmdSearch([]string{"q", "-k", "abc"}); code != 2 {
+			t.Errorf("cmdSearch -k abc = %d; want 2", code)
+		}
+	})
+	if hit != 0 {
+		t.Errorf("server received %d requests; want 0", hit)
+	}
+	if !strings.Contains(out, "k") {
+		t.Errorf("stderr %q missing k role name", out)
+	}
+	if !strings.Contains(out, "usage:") {
+		t.Errorf("stderr %q missing usage line", out)
+	}
+}
+
+func TestCmdSearch_NegativeK_Returns2(t *testing.T) {
+	var hit int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit++
+		fmt.Fprint(w, `[]`)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts)
+	captureStderr(t, func() {
+		if code := c.cmdSearch([]string{"q", "-k", "-3"}); code != 2 {
+			t.Errorf("cmdSearch -k -3 = %d; want 2", code)
+		}
+	})
+	if hit != 0 {
+		t.Errorf("server received %d requests; want 0", hit)
 	}
 }
 
@@ -1416,17 +1737,6 @@ func TestRun_AdminAudit_Dispatches(t *testing.T) {
 // Bug / limitation documentation
 // --------------------------------------------------------------------------
 
-// BUG: cmdList never checks the HTTP status code; it always returns 0 and
-// prints whatever body the server sent, even on 5xx.
-//
-// BUG: cmdTag does not check the HTTP response status; it always returns 0.
-//
-// BUG: cmdVersions does not check the HTTP response status; it always returns 0.
-//
-// BUG: cmdLineage does not check the HTTP response status; it always returns 0.
-//
-// BUG: cmdSearch does not check the HTTP response status; it always returns 0.
-//
 // BUG: cmdSnapshot create silently ignores a missing DB file (stat errors are
 // swallowed with `continue`), so a snapshot is successfully written even when
 // the database file does not exist.

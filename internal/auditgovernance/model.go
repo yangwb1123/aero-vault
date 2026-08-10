@@ -24,18 +24,15 @@ var (
 	ErrInvalidConfig    = errors.New("audit governance configuration is invalid")
 	ErrInvalidEvent     = errors.New("audit governance event is invalid")
 	ErrInvalidReceipt   = errors.New("audit governance receipt is invalid")
+	ErrReceiptConflict  = errors.New("audit governance receipt reports a conflict")
 	ErrTokenUnavailable = errors.New("audit governance token is unavailable")
 )
 
 type httpStatusError struct {
 	Status int
-	Detail string
 }
 
 func (e *httpStatusError) Error() string {
-	if e.Detail != "" {
-		return fmt.Sprintf("audit governance HTTP %d: %s", e.Status, e.Detail)
-	}
 	return fmt.Sprintf("audit governance HTTP %d", e.Status)
 }
 
@@ -45,8 +42,18 @@ type receiptEnvelope struct {
 		TenantID   string    `json:"tenant_id"`
 		Status     string    `json:"status"`
 		AcceptedAt time.Time `json:"accepted_at"`
-		Duplicate  bool      `json:"duplicate"`
-		Conflict   bool      `json:"conflict"`
+		// Duplicate is deliberately unused in the acceptance predicate
+		// (contract A): an idempotent re-POST — lease re-claim, crash
+		// re-delivery, at-least-once — must be answered
+		// {duplicate:true, conflict:false, status:ledgered} and accepted
+		// exactly like a first POST. Never gate acceptance on Duplicate;
+		// the contract test TestReceiptDuplicateSemanticsContract pins this.
+		Duplicate bool `json:"duplicate"`
+		// Conflict means the receiver will never ledger this event (semantic
+		// collision, not idempotency). Terminal-with-retention: the relay
+		// fails the fact (ErrReceiptConflict), never retries it, and keeps
+		// the row until the retention prune.
+		Conflict bool `json:"conflict"`
 	} `json:"receipt"`
 }
 

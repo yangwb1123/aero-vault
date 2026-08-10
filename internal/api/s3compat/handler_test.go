@@ -30,8 +30,8 @@ func newTestServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	svc := service.NewFileService(store, repo, nil)
-	srv := httptest.NewServer(NewRouter(svc, nil))
+	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
+	srv := httptest.NewServer(NewRouter(svc, nil, allowAllProvider{}))
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 	return srv
 }

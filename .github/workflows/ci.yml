@@ -76,10 +76,16 @@ jobs:
         run: go build ./...
 
       - name: Vet
-        run: go vet ./...
+        # -tags=integration: type-checks integration-tagged test files too
+        # (go vet compiles *_test.go; go build does not). Zero-Docker —
+        # compile-only, no DB connection.
+        run: go vet -tags=integration ./...
 
       - name: Test
         run: go test ./...
+
+      - name: Test (race — metadata atomicity + audit-governance cache)
+        run: go test -race -count=1 -timeout 300s ./internal/repository/ ./internal/reconcile/ ./internal/auditgovernance/
 
       - name: Coverage
         run: |

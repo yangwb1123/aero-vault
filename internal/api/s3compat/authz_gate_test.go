@@ -389,8 +389,13 @@ func TestDeniedDeleteWritesNoOutboxRows(t *testing.T) {
 	}
 }
 
-// assertZeroSideEffects locks the FR-5 invariant: no object_events row and no
-// audit_log file.delete row for the denied request.
+// assertZeroSideEffects locks the FR-5 invariant: no object_events row, no
+// audit_log file.delete row, and no audit_governance_outbox file.deleted row
+// for the denied request. The governance-table assertion is vacuously true at
+// raw (non-governance) call sites where the table is always empty — its only
+// non-vacuous execution point is the governance Gate e2e
+// (TestS3CompatGovernanceDeniedDeleteZeroRows), which binds this shared
+// detector (spec Gate.4).
 func assertZeroSideEffects(t *testing.T, dsn string, obj repository.Object) {
 	t.Helper()
 	db, err := sql.Open("sqlite", dsn)
@@ -412,6 +417,12 @@ func assertZeroSideEffects(t *testing.T, dsn string, obj repository.Object) {
 	}
 	if n != 0 {
 		t.Fatalf("denied delete wrote %d audit_log rows", n)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_governance_outbox WHERE action='file.deleted'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("denied delete wrote %d audit_governance_outbox file.deleted rows", n)
 	}
 }
 

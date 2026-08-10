@@ -6,10 +6,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"log/slog"
 
+	"github.com/aero-vault/aero-vault/internal/access"
+	"github.com/aero-vault/aero-vault/internal/auth"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
@@ -23,6 +26,11 @@ func bodyPolicy(policyJSON string) []byte {
 }
 
 func setupTest(t *testing.T) (*service.FileService, repository.Repository, *httptest.Server) {
+	return setupTestWith(t)
+}
+
+// setupTestWith is setupTest plus Handler options (e.g. presign capability).
+func setupTestWith(t *testing.T, opts ...func(*Handler)) (*service.FileService, repository.Repository, *httptest.Server) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -37,12 +45,18 @@ func setupTest(t *testing.T) (*service.FileService, repository.Repository, *http
 	if err != nil {
 		t.Fatalf("new local storage: %v", err)
 	}
-	svc := service.NewFileService(store, repo, nil)
-	router := NewRouter(svc, repo, nil, nil, nil, nil, nil, slog.Default(), false, nil, nil, 0, false)
+	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
+	router := NewRouter(svc, repo, nil, nil, nil, nil, nil, slog.Default(), false, nil, nil, 0, false, opts...)
 	ts := httptest.NewServer(router)
 	t.Cleanup(func() { ts.Close(); _ = repo.Close() })
 	return svc, repo, ts
 }
+
+// allowAllProvider is the CI-baseline test double injected into helpers that
+// construct a bare FileService: it preserves the pre-fail-closed baseline
+// (all actions allowed) for tests exercising non-authz behavior. The
+// fail-closed delete gate itself is covered by dedicated tests
+// (authz_delete_denied_test.go and the T-* gate tests).
 
 func TestPutGetDelete(t *testing.T) {
 	_, _, ts := setupTest(t)
@@ -681,5 +695,404 @@ func TestBucketPolicyRejectsInvalidDocument(t *testing.T) {
 	}
 	if cfg.Policy != "" {
 		t.Fatalf("invalid policy was persisted: %s", cfg.Policy)
+	}
+}
+
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
+}
+
+// ── Bucket-policy Resource constraints (bucket-policy-rest-resource-v1) ─────
+
+// AC-2: REST must enforce key-scoped Allow policies. Out-of-scope keys are
+// 403 (pre-fix they were 200 — fail-open bypass); in-scope keys stay 200.
+func TestBucketPolicyResourceScopedAllow(t *testing.T) {
+	_, _, ts := setupTest(t)
+
+	// 1) Create objects first: after the policy is installed PUT of an
+	// out-of-scope key is itself rejected, so it can't be used for setup.
+	for _, k := range []string{"secret/key1", "other"} {
+		resp, body := req(t, "PUT", ts.URL+"/files/"+k, []byte("data"), nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("setup PUT %s: status=%d want 201, body=%s", k, resp.StatusCode, body)
+		}
+	}
+
+	// 2) Install key-scoped Allow policy: only secret/* readable.
+	policyURL := ts.URL + "/buckets/default/policy"
+	scopedPolicy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+		"Action":"s3:GetObject","Resource":["arn:aws:s3:::default/secret/*"]}]}`
+	resp, body := req(t, "PUT", policyURL, bodyPolicy(scopedPolicy), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set policy: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// 3) Out-of-scope key: 403 (pre-fix fail-open returned 200).
+	resp, body = req(t, "GET", ts.URL+"/files/other", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET other after scoped Allow: status=%d want 403, body=%s", resp.StatusCode, body)
+	}
+
+	// 4) In-scope key: 200.
+	resp, body = req(t, "GET", ts.URL+"/files/secret/key1", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET secret/key1 after scoped Allow: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// 5) Clear policy.
+	resp, _ = req(t, "PUT", policyURL, bodyPolicy(""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear policy: status=%d want 200", resp.StatusCode)
+	}
+}
+
+// AC-2b: key-scoped Deny must only reject matching keys — the divergence leg
+// of the pre-fix empty-resource eval (which denied everything).
+func TestBucketPolicyResourceScopedDeny(t *testing.T) {
+	_, _, ts := setupTest(t)
+
+	for _, k := range []string{"secret/key1", "other"} {
+		resp, body := req(t, "PUT", ts.URL+"/files/"+k, []byte("data"), nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("setup PUT %s: status=%d want 201, body=%s", k, resp.StatusCode, body)
+		}
+	}
+
+	policyURL := ts.URL + "/buckets/default/policy"
+	policy := `{"Version":"2012-10-17","Statement":[
+		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::default/*"},
+		{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":["arn:aws:s3:::default/secret/*"]}]}`
+	resp, body := req(t, "PUT", policyURL, bodyPolicy(policy), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set policy: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// Out-of-scope key: allowed (pre-fix empty-resource eval denied everything).
+	resp, body = req(t, "GET", ts.URL+"/files/other", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET other under scoped Deny: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// In-scope key: denied.
+	resp, body = req(t, "GET", ts.URL+"/files/secret/key1", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET secret/key1 under scoped Deny: status=%d want 403, body=%s", resp.StatusCode, body)
+	}
+
+	resp, _ = req(t, "PUT", policyURL, bodyPolicy(""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear policy: status=%d want 200", resp.StatusCode)
+	}
+}
+
+// QA P0: ListBucket is a bucket-level action evaluated against the bucket ARN.
+// `Allow ListBucket Resource default/*` flips 200→403 (converging with /s3 and
+// AWS — the one documented compat break), while bucket-ARN and "*" still
+// allow. Also locks the empty-key route (GET /files/ → key "" → bucket ARN).
+func TestBucketPolicyListBucketARN(t *testing.T) {
+	_, _, ts := setupTest(t)
+	policyURL := ts.URL + "/buckets/default/policy"
+
+	putPolicy := func(p string) {
+		t.Helper()
+		resp, body := req(t, "PUT", policyURL, bodyPolicy(p), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set policy: status=%d want 200, body=%s", resp.StatusCode, body)
+		}
+	}
+
+	// (a) Object-scoped pattern does not cover the bucket: 403 (flip detector —
+	// pre-fix empty-resource eval returned 200).
+	putPolicy(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::default/*"}]}`)
+	resp, body := req(t, "GET", ts.URL+"/files", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("ListBucket under default/* Allow: status=%d want 403, body=%s", resp.StatusCode, body)
+	}
+
+	// (b) Bucket ARN allows listing.
+	putPolicy(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::default"}]}`)
+	resp, body = req(t, "GET", ts.URL+"/files", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ListBucket under bucket-ARN Allow: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// (c) "*" allows listing.
+	putPolicy(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"*"}]}`)
+	resp, body = req(t, "GET", ts.URL+"/files", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ListBucket under * Allow: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// (d) Empty-key object route (GET /files/) evaluates the bucket ARN:
+	// object-scoped GetObject Allow no longer matches → 403 at the policy gate.
+	putPolicy(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::default/*"}]}`)
+	resp, body = req(t, "GET", ts.URL+"/files/", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET /files/ under default/* GetObject Allow: status=%d want 403, body=%s", resp.StatusCode, body)
+	}
+	// Bucket-ARN Allow passes the policy gate; the service then rejects the
+	// empty key itself (400), which is fine — the gate must not be the blocker.
+	putPolicy(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::default"}]}`)
+	resp, body = req(t, "GET", ts.URL+"/files/", nil, nil)
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("GET /files/ under bucket-ARN Allow must pass the policy gate, got 403, body=%s", body)
+	}
+
+	resp, _ = req(t, "PUT", policyURL, bodyPolicy(""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear policy: status=%d want 200", resp.StatusCode)
+	}
+}
+
+// QA P0: a stored-but-unparseable policy must fail closed (403) on every REST
+// object operation — mirrors s3compat's stored-invalid fail-closed test.
+func TestBucketPolicyStoredInvalidFailsClosed(t *testing.T) {
+	_, repo, ts := setupTest(t)
+
+	resp, body := req(t, "PUT", ts.URL+"/files/init.txt", []byte("init"), nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup PUT: status=%d want 201, body=%s", resp.StatusCode, body)
+	}
+
+	// Rejected write must not persist.
+	resp, body = req(t, "PUT", ts.URL+"/buckets/default/policy", bodyPolicy(`{"Statement":`), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid policy write: status=%d want 400, body=%s", resp.StatusCode, body)
+	}
+	resp, body = req(t, "GET", ts.URL+"/files/init.txt", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rejected policy must not persist, GET: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// Seed a malformed legacy row directly, as if written before validation.
+	if err := repo.SetBucketPolicy(context.Background(), "default", "default", `{"Statement":`); err != nil {
+		t.Fatalf("seed invalid policy: %v", err)
+	}
+	for _, tt := range []struct {
+		method, path string
+	}{
+		{"GET", "/files/init.txt"},
+		{"HEAD", "/files/init.txt"},
+		{"PUT", "/files/init.txt"},
+		{"DELETE", "/files/init.txt"},
+	} {
+		resp, body = req(t, tt.method, ts.URL+tt.path, []byte("data"), nil)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s %s under stored invalid policy: status=%d want 403, body=%s", tt.method, tt.path, resp.StatusCode, body)
+		}
+	}
+}
+
+// AC-4: the policy write path rejects invalid Effect/Principal with 400, the
+// body carries the offending statement index, and nothing is persisted.
+func TestBucketPolicyRejectsInvalidEffectAndPrincipal(t *testing.T) {
+	_, repo, ts := setupTest(t)
+	policyURL := ts.URL + "/buckets/default/policy"
+
+	// Bad Effect in the second statement (index 1) — body must name it.
+	badEffect := `{"Version":"2012-10-17","Statement":[
+		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject"},
+		{"Effect":"deny","Principal":"*","Action":"s3:PutObject"}]}`
+	resp, body := req(t, "PUT", policyURL, bodyPolicy(badEffect), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad Effect: status=%d want 400, body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "statement 1") {
+		t.Fatalf("bad Effect: body=%s want it to name statement 1", body)
+	}
+
+	// Invalid (non-wildcard) Principal.
+	badPrincipal := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123:root"},"Action":"s3:*"}]}`
+	resp, body = req(t, "PUT", policyURL, bodyPolicy(badPrincipal), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad Principal: status=%d want 400, body=%s", resp.StatusCode, body)
+	}
+
+	// Neither may be persisted.
+	cfg, err := repo.GetBucketConfig(context.Background(), "default", "default")
+	if err != nil {
+		t.Fatalf("get bucket config: %v", err)
+	}
+	if cfg.Policy != "" {
+		t.Fatalf("invalid policy was persisted: %s", cfg.Policy)
+	}
+}
+
+// AC-5: the REST ARN builder must mirror s3compat s3ResourceARN byte-for-byte.
+func TestBucketPolicyResourceARNFormat(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"", "arn:aws:s3:::default"},
+		{"secret/key1", "arn:aws:s3:::default/secret/key1"},
+		{"a", "arn:aws:s3:::default/a"},
+		{"dir/with space", "arn:aws:s3:::default/dir/with space"},
+	}
+	for _, tt := range tests {
+		if got := bucketPolicyResourceARN(tt.key); got != tt.want {
+			t.Errorf("bucketPolicyResourceARN(%q) = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}
+
+// QA P1: every policy call site (Put/Get/Head/Delete/PostForm/presign) must
+// evaluate the ARN of the key it actually operates on. The PostForm key comes
+// from the form (with filename fallback) and the presign key strips the
+// /presign suffix — wiring bugs here would let a scoped Deny be bypassed via
+// an attacker-controlled filename.
+func TestBucketPolicyScopedAllCallSites(t *testing.T) {
+	// Presign signer so in-scope presign requests complete past the policy gate.
+	_, _, ts := setupTestWith(t, func(h *Handler) {
+		h.WithPutPresigner(auth.NewPutPresigner("0123456789abcdef0123456789abcdef"))
+	})
+
+	// Create in-scope objects before installing the policy (out-of-scope PUTs
+	// will be rejected afterwards).
+	for _, k := range []string{"secret/a", "secret/b", "secret/c.txt", "secret/d.txt"} {
+		resp, body := req(t, "PUT", ts.URL+"/files/"+k, []byte("data"), nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("setup PUT %s: status=%d want 201, body=%s", k, resp.StatusCode, body)
+		}
+	}
+
+	policyURL := ts.URL + "/buckets/default/policy"
+	policy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+		"Action":["s3:PutObject","s3:GetObject","s3:DeleteObject"],
+		"Resource":"arn:aws:s3:::default/secret/*"}]}`
+	resp, body := req(t, "PUT", policyURL, bodyPolicy(policy), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set policy: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	scope := func(method, path string, want int) {
+		t.Helper()
+		resp, body := req(t, method, ts.URL+path, []byte("data"), nil)
+		if resp.StatusCode != want {
+			t.Fatalf("%s %s: status=%d want %d, body=%s", method, path, resp.StatusCode, want, body)
+		}
+	}
+
+	// Path CRUD matrix: in-scope allowed, out-of-scope 403.
+	scope("PUT", "/files/secret/new.txt", http.StatusCreated)
+	scope("PUT", "/files/other/new.txt", http.StatusForbidden)
+	scope("GET", "/files/secret/a", http.StatusOK)
+	scope("GET", "/files/other/a", http.StatusForbidden)
+	scope("HEAD", "/files/secret/a", http.StatusOK)
+	scope("HEAD", "/files/other/a", http.StatusForbidden)
+	scope("DELETE", "/files/secret/b", http.StatusNoContent)
+	scope("DELETE", "/files/other/b", http.StatusForbidden)
+
+	// PostForm with explicit key field.
+	form := func(key, filename string) []byte {
+		b := "--tb\r\n" +
+			`Content-Disposition: form-data; name="key"` + "\r\n\r\n" + key + "\r\n" +
+			"--tb\r\n" +
+			`Content-Disposition: form-data; name="file"; filename="` + filename + `"` + "\r\n" +
+			"Content-Type: text/plain\r\n\r\n" +
+			"form data\r\n" +
+			"--tb--\r\n"
+		return []byte(b)
+	}
+	postForm := func(key, filename string, want int) {
+		t.Helper()
+		resp, body := req(t, "POST", ts.URL+"/files", form(key, filename), map[string]string{
+			"Content-Type": "multipart/form-data; boundary=tb",
+		})
+		if resp.StatusCode != want {
+			t.Fatalf("POST form key=%q filename=%q: status=%d want %d, body=%s", key, filename, resp.StatusCode, want, body)
+		}
+	}
+	postForm("secret/e", "ignored.txt", http.StatusCreated)  // form key wins
+	postForm("other/e", "ignored.txt", http.StatusForbidden) // scoped Deny via form key
+
+	// Filename fallback: no key field — the stored key is filepath.Base(filename)
+	// (Go multipart strips directory info), and the policy must be evaluated
+	// against that SAME stored key. filename="secret/f.txt" lands at "f.txt":
+	// if the gate evaluated the raw (in-scope) filename instead, this would
+	// 201 and leave an unchecked object at f.txt — the bypass this locks.
+	formNoKey := func(filename string) []byte {
+		b := "--tb\r\n" +
+			`Content-Disposition: form-data; name="file"; filename="` + filename + `"` + "\r\n" +
+			"Content-Type: text/plain\r\n\r\n" +
+			"form data\r\n" +
+			"--tb--\r\n"
+		return []byte(b)
+	}
+	postFormNoKey := func(filename string, want int) {
+		t.Helper()
+		resp, body := req(t, "POST", ts.URL+"/files", formNoKey(filename), map[string]string{
+			"Content-Type": "multipart/form-data; boundary=tb",
+		})
+		if resp.StatusCode != want {
+			t.Fatalf("POST form filename=%q: status=%d want %d, body=%s", filename, resp.StatusCode, want, body)
+		}
+	}
+	postFormNoKey("secret/f.txt", http.StatusForbidden) // stored key f.txt is out of scope
+	resp, body = req(t, "GET", ts.URL+"/files/f.txt", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET f.txt (basename of fallback filename): status=%d want 403, body=%s", resp.StatusCode, body)
+	}
+
+	// Presign: the key is the URL path minus the /presign suffix.
+	presign := func(path, op string, want int) {
+		t.Helper()
+		resp, body := req(t, "POST", ts.URL+path+"?op="+op, nil, nil)
+		if resp.StatusCode != want {
+			t.Fatalf("presign %s op=%s: status=%d want %d, body=%s", path, op, resp.StatusCode, want, body)
+		}
+	}
+	presign("/files/secret/c.txt/presign", "get", http.StatusOK)
+	presign("/files/other/c.txt/presign", "get", http.StatusForbidden)
+	presign("/files/secret/d.txt/presign", "put", http.StatusOK)
+	presign("/files/other/d.txt/presign", "put", http.StatusForbidden)
+
+	resp, _ = req(t, "PUT", policyURL, bodyPolicy(""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear policy: status=%d want 200", resp.StatusCode)
+	}
+}
+
+// QA P1: the policy gate runs before the anonymous/public-share allowance, so
+// a scoped Allow cannot be bypassed through a public ACL on an out-of-scope
+// object. Pre-fix this returned 200 (policy passed via empty resource, then
+// allowAnonymous granted access); post-fix it is 403.
+func TestBucketPolicyGatesBeforePublicShare(t *testing.T) {
+	_, svc, ts := setupTest(t)
+
+	for _, k := range []string{"secret/pub.txt", "other/pub.txt"} {
+		resp, body := req(t, "PUT", ts.URL+"/files/"+k, []byte("data"), nil)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("setup PUT %s: status=%d want 201, body=%s", k, resp.StatusCode, body)
+		}
+		if err := svc.SetObjectACL(context.Background(), "default", "default", k, "public-read"); err != nil {
+			t.Fatalf("set public ACL on %s: %v", k, err)
+		}
+	}
+
+	policyURL := ts.URL + "/buckets/default/policy"
+	policy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+		"Action":"s3:GetObject","Resource":"arn:aws:s3:::default/secret/*"}]}`
+	resp, body := req(t, "PUT", policyURL, bodyPolicy(policy), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set policy: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+
+	// Anonymous (no auth context in these requests) in-scope public object: 200.
+	resp, body = req(t, "GET", ts.URL+"/files/secret/pub.txt", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous GET in-scope public: status=%d want 200, body=%s", resp.StatusCode, body)
+	}
+	// Anonymous out-of-scope public object: 403 at the policy gate (pre-fix 200).
+	resp, body = req(t, "GET", ts.URL+"/files/other/pub.txt", nil, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("anonymous GET out-of-scope public: status=%d want 403, body=%s", resp.StatusCode, body)
+	}
+
+	resp, _ = req(t, "PUT", policyURL, bodyPolicy(""), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear policy: status=%d want 200", resp.StatusCode)
 	}
 }

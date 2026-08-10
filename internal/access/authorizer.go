@@ -17,11 +17,21 @@ func (m *Manager) Authorize(
 	action Action,
 	resource Resource,
 ) (Decision, error) {
-	if !m.cfg.Enabled {
-		return Decision{Allowed: true, Reason: "access_control_disabled"}, nil
-	}
+	// System principals are trusted regardless of the enabled gate: a
+	// disabled manager already allowed everyone, so moving the early exit
+	// above the gate is behavior-preserving for system actors (and keeps
+	// the AV quarantine path working even with access control off).
 	if principal.Kind == PrincipalSystem {
 		return Decision{Allowed: true, Reason: "trusted_system"}, nil
+	}
+	if !m.cfg.Enabled {
+		// Fail-closed for deletes (FR-2): a disabled PDP must not grant
+		// delete capability unless the operator explicitly opts out via
+		// DeleteFailOpen. Read/write actions keep the legacy allow.
+		if action == ActionDelete && !m.cfg.DeleteFailOpen {
+			return denied("access_control_disabled"), nil
+		}
+		return Decision{Allowed: true, Reason: "access_control_disabled"}, nil
 	}
 	if principal.SubjectID == "" {
 		return denied("missing_principal"), nil

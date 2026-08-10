@@ -110,13 +110,15 @@ func TestQdrantSearchVectorsClampsLimit(t *testing.T) {
 	defer srv.Close()
 
 	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL})
-	for _, lim := range []int{0, -5, 99999} {
+	for _, tc := range []struct{ in, want int }{
+		{0, 10}, {-5, 10}, {100, 100}, {101, 100}, {200, 100}, {99999, 100},
+	} {
 		gotBody = nil
-		if _, err := qi.SearchVectors(context.Background(), "acme", "", []float32{1}, lim); err != nil {
-			t.Fatalf("search lim=%d: %v", lim, err)
+		if _, err := qi.SearchVectors(context.Background(), "acme", "", []float32{1}, tc.in); err != nil {
+			t.Fatalf("search lim=%d: %v", tc.in, err)
 		}
-		if v, _ := gotBody["limit"].(float64); int(v) != 10 {
-			t.Errorf("limit=%d should clamp to 10, got %v", lim, gotBody["limit"])
+		if v, _ := gotBody["limit"].(float64); int(v) != tc.want {
+			t.Errorf("limit=%d should clamp to %d, got %v", tc.in, tc.want, gotBody["limit"])
 		}
 	}
 }

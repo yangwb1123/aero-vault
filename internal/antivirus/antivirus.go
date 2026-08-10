@@ -53,19 +53,47 @@ func NewSignatureScanner(extra map[string]string) *SignatureScanner {
 func (s *SignatureScanner) Name() string { return "signature" }
 
 func (s *SignatureScanner) Scan(ctx context.Context, r io.Reader) (Result, error) {
-	// Bounded read: scan up to 32 MiB (signatures are small; large binaries are
-	// streamed past for a remote engine, not the local matcher).
-	const max = 32 << 20
-	data, err := io.ReadAll(io.LimitReader(r, max))
-	if err != nil {
-		return Result{}, err
-	}
-	for name, sig := range s.sigs {
-		if bytes.Contains(data, sig) {
-			return Result{Clean: false, Signature: name}, nil
+	// Streaming matcher: single pass over the whole stream, O(maxSigLen) memory.
+	// The window keeps the last maxSigLen-1 bytes; every signature occurrence is
+	// fully contained in window∪chunk at the iteration where its final byte
+	// arrives (its start stays in the window until then), so no offset is
+	// missed. Clean is returned only after the stream reports EOF — a partial
+	// read can never produce a clean verdict, so >32 MiB tails are scanned
+	// instead of being silently truncated.
+	maxSigLen := 0
+	for _, sig := range s.sigs {
+		if len(sig) > maxSigLen {
+			maxSigLen = len(sig)
 		}
 	}
-	return Result{Clean: true}, nil
+	if maxSigLen == 0 {
+		return Result{Clean: true}, nil // no signatures configured
+	}
+	win := make([]byte, 0, maxSigLen-1+64<<10)
+	chunk := make([]byte, 64<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		n, err := r.Read(chunk)
+		if n > 0 {
+			win = append(win, chunk[:n]...)
+			for name, sig := range s.sigs {
+				if len(sig) > 0 && bytes.Contains(win, sig) {
+					return Result{Clean: false, Signature: name}, nil
+				}
+			}
+			if keep := maxSigLen - 1; len(win) > keep {
+				win = append(win[:0], win[len(win)-keep:]...) // trim front; overlap-safe (memmove semantics)
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return Result{Clean: true}, nil
+			}
+			return Result{}, err
+		}
+	}
 }
 
 // HTTPScanner POSTs the object bytes to an external scanning service and expects
@@ -103,7 +131,10 @@ func (h *HTTPScanner) Scan(ctx context.Context, r io.Reader) (Result, error) {
 		Clean     bool   `json:"clean"`
 		Signature string `json:"signature"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// Bound the response: a verdict is at most a few hundred bytes, so 1 MiB is
+	// ample for any real engine; a hostile or broken endpoint must not be able
+	// to stream unbounded JSON into worker memory until the 60 s client timeout.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
 		return Result{}, errors.New("antivirus: malformed scanner response")
 	}
 	return Result{Clean: body.Clean, Signature: body.Signature}, nil

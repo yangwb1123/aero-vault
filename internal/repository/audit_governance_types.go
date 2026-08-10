@@ -34,7 +34,14 @@ func (e *AuditGovernanceUnboundBacklogError) TenantIDs() []string {
 // AuditGovernanceFact is the fixed, redacted record stored in the durable
 // relay outbox. Raw audit details and object paths never enter this table.
 type AuditGovernanceFact struct {
-	ID              string
+	ID string
+	// SourceID is the deterministic per-tenant source-system identifier used
+	// for fact-ID derivation only. It is never persisted: the outbox INSERT
+	// column list and claim round-trips omit it (claims carry "" with zero
+	// behavioral impact — the publisher derives the wire SourceSystem from
+	// the binding, http.go:111). Do not persist without re-validating the
+	// ID formula.
+	SourceID        string
 	TenantID        string
 	OriginKind      string
 	OriginID        int64
@@ -51,6 +58,12 @@ type AuditGovernanceFact struct {
 	ClaimOwner      string
 	ClaimToken      string
 	LeaseExpiresAt  time.Time
+	// FirstAttemptAt is the cumulative-window anchor: the wall-clock time of
+	// the row's FIRST claim, set exactly once by the fenced claim UPDATE
+	// (0044, CASE WHEN first_attempt_at_ns=0). Read-back only — never written
+	// by callers; zero time.Time means the row was never claimed (pre-0044
+	// row or pre-first-claim read) and is never window-terminal.
+	FirstAttemptAt time.Time
 }
 
 // AuditGovernanceGap is a local durable fact that has no relay outbox row yet.
@@ -82,9 +95,14 @@ type AuditGovernanceStore interface {
 	ClaimAuditGovernance(context.Context, string, string, uint64, int, time.Duration) ([]AuditGovernanceFact, error)
 	CompleteAuditGovernance(context.Context, string, string, string) error
 	RetryAuditGovernance(context.Context, string, string, string, string, time.Time) error
+	// FailAuditGovernance lands a claimed fact in the terminal failed state
+	// (failed_at_ns set): never re-claimed, never re-POSTed, retained until
+	// CleanupFailedAuditGovernance prunes it after the retention window.
+	FailAuditGovernance(context.Context, string, string, string, string) error
 	OldestPendingAuditGovernance(context.Context) (time.Time, bool, error)
 	HasPendingDrainingAuditGovernance(context.Context) (bool, error)
 	CleanupDeliveredAuditGovernance(context.Context, time.Time, int) (int64, error)
+	CleanupFailedAuditGovernance(context.Context, time.Time, int) (int64, error)
 }
 
 var _ AuditGovernanceStore = (*sqlStore)(nil)

@@ -10,6 +10,13 @@ import (
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
+// errKeyProtected is returned by hardDeleteKey/hardDeleteVersion when any
+// version of the key is under legal hold or an active WORM lock. It is a
+// package-private sentinel so callers can distinguish "skipped: protected"
+// (zero side effects) from genuine failures without mis-counting a skipped
+// key as deleted.
+var errKeyProtected = errors.New("reconcile: key protected by legal hold or WORM lock")
+
 func hardDeleteKey(
 	ctx context.Context,
 	repo repository.Repository,
@@ -25,7 +32,28 @@ func hardDeleteKey(
 	if len(versions) == 0 {
 		versions = []repository.Object{obj}
 	}
+	// Gate before any destructive action (FR-1.1): a hold or WORM lock placed
+	// after the caller's pre-check is caught here with zero side effects — no
+	// chunk cleanup, no blob delete, no row delete.
 	for _, version := range versions {
+		protected, err := objectDeletionProtected(ctx, repo, version)
+		if err != nil {
+			return err
+		}
+		if protected {
+			return errKeyProtected
+		}
+	}
+	for _, version := range versions {
+		// Per-version re-check (FR-1.2) narrows the residual TOCTOU window to
+		// the width of a single store.Delete call; on hit, abort immediately.
+		protected, err := objectDeletionProtected(ctx, repo, version)
+		if err != nil {
+			return err
+		}
+		if protected {
+			return errKeyProtected
+		}
 		cleanObjectChunks(ctx, cleaner, version, logger)
 		if isDeleteMarker(version) {
 			continue
@@ -65,6 +93,16 @@ func hardDeleteVersion(
 	obj repository.Object,
 	logger *slog.Logger,
 ) error {
+	// Re-check before any destructive action (FR-1.4). WORM is covered here
+	// because objectDeletionProtected checks LockedUntil in addition to legal
+	// holds — the repository-level gate never checks locked_until.
+	protected, err := objectDeletionProtected(ctx, repo, obj)
+	if err != nil {
+		return err
+	}
+	if protected {
+		return errKeyProtected
+	}
 	cleanObjectChunks(ctx, cleaner, obj, logger)
 	if !isDeleteMarker(obj) {
 		if err := store.Delete(ctx, obj.StorageKey); err != nil && !errors.Is(err, storage.ErrNotFound) {

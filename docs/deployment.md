@@ -188,7 +188,13 @@ inline. The jobs table makes the work crash-safe across restarts; inspect it via
 
 **Security.** Enable auth (`AUTH_KEYS` and/or `AUTH_JWT_SECRET`) before exposing
 the service. Use tenant-scoped keys for callers and reserve `*:admin` operator
-keys for control-plane use. For S3 clients, configure `S3_SIGV4_CREDENTIALS`.
+keys for control-plane use. **Caveat:** the `admin` scope is operator-grade on
+its own — `requireAdmin` checks scope only, never the caller's tenant, and the
+admin API takes the target tenant from the request body/path. A tenant-scoped
+key with the `admin` scope (e.g. `ops:acme:admin`) is therefore
+operator-equivalent: it can mint keys/JWTs for any tenant, delete files in any
+tenant, and set quotas. Never issue tenant-scoped admin keys unless operator
+equivalence is intended. For S3 clients, configure `S3_SIGV4_CREDENTIALS`.
 Keep all secrets in a Kubernetes Secret (or `existingSecret`), never in the
 ConfigMap. Set per-tenant quotas via `PUT /v1/admin/tenants/{tenant}/quota`.
 

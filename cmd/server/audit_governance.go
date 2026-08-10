@@ -43,9 +43,31 @@ func buildAuditGovernanceRuntime(
 	if err != nil {
 		return nil, fmt.Errorf("configure Snaplink Audit Governance: %w", err)
 	}
+	if runtime.Draining() {
+		// Drain mode is the only legal zero-tenant enabled boot (the empty-
+		// manifest gate is bypassed by AUDIT_GOVERNANCE_DRAIN). It is a
+		// transition state, never silent: a distinct WARN (healthy boots keep
+		// the INFO line byte-identical) naming the flag + revision + digest
+		// fingerprint — the only trace that survives the forensically
+		// destructive DELETE-all beside the control-row revision watermark.
+		logger.Warn("Snaplink Audit Governance relay enabled — drain mode",
+			"flag", "AUDIT_GOVERNANCE_DRAIN", "tenants", len(cfg.AuditGovernance.Bindings),
+			"revision", cfg.AuditGovernance.Revision,
+			"digest", digestFingerprint(runtime.AppliedDigest()))
+		return runtime, nil
+	}
 	logger.Info("Snaplink Audit Governance relay enabled",
 		"tenants", len(cfg.AuditGovernance.Bindings), "revision", cfg.AuditGovernance.Revision)
 	return runtime, nil
+}
+
+// digestFingerprint shortens the persisted desired-manifest digest
+// (43-char base64url) to a log-safe prefix for the drain-mode WARN line.
+func digestFingerprint(digest string) string {
+	if len(digest) <= 8 {
+		return digest
+	}
+	return digest[:8]
 }
 
 func runtimeReadiness(

@@ -178,9 +178,11 @@ func governancePayload(fact repository.AuditGovernanceFact) map[string]any {
 func validateReceipt(response *http.Response, fact repository.AuditGovernanceFact) error {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusAccepted {
-		// 调试：403/4xx 时保留响应体供人工诊断（生产无敏感信息）
-		body, _ := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
-		return &httpStatusError{Status: response.StatusCode, Detail: string(body)}
+		// 响应体必须丢弃，不得进入错误信息：receiver 的错误体不可信
+		// （可回显原始输入），relay 会把错误原样写入 WARN 日志与事实行的
+		// last_error —— TestRelayLogsNeverExposeRawFactInputs 钉死该不变量。
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
+		return &httpStatusError{Status: response.StatusCode}
 	}
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
@@ -191,16 +193,31 @@ func validateReceipt(response *http.Response, fact repository.AuditGovernanceFac
 		return ErrInvalidReceipt
 	}
 	var envelope receiptEnvelope
-	if json.Unmarshal(body, &envelope) != nil || !receiptMatches(envelope, fact) {
+	if json.Unmarshal(body, &envelope) != nil {
+		return ErrInvalidReceipt
+	}
+	if envelope.Receipt.Conflict {
+		// Contract A: conflict is terminal — the receiver will never ledger
+		// this event, so retrying cannot succeed. Distinct sentinel so the
+		// relay fails the fact with retention instead of bounded-backoff
+		// retrying it forever.
+		return ErrReceiptConflict
+	}
+	if !receiptMatches(envelope, fact) {
 		return ErrInvalidReceipt
 	}
 	return nil
 }
 
+// receiptMatches accepts ledgered/indexed/archived receipts whose identity
+// (event_id/tenant_id) and commit point (accepted_at) line up with the posted
+// fact. Duplicate is intentionally absent from this predicate (contract A):
+// idempotent re-POSTs arrive as {duplicate:true, conflict:false,
+// status:ledgered} and must complete exactly like a first POST.
 func receiptMatches(envelope receiptEnvelope, fact repository.AuditGovernanceFact) bool {
 	receipt := envelope.Receipt
 	if receipt.EventID != fact.ID || receipt.TenantID != fact.TenantID ||
-		receipt.AcceptedAt.IsZero() || receipt.Conflict {
+		receipt.AcceptedAt.IsZero() {
 		return false
 	}
 	return receipt.Status == "ledgered" || receipt.Status == "indexed" || receipt.Status == "archived"

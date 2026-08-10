@@ -44,6 +44,7 @@ var errBucketNotEmpty = errors.New("the bucket you tried to delete is not empty"
 
 var s3CodeStatus = map[string]int{
 	"MalformedJSON":                http.StatusBadRequest,
+	"EntityTooLarge":               http.StatusRequestEntityTooLarge,
 	"MalformedXML":                 http.StatusBadRequest,
 	"NoSuchBucket":                 http.StatusNotFound,
 	"BucketNotEmpty":               http.StatusConflict,
@@ -68,6 +69,7 @@ var s3CodeStatus = map[string]int{
 
 var s3CodeMessage = map[string]string{
 	"MalformedXML":                 "The XML you provided was not well-formed or did not validate against our published schema.",
+	"EntityTooLarge":               "Your proposed upload exceeds the maximum allowed object size.",
 	"NoSuchBucket":                 "The specified bucket does not exist.",
 	"BucketNotEmpty":               "The bucket you tried to delete is not empty.",
 	"NoSuchBucketPolicy":           "The bucket policy does not exist.",
@@ -94,6 +96,7 @@ var errToS3Code = []struct {
 	code string
 }{
 	{errMalformedXML, "MalformedXML"},
+	{mw.ErrBodyTooLarge, "EntityTooLarge"},
 	{errNoSuchBucket, "NoSuchBucket"},
 	{errBucketNotEmpty, "BucketNotEmpty"},
 	{errNoSuchBucketPolicy, "NoSuchBucketPolicy"},

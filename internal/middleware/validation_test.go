@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +75,106 @@ func TestMaxBodySize_GETNotAffected(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET = %d, want 200", rec.Code)
+	}
+}
+
+// chunkedRequest builds a request whose body carries unknown length
+// (ContentLength == -1, Transfer-Encoding: chunked) so the MaxBodySize
+// early-reject path is skipped and the body goes through the wrapping
+// reader — httptest.NewRequest would otherwise set a known Content-Length.
+func chunkedRequest(t *testing.T, body []byte) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/x", bytes.NewReader(body))
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	return req
+}
+
+// AC-1: an unknown-length (chunked) body that exceeds maxBytes must surface
+// a distinguishable error (ErrBodyTooLarge), never a clean EOF — a clean EOF
+// would let the adapter store a silently truncated object.
+func TestMaxBodySize_ChunkedOversizeReturnsErrBodyTooLarge(t *testing.T) {
+	var gotErr error
+	h := MaxBodySize(5)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, gotErr = io.ReadAll(r.Body)
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, chunkedRequest(t, []byte("too long body"))) // 12 bytes > 5
+	if gotErr == nil {
+		t.Fatal("ReadAll returned nil error — truncation was silent")
+	}
+	if !errors.Is(gotErr, ErrBodyTooLarge) {
+		t.Fatalf("error = %v, want errors.Is(err, ErrBodyTooLarge)", gotErr)
+	}
+	if errors.Is(gotErr, io.EOF) {
+		t.Fatalf("error = %v must not satisfy errors.Is(err, io.EOF) — truncation must not look like a clean end", gotErr)
+	}
+}
+
+// AC-2: no off-by-one. A body that ends exactly at maxBytes is fully read
+// with a clean end; a body one byte over fails on the read after the limit.
+func TestMaxBodySize_ChunkedExactLimitNoOffByOne(t *testing.T) {
+	t.Run("exactly-at-limit reads fully, clean EOF", func(t *testing.T) {
+		exact := bytes.Repeat([]byte("x"), 1024)
+		var got []byte
+		var gotErr error
+		h := MaxBodySize(1024)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got, gotErr = io.ReadAll(r.Body)
+		}))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, chunkedRequest(t, exact))
+		if gotErr != nil {
+			t.Fatalf("exactly-at-limit read: unexpected error %v", gotErr)
+		}
+		if !bytes.Equal(got, exact) {
+			t.Fatalf("body = %d bytes, want 1024 bytes identical to input", len(got))
+		}
+	})
+	t.Run("one byte over fails on the read after the limit", func(t *testing.T) {
+		var firstN int
+		var firstErr, nextErr error
+		h := MaxBodySize(1024)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			buf := make([]byte, 1024)
+			firstN, firstErr = r.Body.Read(buf)
+			if firstErr != nil {
+				return
+			}
+			var one [1]byte
+			_, nextErr = r.Body.Read(one[:])
+		}))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, chunkedRequest(t, bytes.Repeat([]byte("y"), 1025)))
+		if firstErr != nil {
+			t.Fatalf("first 1024-byte read: unexpected error %v", firstErr)
+		}
+		if firstN != 1024 {
+			t.Fatalf("first read = %d bytes, want 1024", firstN)
+		}
+		if !errors.Is(nextErr, ErrBodyTooLarge) {
+			t.Fatalf("read after limit: err = %v, want errors.Is(err, ErrBodyTooLarge)", nextErr)
+		}
+	})
+}
+
+// Control: chunked body under the limit passes through byte-identical
+// (locks in no regression on normal chunked uploads).
+func TestMaxBodySize_ChunkedUnderLimit(t *testing.T) {
+	body := []byte("short")
+	var got []byte
+	var gotErr error
+	h := MaxBodySize(1024)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, gotErr = io.ReadAll(r.Body)
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, chunkedRequest(t, body))
+	if gotErr != nil {
+		t.Fatalf("under-limit chunked read: unexpected error %v", gotErr)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", string(got), string(body))
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("under-limit chunked = %d, want 200", rec.Code)
 	}
 }
 

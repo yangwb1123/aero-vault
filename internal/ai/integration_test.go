@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
@@ -834,3 +835,30 @@ func TestIndexerRunInlineProcessesEvent(t *testing.T) {
 
 // sanity: ensure io import used (read_file uses io in agent.go path indirectly).
 var _ = io.Discard
+
+// TestSearchVectorK51ReturnsKExactly pins the fix on the default (SQLite)
+// path — the CI baseline. K in (50,100] requests K*2 candidates; without the
+// cap in searchVector the default repository scan (SearchChunks) clamps the
+// request to 10 and silently truncates the result set below the requested K.
+func TestSearchVectorK51ReturnsKExactly(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t)
+	emb := NewHashEmbedder(64)
+	o := env.putObject(t, "k60.txt", "text/plain", "k60")
+	contents := make([]string, 60)
+	for i := range contents {
+		contents[i] = fmt.Sprintf("seed content line %d", i)
+	}
+	env.seedChunks(t, o, emb, contents...)
+
+	s := NewSearch(env.repo, emb, nil)
+	for _, k := range []int{50, 60} { // 50 = exact boundary (K*2 == 100); 60 = over the cap
+		hits, err := s.Query(ctx, Request{Tenant: testTenant, Bucket: testBucket, Query: "seed", K: k, Mode: "vector"})
+		if err != nil {
+			t.Fatalf("K=%d query: %v", k, err)
+		}
+		if len(hits) != k {
+			t.Fatalf("K=%d: got %d hits, want exactly %d (pre-fix: K>=51 returned <=10)", k, len(hits), k)
+		}
+	}
+}

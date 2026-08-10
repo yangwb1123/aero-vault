@@ -29,7 +29,7 @@ func (h *Handler) Presign(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	if !h.checkBucketPolicy(w, r, action) {
+	if !h.checkBucketPolicy(w, r, key, action) {
 		return
 	}
 	signedURL, err := h.presignURL(r, key, op, expiry)

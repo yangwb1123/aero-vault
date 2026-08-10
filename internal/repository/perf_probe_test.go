@@ -1,13 +1,15 @@
 package repository_test
 
-// TEMPORARY performance probe — deleted after the review run.
+// Performance probe for the access-ACL lookup path (ListApplicableACL). This
+// is a permanent guard: currentSQL must mirror the production clause in
+// sql_access_acl.go so the benchmark measures the shipped query (the folder
+// prefix branch is non-sargable; this file is where any cost regression shows).
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -56,14 +58,7 @@ const currentSQL = `SELECT ` + probeCols + ` FROM resource_acls
  WHERE tenant_id=? AND bucket=? AND (
    resource_kind='bucket'
    OR (resource_kind='object' AND resource_key=?)
-   OR (resource_kind='folder' AND (resource_key=? OR (inherit_acl=1 AND ? LIKE resource_key || '%')))
- ) ORDER BY LENGTH(resource_key) DESC, created_at, id`
-
-const fixedSQL = `SELECT ` + probeCols + ` FROM resource_acls
- WHERE tenant_id=? AND bucket=? AND (
-   resource_kind='bucket'
-   OR (resource_kind='object' AND resource_key=?)
-   OR (resource_kind='folder' AND (resource_key=? OR inherit_acl=1))
+   OR (resource_kind='folder' AND (resource_key=? OR (inherit_acl=1 AND substr(?, 1, length(resource_key)) = resource_key)))
  ) ORDER BY LENGTH(resource_key) DESC, created_at, id`
 
 func scanRows(rows *sql.Rows) (int64, error) {
@@ -79,51 +74,10 @@ func scanRows(rows *sql.Rows) (int64, error) {
 	return n, rows.Err()
 }
 
-// filterApplicableACL — copy of the proposed design §2.3 helper.
-func filterApplicableACL(entries []access.ACLEntry, key string) []access.ACLEntry {
-	out := make([]access.ACLEntry, 0, len(entries))
-	for _, entry := range entries {
-		switch entry.ResourceKind {
-		case access.ResourceBucket:
-			out = append(out, entry)
-		case access.ResourceObject:
-			if entry.Key == key {
-				out = append(out, entry)
-			}
-		case access.ResourceFolder:
-			if entry.Key == key || strings.HasPrefix(key, folderPrefix(entry.Key)) {
-				out = append(out, entry)
-			}
-		}
-	}
-	return out
-}
-
-func folderPrefix(folderKey string) string {
-	if folderKey == "" || strings.HasSuffix(folderKey, "/") {
-		return folderKey
-	}
-	return folderKey + "/"
-}
-
-func scanEntries(rows *sql.Rows) ([]access.ACLEntry, error) {
-	out := make([]access.ACLEntry, 0)
-	for rows.Next() {
-		var e access.ACLEntry
-		var kind, ptype, action, effect, created string
-		var inherit int
-		if err := rows.Scan(&e.ID, &e.TenantID, &e.Bucket, &e.Key, &kind, &ptype,
-			&e.PrincipalID, &action, &effect, &inherit, &e.CreatedBy, &created); err != nil {
-			return nil, err
-		}
-		e.ResourceKind = access.ResourceKind(kind)
-		e.PrincipalType = access.PrincipalType(ptype)
-		e.Action, e.Effect = access.Action(action), access.Effect(effect)
-		e.Inherit = inherit != 0
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
+// filterApplicableACL and folderPrefix were removed: they implemented the
+// rejected Go-side filter arm (the shipped fix does literal-prefix matching in
+// SQL). scanEntries was their row scanner; the surviving benchmarks use
+// scanRows.
 
 func BenchmarkListApplicableCurrent(b *testing.B) {
 	for _, n := range []int{0, 1000, 10000} {
@@ -140,52 +94,6 @@ func BenchmarkListApplicableCurrent(b *testing.B) {
 					b.Fatal(err)
 				}
 				rows.Close()
-			}
-		})
-	}
-}
-
-func BenchmarkListApplicableFixed(b *testing.B) {
-	for _, n := range []int{0, 1000, 10000} {
-		b.Run(fmt.Sprintf("folders=%d", n), func(b *testing.B) {
-			_, raw, ctx, _ := probeSetup(b, n)
-			const key = "folder000001/sub/x.txt"
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				rows, err := raw.QueryContext(ctx, fixedSQL, "acme", "default", key, key)
-				if err != nil {
-					b.Fatal(err)
-				}
-				entries, err := scanEntries(rows)
-				rows.Close()
-				if err != nil {
-					b.Fatal(err)
-				}
-				_ = filterApplicableACL(entries, key)
-			}
-		})
-	}
-}
-
-// Isolates the Go filter cost with rows fetched once outside the loop.
-func BenchmarkGoFilterOnly(b *testing.B) {
-	for _, n := range []int{1000, 10000} {
-		b.Run(fmt.Sprintf("folders=%d", n), func(b *testing.B) {
-			_, raw, ctx, _ := probeSetup(b, n)
-			const key = "folder000001/sub/x.txt"
-			rows, err := raw.QueryContext(ctx, fixedSQL, "acme", "default", key, key)
-			if err != nil {
-				b.Fatal(err)
-			}
-			entries, err := scanEntries(rows)
-			rows.Close()
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.ReportMetric(float64(len(entries)), "rows/call")
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_ = filterApplicableACL(entries, key)
 			}
 		})
 	}
@@ -224,39 +132,6 @@ func BenchmarkListApplicableINList(b *testing.B) {
 	}
 }
 
-// Simulated request-scoped cache: fetch bucket+folder scope rows ONCE per list
-// request, then filter per object in Go (no per-object SQL for scope rows).
-func BenchmarkScopeFetchOnceThenFilter(b *testing.B) {
-	for _, n := range []int{1000, 10000} {
-		b.Run(fmt.Sprintf("folders=%d", n), func(b *testing.B) {
-			_, raw, ctx, _ := probeSetup(b, n)
-			// one scope fetch (this is the fixed SQL row set)
-			rows, err := raw.QueryContext(ctx, fixedSQL, "acme", "default", "unused", "unused")
-			if err != nil {
-				b.Fatal(err)
-			}
-			scope, err := scanEntries(rows)
-			rows.Close()
-			if err != nil {
-				b.Fatal(err)
-			}
-			// N=1000 objects per list page, each filtered against cached scope
-			const objectsPerPage = 1000
-			keys := make([]string, objectsPerPage)
-			for i := range keys {
-				keys[i] = fmt.Sprintf("folder%06d/sub/file%04d.txt", i%n, i)
-			}
-			b.ReportMetric(float64(len(scope)), "scope-rows")
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				for _, k := range keys {
-					_ = filterApplicableACL(scope, k)
-				}
-			}
-		})
-	}
-}
-
 // N+1 baseline: full Authorize decision per object (ListApplicableACL + ListSubjectDepartments).
 func BenchmarkAuthorizePerObject(b *testing.B) {
 	for _, n := range []int{0, 1000, 10000} {
@@ -284,7 +159,7 @@ func BenchmarkAuthorizePerObject(b *testing.B) {
 func TestProbeQueryPlans(t *testing.T) {
 	store, raw, ctx, _ := probeSetup(t, 1000)
 	_ = store
-	for name, q := range map[string]string{"current": currentSQL, "fixed": fixedSQL, "inlist": inListSQL} {
+	for name, q := range map[string]string{"current": currentSQL, "inlist": inListSQL} {
 		args := []any{"acme", "default", "folder000001/sub/x.txt", "folder000001/sub/x.txt"}
 		if name == "current" {
 			args = append(args, "folder000001/sub/x.txt")

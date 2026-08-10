@@ -147,21 +147,36 @@ func startNotificationWorker(ctx context.Context, logger *slog.Logger, repo repo
 }
 
 // startEventOutboxRelay drains the transactional deletion outbox (claim →
-// deliver → complete). It always starts: deletion atomicity is not gated, and
-// with no notification rules the relay is a silent no-op. Notify facts are
-// delivered from their self-contained payload; deleted@1.1 facts are
-// completed without local re-broadcast (D3) unless an L2 AuditSink is
+// deliver → complete). It starts unless EVENT_OUTBOX_ENABLED=false: the
+// kill-switch gates only the relay loop — the transactional enqueue inside
+// *DeleteObject*WithEvent is never gated (deletion atomicity is not
+// negotiable), so rows keep accumulating while disabled and drain (FIFO) on
+// re-enable. With no notification rules the relay is a silent no-op. Notify
+// facts are delivered from their self-contained payload; deleted@1.1 facts
+// are completed without local re-broadcast (D3) unless an L2 AuditSink is
 // configured, in which case they are delivered to the audit sink (FR-2/FR-4).
 // An L2 adapter that fails its own endpoint validation aborts startup
 // (fail-fast, F6 — config.Validate already rejected it; this is the second
-// enforcement point).
+// enforcement point). Numeric knobs are likewise validated unconditionally,
+// so a disabled relay still fails startup on a bad poll interval or
+// malformed L2 endpoint (F3/F7).
 func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository) error {
+	// Kill-switch gate first, before any options/L2-sink construction or
+	// goroutine (D1): the backlog count is the one diagnostic that still runs
+	// while disabled (read-only, nil-repo-safe, never blocks startup — D6).
+	if !cfg.EventOutbox.Enabled {
+		logger.Info("event outbox relay disabled",
+			"backlog", eventOutboxBacklog(ctx, repo))
+		return nil
+	}
 	opts := events.EventOutboxRelayOptions{
-		PollInterval: time.Duration(cfg.EventOutbox.PollMilliseconds) * time.Millisecond,
-		BatchSize:    cfg.EventOutbox.BatchSize,
-		ClaimTTL:     time.Duration(cfg.EventOutbox.ClaimTTLSeconds) * time.Second,
-		HTTPTimeout:  time.Duration(cfg.EventOutbox.HTTPTimeoutSeconds) * time.Second,
-		MaxAttempts:  cfg.EventOutbox.MaxAttempts,
+		PollInterval:    time.Duration(cfg.EventOutbox.PollMilliseconds) * time.Millisecond,
+		BatchSize:       cfg.EventOutbox.BatchSize,
+		ClaimTTL:        time.Duration(cfg.EventOutbox.ClaimTTLSeconds) * time.Second,
+		HTTPTimeout:     time.Duration(cfg.EventOutbox.HTTPTimeoutSeconds) * time.Second,
+		MaxAttempts:     cfg.EventOutbox.MaxAttempts,
+		DeliveredRetain: time.Duration(cfg.EventOutbox.DeliveredRetentionHours) * time.Hour,
+		FailedRetain:    time.Duration(cfg.EventOutbox.FailedRetentionHours) * time.Hour,
 	}
 	if cfg.AuditSinkL2.Endpoint != "" {
 		sink, err := events.NewAuditSinkL2(cfg.AuditSinkL2.Endpoint,
@@ -181,8 +196,27 @@ func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog
 		"batch", cfg.EventOutbox.BatchSize,
 		"claim_ttl_s", cfg.EventOutbox.ClaimTTLSeconds,
 		"http_timeout_s", cfg.EventOutbox.HTTPTimeoutSeconds,
-		"max_attempts", cfg.EventOutbox.MaxAttempts)
+		"max_attempts", cfg.EventOutbox.MaxAttempts,
+		"delivered_retain_h", cfg.EventOutbox.DeliveredRetentionHours,
+		"failed_retain_h", cfg.EventOutbox.FailedRetentionHours,
+		"backlog", eventOutboxBacklog(ctx, repo))
 	return nil
+}
+
+// eventOutboxBacklog returns the event_outbox depth for the startup log
+// (D6). Diagnostic only: a nil repo or query error yields "unknown" and
+// never blocks or fails startup. It is the only outbox signal that exists
+// while the relay is disabled — all outbox counters are relay-side and
+// frozen when off, and PROMETHEUS_ENABLED defaults to false.
+func eventOutboxBacklog(ctx context.Context, repo repository.Repository) any {
+	if repo == nil {
+		return "unknown"
+	}
+	n, err := repo.CountEventOutbox(ctx)
+	if err != nil {
+		return "unknown"
+	}
+	return n
 }
 
 // auditSinkL2Bindings flattens the config bindings into the adapter's

@@ -48,12 +48,14 @@ func classify(err error) (string, string, int) {
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrSizeMismatch):
 		return "SizeMismatch", err.Error(), http.StatusBadRequest
+	case errors.Is(err, mw.ErrBodyTooLarge):
+		return "BodyTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrRangeNotSatisfiable):
 		return "InvalidRange", "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable
 	case errors.Is(err, service.ErrPreconditionFailed):
 		return "PreconditionFailed", "precondition failed", http.StatusPreconditionFailed
 	case errors.Is(err, service.ErrForbidden):
-		return "AccessDenied", "access denied", http.StatusForbidden
+		return "AccessDenied", err.Error(), http.StatusForbidden
 	case errors.Is(err, service.ErrObjectCorrupt):
 		return "ObjectCorrupt", "object is marked as corrupt", http.StatusGone
 	default:

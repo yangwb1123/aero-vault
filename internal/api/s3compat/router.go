@@ -11,8 +11,8 @@ import (
 // NewRouter mounts S3-compatible routes. Operations are dispatched by HTTP
 // method on each path; bucket-scoped paths handle ListObjectsV2/HeadBucket/
 // CreateBucket, while wildcard key paths handle the object verbs.
-func NewRouter(svc *service.FileService, logger *slog.Logger) chi.Router {
-	h := NewHandler(svc, logger)
+func NewRouter(svc *service.FileService, logger *slog.Logger, authz AuthorizationProvider) chi.Router {
+	h := NewHandler(svc, logger, authz)
 	r := chi.NewRouter()
 
 	// Bucket-only paths: with or without trailing slash.

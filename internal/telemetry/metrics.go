@@ -29,6 +29,7 @@ var (
 	mIdempotencyReplays     metric.Int64Counter
 	mEventsDropped          metric.Int64Counter
 	mIndexerSkip            metric.Int64Counter
+	mSearchDegraded         metric.Int64Counter
 	mJobsCompleted          metric.Int64Counter
 	mJobsFailed             metric.Int64Counter
 	mJobsRetried            metric.Int64Counter
@@ -75,6 +76,7 @@ func initDomain() {
 		mIdempotencyReplays, _ = m.Int64Counter("idempotency.replays")
 		mEventsDropped, _ = m.Int64Counter("events.dropped")
 		mIndexerSkip, _ = m.Int64Counter("indexer.skip_total")
+		mSearchDegraded, _ = m.Int64Counter("ai.search.degraded")
 		mJobsCompleted, _ = m.Int64Counter("jobs.completed_total")
 		mJobsFailed, _ = m.Int64Counter("jobs.failed_total")
 		mJobsRetried, _ = m.Int64Counter("jobs.retried_total")
@@ -281,6 +283,14 @@ func IncIndexerSkip(ctx context.Context, reason string) {
 	mIndexerSkip.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
 
+// IncSearchDegraded counts one degraded search read path, attributed by
+// reason ("embed" | "vector" | "lexical") so operators can distinguish a
+// healthy BM25-only result from a degraded fallback.
+func IncSearchDegraded(ctx context.Context, reason string) {
+	initDomain()
+	mSearchDegraded.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+}
+
 // IncJobCompleted counts one successful job execution, attributed by job_type.
 func IncJobCompleted(ctx context.Context, jobType string) {
 	initDomain()
@@ -362,6 +372,41 @@ func RegisterAuditGovernanceBacklogAgeGauge(fn func(context.Context) int64) {
 			o.Observe(fn(ctx))
 			return nil
 		}))
+}
+
+// RegisterAuditGovernanceDegradedGauge registers an observable gauge
+// (audit_governance_degraded) whose value is read from fn on each scrape —
+// the F11/F16 alert arm: 1 when the last run-loop probe recorded degraded
+// (lag > configured maxLag, or store probe timeout/cancel — age unknown),
+// 0 otherwise. Cache-fed via Runtime.Degraded(): zero store I/O per scrape.
+func RegisterAuditGovernanceDegradedGauge(fn func(context.Context) int64) {
+	m := otel.Meter("aero-vault/domain")
+	_, _ = m.Int64ObservableGauge("audit_governance.degraded", metric.WithInt64Callback(
+		func(ctx context.Context, o metric.Int64Observer) error {
+			o.Observe(fn(ctx))
+			return nil
+		}))
+}
+
+// RegisterAuditGovernanceDrainGauges registers the drain-mode gauge pair
+// (audit_governance.bound_tenants, audit_governance.draining) in one
+// callback: fn returns (bound tenants, draining 0/1) from zero-I/O Runtime
+// accessors. bound_tenants==0 with the series present means an enabled relay
+// with no bound tenants — the drained-but-enabled state (legit transition or
+// stale AUDIT_GOVERNANCE_DRAIN replay) that the AuditGovernanceEnabledUnbound
+// alert arms on; the draining flag discriminates the two in annotations.
+// Series are registered only when the feature is enabled (absent series ==
+// feature off, no false positives).
+func RegisterAuditGovernanceDrainGauges(fn func(context.Context) (int64, int64)) {
+	m := otel.Meter("aero-vault/domain")
+	bound, _ := m.Int64ObservableGauge("audit_governance.bound_tenants")
+	draining, _ := m.Int64ObservableGauge("audit_governance.draining")
+	_, _ = m.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		boundTenants, drainingFlag := fn(ctx)
+		o.ObserveInt64(bound, boundTenants)
+		o.ObserveInt64(draining, drainingFlag)
+		return nil
+	}, bound, draining)
 }
 
 // TenantStorage is one tenant's storage usage, emitted by the storage gauges.

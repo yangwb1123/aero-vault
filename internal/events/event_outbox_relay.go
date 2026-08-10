@@ -42,19 +42,25 @@ type EventOutboxRelay struct {
 	claimTTL    time.Duration
 	httpTimeout time.Duration
 	maxAttempts int
+
+	deliveredRetain time.Duration // prune horizon for delivered rows (default 24h)
+	failedRetain    time.Duration // prune horizon for terminal-failed rows (default 7d)
 }
 
 // EventOutboxRelayOptions configures the relay. Zero values fall back to the
-// billing-mirrored defaults (poll 1000ms / batch 32 / TTL 30s). AuditSink,
-// when non-nil, receives deleted@1.1 facts (L2 egress); nil keeps the
-// complete-only behavior (L0 audit_log remains authoritative).
+// billing-mirrored defaults (poll 1000ms / batch 32 / TTL 30s / delivered
+// retain 24h / failed retain 7d). AuditSink, when non-nil, receives
+// deleted@1.1 facts (L2 egress); nil keeps the complete-only behavior (L0
+// audit_log remains authoritative).
 type EventOutboxRelayOptions struct {
-	PollInterval time.Duration
-	BatchSize    int
-	ClaimTTL     time.Duration
-	HTTPTimeout  time.Duration
-	MaxAttempts  int
-	AuditSink    AuditSink
+	PollInterval    time.Duration
+	BatchSize       int
+	ClaimTTL        time.Duration
+	HTTPTimeout     time.Duration
+	MaxAttempts     int
+	AuditSink       AuditSink
+	DeliveredRetain time.Duration // ≤ 0 → eventOutboxDeliveredRetain (24h)
+	FailedRetain    time.Duration // ≤ 0 → eventOutboxFailedRetain (7×24h)
 }
 
 const (
@@ -65,9 +71,9 @@ const (
 	eventOutboxRemoveEventName  = "s3:ObjectRemoved:Delete"
 )
 
-// NewEventOutboxRelay builds a relay. Always started by cmd/server — the core
-// deletion atomicity must not be gated; with no notification rules it is a
-// silent no-op.
+// NewEventOutboxRelay builds a relay. Started by cmd/server unless
+// EVENT_OUTBOX_ENABLED=false — the core deletion atomicity is never gated;
+// with no notification rules the relay is a silent no-op.
 func NewEventOutboxRelay(
 	repo repository.Repository, logger *slog.Logger, opts EventOutboxRelayOptions,
 ) *EventOutboxRelay {
@@ -89,6 +95,12 @@ func NewEventOutboxRelay(
 	if opts.MaxAttempts <= 0 {
 		opts.MaxAttempts = 10
 	}
+	if opts.DeliveredRetain <= 0 {
+		opts.DeliveredRetain = eventOutboxDeliveredRetain
+	}
+	if opts.FailedRetain <= 0 {
+		opts.FailedRetain = eventOutboxFailedRetain
+	}
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "unknown"
@@ -104,6 +116,9 @@ func NewEventOutboxRelay(
 		claimTTL:    opts.ClaimTTL,
 		httpTimeout: opts.HTTPTimeout,
 		maxAttempts: opts.MaxAttempts,
+
+		deliveredRetain: opts.DeliveredRetain,
+		failedRetain:    opts.FailedRetain,
 	}
 }
 
@@ -338,8 +353,10 @@ func (r *EventOutboxRelay) retry(fact repository.EventOutboxRow, cause error) {
 }
 
 // eventOutboxBackoff mirrors the billingBackoff shape: 1s base, 2×, 5min cap,
-// ±25% jitter (the in-package crypto/rand jitter from webhook.go — no
-// cross-domain import). Bounds are testable; exact values are not (random).
+// downward-only jitter [0.75, 1.0)×base (the in-package crypto/rand jitter
+// from webhook.go — no cross-domain import; strictly faster than base, which
+// shrinks the at-least-once window, D-7). Bounds are testable; exact values
+// are not (random).
 func eventOutboxBackoff(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
@@ -354,14 +371,16 @@ func eventOutboxBackoff(attempt int) time.Duration {
 	return jitter(base)
 }
 
-// prune removes delivered facts older than 24h and terminal-failed facts older
-// than 7d. DELETE-style, no tombstones — nothing re-enqueues from this table
-// (unlike audit governance there is no gap-scan, D6/GAP-3).
+// prune removes delivered facts older than the configured delivered
+// retention (default 24h) and terminal-failed facts older than the
+// configured failed retention (default 7d). DELETE-style, no tombstones —
+// nothing re-enqueues from this table (unlike audit governance there is no
+// gap-scan, D6/GAP-3).
 func (r *EventOutboxRelay) prune() {
 	now := time.Now().UTC()
 	ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
 	defer cancel()
-	removed, err := r.repo.PruneEventOutbox(ctx, now.Add(-eventOutboxDeliveredRetain), now.Add(-eventOutboxFailedRetain))
+	removed, err := r.repo.PruneEventOutbox(ctx, now.Add(-r.deliveredRetain), now.Add(-r.failedRetain))
 	if err != nil {
 		r.logger.Warn("event outbox prune failed", "err", err)
 		return

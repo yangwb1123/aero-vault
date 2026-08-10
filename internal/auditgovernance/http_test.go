@@ -3,6 +3,8 @@ package auditgovernance
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -41,6 +43,26 @@ func TestTenantSourceIDIsKeyedOpaqueAndDomainSeparated(t *testing.T) {
 	}
 }
 
+// TestTenantSourceIDRejectsControlChars pins the P-1 hardening: the fact-ID
+// frame is NUL-separated, so any C0 control or DEL in the tenant field would
+// corrupt its injectivity (tenant is the only unconstrained frame input).
+func TestTenantSourceIDRejectsControlChars(t *testing.T) {
+	redactor, err := newRedactor("audit-governance-hmac-key-32-bytes-minimum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"acme\x00evil", "acme\x01", "acme\tx", "acme\x7f"} {
+		if _, err := redactor.tenantSourceID(tenant); err == nil {
+			t.Fatalf("tenantSourceID(%q) accepted a control char", tenant)
+		}
+	}
+	for _, tenant := range []string{"acme", "acme space", "default", "tenant.with._-chars"} {
+		if _, err := redactor.tenantSourceID(tenant); err != nil {
+			t.Fatalf("tenantSourceID(%q) rejected a valid tenant: %v", tenant, err)
+		}
+	}
+}
+
 func TestPublisherUsesResourceBoundTokenAndRedactedFixedSchema(t *testing.T) {
 	var tokenCalls atomic.Int32
 	var eventCalls atomic.Int32
@@ -51,7 +73,7 @@ func TestPublisherUsesResourceBoundTokenAndRedactedFixedSchema(t *testing.T) {
 			tokenCalls.Add(1)
 			assertTokenRequest(t, r)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"machine-token","token_type":"Bearer","expires_in":300,"scope":"audit:event:write"}`))
+			_, _ = w.Write([]byte(`{"access_token":"machine-token","token_type":"Bearer","expires_in":300,"scope":"` + RequiredScope + `"}`))
 		case "/api/v1/events":
 			eventCalls.Add(1)
 			if r.URL.Query().Get("wait_for") != "ledgered" || r.Header.Get("Authorization") != "Bearer machine-token" {
@@ -159,7 +181,7 @@ func TestPublisherRejectsRedirectAndInvalidReceipt(t *testing.T) {
 func TestTokenSourceRejectsExpandedScope(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer","expires_in":60,"scope":"audit:event:write admin"}`))
+		_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer","expires_in":60,"scope":"` + RequiredScope + ` admin"}`))
 	}))
 	defer server.Close()
 	client, transport := noRedirectClient(time.Second)
@@ -184,5 +206,112 @@ func TestSecureEndpointRejectsRemoteHTTPAndCredentials(t *testing.T) {
 	}
 	if _, err := url.Parse("https://example.com"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ── Contract A: audit-governance duplicate re-POST semantics ─────────────────
+//
+// The governance receiver answers an idempotent re-POST (lease re-claim,
+// crash re-delivery, at-least-once) with
+//   {duplicate:true, conflict:false, status:ledgered}
+// and the relay must accept it exactly like a first POST. The receipt model's
+// Duplicate field (model.go) is deliberately unused in the acceptance
+// predicate — this test pins that contract: toggling Duplicate must never
+// change acceptance, and conflict:true must surface as the distinct terminal
+// sentinel ErrReceiptConflict (terminal-with-retention, never bounded-backoff
+// retried).
+
+func TestReceiptDuplicateSemanticsContract(t *testing.T) {
+	base := receiptEnvelope{}
+	base.Receipt.EventID, base.Receipt.TenantID = "fact-1", "acme"
+	base.Receipt.Status, base.Receipt.AcceptedAt = "ledgered", time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
+	fact := repository.AuditGovernanceFact{ID: "fact-1", TenantID: "acme", FactKind: "file",
+		Action: "file.deleted", OccurredAt: time.Now().UTC()}
+
+	// ① Duplicate must be inert in the predicate: duplicate:false (first POST)
+	// and duplicate:true (idempotent re-POST) both match, for every accepted
+	// status. The field is contract-documentation only.
+	for _, status := range []string{"ledgered", "indexed", "archived"} {
+		first, dup := base, base
+		first.Receipt.Status, dup.Receipt.Status = status, status
+		dup.Receipt.Duplicate = true
+		if !receiptMatches(first, fact) || !receiptMatches(dup, fact) {
+			t.Fatalf("status=%q: duplicate toggle changed acceptance", status)
+		}
+	}
+	// Mismatched identity must still be rejected — the predicate is not
+	// trivially true; only Duplicate is exempt.
+	rejected := base
+	rejected.Receipt.EventID = "other-fact"
+	if receiptMatches(rejected, fact) {
+		t.Fatal("mismatched event_id accepted")
+	}
+
+	// ② End-to-end: a re-POST answered {duplicate:true, conflict:false,
+	// status:ledgered} completes like a first POST.
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer","expires_in":60}`))
+			return
+		}
+		posts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"receipt":{"event_id":"fact-1","tenant_id":"acme","status":"ledgered","accepted_at":"2026-08-04T00:00:00Z","duplicate":true,"conflict":false}}`))
+	}))
+	defer server.Close()
+	client, transport := noRedirectClient(time.Second)
+	defer transport.CloseIdleConnections()
+	publisher, err := newPublisher(publisherConfig(server.URL), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Publish(context.Background(), fact); err != nil {
+		t.Fatalf("duplicate re-POST rejected: %v (contract A violated)", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("posts=%d want=1", posts.Load())
+	}
+}
+
+// ③ conflict:true is terminal: a distinct sentinel (not ErrInvalidReceipt),
+// so the relay can fail the fact with retention instead of bounded-backoff
+// retrying it forever.
+func TestReceiptConflictIsTerminalSentinel(t *testing.T) {
+	fact := repository.AuditGovernanceFact{ID: "fact-1", TenantID: "acme", FactKind: "admin",
+		Action: "tenant.status", OccurredAt: time.Now().UTC()}
+	for _, conflict := range []bool{true, false} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/token" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer","expires_in":60}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = fmt.Fprintf(w, `{"receipt":{"event_id":"fact-1","tenant_id":"acme","status":"ledgered","accepted_at":"2026-08-04T00:00:00Z","conflict":%v}}`, conflict)
+		}))
+		client, transport := noRedirectClient(time.Second)
+		publisher, err := newPublisher(publisherConfig(server.URL), client)
+		if err != nil {
+			server.Close()
+			transport.CloseIdleConnections()
+			t.Fatal(err)
+		}
+		err = publisher.Publish(context.Background(), fact)
+		server.Close()
+		transport.CloseIdleConnections()
+		if conflict {
+			if !errors.Is(err, ErrReceiptConflict) {
+				t.Fatalf("conflict:true err=%v want ErrReceiptConflict", err)
+			}
+			if errors.Is(err, ErrInvalidReceipt) {
+				t.Fatal("conflict classified as plain invalid receipt, not terminal")
+			}
+		} else if err != nil {
+			t.Fatalf("conflict:false err=%v want nil", err)
+		}
 	}
 }

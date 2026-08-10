@@ -12,7 +12,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
-func testManager(t *testing.T, defaultPolicy string) (*access.Manager, context.Context) {
+func testManager(t *testing.T, defaultPolicy string) (*access.Manager, access.Store, context.Context) {
 	t.Helper()
 	ctx := context.Background()
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "access.db"))
@@ -34,7 +34,7 @@ func testManager(t *testing.T, defaultPolicy string) (*access.Manager, context.C
 	if err != nil {
 		t.Fatal(err)
 	}
-	return manager, ctx
+	return manager, store, ctx
 }
 
 func adminContext(ctx context.Context, tenant string) context.Context {
@@ -45,7 +45,7 @@ func adminContext(ctx context.Context, tenant string) context.Context {
 }
 
 func TestDepartmentACLInheritance(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	admin := adminContext(ctx, "acme")
 	department, err := manager.CreateDepartment(admin, access.Department{TenantID: "acme", Name: "engineering"})
 	if err != nil {
@@ -78,7 +78,7 @@ func TestDepartmentACLInheritance(t *testing.T) {
 }
 
 func TestExplicitDenyWinsAndOwnerCanRead(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultTenant)
+	manager, _, ctx := testManager(t, access.DefaultTenant)
 	admin := adminContext(ctx, "acme")
 	_, err := manager.PutACL(admin, access.ACLEntry{
 		TenantID: "acme", Bucket: "default", Key: "private.txt",
@@ -108,7 +108,7 @@ func TestExplicitDenyWinsAndOwnerCanRead(t *testing.T) {
 }
 
 func TestPutACLIsIdempotentByNaturalKey(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	admin := adminContext(ctx, "acme")
 	entry := access.ACLEntry{
 		TenantID: "acme", Bucket: "default", Key: "docs/", ResourceKind: access.ResourceFolder,
@@ -136,7 +136,7 @@ func TestPutACLIsIdempotentByNaturalKey(t *testing.T) {
 }
 
 func TestDepartmentACLRequiresExistingDepartment(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	_, err := manager.PutACL(adminContext(ctx, "acme"), access.ACLEntry{
 		TenantID: "acme", Bucket: "default", Key: "docs/", ResourceKind: access.ResourceFolder,
 		PrincipalType: access.PrincipalTypeDepartment, PrincipalID: "missing",
@@ -148,7 +148,7 @@ func TestDepartmentACLRequiresExistingDepartment(t *testing.T) {
 }
 
 func TestSharePasswordAndUseLimit(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	admin := adminContext(ctx, "acme")
 	share, token, err := manager.CreateShare(admin, access.CreateShareRequest{
 		TenantID: "acme", Bucket: "default", Key: "photo.jpg", Password: "secret",
@@ -173,7 +173,7 @@ func TestSharePasswordAndUseLimit(t *testing.T) {
 }
 
 func TestShareUseLimitIsAtomicUnderConcurrency(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	_, token, err := manager.CreateShare(adminContext(ctx, "acme"), access.CreateShareRequest{
 		TenantID: "acme", Bucket: "default", Key: "limited.jpg",
 		AllowPreview: true, MaxUses: 1,
@@ -211,7 +211,7 @@ func TestShareUseLimitIsAtomicUnderConcurrency(t *testing.T) {
 }
 
 func TestPublicAssetLifecycle(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	admin := adminContext(ctx, "acme")
 	asset, err := manager.PublishAsset(admin, access.PublicAsset{
 		TenantID: "acme", Bucket: "default", Key: "blog/hero.jpg", Slug: "blog/hero.jpg",
@@ -232,7 +232,7 @@ func TestPublicAssetLifecycle(t *testing.T) {
 }
 
 func TestExpiredShareRejected(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	_, token, err := manager.CreateShare(adminContext(ctx, "acme"), access.CreateShareRequest{
 		TenantID: "acme", Bucket: "default", Key: "old.png", AllowPreview: true,
 		ExpiresAt: time.Now().Add(-time.Minute),
@@ -246,7 +246,7 @@ func TestExpiredShareRejected(t *testing.T) {
 }
 
 func TestObjectOwnerCanRevokeCollaboratorCapabilities(t *testing.T) {
-	manager, ctx := testManager(t, access.DefaultDeny)
+	manager, _, ctx := testManager(t, access.DefaultDeny)
 	admin := adminContext(ctx, "acme")
 	resource := access.Resource{
 		TenantID: "acme", Bucket: "default", Key: "team/photo.jpg",
@@ -287,5 +287,159 @@ func TestObjectOwnerCanRevokeCollaboratorCapabilities(t *testing.T) {
 	}
 	if err := manager.UnpublishAsset(owner, "acme", asset.Slug); err != nil {
 		t.Fatalf("owner unpublish asset: %v", err)
+	}
+}
+
+// AC-2: an allow on folder "a_/" must not authorize ActionRead on sibling
+// "ab/x" (LIKE wildcard leak). The wildcard row is seeded through the
+// repo-backed store because REQ-2 forbids manager.PutACL for such keys — that
+// rejection is asserted first.
+func TestFolderACLWildcardDoesNotLeakToSiblings(t *testing.T) {
+	manager, store, ctx := testManager(t, access.DefaultDeny)
+	admin := adminContext(ctx, "acme")
+	// REQ-2: manager.PutACL rejects wildcard folder keys.
+	_, err := manager.PutACL(admin, access.ACLEntry{
+		TenantID: "acme", Bucket: "default", Key: "a_/", ResourceKind: access.ResourceFolder,
+		PrincipalType: access.PrincipalTypeUser, PrincipalID: "alice",
+		Action: access.ActionRead, Effect: access.EffectAllow, Inherit: true,
+	})
+	if !errors.Is(err, access.ErrInvalidArgument) {
+		t.Fatalf("PutACL folder key %q error=%v, want ErrInvalidArgument", "a_/", err)
+	}
+	// Seed the legacy-style wildcard row directly through the store.
+	if err := store.PutACLEntry(ctx, access.ACLEntry{
+		ID: "acl-underscore", TenantID: "acme", Bucket: "default", Key: "a_/",
+		ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+		PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+		Inherit: true, CreatedBy: "seed", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alice := access.Principal{SubjectID: "alice", TenantID: "acme", Kind: access.PrincipalUser}
+	// Sibling must be denied (reason-agnostic: default_deny or no_match).
+	decision, err := manager.Authorize(ctx, alice, access.ActionRead, access.Resource{
+		TenantID: "acme", Bucket: "default", Key: "ab/x", Kind: access.ResourceObject,
+	})
+	if err != nil || decision.Allowed {
+		t.Fatalf("sibling ab/x must be denied: decision=%+v err=%v", decision, err)
+	}
+	// Positive control: the genuine child still inherits.
+	decision, err = manager.Authorize(ctx, alice, access.ActionRead, access.Resource{
+		TenantID: "acme", Bucket: "default", Key: "a_/x", Kind: access.ResourceObject,
+	})
+	if err != nil || !decision.Allowed || decision.Reason != "acl_allow" {
+		t.Fatalf("genuine child a_/x must be allowed: decision=%+v err=%v", decision, err)
+	}
+}
+
+// REQ-2 matrix: wildcard folder keys are rejected; object keys (exact-match
+// only) and bucket keys are unaffected.
+func TestPutACLRejectsWildcardFolderKeys(t *testing.T) {
+	manager, _, ctx := testManager(t, access.DefaultDeny)
+	admin := adminContext(ctx, "acme")
+	base := access.ACLEntry{
+		TenantID: "acme", Bucket: "default", PrincipalType: access.PrincipalTypeUser,
+		PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow, Inherit: true,
+	}
+	for _, key := range []string{"a_/", "50%/", "report_2026/", "_/", "%/"} {
+		entry := base
+		entry.Key, entry.ResourceKind = key, access.ResourceFolder
+		if _, err := manager.PutACL(admin, entry); !errors.Is(err, access.ErrInvalidArgument) {
+			t.Fatalf("folder key %q error=%v, want ErrInvalidArgument", key, err)
+		}
+	}
+	// Clean folder keys remain accepted.
+	clean := base
+	clean.Key, clean.ResourceKind = "docs/", access.ResourceFolder
+	if _, err := manager.PutACL(admin, clean); err != nil {
+		t.Fatalf("clean folder key rejected: %v", err)
+	}
+	// Object keys may contain %/_ (they match exactly and cannot leak).
+	for _, key := range []string{"a_b.txt", "50%_off.txt"} {
+		obj := base
+		obj.Key, obj.ResourceKind, obj.Inherit = key, access.ResourceObject, false
+		if _, err := manager.PutACL(admin, obj); err != nil {
+			t.Fatalf("object key %q must remain accepted: %v", key, err)
+		}
+	}
+	// Bucket ACLs (empty key) remain accepted.
+	bucket := base
+	bucket.Key, bucket.ResourceKind, bucket.Inherit = "", access.ResourceBucket, false
+	if _, err := manager.PutACL(admin, bucket); err != nil {
+		t.Fatalf("bucket ACL rejected: %v", err)
+	}
+}
+
+// Compatibility carve-out: legacy wildcard folder rows stay readable and
+// deletable, but are no longer updatable via manager.PutACL.
+func TestLegacyWildcardACLRowReadableAndDeletableButNotUpdatable(t *testing.T) {
+	manager, store, ctx := testManager(t, access.DefaultDeny)
+	admin := adminContext(ctx, "acme")
+	if err := store.PutACLEntry(ctx, access.ACLEntry{
+		ID: "acl-legacy", TenantID: "acme", Bucket: "default", Key: "report_2026/",
+		ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+		PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+		Inherit: true, CreatedBy: "seed", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resource := access.Resource{TenantID: "acme", Bucket: "default", Key: "report_2026/", Kind: access.ResourceFolder}
+	// Readable via ListACL.
+	entries, err := manager.ListACL(admin, resource)
+	if err != nil || len(entries) != 1 || entries[0].ID != "acl-legacy" {
+		t.Fatalf("ListACL entries=%+v err=%v, want the legacy row", entries, err)
+	}
+	// Not updatable via PutACL (same natural key, flipped effect).
+	_, err = manager.PutACL(admin, access.ACLEntry{
+		TenantID: "acme", Bucket: "default", Key: "report_2026/", ResourceKind: access.ResourceFolder,
+		PrincipalType: access.PrincipalTypeUser, PrincipalID: "alice",
+		Action: access.ActionRead, Effect: access.EffectDeny, Inherit: true,
+	})
+	if !errors.Is(err, access.ErrInvalidArgument) {
+		t.Fatalf("updating legacy wildcard row error=%v, want ErrInvalidArgument", err)
+	}
+	// Deletable via DeleteACL.
+	if err := manager.DeleteACL(admin, "acme", "acl-legacy"); err != nil {
+		t.Fatalf("deleting legacy row: %v", err)
+	}
+	entries, err = manager.ListACL(admin, resource)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("legacy row still present after delete: entries=%+v err=%v", entries, err)
+	}
+}
+
+// failingACLStore is a minimal fake embedding access.Store: only
+// ListApplicableACL is overridden, which is all Authorize touches before the
+// error branch fires.
+type failingACLStore struct {
+	access.Store
+	aclErr error
+}
+
+func (f *failingACLStore) ListApplicableACL(context.Context, string, string, string) ([]access.ACLEntry, error) {
+	return nil, f.aclErr
+}
+
+// The acl_store_error branch must fail closed: a store error denies the
+// decision and surfaces the underlying error to the caller.
+func TestAuthorizeFailsClosedOnACLStoreError(t *testing.T) {
+	probeErr := errors.New("store down")
+	manager, err := access.NewManager(&failingACLStore{aclErr: probeErr}, access.Config{
+		Enabled: true, DefaultPolicy: access.DefaultDeny,
+		ShareSecret: []byte("0123456789abcdef0123456789abcdef"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	alice := access.Principal{SubjectID: "alice", TenantID: "acme", Kind: access.PrincipalUser}
+	decision, err := manager.Authorize(ctx, alice, access.ActionRead, access.Resource{
+		TenantID: "acme", Bucket: "default", Key: "x.txt", Kind: access.ResourceObject,
+	})
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("Authorize err=%v, want %v", err, probeErr)
+	}
+	if decision.Allowed || decision.Reason != "acl_store_error" {
+		t.Fatalf("decision=%+v, want fail-closed acl_store_error", decision)
 	}
 }

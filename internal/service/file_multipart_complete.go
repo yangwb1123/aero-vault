@@ -211,6 +211,12 @@ func (s *FileService) finishMultipartCompletion(
 	if err != nil {
 		return repository.Object{}, s.releaseMultipartCompletion(ctx, scope, idemKey, err)
 	}
+	// FR-1a: account usage before the storage upload is consumed and before the
+	// object row is committed, so an accounting failure leaves zero durable
+	// footprint and a retry re-runs the whole completion cleanly (claim released).
+	if err := s.accountObjectUsage(ctx, u.TenantID, usage, total); err != nil {
+		return repository.Object{}, s.releaseMultipartCompletion(ctx, scope, idemKey, err)
+	}
 	info, err := s.completeStoredMultipart(ctx, u, storageParts, opts)
 	if err != nil {
 		wrapped := fmt.Errorf("storage complete: %w", err)
@@ -274,12 +280,9 @@ func (s *FileService) persistMultipartCompletion(
 	ctx context.Context,
 	u repository.Upload,
 	saved repository.Object,
-	usage objectWriteUsage,
+	usage objectWriteUsage, // D4: signature retained; accounting moved to finishMultipartCompletion
 	idemKey string,
 ) error {
-	if err := s.accountObjectUsage(ctx, u.TenantID, usage, saved.Size); err != nil {
-		return err
-	}
 	body, _ := json.Marshal(saved)
 	if err := s.repo.CompleteIdempotencyKey(
 		ctx, u.TenantID, idemKey, http.StatusOK, body, "application/json", nil,

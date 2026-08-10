@@ -61,8 +61,10 @@ func keyFromPath(r *http.Request) string {
 }
 
 // checkBucketPolicy loads the bucket policy and denies the request when the
-// action is not allowed. Returns true when the request may proceed.
-func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, action string) bool {
+// action is not allowed for the concrete object/bucket resource. key == ""
+// means a bucket-level action (resource = bucket ARN). Returns true when the
+// request may proceed.
+func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, key, action string) bool {
 	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket)
 	if err != nil {
 		h.logger.Warn("bucket policy lookup failed; denying request", "bucket", service.DefaultBucket, "err", err)
@@ -82,11 +84,22 @@ func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, acti
 	if splitErr != nil {
 		host = r.RemoteAddr
 	}
-	if !auth.Allowed(p, action, host) {
+	if !auth.AllowedResource(p, action, bucketPolicyResourceARN(key), host) {
 		h.writeError(w, r, service.ErrForbidden)
 		return false
 	}
 	return true
+}
+
+// bucketPolicyResourceARN builds the concrete S3 resource ARN for a REST
+// object key. It mirrors internal/api/s3compat/policy.go s3ResourceARN
+// byte-for-byte; the /v1 path always targets service.DefaultBucket.
+func bucketPolicyResourceARN(key string) string {
+	resource := "arn:aws:s3:::" + service.DefaultBucket
+	if key != "" {
+		resource += "/" + key
+	}
+	return resource
 }
 
 // ── Core CRUD ──────────────────────────────────────────────────────────────────
@@ -94,7 +107,7 @@ func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, acti
 // PUT /v1/files/*key — raw upload.
 func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
-	if !h.checkBucketPolicy(w, r, "s3:PutObject") {
+	if !h.checkBucketPolicy(w, r, key, "s3:PutObject") {
 		return
 	}
 	if r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != "" {
@@ -138,7 +151,7 @@ func (h *Handler) PostForm(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		key = header.Filename
 	}
-	if !h.checkBucketPolicy(w, r, "s3:PutObject") {
+	if !h.checkBucketPolicy(w, r, key, "s3:PutObject") {
 		return
 	}
 	ct := header.Header.Get("Content-Type")
@@ -170,7 +183,7 @@ func (h *Handler) PostForm(w http.ResponseWriter, r *http.Request) {
 // GET /v1/files/*key — download. Supports ?version=ID for historical versions.
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
-	if !h.checkBucketPolicy(w, r, "s3:GetObject") {
+	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
 		return
 	}
 	if !h.allowAnonymous(w, r, key) {
@@ -200,7 +213,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // HEAD /v1/files/*key
 func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
-	if !h.checkBucketPolicy(w, r, "s3:GetObject") {
+	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
 		return
 	}
 	if !h.allowAnonymous(w, r, key) {
@@ -238,7 +251,7 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 // DELETE /v1/files/*key
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	key := keyFromPath(r)
-	if !h.checkBucketPolicy(w, r, "s3:DeleteObject") {
+	if !h.checkBucketPolicy(w, r, key, "s3:DeleteObject") {
 		return
 	}
 	hard := r.URL.Query().Get("hard") == "1"
@@ -251,7 +264,8 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/files — list.
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	if !h.checkBucketPolicy(w, r, "s3:ListBucket") {
+	// ListBucket is a bucket-level action: resource = bucket ARN.
+	if !h.checkBucketPolicy(w, r, "", "s3:ListBucket") {
 		return
 	}
 	q := r.URL.Query()

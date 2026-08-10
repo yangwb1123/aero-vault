@@ -142,11 +142,9 @@ type qdrantSearchResp struct {
 
 // SearchVectors runs a Qdrant nearest-neighbour search scoped to the tenant (and
 // optional bucket) and maps the points back to repository SearchHits. Limit is
-// clamped like PgVectorIndex (<=0 or too large -> default 10).
+// clamped like PgVectorIndex (<=0 -> default 10; >100 -> capped at 100).
 func (q *QdrantIndex) SearchVectors(ctx context.Context, tenant, bucket string, query []float32, limit int) ([]repository.SearchHit, error) {
-	if limit <= 0 || limit > 100 {
-		limit = 10
-	}
+	limit = clampSearchLimit(limit)
 	reqBody := qdrantSearchReq{
 		Vector:      query,
 		Limit:       limit,

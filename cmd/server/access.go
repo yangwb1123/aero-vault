@@ -17,8 +17,9 @@ func buildAccessManager(cfg *config.Config, repo repository.Repository) (*access
 		return nil, fmt.Errorf("repository does not implement enterprise access store")
 	}
 	return access.NewManager(store, access.Config{
-		Enabled:       true,
-		DefaultPolicy: cfg.Access.DefaultPolicy,
-		ShareSecret:   []byte(cfg.Access.ShareSecret),
+		Enabled:        true,
+		DefaultPolicy:  cfg.Access.DefaultPolicy,
+		ShareSecret:    []byte(cfg.Access.ShareSecret),
+		DeleteFailOpen: !cfg.Access.DeleteFailClosed,
 	})
 }

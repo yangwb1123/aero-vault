@@ -14,6 +14,10 @@ type AccessConfig struct {
 	DefaultPolicy string
 	ShareSecret   string
 	PublicBaseURL string
+	// DeleteFailClosed makes deletes fail closed when access control is
+	// disabled (default true): no authorizer ⇒ ActionDelete is denied.
+	// Set ACCESS_DELETE_FAIL_CLOSED=false to restore the legacy allow.
+	DeleteFailClosed bool
 }
 
 type EventsConfig struct {

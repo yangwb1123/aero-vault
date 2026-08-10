@@ -29,6 +29,14 @@ RETURNING id`), entry.CreatedAt, entry.Actor, entry.Action, entry.Target, entry.
 		return err
 	}
 	fact.OriginKind = AuditOriginAdmin
+	// REQ-2: the ID's time bucket derives from the durably stored origin
+	// timestamp (the exact string the gap path will parse), so the atomic
+	// path and gap reconcile converge on the same bucket (E8 drift).
+	if t, err := time.Parse(time.RFC3339Nano, entry.CreatedAt); err == nil && !t.IsZero() {
+		fact.OccurredAt = t
+	}
+	fact.ID = DeterministicFactID(fact.SourceID, defaultTenant(fact.TenantID),
+		fact.Action, fact.OriginKind, fact.OriginID, fact.OccurredAt)
 	active, err := s.governanceCaptureActive(ctx, tx, fact.TenantID)
 	if err != nil {
 		return err
@@ -56,18 +64,25 @@ func (s *sqlStore) InsertEventWithGovernance(
 	}
 	defer func() { _ = tx.Rollback() }()
 	query := `INSERT INTO object_events
-(tenant_id,bucket,key,type,object_id,request_id,payload) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`
+(tenant_id,bucket,key,type,object_id,request_id,payload) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, created_at`
 	if s.dialect == dialectPostgres {
 		query = `INSERT INTO object_events
-(tenant_id,bucket,key,type,object_id,request_id,payload) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING id`
+(tenant_id,bucket,key,type,object_id,request_id,payload) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING id, created_at`
 	}
 	var id int64
+	var occurred flexTime
 	err = tx.QueryRowContext(ctx, s.rebind(query), event.TenantID, event.Bucket, event.Key,
-		string(event.Type), oid, event.RequestID, string(payload)).Scan(&id)
+		string(event.Type), oid, event.RequestID, string(payload)).Scan(&id, &occurred)
 	if err != nil {
 		return 0, err
 	}
 	fact.OriginKind, fact.OriginID = AuditOriginFile, id
+	// REQ-2: canonicalize occurred to the DB-default created_at (sqlite ms /
+	// postgres µs) — byte-identical to what the gap path will parse, so the
+	// two paths converge on the same time bucket.
+	fact.OccurredAt = occurred.Time
+	fact.ID = DeterministicFactID(fact.SourceID, defaultTenant(fact.TenantID),
+		fact.Action, fact.OriginKind, fact.OriginID, fact.OccurredAt)
 	active, err := s.governanceCaptureActive(ctx, tx, fact.TenantID)
 	if err != nil {
 		return 0, err
@@ -105,6 +120,11 @@ func (s *sqlStore) EnqueueAuditGovernance(
 	if err != nil || !active {
 		return false, err
 	}
+	// Store-authoritative: recompute the deterministic ID from the fact's
+	// final fields (idempotent with factFromGap's computation; overwrites any
+	// caller-set ID so the store is the single authority).
+	fact.ID = DeterministicFactID(fact.SourceID, defaultTenant(fact.TenantID),
+		fact.Action, fact.OriginKind, fact.OriginID, fact.OccurredAt)
 	result, err := s.insertAuditGovernanceResult(ctx, tx, fact, true)
 	if err != nil {
 		return false, err

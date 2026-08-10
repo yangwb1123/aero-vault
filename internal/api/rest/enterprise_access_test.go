@@ -349,3 +349,28 @@ func assertPortableArchive(t *testing.T, payload []byte, wantedKey, wantedBody s
 		t.Fatalf("archive manifest=%v object=%v", foundManifest, foundObject)
 	}
 }
+
+// P2-2 reframed: REQ-2 surfaces as the REST contract — PUT /v1/access/acl
+// with a wildcard folder key returns 400 InvalidArgument, while object keys
+// containing %/_ stay accepted (exact-match only, no leak).
+func TestPutACLWildcardFolderKeyRejected(t *testing.T) {
+	server, _, operator, _ := newEnterpriseRESTTest(t)
+	headers := map[string]string{"Authorization": operator, "Content-Type": "application/json"}
+
+	response, body := req(t, http.MethodPut, server.URL+"/v1/access/acl", []byte(`{
+		"key":"a_/","resource_kind":"folder","principal_type":"user","principal_id":"alice",
+		"actions":["object:read"],"effect":"allow","inherit":true
+	}`), headers)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "InvalidArgument") {
+		t.Fatalf("wildcard folder status=%d body=%s, want 400 InvalidArgument", response.StatusCode, body)
+	}
+
+	// Object keys with wildcard metacharacters remain accepted (201).
+	response, body = req(t, http.MethodPut, server.URL+"/v1/access/acl", []byte(`{
+		"key":"50%_off.txt","resource_kind":"object","principal_type":"user","principal_id":"alice",
+		"actions":["object:read"],"effect":"allow"
+	}`), headers)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("wildcard object status=%d body=%s, want 201", response.StatusCode, body)
+	}
+}

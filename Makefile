@@ -3,7 +3,7 @@ BIN   := bin/aero-vault
 PKG   := ./cmd/server
 GOBIN := $(shell go env GOPATH)/bin
 
-.PHONY: build run test cover test-integration test-integration-qdrant tidy clean check fmt lint vet complexity-lines coverage docker compose-up compose-down
+.PHONY: build run test cover test-integration test-integration-qdrant tidy clean check fmt lint vet vet-integration complexity-lines coverage docker compose-up compose-down
 
 AERO_PG_DSN ?= postgres://aero:aero@localhost:55432/aero?sslmode=disable
 
@@ -105,12 +105,29 @@ cover-html: cover
 
 test-race:
 	@echo "[check] data race detection (this may take 2-5x longer) ..."
-	go test -race -count=1 -timeout 120s ./internal/...
+	# cmd/server included: package-main E2E suites (governance_e2e_test.go,
+	# http_test.go, readyz_drill_test.go, mcp-governance E2E) exercise the
+	# production wiring order and must run under the detector (measured +20s
+	# vs ./internal/... alone, 2026-08-08).
+	go test -race -count=1 -timeout 300s ./cmd/server/ ./internal/...
 	@echo "  OK (no races detected)"
 
 .PHONY: test-race
 
-check: fmt vet build test cli-check
+# Scoped race detection for the metadata-key atomicity packages (repository +
+# its scrub caller) plus the audit-governance degraded-cache contract (the
+# (degraded, age) pair discipline is provable only under -race). Full
+# `test-race` stays opt-in (takes ~5-10 min); both use 300s per-package —
+# the full-gate 120s budget provably fails under -race on 4 heavy packages
+# (repository alone needs ~124s, verified 2026-08-08).
+test-race-meta:
+	@echo "[check] data race detection (metadata atomicity + audit-governance cache) ..."
+	go test -race -count=1 -timeout 300s ./internal/repository/ ./internal/reconcile/ ./internal/auditgovernance/
+	@echo "  OK (no races detected)"
+
+.PHONY: test-race-meta
+
+check: fmt vet vet-integration build test test-race-meta cli-check
 
 .PHONY: dev
 
@@ -133,6 +150,17 @@ fmt:
 vet:
 	@echo "[check] go vet ..."; \
 	go vet ./...; \
+	echo "  OK"
+
+# Zero-Docker compile gate for -tags=integration test files. `go vet`
+# type-checks *_test.go (which `go build` never does), so integration-tagged
+# tests (e.g. internal/integration G2b/G2c) cannot rot un-compiled. Compile-
+# only: no Docker, no network, no DB connection — consistent with the
+# zero-Docker `make check` gate. Runtime PG coverage stays opt-in:
+# `make test-integration` (local Docker) / workflow_dispatch CI job.
+vet-integration:
+	@echo "[check] go vet -tags=integration ..."; \
+	go vet -tags=integration ./...; \
 	echo "  OK"
 
 complexity-lines:

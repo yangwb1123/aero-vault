@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -266,66 +268,49 @@ WHERE id = (
 // ── Metadata operations ─────────────────────────────────────────────────────
 
 func (s *sqlStore) SetObjectMetaKey(ctx context.Context, tenant, bucket, key, metaKey, metaValue string) error {
-	tenant = defaultTenant(tenant)
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT metadata FROM objects WHERE tenant_id=$1 AND bucket=$2 AND key=$3 AND deleted_at IS NULL`), tenant, bucket, key)
-	var rawMeta []byte
-	if err := row.Scan(&rawMeta); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
-	}
-	meta, _ := unmarshalKV(rawMeta)
-	if meta == nil {
-		meta = map[string]string{}
-	}
-	meta[metaKey] = metaValue
-	updated, err := json.Marshal(meta)
-	if err != nil {
-		return err
-	}
-	if s.dialect == dialectPostgres {
-		_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata=$1::jsonb WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
-			string(updated), tenant, bucket, key)
-	} else {
-		_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata=$1 WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
-			string(updated), tenant, bucket, key)
-	}
-	return err
+	return s.mergeObjectMetadata(ctx, tenant, bucket, key, map[string]string{metaKey: metaValue})
 }
 
 func (s *sqlStore) SetObjectMetaKeys(ctx context.Context, tenant, bucket, key string, meta map[string]string) error {
 	if len(meta) == 0 {
-		return nil
+		return nil // empty patch: zero DB access (object need not exist)
 	}
+	return s.mergeObjectMetadata(ctx, tenant, bucket, key, meta)
+}
+
+// mergeObjectMetadata merges patch into the object's metadata in one atomic
+// in-DB statement (json_patch on SQLite, || on Postgres), closing the former
+// SELECT→Go-merge→UPDATE lost-update window between concurrent callers.
+// Existence is decided by RowsAffected, never a pre-read: both dialects count
+// rows matched by WHERE even when the new value equals the old (SQLite
+// sqlite3_changes; Postgres UPDATE command tags count matched rows), so
+// 0 ⟺ no live row ⟺ ErrNotFound. That also turns the former silent no-op on
+// a concurrently deleted object into ErrNotFound.
+func (s *sqlStore) mergeObjectMetadata(ctx context.Context, tenant, bucket, key string, patch map[string]string) error {
 	tenant = defaultTenant(tenant)
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT metadata FROM objects WHERE tenant_id=$1 AND bucket=$2 AND key=$3 AND deleted_at IS NULL`), tenant, bucket, key)
-	var rawMeta []byte
-	if err := row.Scan(&rawMeta); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
-	}
-	current, _ := unmarshalKV(rawMeta)
-	if current == nil {
-		current = map[string]string{}
-	}
-	for k, v := range meta {
-		current[k] = v
-	}
-	updated, err := json.Marshal(current)
+	merged, err := json.Marshal(patch)
 	if err != nil {
 		return err
 	}
+	var result sql.Result
 	if s.dialect == dialectPostgres {
-		_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata=$1::jsonb WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
-			string(updated), tenant, bucket, key)
+		result, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata = metadata || $1::jsonb WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
+			string(merged), tenant, bucket, key)
 	} else {
-		_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata=$1 WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
-			string(updated), tenant, bucket, key)
+		result, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata = json_patch(metadata, $1) WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
+			string(merged), tenant, bucket, key)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *sqlStore) ReplaceObjectMetadata(ctx context.Context, tenant, bucket, key string, meta map[string]string) error {
@@ -357,29 +342,56 @@ func (s *sqlStore) ReplaceObjectMetadata(ctx context.Context, tenant, bucket, ke
 
 func (s *sqlStore) DeleteObjectMetaKey(ctx context.Context, tenant, bucket, key, metaKey string) error {
 	tenant = defaultTenant(tenant)
-	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT metadata FROM objects WHERE tenant_id=$1 AND bucket=$2 AND key=$3 AND deleted_at IS NULL`), tenant, bucket, key)
-	var rawMeta []byte
-	if err := row.Scan(&rawMeta); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
+	var result sql.Result
+	var err error
+	if s.dialect == dialectPostgres {
+		result, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata = metadata - $1::text WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
+			metaKey, tenant, bucket, key)
+	} else {
+		result, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata = json_remove(metadata, $1) WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
+			jsonPath(metaKey), tenant, bucket, key)
 	}
-	current, _ := unmarshalKV(rawMeta)
-	if len(current) == 0 {
-		return nil
-	}
-	delete(current, metaKey)
-	updated, err := json.Marshal(current)
 	if err != nil {
 		return err
 	}
-	if s.dialect == dialectPostgres {
-		_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata=$1::jsonb WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
-			string(updated), tenant, bucket, key)
-	} else {
-		_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE objects SET metadata=$1 WHERE tenant_id=$2 AND bucket=$3 AND key=$4 AND deleted_at IS NULL`),
-			string(updated), tenant, bucket, key)
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
 	}
-	return err
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// jsonPath returns a SQLite JSON path addressing key as one quoted "$." segment,
+// escaping per JSON string syntax (backslash, quote, control chars via \uXXXX;
+// UTF-8 bytes pass through) so keys containing arbitrary characters delete
+// exactly and only themselves (probe-verified: space/quote/backslash/newline/
+// control/empty/dot/bracket/unicode keys).
+func jsonPath(key string) string {
+	var b strings.Builder
+	b.Grow(len(key) + 8)
+	b.WriteString(`$."`)
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c == '\\':
+			b.WriteString(`\\`)
+		case c == '"':
+			b.WriteString(`\"`)
+		case c == '\n':
+			b.WriteString(`\n`)
+		case c == '\r':
+			b.WriteString(`\r`)
+		case c == '\t':
+			b.WriteString(`\t`)
+		case c < 0x20:
+			fmt.Fprintf(&b, `\u%04x`, c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

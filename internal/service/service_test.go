@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
@@ -28,7 +29,19 @@ func newTestSvc(t *testing.T) (*FileService, repository.Repository) {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	return NewFileService(store, repo, nil), repo
+	return NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{}), repo
+}
+
+// allowAllProvider is the CI-baseline test double injected into helpers that
+// construct a bare FileService: it keeps the pre-fail-closed baseline (all
+// actions allowed) for tests that exercise behavior other than the delete
+// gate. Deny/error providers set via WithAuthorizer afterwards replace it
+// (the setter overwrites), and tests that need the real fail-closed default
+// build the service directly (see TestDeleteFailClosed_BareConstruction).
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
 }
 
 func putTestObject(t *testing.T, svc *FileService, key, body string) repository.Object {

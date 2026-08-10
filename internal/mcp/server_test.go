@@ -718,7 +718,7 @@ func TestNewServer_EmptyTenantFallback(t *testing.T) {
 	t.Cleanup(func() { repo.Close() })
 	repo.Migrate(context.Background())
 	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
 
 	srv := NewServer(svc, repo, nil, "", nil)
 	if srv.tenant != "default" {

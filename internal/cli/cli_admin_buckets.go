@@ -33,8 +33,12 @@ func (c *Client) adminBucketLifecycle(args []string) int {
 		return 2
 	}
 	bucket := args[0]
-	var days int
-	fmt.Sscanf(args[1], "%d", &days)
+	days, err := requireNonNegInt("days", args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "usage: admin buckets lifecycle <bucket> <days> [--action soft_delete|hard_delete]")
+		return 2
+	}
 	action := "soft_delete"
 	for i := 2; i < len(args); i++ {
 		if args[i] == "--action" && i+1 < len(args) {
@@ -143,9 +147,18 @@ func (c *Client) adminBucketQuota(args []string) int {
 		return 2
 	}
 	bucket := args[0]
-	var maxBytes, maxObjects int64
-	fmt.Sscanf(args[1], "%d", &maxBytes)
-	fmt.Sscanf(args[2], "%d", &maxObjects)
+	maxBytes, err := requireNonNegInt64("max_bytes", args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "usage: admin buckets quota <bucket> <max_bytes> <max_objects>")
+		return 2
+	}
+	maxObjects, err := requireNonNegInt64("max_objects", args[2])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "usage: admin buckets quota <bucket> <max_bytes> <max_objects>")
+		return 2
+	}
 	body := map[string]any{"max_bytes": maxBytes, "max_objects": maxObjects}
 	b, _ := json.Marshal(body)
 	resp, err := c.do(http.MethodPut, "/v1/admin/buckets/"+url.PathEscape(bucket)+"/quota", bytes.NewReader(b), map[string]string{"Content-Type": "application/json"})

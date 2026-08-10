@@ -88,6 +88,7 @@ func (j *Job) scrubObject(ctx context.Context, obj repository.Object) error {
 	computed := h.Sum(nil)
 	if bytes.Equal(computed, expected) {
 		telemetry.IncScrubResult(ctx, "ok")
+		j.clearCorruptFlag(ctx, obj)
 		return nil
 	}
 	telemetry.IncScrubResult(ctx, "corrupt")
@@ -98,4 +99,23 @@ func (j *Job) scrubObject(ctx context.Context, obj repository.Object) error {
 	j.logger.Warn("scrub: CORRUPT object detected",
 		"tenant", obj.TenantID, "bucket", obj.Bucket, "key", obj.Key, "storage_key", obj.StorageKey)
 	return errors.New("corrupt")
+}
+
+// clearCorruptFlag removes the _aero_scrub_status marker from a previously
+// corrupt object once its content verifies intact, restoring read access.
+// No-op for objects never flagged (the guard avoids a DB round-trip on the
+// hot intact path) and non-fatal on failure: the marker stays, the object
+// remains locked, and the next sweep retries.
+func (j *Job) clearCorruptFlag(ctx context.Context, obj repository.Object) {
+	if obj.Metadata["_aero_scrub_status"] != "corrupt" {
+		return
+	}
+	if err := j.repo.DeleteObjectMetaKey(ctx, obj.TenantID, obj.Bucket, obj.Key, "_aero_scrub_status"); err != nil {
+		j.logger.Warn("scrub: failed to clear corrupt flag",
+			"tenant", obj.TenantID, "bucket", obj.Bucket, "key", obj.Key, "err", err)
+		return
+	}
+	telemetry.IncScrubResult(ctx, "repaired")
+	j.logger.Info("scrub: repaired object cleared",
+		"tenant", obj.TenantID, "bucket", obj.Bucket, "key", obj.Key, "storage_key", obj.StorageKey)
 }

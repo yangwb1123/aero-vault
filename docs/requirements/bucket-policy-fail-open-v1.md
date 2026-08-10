@@ -220,3 +220,10 @@ func TestDeny_NonWildcardPrincipalNeverSkipped(t *testing.T) {
 - 分支 A 的 Principal 校验：在 `validateConditions` 旁新增校验函数（接受 `"*"`、`{"AWS":"*"}`/`{"AWS":["*"]}`，其余拒绝），于 `ParsePolicy` 循环内调用。
 - 分支 B：`EvalResource` 在 `matchesPrincipal`/`matchesConditions` 之前判断"Deny + 无法求值（principal 非通配或条件含未知操作符）"→ 直接 `return EffectDeny`。
 - 新增测试按 §4 四组验收落地；运行 `go test ./internal/auth/` 与 `make check` 确认全绿。
+
+---
+
+## 7. 已知行为记录（来自 sibling 方向 bucket-policy-rest-resource-v1 的设计复核）
+
+- **`{"Service":"*"}`（及任意 `{"<key>":"*"}` map）被当作通配 Principal 接受**：`UnmarshalJSON` 的 map 分支原样保留，`validatePrincipal` 只检查取值 `"*"` 不检查键。AWS 语义中 Service principal 应被拒绝——当前接受为通配**不会放宽授权**（通配即现状基线），属过度接受而非 fail-open；由后续解析加固方向处理。
+- **`"Resource": []` 空数组 = 通配**（`matchesResource` 的 `len(s.Resource)==0` 分支，既有设计）。

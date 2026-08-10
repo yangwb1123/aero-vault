@@ -15,10 +15,12 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/events"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -335,4 +337,74 @@ func TestPgEventTransport(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for LISTEN/NOTIFY delivery")
 	}
+}
+
+// TestPostgresAccessACLWildcardSemantics mirrors the SQLite regression matrix
+// for the folder-ACL prefix clause (substr literal prefix): wildcard
+// characters in folder keys must not match siblings, genuine children must
+// still inherit, and ORDER BY LENGTH precedence must hold on Postgres.
+func TestPostgresAccessACLWildcardSemantics(t *testing.T) {
+	repo, _ := freshRepo(t)
+	ctx := context.Background()
+	store, ok := repo.(access.Store)
+	if !ok {
+		t.Fatal("repository does not implement access.Store")
+	}
+	now := time.Now().UTC()
+	seed := []access.ACLEntry{
+		{ID: "acl-underscore", TenantID: "acme", Bucket: "default", Key: "report_2026/",
+			ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+			PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+			Inherit: true, CreatedBy: "seed", CreatedAt: now},
+		{ID: "acl-percent", TenantID: "acme", Bucket: "default", Key: "50%/",
+			ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+			PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectDeny,
+			Inherit: true, CreatedBy: "seed", CreatedAt: now},
+		{ID: "acl-case", TenantID: "acme", Bucket: "default", Key: "Docs/",
+			ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+			PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+			Inherit: true, CreatedBy: "seed", CreatedAt: now},
+		{ID: "acl-shallow", TenantID: "acme", Bucket: "default", Key: "a/",
+			ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+			PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectDeny,
+			Inherit: true, CreatedBy: "seed", CreatedAt: now},
+		{ID: "acl-deep", TenantID: "acme", Bucket: "default", Key: "a/b/",
+			ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+			PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+			Inherit: true, CreatedBy: "seed", CreatedAt: now},
+		{ID: "acl-wide", TenantID: "acme", Bucket: "default", Key: "",
+			ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+			PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+			Inherit: true, CreatedBy: "seed", CreatedAt: now},
+	}
+	for _, entry := range seed {
+		if err := store.PutACLEntry(ctx, entry); err != nil {
+			t.Fatalf("seed ACL %q: %v", entry.ID, err)
+		}
+	}
+	assertIDs := func(key string, want ...string) {
+		t.Helper()
+		entries, err := store.ListApplicableACL(ctx, "acme", "default", key)
+		if err != nil {
+			t.Fatalf("ListApplicableACL(%q): %v", key, err)
+		}
+		got := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			got = append(got, entry.ID)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("ListApplicableACL(%q) = %v, want %v", key, got, want)
+		}
+	}
+	// Wildcard siblings must not match (only the bucket-wide root folder
+	// acl-wide remains applicable — it is seeded above and asserted for
+	// arbitrary keys at the bottom, so the sibling cases expect exactly it).
+	assertIDs("reportX2026/x", "acl-wide")
+	assertIDs("50x/y", "acl-wide")
+	assertIDs("docs/x", "acl-wide") // case sibling (case-sensitive literal prefix)
+	// Genuine children still inherit; deep folder wins over shallow; the
+	// bucket-wide root folder applies to every key (sorted last by key length).
+	assertIDs("report_2026/x", "acl-underscore", "acl-wide")
+	assertIDs("a/b/x", "acl-deep", "acl-shallow", "acl-wide")
+	assertIDs("anything", "acl-wide")
 }

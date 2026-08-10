@@ -20,13 +20,14 @@ import (
 type Handler struct {
 	svc    *service.FileService
 	logger *slog.Logger
+	authz  AuthorizationProvider // nil = unset = fail-closed deny on delete
 }
 
-func NewHandler(svc *service.FileService, logger *slog.Logger) *Handler {
+func NewHandler(svc *service.FileService, logger *slog.Logger, authz AuthorizationProvider) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{svc: svc, logger: logger}
+	return &Handler{svc: svc, logger: logger, authz: authz}
 }
 
 // ── Core Object CRUD ────────────────────────────────────────────────────────

@@ -173,6 +173,53 @@ func TestTenantWithStatusFailureAndPublicBypass(t *testing.T) {
 	}
 }
 
+// TestTenantWithStatus_BypassTable pins the complete bypass list (the flip
+// side of TestFullServer_DisabledTenant403): a disabled tenant must still get
+// 200 on health probes, docs, UI, OIDC, share and public-asset paths, while
+// any non-bypass path is rejected. Removing an entry from tenantStatusBypass
+// fails this test — the availability decision is a pinned contract.
+func TestTenantWithStatus_BypassTable(t *testing.T) {
+	// A lookup that reports every tenant as disabled: only the bypass list may
+	// let a request through.
+	lookup := func(context.Context, string) (string, bool, error) { return "disabled", true, nil }
+	h := TenantWithStatus(lookup)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	bypassPaths := []string{
+		"/",
+		"/favicon.ico",
+		"/healthz",
+		"/readyz",
+		"/metrics",
+		"/openapi.json",
+		"/docs",
+		"/ui",
+		"/ui/",
+		"/ui/settings",
+		"/auth/oidc/login",
+		"/auth/oidc/callback",
+		"/share/abc123",
+		"/public/assets/logo.png",
+	}
+	for _, path := range bypassPaths {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set(TenantHeader, "disabled-tenant")
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("bypass path %q: status=%d, want 204 (bypass entry dropped?)", path, rec.Code)
+		}
+	}
+	// Control: a non-bypass path must still be rejected for the disabled tenant.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/files", nil)
+	req.Header.Set(TenantHeader, "disabled-tenant")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-bypass path /v1/files: status=%d, want 403", rec.Code)
+	}
+}
+
 // --- Recoverer ---
 
 func TestRecoverer_TurnsPanicInto500(t *testing.T) {

@@ -30,7 +30,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `APP_LOG_LEVEL` | `info` | Log level: `debug` \| `info` \| `warn`/`warning` \| `error`. Invalid values fail startup. |
 | `APP_WRITE_TIMEOUT` | `60` | HTTP write timeout in seconds. SSE streams exempt themselves via `SetWriteDeadline`. Set to `0` to disable. |
 | `APP_IDLE_TIMEOUT` | `120` | HTTP idle (keep-alive) timeout in seconds. Set to `0` to disable. |
-| `APP_MAX_BODY_SIZE` | `0` | Maximum request body size in bytes. Requests above the limit receive `413`; `0` disables the limit. |
+| `APP_MAX_BODY_SIZE` | `0` | Maximum request body size in bytes. Requests above the limit receive `413`; `0` disables the limit. Unknown-length (chunked) bodies over the limit are rejected with `413`, never truncated. |
 | `APP_TLS_ENABLED` | `false` | Enable TLS/HTTPS. Requires `APP_TLS_CERT_FILE` and `APP_TLS_KEY_FILE`. |
 | `APP_TLS_CERT_FILE` | _(empty)_ | Path to TLS certificate file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `APP_TLS_KEY_FILE` | _(empty)_ | Path to TLS private key file (PEM). Required when `APP_TLS_ENABLED=true`. |
@@ -175,7 +175,7 @@ Validation (fails fast on startup): the storage backend must be one of
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = operator (any tenant). Empty disables API-key auth (MVP/open mode). |
+| `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = operator (any tenant). Empty disables API-key auth (MVP/open mode). **Deployment caveat — the `admin` scope is operator-grade on its own:** `requireAdmin` checks scope only (never the caller's tenant) and the admin API takes the target tenant from the request body/path, so a tenant-scoped admin key (e.g. `ops:acme:admin`) is operator-equivalent: it can mint keys/JWTs for any tenant, delete files in any tenant, and set quotas. Never issue tenant-scoped admin keys unless operator equivalence is intended. |
 | `AUTH_JWT_SECRET` | _(empty)_ | Secret enabling HS256 JWT verification and issuance (`POST /v1/admin/jwt`). |
 | `AUTH_JWKS_ENDPOINT` | _(empty)_ | Snaplink JWKS URL. Setting it activates `interfaces/ssoclient/rs`; Aero does not implement external JWT cryptography. |
 | `AUTH_JWKS_KEY_TTL` | `3600` | Snaplink SDK background JWKS refresh interval in seconds; unknown keys also trigger the SDK's bounded refresh path. |
@@ -191,7 +191,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `AUTH_OIDC_TOKEN_ENDPOINT` | `<issuer>/token` | Authorization-code token endpoint. |
 | `AUTH_OIDC_SCOPES` | `openid,profile,email` | Comma-separated scopes requested during login. |
 | `AUTH_PRESIGN_SECRET` | _(empty = process-random)_ | HMAC key for REST presigned GET/PUT capability URLs. Configured values must be at least 32 bytes. Set the same value on every replica so URLs survive restarts and load-balancer routing; an empty value is suitable only for single-process development because issued URLs become invalid after restart. GET capabilities still traverse Aero Vault, so tenant suspension, bucket policy, ACL explicit deny, and object deletion take effect immediately. |
-| `AUTH_ANONYMOUS_PUBLIC_READ` | `false` | Allow unauthenticated `GET`/`HEAD` of public-read objects (the handler still enforces the object ACL). |
+| `AUTH_ANONYMOUS_PUBLIC_READ` | `false` | Parse-only (no effect through the production chain): intended to allow unauthenticated `GET`/`HEAD` of public-read objects with the handler ACL gate enforcing object ACLs. The auth ring does admit anonymous object reads (`internal/auth`), but the REST router's `requireRESTScope` scope gate then rejects them with `401 not authenticated` before the handler's ACL check runs (`requireRESTScope` → `Require(read)` has no anonymous carve-out); the S3 gateway has no anonymous admission at all. The flag therefore currently serves no path — do not rely on it until the 12-ring fix lands (recorded as defect S1 in `docs/requirements/internal-cli-activation-gate-scope-matrix-e2e-v1.design.md` §2.5, with a 12-ring integration test as the acceptance vehicle). |
 | `AUTH_PERSIST_KEYS` | `false` | Back runtime API keys with the DB (`api_keys` table, tokens sha256-hashed). Keys survive restart and are shared across replicas. Also acts as an implicit auth switch: setting this without `AUTH_KEYS` still enables auth. |
 | `AUTH_KEY_CACHE_TTL_SECONDS` | `0` | `>0` adds a bounded TTL'd read-through cache in front of the DB key lookup, reducing per-request DB hits. Revokes are bounded by this TTL — keep short (e.g. 30). When `EVENTS_TRANSPORT_DSN` is set, add/revoke also broadcasts immediately via a dedicated Postgres LISTEN/NOTIFY channel (`aero_key_invalidate`) so other replicas drop the cache entry without waiting for TTL expiry. |
 | `S3_SIGV4_CREDENTIALS` | _(empty)_ | AWS SigV4 credentials for the S3 endpoint: `accessKey:secretKey:tenant[:scope+scope]`, comma-separated (e.g. `AKIA...:secret...:acme:read+write`). |
@@ -204,6 +204,7 @@ authentication source (API key, JWT/JWKS, SigV4, or persistent API-key store).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ACCESS_CONTROL_ENABLED` | `false` | Enable normalized principals, ownership, department/resource ACL enforcement, protected shares, and public assets. |
+| `ACCESS_DELETE_FAIL_CLOSED` | `true` | Fail-closed delete gate: with access control disabled (`ACCESS_CONTROL_ENABLED=false`), object deletes (REST/WebDAV/admin/MCP/quarantine via the service gate) are denied unless this is explicitly `false` (restores the legacy allow). **The S3 gateway is unaffected** — it always denies deletes without access control, and this flag does not re-enable it; only `ACCESS_CONTROL_ENABLED=true` does. See breaking-change notes. |
 | `ACCESS_DEFAULT_POLICY` | `deny` | `deny` requires ownership/ACL/admin access. `tenant` allows the existing `read`/`write` scope fallback only when no resource ACL applies; useful for gradual migration. |
 | `ACCESS_SHARE_SECRET` | _(empty)_ | Required when enabled; at least 32 bytes and identical on every replica. HMAC-protects share passwords. |
 | `ACCESS_PUBLIC_BASE_URL` | _(empty)_ | Canonical external base URL placed in returned share/asset URLs, e.g. `https://source.ywbsd.site`. Empty derives it from the request. |
@@ -259,18 +260,19 @@ secret values.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AUDIT_GOVERNANCE_ENABLED` | `false` | Enable durable capture, reconcile, and delivery. |
+| `AUDIT_GOVERNANCE_ENABLED` | `false` | Enable durable capture, reconcile, and delivery. An enabled boot with an empty `bindings` manifest is refused (fail-closed activation gate) unless `AUDIT_GOVERNANCE_DRAIN` is set. **Strict boolean:** any set, non-canonical value (e.g. `yes`, `on`) fails startup instead of silently disabling the relay — only `strconv.ParseBool` spellings (`true`/`false`/`1`/`0` and case variants) are accepted. |
+| `AUDIT_GOVERNANCE_DRAIN` | `false` | Permit an empty `bindings` manifest to apply a drain (disable flow only). `true` with a non-empty manifest fails startup; clear the flag (and remove the empty manifest) after disabling. **Strict boolean:** non-canonical values (e.g. `yes`) fail startup instead of silently no-op'ing the drain. |
 | `AUDIT_GOVERNANCE_BASE_URL` | _(required)_ | Audit Governance base URL. HTTPS is required except for a literal loopback HTTP endpoint. |
 | `AUDIT_GOVERNANCE_TOKEN_URL` | _(required)_ | Snaplink OAuth token endpoint, with the same URL policy. |
 | `AUDIT_GOVERNANCE_BINDINGS_FILE` | _(required)_ | Revisioned, strict JSON tenant/client binding file; duplicate credentials, symlinks, and group/world-writable files are rejected. |
-| `AUDIT_GOVERNANCE_HMAC_KEY` | _(required)_ | Dedicated `32..4096` byte HMAC key for tenant/field-domain pseudonyms. It must be identical on every replica and must not reuse an OAuth or Billing credential. |
+| `AUDIT_GOVERNANCE_HMAC_KEY` | _(required)_ | Dedicated `32..4096` byte HMAC key for tenant/field-domain pseudonyms. Must not reuse an OAuth or Billing credential. **Share scope:** only across replicas of the *same* origin-counter store (the same underlying DB) — never across independent databases, where identical `origin_id` values collide into duplicate EventIDs and the receiver silently drops one instance's ledger rows. **Rotation is not idempotency-safe:** rotating changes every fact ID, so in-flight facts (claimed-but-unacked, or pruned-then-re-enqueued) get a new EventID and the receiver double-ledgers them (tombstones protect only delivered facts); keep the key stable for at least `AUDIT_GOVERNANCE_DELIVERED_RETENTION_SECONDS` and rotate only after the outbox is fully drained. |
 | `AUDIT_GOVERNANCE_HTTP_TIMEOUT_SECONDS` | `5` | Token/event/database operation timeout (`1..29`). |
 | `AUDIT_GOVERNANCE_POLL_MILLISECONDS` | `1000` | Outbox reconcile/claim interval. |
 | `AUDIT_GOVERNANCE_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
 | `AUDIT_GOVERNANCE_CLAIM_TTL_SECONDS` | `30` | Fenced delivery lease (`1..60`); must exceed twice the HTTP timeout so publish plus acknowledgement/retry remain fenced. |
 | `AUDIT_GOVERNANCE_INITIAL_BACKOFF_SECONDS` | `1` | Initial retry delay before deterministic jitter. |
-| `AUDIT_GOVERNANCE_MAX_BACKOFF_SECONDS` | `300` | Retry cap; facts retry indefinitely. |
-| `AUDIT_GOVERNANCE_MAX_LAG_SECONDS` | `900` | Oldest undelivered outbox age that `/readyz` permits. |
+| `AUDIT_GOVERNANCE_MAX_BACKOFF_SECONDS` | `300` | Retry cap (`2..86400`): the per-attempt delay **and** the cumulative transient-retry window. A fact failing with transient-only errors (e.g. a receiver answering 500) is re-POSTed with bounded backoff until `now − first attempt` strictly exceeds this value, then dead-letters with the same terminal-with-retention semantics as permanent classes (`failed_at_ns` set, never re-claimed, pruned after the delivered retention). The window anchor (`first_attempt_at_ns`) is set once on the row's first claim and survives lease/ack-lost re-claims. |
+| `AUDIT_GOVERNANCE_MAX_LAG_SECONDS` | `900` | Oldest undelivered outbox age after which the relay reports degraded (`degraded=1`; `/readyz` stays `200` with `degraded:true`). The `AuditGovernanceBacklogDegraded` alert fires earlier at half this value (450s at default) as early warning, or immediately when degraded. |
 | `AUDIT_GOVERNANCE_RECONCILE_BATCH_SIZE` | `100` | Historical local facts reconciled per tenant and poll (`2..500`); batches alternate admin/security and file origins. |
 | `AUDIT_GOVERNANCE_DELIVERED_RETENTION_SECONDS` | `604800` | Retain delivered outbox bodies before replacing them with permanent origin tombstones (`3600..31536000`). |
 | `AUDIT_GOVERNANCE_CLEANUP_INTERVAL_SECONDS` | `3600` | Delivered-row cleanup interval (`60..86400`, no greater than retention). Full batches continue at the poll interval. |
@@ -348,14 +350,24 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 
 ## Deletion transactional outbox
 
-File delete (`FileService.Delete`, hard and soft) commits the metadata delete and two versioned event facts (`vault.file.deleted@1.1` / `vault.file.notify@1.1`) in **one transaction**; the always-on relay drains them (claim → deliver → complete). `notify@1.1` facts are POSTed byte-exact to matching bucket-notification targets; `deleted@1.1` facts are durable lifecycle records that are completed without local re-broadcast. Delivery is exactly-once only after `complete`; the deliver→complete window is at-least-once (S3-equivalent) — receivers must be idempotent. |
+File delete (`FileService.Delete`, hard and soft) commits the metadata delete and two versioned event facts (`vault.file.deleted@1.1` / `vault.file.notify@1.1`) in **one transaction**; the always-on relay — unless `EVENT_OUTBOX_ENABLED=false` — drains them (claim → deliver → complete). `notify@1.1` facts are POSTed byte-exact to matching bucket-notification targets; `deleted@1.1` facts are durable lifecycle records that are completed without local re-broadcast. Delivery is exactly-once only after `complete`; the deliver→complete window is at-least-once (S3-equivalent) — receivers must be idempotent. |
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `EVENT_OUTBOX_ENABLED` | `true` | Kill-switch for the relay loop (claim → deliver → complete → prune). Enqueue of the two delete facts is **never** gated — rows keep accumulating while disabled and drain (FIFO) once re-enabled. Unparseable values fall back to the default (`true`). |
 | `EVENT_OUTBOX_POLL_INTERVAL_MILLIS` | `1000` | Relay claim poll interval (`1..60000`). |
 | `EVENT_OUTBOX_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
 | `EVENT_OUTBOX_CLAIM_TTL_SECONDS` | `30` | Fenced delivery lease; must exceed twice `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` so a slow target plus lease expiry cannot cause concurrent duplicate POSTs without any crash (`1..600`). Worst-case in-flight time per fact is `targets×timeout` — raise the TTL when a rule targets more than 3 endpoints at the default timeout. |
 | `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` | `5` | Per-target HTTP POST timeout (`1..29`). |
-| `EVENT_OUTBOX_MAX_ATTEMPTS` | `10` | Delivery attempts before a fact becomes terminal `failed` (`1..1000`); failed rows are pruned after 7 days, delivered rows after 24h. |
+| `EVENT_OUTBOX_MAX_ATTEMPTS` | `10` | Delivery attempts before a fact becomes terminal `failed` (`1..1000`); prune cutoffs are configurable — defaults 24h for delivered, 7 days for failed, see `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` / `EVENT_OUTBOX_FAILED_RETENTION_HOURS`. |
+| `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` | `24` | Delivered rows are pruned after this many hours (`1..8760`). Non-numeric values silently fall back to the default (`24`). Prune runs once per 60 relay rounds — a 60s–60min cadence across the poll bounds — so effective retention is the horizon plus up to one prune interval (≈2× the horizon at the extremes, e.g. poll 60s + retention 1h ⇒ 1–2h). With replicas sharing one `event_outbox` table, effective retention is the **minimum across running nodes** — the most aggressive prune wins fleet-wide; configure identically on every replica. |
+| `EVENT_OUTBOX_FAILED_RETENTION_HOURS` | `168` | Terminal `failed` rows are pruned after this many hours (`1..8760`; default 168 = 7 days, matching the shipped behavior). Non-numeric values silently fall back to the default (`168`). Same prune cadence and fleet-min property as `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS`. |
+| `AUDIT_SINK_L2_ENDPOINT` | _(empty = L2 off)_ | Optional L2 audit sink: the relay POSTs each `vault.file.deleted@1.1` fact to this URL with the tenant's bearer token. Must be an absolute URL without credentials/query/fragment; scheme must be `https`, or `http` only to a loopback host (`localhost` / loopback IP). Enforced twice at startup (config validation + relay construction) — an invalid value aborts boot. Empty disables L2: facts are still completed without delivery and the L0 `audit_log` stays authoritative. |
+| `AUDIT_SINK_L2_BINDINGS_FILE` | _(empty)_ | JSON file `{"bindings":[{"tenant":"…","token":"…"\|"token_env":"…"}]}` mapping tenant → bearer token. Must be a regular file with mode 0600 (owner-only) and ≤1 MiB; unknown fields and trailing JSON are rejected — any violation fails startup. `token` values must be ≥16 characters with no surrounding whitespace; prefer the `token_env` indirection (env var must start with `AUDIT_SINK_L2_TOKEN_` and resolve) to keep secrets out of the filesystem. Duplicate tenants or tokens are rejected. The wildcard tenant `"*"` is accepted as an operator-grade mapping (same trust class as the auth operator key). Without this file every tenant is unbound: deleted facts complete without delivery — the startup log line `event outbox relay L2 audit sink enabled … bindings: 0` is the only signal. |
+
+> L2 delivery rides the same relay machinery and the same at-least-once
+> contract as the `EVENT_OUTBOX_*` options above (claim lease, retry/backoff,
+> idempotent receivers) — no separate knobs; per-fact in-flight time is still
+> bounded by `EVENT_OUTBOX_CLAIM_TTL_SECONDS`. Tokens are never logged.
 
 ## Background reconcile / lifecycle
 

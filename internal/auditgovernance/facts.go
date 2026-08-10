@@ -5,8 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
@@ -14,12 +12,13 @@ func (r *redactor) factFromAudit(
 	entry repository.AuditEntry, now time.Time,
 ) repository.AuditGovernanceFact {
 	tenant := normalizedTenant(entry.TenantID)
+	source, _ := r.tenantSourceID(tenant) // normalizedTenant (non-empty, trimmed) makes the error unreachable
 	occurred, err := time.Parse(time.RFC3339Nano, entry.CreatedAt)
 	if err != nil || occurred.IsZero() {
 		occurred = now.UTC()
 	}
 	return repository.AuditGovernanceFact{
-		ID: uuid.NewString(), TenantID: tenant, OriginKind: repository.AuditOriginAdmin,
+		SourceID: source, TenantID: tenant, OriginKind: repository.AuditOriginAdmin,
 		FactKind: auditFactKind(entry.Action), ActorDigest: r.digest(tenant, "actor", entry.Actor),
 		Action:       safeAction(entry.Action, "admin.unknown"),
 		TargetDigest: r.digest(tenant, "target", entry.Target),
@@ -31,12 +30,13 @@ func (r *redactor) factFromEvent(
 	event repository.Event, now time.Time,
 ) repository.AuditGovernanceFact {
 	tenant := normalizedTenant(event.TenantID)
+	source, _ := r.tenantSourceID(tenant) // normalizedTenant (non-empty, trimmed) makes the error unreachable
 	occurred := event.CreatedAt.UTC()
 	if occurred.IsZero() {
 		occurred = now.UTC()
 	}
 	return repository.AuditGovernanceFact{
-		ID: uuid.NewString(), TenantID: tenant, OriginKind: repository.AuditOriginFile,
+		SourceID: source, TenantID: tenant, OriginKind: repository.AuditOriginFile,
 		FactKind: "file", Action: safeAction("file."+string(event.Type), "file.unknown"),
 		TargetDigest:    r.digest(tenant, "file-target", event.Bucket+"\x00"+event.Key),
 		RequestID:       r.digest(tenant, "request", event.RequestID),
@@ -48,22 +48,27 @@ func (r *redactor) factFromEvent(
 func (r *redactor) factFromGap(
 	gap repository.AuditGovernanceGap, now time.Time,
 ) repository.AuditGovernanceFact {
+	var fact repository.AuditGovernanceFact
 	if gap.OriginKind == repository.AuditOriginFile {
 		event := repository.Event{TenantID: gap.TenantID, Bucket: gap.Bucket, Key: gap.Key,
 			Type:      repository.EventType(strings.TrimPrefix(gap.Action, "file.")),
 			RequestID: gap.RequestID, Payload: gap.Payload, CreatedAt: gap.OccurredAt}
-		fact := r.factFromEvent(event, now)
-		fact.OriginID = gap.OriginID
-		return fact
+		fact = r.factFromEvent(event, now)
+	} else {
+		createdAt := ""
+		if !gap.OccurredAt.IsZero() {
+			createdAt = gap.OccurredAt.Format(time.RFC3339Nano)
+		}
+		entry := repository.AuditEntry{TenantID: gap.TenantID, Actor: gap.Actor, Action: gap.Action,
+			Target: gap.Target, Detail: gap.Detail, CreatedAt: createdAt}
+		fact = r.factFromAudit(entry, now)
 	}
-	createdAt := ""
-	if !gap.OccurredAt.IsZero() {
-		createdAt = gap.OccurredAt.Format(time.RFC3339Nano)
-	}
-	entry := repository.AuditEntry{TenantID: gap.TenantID, Actor: gap.Actor, Action: gap.Action,
-		Target: gap.Target, Detail: gap.Detail, CreatedAt: createdAt}
-	fact := r.factFromAudit(entry, now)
 	fact.OriginID = gap.OriginID
+	// Single call site for the formula: same inputs as the atomic path
+	// (REQ-2 canonicalized occurred), so capture and gap reconcile converge
+	// on the same ID (B3.3 / T-4).
+	fact.ID = repository.DeterministicFactID(fact.SourceID, fact.TenantID,
+		fact.Action, fact.OriginKind, fact.OriginID, fact.OccurredAt)
 	return fact
 }
 

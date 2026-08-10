@@ -53,12 +53,17 @@ func (s *sqlStore) ListResourceACL(
 }
 
 func (s *sqlStore) ListApplicableACL(ctx context.Context, tenant, bucket, key string) ([]access.ACLEntry, error) {
+	// Literal prefix comparison instead of LIKE: a folder key containing
+	// '%' or '_' (e.g. report_2026/) must not act as a SQL wildcard and
+	// widen the ACL to sibling keys (reportX2026/...). folder keys always
+	// end in '/' (normalizeACLResource), so the length-bound comparison
+	// preserves the slash boundary; substr/length are portable SQLite/PG.
 	return s.queryACL(ctx,
 		`SELECT `+accessACLColumns+` FROM resource_acls
 		 WHERE tenant_id=$1 AND bucket=$2 AND (
 		   resource_kind='bucket'
 		   OR (resource_kind='object' AND resource_key=$3)
-		   OR (resource_kind='folder' AND (resource_key=$4 OR (inherit_acl=1 AND $5 LIKE resource_key || '%')))
+		   OR (resource_kind='folder' AND (resource_key=$4 OR (inherit_acl=1 AND substr($5, 1, length(resource_key)) = resource_key)))
 		 ) ORDER BY LENGTH(resource_key) DESC, created_at, id`,
 		tenant, bucket, key, key, key)
 }

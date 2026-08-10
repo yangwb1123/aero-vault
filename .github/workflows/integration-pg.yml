@@ -54,15 +54,34 @@ jobs:
         run: go vet -tags=integration ./...
 
       - name: PG integration suite (loud skip => job failure)
+        # Count floor is derived from `go test -list` with the SAME -run regex,
+        # not hard-coded: additions/removals of PG tests self-adjust, and a
+        # non-selection regression (test renamed off-regex, gate regex
+        # narrowed) fails the job instead of silently running fewer tests.
+        # Order: skips -> real failure -> floor, so a genuine test failure is
+        # never masked by a misleading "tests unselected?" message.
         run: |
           set -o pipefail
+          listed=$(go test -tags=integration ./internal/integration/ \
+            -list 'TestPostgres|TestPg' | grep -c '^Test')
           go test -tags=integration ./internal/integration/ -v -count=1 \
             -run 'TestPostgres|TestPg' 2>&1 | tee /tmp/pg-tests.log
           rc=${PIPESTATUS[0]}
           skips=$(grep -c -- '--- SKIP' /tmp/pg-tests.log || true)
+          passes=$(grep -c '^--- PASS' /tmp/pg-tests.log || true)
+          echo "listed=${listed} passes=${passes} skips=${skips} rc=${rc}"
           if [ "${skips}" -ne 0 ]; then
             echo "::error::${skips} PG test(s) SKIPPED — service unreachable" \
               "or DSN misconfigured; refusing silent all-skip green."
             exit 1
           fi
-          exit "${rc}"
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error::PG suite failed (go test exit ${rc}); see log above."
+            exit "${rc}"
+          fi
+          if [ "${passes}" -lt "${listed}" ]; then
+            echo "::error::${passes} PASS lines < ${listed} listed tests —" \
+              "tests unselected by -run; refusing silent green."
+            exit 1
+          fi
+          exit 0

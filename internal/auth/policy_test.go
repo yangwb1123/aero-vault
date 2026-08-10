@@ -303,6 +303,66 @@ func TestParsePolicyRejectsNonWildcardPrincipal(t *testing.T) {
 	}
 }
 
+// AC-1: EvalResource must honor per-statement Resource constraints. A
+// key-scoped Allow grants only keys inside its scope; anything else is an
+// implicit deny. This locks the semantics the REST adapter relies on after
+// the resource-constraint fix (bucket-policy-rest-resource-v1).
+func TestEvalResource_ResourceScopedAllow(t *testing.T) {
+	p, err := ParsePolicy(`{"Version":"2012-10-17","Statement":[
+		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",
+		 "Resource":["arn:aws:s3:::default/secret/*"]}]}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tests := []struct {
+		resource string
+		want     PolicyEffect
+	}{
+		{"arn:aws:s3:::default/secret/key1", EffectAllow},       // 命中 Allow 作用域
+		{"arn:aws:s3:::default/other/key1", EffectImplicitDeny}, // 作用域外：隐式拒绝
+	}
+	for _, tt := range tests {
+		if got := p.EvalResource("s3:GetObject", tt.resource, "10.0.0.1"); got != tt.want {
+			t.Errorf("EvalResource(%q) = %v, want %v", tt.resource, got, tt.want)
+		}
+	}
+}
+
+// wildcardMatch is the semantic core of IAM '*' matching (may span '/'); this
+// table locks its behavior directly so a regression (e.g. path.Match
+// semantics) cannot silently widen or narrow scoped policies.
+func TestWildcardMatch(t *testing.T) {
+	tests := []struct {
+		pattern, value string
+		want           bool
+	}{
+		{"a*b", "aXb", true},           // '*' spans any chars
+		{"a*b", "aX/Yb", true},         // '*' spans '/'
+		{"a*b", "a*b", true},           // literal '*' in value matches literally
+		{"a*b", "ab", true},            // '*' matches empty
+		{"*", "anything/at/all", true}, // lone '*'
+		{"*", "", true},                // lone '*' matches empty value
+		{"", "", true},                 // empty pattern matches empty value
+		{"", "x", false},               // empty pattern never matches non-empty
+		{"s3:*", "s3:GetObject", true},
+		{"s3:*", "s3:", true},
+		{"s3:*", "ec2:RunInstances", false},
+		{"arn:aws:s3:::default/*", "arn:aws:s3:::default", false}, // bucket ARN not under '/*'
+		{"arn:aws:s3:::default/*", "arn:aws:s3:::default/secret/k", true},
+		{"arn:aws:s3:::default", "arn:aws:s3:::default", true},    // exact bucket ARN
+		{"arn:aws:s3:::default", "arn:aws:s3:::default/x", false}, // prefix without '*' does not match longer value
+		{"a**b", "axxb", true},      // adjacent stars collapse
+		{"prefix*", "prefix", true}, // trailing '*' only
+		{"prefix*", "prefixsuffix", true},
+		{"a*b", "axbxc", false},
+	}
+	for _, tt := range tests {
+		if got := wildcardMatch(tt.pattern, tt.value); got != tt.want {
+			t.Errorf("wildcardMatch(%q, %q) = %v, want %v", tt.pattern, tt.value, got, tt.want)
+		}
+	}
+}
+
 // Eval-layer guard (defense in depth): under branch A the AC-3b eval assertion
 // is dead code after the parse early-return, so exercise the guard directly.
 func TestEvalResource_DenyNonWildcardPrincipalFailsClosed(t *testing.T) {

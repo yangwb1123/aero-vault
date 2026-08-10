@@ -103,3 +103,39 @@ WHERE id=$1 AND delivered_at_ns>0 AND delivered_at_ns <= $2`),
 		origin.id, before.UTC().UnixNano())
 	return err
 }
+
+// CleanupFailedAuditGovernance prunes terminal-failed rows older than the
+// retention window (terminal-with-retention). Unlike delivered cleanup there
+// is no origin tombstone: a failed row's origin was never ledgered, so a
+// later mutation of the same origin may enqueue a fresh fact (no dedupe
+// collision). DELETE-style, no gap-scan — the 7d default retention window is
+// the documented delivery-recovery SLA.
+func (s *sqlStore) CleanupFailedAuditGovernance(
+	ctx context.Context, before time.Time, limit int,
+) (int64, error) {
+	if before.IsZero() || limit <= 0 || limit > 500 {
+		return 0, errors.New("audit governance failed cleanup arguments are invalid")
+	}
+	if s.dialect == dialectPostgres {
+		result, err := s.db.ExecContext(ctx, `DELETE FROM audit_governance_outbox
+WHERE id IN (
+ SELECT id FROM audit_governance_outbox
+ WHERE failed_at_ns>0 AND failed_at_ns <= $1
+ ORDER BY failed_at_ns,id LIMIT $2 FOR UPDATE SKIP LOCKED)`,
+			before.UTC().UnixNano(), limit)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	}
+	result, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM audit_governance_outbox
+WHERE id IN (
+ SELECT id FROM audit_governance_outbox
+ WHERE failed_at_ns>0 AND failed_at_ns <= $1
+ ORDER BY failed_at_ns,id LIMIT $2)`),
+		before.UTC().UnixNano(), limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}

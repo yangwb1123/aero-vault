@@ -20,7 +20,13 @@ func (c *Client) cmdSearch(args []string) int {
 	for i := 1; i < len(args)-1; i++ {
 		switch args[i] {
 		case "-k":
-			fmt.Sscanf(args[i+1], "%d", &k)
+			v, err := requireNonNegInt("k", args[i+1])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				fmt.Fprintln(os.Stderr, "usage: search <query> [-k N]")
+				return 2
+			}
+			k = v
 		case "--mode":
 			mode = args[i+1]
 		}

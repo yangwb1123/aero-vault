@@ -133,6 +133,7 @@ commands:
   admin jobs list [--status s] [--type t] [--limit N]
   admin jobs retry <id>
   admin audit list [--limit N]
+  admin files delete <tenant> <key> [--hard]
 
 env: AERO_ENDPOINT, AERO_API_KEY, AERO_TENANT`)
 }

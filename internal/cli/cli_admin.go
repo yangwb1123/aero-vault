@@ -27,11 +27,14 @@ resources:
   jobs list [--status s] [--type t] [--limit N]
   jobs retry <id>
   audit list [--limit N]
+  files delete <tenant> <key> [--hard]
   buckets lifecycle <bucket> <days> [--action soft_delete|hard_delete]
   buckets encryption <bucket> <algorithm> [--kms-key-id <id>]
   buckets website <bucket> --index <suffix> [--error <key>]
   buckets quota <bucket> <max_bytes> <max_objects>
-  buckets delete <bucket>`)
+  buckets delete <bucket>
+
+note: buckets lifecycle|encryption|website|delete are tenant-scoped writes (X-Aero-Tenant caller), not admin-gated; only buckets quota is admin-gated.`)
 }
 
 func (c *Client) cmdAdmin(args []string) int {
@@ -50,6 +53,8 @@ func (c *Client) cmdAdmin(args []string) int {
 		return c.cmdAdminJobs(action, rest)
 	case "audit":
 		return c.cmdAdminAudit(action, rest)
+	case "files":
+		return c.cmdAdminFiles(action, rest)
 	case "buckets":
 		return c.cmdAdminBuckets(action, rest)
 	default:
@@ -277,9 +282,18 @@ func (c *Client) adminTenantQuota(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: admin tenants quota <id> <max_bytes> <max_objects>")
 		return 2
 	}
-	var maxBytes, maxObjects int64
-	fmt.Sscanf(args[1], "%d", &maxBytes)
-	fmt.Sscanf(args[2], "%d", &maxObjects)
+	maxBytes, err := requireNonNegInt64("max_bytes", args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "usage: admin tenants quota <id> <max_bytes> <max_objects>")
+		return 2
+	}
+	maxObjects, err := requireNonNegInt64("max_objects", args[2])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "usage: admin tenants quota <id> <max_bytes> <max_objects>")
+		return 2
+	}
 	body := map[string]any{"max_bytes": maxBytes, "max_objects": maxObjects}
 	b, _ := json.Marshal(body)
 	resp, err := c.do(http.MethodPut, "/v1/admin/tenants/"+url.PathEscape(args[0])+"/quota", bytes.NewReader(b), map[string]string{"Content-Type": "application/json"})
@@ -301,8 +315,12 @@ func (c *Client) adminTenantBudget(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: admin tenants budget <id> <daily_budget_usd>")
 		return 2
 	}
-	var budget float64
-	fmt.Sscanf(args[1], "%f", &budget)
+	budget, err := requireNonNegFloat("daily_budget_usd", args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "usage: admin tenants budget <id> <daily_budget_usd>")
+		return 2
+	}
 	body := map[string]any{"daily_budget_usd": budget}
 	b, _ := json.Marshal(body)
 	resp, err := c.do(http.MethodPut, "/v1/admin/tenants/"+url.PathEscape(args[0])+"/budget", bytes.NewReader(b), map[string]string{"Content-Type": "application/json"})
@@ -352,11 +370,11 @@ func (c *Client) adminJobsList(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr, "HTTP %d: %s\n", resp.StatusCode, string(respBody))
+		fmt.Fprintln(os.Stderr, renderError(resp))
 		return 1
 	}
+	respBody, _ := io.ReadAll(resp.Body)
 	fmt.Println(string(respBody))
 	return 0
 }
@@ -372,11 +390,11 @@ func (c *Client) adminJobsRetry(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr, "HTTP %d: %s\n", resp.StatusCode, string(respBody))
+		fmt.Fprintln(os.Stderr, renderError(resp))
 		return 1
 	}
+	respBody, _ := io.ReadAll(resp.Body)
 	fmt.Println(string(respBody))
 	return 0
 }
@@ -397,11 +415,11 @@ func (c *Client) cmdAdminAudit(action string, args []string) int {
 			return 1
 		}
 		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 300 {
-			fmt.Fprintf(os.Stderr, "HTTP %d: %s\n", resp.StatusCode, string(respBody))
+			fmt.Fprintln(os.Stderr, renderError(resp))
 			return 1
 		}
+		respBody, _ := io.ReadAll(resp.Body)
 		fmt.Println(string(respBody))
 		return 0
 
@@ -425,11 +443,11 @@ func (c *Client) cmdListBuckets(args []string) int {
 		return 1
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr, "HTTP %d: %s\n", resp.StatusCode, string(body))
+		fmt.Fprintln(os.Stderr, renderError(resp))
 		return 1
 	}
+	body, _ := io.ReadAll(resp.Body)
 	fmt.Println(string(body))
 	return 0
 }
@@ -446,8 +464,7 @@ func (c *Client) cmdDeleteBucket(args []string) int {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "HTTP %d: %s\n", resp.StatusCode, string(body))
+		fmt.Fprintln(os.Stderr, renderError(resp))
 		return 1
 	}
 	fmt.Println("bucket deleted")

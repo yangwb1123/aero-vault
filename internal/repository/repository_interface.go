@@ -30,6 +30,7 @@ type Repository interface {
 	SoftDeleteObject(ctx context.Context, tenant, bucket, key string) error
 	SoftDeleteObjectByID(ctx context.Context, id int64) error
 	SoftDeleteObjectWithEvent(ctx context.Context, tenant, bucket, key string, entry AuditEntry, facts []OutboxFact) error
+	SoftDeleteObjectByIDWithEvent(ctx context.Context, id int64, entry AuditEntry, facts []OutboxFact) error
 	HardDeleteObject(ctx context.Context, tenant, bucket, key string) error
 	HardDeleteObjectWithEvent(ctx context.Context, tenant, bucket, key string, entry AuditEntry, facts []OutboxFact) error
 	HardDeleteObjectByID(ctx context.Context, id int64) error
@@ -107,6 +108,7 @@ type Repository interface {
 	RetryEventOutbox(ctx context.Context, id int64, owner, token, lastErr string, next time.Time, maxAttempts int) error
 	PruneEventOutbox(ctx context.Context, deliveredBefore, failedBefore time.Time) (int64, error)
 	HasEventOutboxFact(ctx context.Context, originID int64, eventType OutboxEventType) (bool, error)
+	CountEventOutbox(ctx context.Context) (int64, error)
 
 	// ── AI Chunks ──
 	DeleteChunksForObject(ctx context.Context, objectID int64) error

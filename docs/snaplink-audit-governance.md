@@ -134,10 +134,16 @@ already delivered origin or silently omit a never-delivered origin. Tombstones
 are part of the metadata backup contract.
 
 `/healthz` remains pure liveness. `/readyz` fails only when the database/storage
-checks fail, Billing has no usable projection, or the oldest undelivered audit
-fact for a currently bound tenant exceeds `AUDIT_GOVERNANCE_MAX_LAG_SECONDS`,
-or a `draining` tenant still has pending facts. Unbound local history does not
-pollute readiness. A short Governance outage does not evict replicas. Shutdown
+checks fail, Billing has no usable projection, or a `draining` tenant still has
+pending facts. Unbound local history does not pollute readiness. Backlog lag is
+not a failure: when the oldest undelivered audit fact for a currently bound
+tenant exceeds `AUDIT_GOVERNANCE_MAX_LAG_SECONDS` (or the relay store probe
+times out), `/readyz` still answers `200` with
+`{"ok":true,"degraded":true,"backlog_age_seconds":N}` and the
+`AuditGovernanceBacklogDegraded` alert fires — at the early-warning threshold
+of half `AUDIT_GOVERNANCE_MAX_LAG_SECONDS` (450s at the 900s default), or
+immediately once the degraded flag flips. A short Governance outage does not
+evict replicas. Shutdown
 stops new claims, lets the current bounded batch finish, and then closes idle
 connections. Production supervisors allow 95 seconds, covering the configured
 60-second maximum claim lease and 29-second maximum HTTP timeout.
@@ -158,12 +164,31 @@ only keyed opaque references. Use this sequence for one tenant:
 4. Remove the binding, increment the revision again, and roll replicas.
 
 To disable the integration entirely, drain every tenant, apply and roll one
-enabled manifest with an empty `bindings` array and a higher revision, and only
-then set `AUDIT_GOVERNANCE_ENABLED=false`. Startup refuses the disabled state
-while persisted bindings or undelivered rows remain. To restore a removed
-tenant, provision fresh source/client credentials and add an `active` binding
-at a higher revision; reconcile then captures local history produced while it
-was draining or absent, without rebuilding tombstoned delivered origins.
+enabled manifest with an empty `bindings` array and a higher revision **with
+`AUDIT_GOVERNANCE_DRAIN=true`** (the fail-closed activation gate refuses an
+empty manifest without the flag), and only then set
+`AUDIT_GOVERNANCE_ENABLED=false`. The drained boot logs a distinct WARN
+naming `AUDIT_GOVERNANCE_DRAIN`, the applied revision, and a digest
+fingerprint; the `audit_governance_draining`/`audit_governance_bound_tenants`
+gauges show `1`/`0` while the `AuditGovernanceEnabledUnbound` alert fires
+until the feature is disabled. After disabling, **clear `AUDIT_GOVERNANCE_DRAIN`
+and remove/rename the empty bindings manifest** — leaving them in place makes
+any future `AUDIT_GOVERNANCE_ENABLED=true` boot a silent same-revision replay
+or higher-revision re-drain (the flag with a non-empty manifest fails
+startup, so a legitimate re-enable is impossible until it is cleared).
+Startup refuses the disabled state while persisted bindings or undelivered
+rows remain. To restore a removed tenant, provision fresh source/client
+credentials and add an `active` binding at a higher revision; reconcile then
+captures local history produced while it was draining or absent, without
+rebuilding tombstoned delivered origins.
+
+Both boolean flags are parsed strictly: a set, non-canonical value such as
+`AUDIT_GOVERNANCE_ENABLED=yes` or `AUDIT_GOVERNANCE_DRAIN=yes` fails startup
+with an explicit error instead of silently parsing to `false` — which would
+either leave capture silently off (fail-open for the audit trail) or leave a
+requested drain silently unapplied. Only `strconv.ParseBool` spellings
+(`true`/`false`/`1`/`0` and case variants) are accepted; unset or empty
+values keep their defaults.
 
 Back up the outbox with the metadata database. After restore, workers reconcile
 and replay undelivered facts; Audit Governance idempotency prevents duplicates.

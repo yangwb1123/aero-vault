@@ -118,10 +118,9 @@ func (p *PgVectorIndex) Close() error {
 // SearchVectors runs a pgvector cosine-distance ANN query for the given tenant
 // (and optional bucket) and returns the top-`limit` chunks as repository
 // SearchHits, ordered by descending similarity. Score is 1 - cosine_distance.
+// Limit is clamped like QdrantIndex (<=0 -> default 10; >100 -> capped at 100).
 func (p *PgVectorIndex) SearchVectors(ctx context.Context, tenant, bucket string, query []float32, limit int) ([]repository.SearchHit, error) {
-	if limit <= 0 || limit > 100 {
-		limit = 10
-	}
+	limit = clampSearchLimit(limit)
 
 	// Table/column come from operator config, not user input; inject via
 	// Sprintf. All runtime values are bound with distinct $N placeholders

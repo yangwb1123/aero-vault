@@ -56,7 +56,7 @@ Errors use a consistent envelope:
 | HTTP | `code` | Cause |
 |------|--------|-------|
 | 400 | `InvalidArgument` | Bad request / malformed body. |
-| 403 | `AccessDenied` / `Forbidden` | Missing scope, tenant mismatch, ACL denial. |
+| 403 | `AccessDenied` / `Forbidden` | Missing scope, tenant mismatch, ACL denial. Authorization denials carry the raw denial reason in `message` (e.g. `forbidden: default_deny`). |
 | 404 | `NotFound` / `NoSuchUpload` | Object or multipart upload not found. |
 | 409 / 423 | object-lock codes | Object under retention lock. |
 | 412 | `PreconditionFailed` | `If-Match` / `If-None-Match` failed. |
@@ -452,6 +452,14 @@ curl -s "$BASE/v1/lineage/objects/42?limit=20"
 
 ### MCP over HTTP (JSON-RPC 2.0)
 
+> **Scope gate (breaking with auth enabled):** the HTTP `/mcp` mount requires
+> the authenticated principal to hold **`write` AND `audit:event:write`, or
+> `admin`** — all tools, read tools included (denial is transport-level, HTTP
+> 403 `missing scope: audit:event:write`, before any JSON-RPC dispatch).
+> Unauthenticated requests get HTTP 401. `AUTH_KEYS` / SigV4 / Snaplink keys
+> cannot express the audit scope (`knownScope`); provision MCP principals via
+> JWT claims or `/v1/admin/keys`, or use stdio (`aero-vault mcp`, ungated).
+
 The MCP server exposes tools `list_files`, `read_file`, and `search` (the last
 only when an embedder is configured) plus object resources.
 
@@ -471,6 +479,8 @@ curl -s -X POST "$BASE/mcp" -H 'Content-Type: application/json' \
 ```
 
 MCP is also available over stdio for local agent integrations: `aero-vault mcp`.
+The stdio transport has no HTTP principal and is **not** covered by the scope
+gate above.
 
 ---
 

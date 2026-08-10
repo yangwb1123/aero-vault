@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -18,6 +19,7 @@ const (
 
 type AuditGovernanceConfig struct {
 	Enabled                   bool
+	Drain                     bool
 	BaseURL                   string
 	TokenURL                  string
 	BindingsFile              string
@@ -37,6 +39,17 @@ type AuditGovernanceConfig struct {
 	Bindings                  []AuditGovernanceBinding
 }
 
+// BacklogAlertThresholdSeconds returns the age-arm threshold of the
+// AuditGovernanceBacklogDegraded alert: maxLag×0.5, floored — the shipped
+// default 900s → 450s (deploy/prometheus/alerts.yml expr). The alert's
+// degraded==1 arm remains the config-true signal for any non-default
+// maxLag; this accessor is what the alerts.yml parity pin derives from,
+// so an operator override of AUDIT_GOVERNANCE_MAX_LAG_SECONDS stays
+// coupled to the alert threshold. Value receiver; zero I/O.
+func (c AuditGovernanceConfig) BacklogAlertThresholdSeconds() int {
+	return c.MaxLagSeconds / 2
+}
+
 type AuditGovernanceBinding struct {
 	TenantID        string `json:"tenant_id"`
 	ClientID        string `json:"client_id"`
@@ -50,9 +63,44 @@ type auditGovernanceBindingsFile struct {
 	Bindings []AuditGovernanceBinding `json:"bindings"`
 }
 
+// auditGovernanceBoolForms lists every spelling strconv.ParseBool accepts —
+// the only set, non-empty values AUDIT_GOVERNANCE_ENABLED and
+// AUDIT_GOVERNANCE_DRAIN may carry. Anything else is a boot error.
+const auditGovernanceBoolForms = "1, t, T, TRUE, true, True, 0, f, F, FALSE, false, False"
+
+// getAuditGovernanceEnvBool is the strict boolean parse used by the audit
+// governance loader. The generic getEnvBool helper silently falls back to
+// the default on parse failure, which is a fail-open-for-capture footgun on
+// the enable flag (AUDIT_GOVERNANCE_ENABLED=yes would boot with the relay
+// silently off) and a silent no-op on the drain flag (the operator believes
+// draining while the relay keeps running). Unset and empty values are
+// neutralized to the default exactly like getEnvBool — the strictness adds
+// an explicit error, it does not narrow the accepted set — so every
+// previously legal configuration loads identically.
+func getAuditGovernanceEnvBool(key string, def bool) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return def, fmt.Errorf("%s: invalid boolean value %q (accepted: %s)", key, v, auditGovernanceBoolForms)
+	}
+	return parsed, nil
+}
+
 func loadAuditGovernanceConfig() (AuditGovernanceConfig, error) {
+	enabled, err := getAuditGovernanceEnvBool("AUDIT_GOVERNANCE_ENABLED", false)
+	if err != nil {
+		return AuditGovernanceConfig{}, err
+	}
+	drain, err := getAuditGovernanceEnvBool("AUDIT_GOVERNANCE_DRAIN", false)
+	if err != nil {
+		return AuditGovernanceConfig{}, err
+	}
 	cfg := AuditGovernanceConfig{
-		Enabled:                   getEnvBool("AUDIT_GOVERNANCE_ENABLED", false),
+		Enabled:                   enabled,
+		Drain:                     drain,
 		BaseURL:                   strings.TrimRight(getEnv("AUDIT_GOVERNANCE_BASE_URL", ""), "/"),
 		TokenURL:                  getEnv("AUDIT_GOVERNANCE_TOKEN_URL", ""),
 		BindingsFile:              getEnv("AUDIT_GOVERNANCE_BINDINGS_FILE", ""),
@@ -166,6 +214,20 @@ func (c AuditGovernanceConfig) Validate() error {
 	if !c.Enabled {
 		return nil
 	}
+	// Fail-closed activation gate: an enabled relay with zero bound tenants
+	// silently stops capturing audit facts, so the empty-manifest boot is
+	// refused here — first placement (before URL/HMAC/revision checks) makes
+	// the error deterministic regardless of other env. The drain flag is the
+	// only escape: it permits an empty manifest to apply the documented
+	// disable-flow drain, and errors if it finds a non-empty one (it must not
+	// survive as a silent sticky no-op into a re-enable). Both guards mirror
+	// the BillingConfig.Validate binding guard (config_billing.go).
+	if c.Drain && len(c.Bindings) > 0 {
+		return errors.New("AUDIT_GOVERNANCE_DRAIN requires an empty bindings manifest")
+	}
+	if !c.Drain && len(c.Bindings) == 0 {
+		return errors.New("audit governance bindings must not be empty")
+	}
 	if err := validateAuditGovernanceURL(c.BaseURL); err != nil {
 		return fmt.Errorf("AUDIT_GOVERNANCE_BASE_URL: %w", err)
 	}
@@ -236,8 +298,16 @@ func validAuditGovernanceWorker(c AuditGovernanceConfig) bool {
 		c.CleanupBatchSize > 0 && c.CleanupBatchSize <= 500
 }
 
+// validAuditGovernanceRetry validates the retry timing envelope. The
+// cumulative transient-retry window IS MaxBackoffSeconds (D3 — a single
+// "cap" covers both the per-attempt delay and the total retry span), so the
+// window gets its own floor: 2s..86400s (the harness/CI minimum and the
+// bounded-timing cap). Below 2s the window is unrepresentable at CI speed
+// (the webdav harness shrinks exactly to 2s) and the clock-skew safe
+// direction (negative/zero elapsed never terminal) loses its margin.
 func validAuditGovernanceRetry(c AuditGovernanceConfig) bool {
-	return c.InitialBackoffSeconds > 0 && c.MaxBackoffSeconds >= c.InitialBackoffSeconds &&
+	return c.InitialBackoffSeconds > 0 && c.MaxBackoffSeconds >= 2 &&
+		c.MaxBackoffSeconds >= c.InitialBackoffSeconds &&
 		c.MaxLagSeconds > c.ClaimTTLSeconds
 }
 

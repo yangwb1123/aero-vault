@@ -113,6 +113,10 @@ func (g *Group) Go(name string, fn func(ctx context.Context)) {
 
 // GoStarted is like Go but expects fn to signal readiness on ready chan.
 // This ensures the goroutine has started before Shutdown can be called.
+// GoStarted returns when any of the following happens:
+//   - fn signals readiness on ready;
+//   - fn exits (panics or returns) without signalling readiness;
+//   - the group's root context is cancelled.
 func (g *Group) GoStarted(name string, fn func(ctx context.Context, ready chan<- struct{})) {
 	g.mu.Lock()
 	g.names = append(g.names, name)
@@ -122,9 +126,23 @@ func (g *Group) GoStarted(name string, fn func(ctx context.Context, ready chan<-
 	go func() {
 		defer g.wg.Done()
 		defer g.recoverPanic(name)
+		// Exactly-once readiness signal on ANY exit (panic or plain return).
+		// The non-blocking receive is the closedness check: fn is the only
+		// other closer and its close happens-before this defer (same
+		// goroutine). fn must not hand ready to another goroutine to close.
+		defer func() {
+			select {
+			case <-ready:
+			default:
+				close(ready)
+			}
+		}()
 		fn(g.root, ready)
 	}()
-	<-ready
+	select {
+	case <-ready:
+	case <-g.root.Done():
+	}
 }
 
 func (g *Group) recoverPanic(name string) {

@@ -1,7 +1,10 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -10,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
@@ -566,5 +570,95 @@ func TestJobSweep_OrphanBlob_Idempotent(t *testing.T) {
 
 	if _, err := store.Stat(ctx, orphanBlobKey); err == nil {
 		t.Fatal("orphan blob should remain deleted after idempotent re-run")
+	}
+}
+
+// TestJobSweep_ReportsScrubCorruptCount verifies that the sweep summary log
+// carries the scrub_corrupt field (previously the corrupt count was dropped).
+// Sub-scenarios: A = one corrupt object → scrub_corrupt=1; B = healthy control
+// → scrub_corrupt=0 (field always present); C = two tenants with one corrupt
+// object each → cumulative scrub_corrupt=2 (regression guard against a loop-
+// scoped `:=` shadowing the accumulator and reporting only the last tenant).
+func TestJobSweep_ReportsScrubCorruptCount(t *testing.T) {
+	ctx := context.Background()
+
+	// 子场景 A：1 个损坏对象 → scrub_corrupt=1
+	repo := openTestRepo(t)
+	store := openTestStore(t)
+	if err := repo.CreateBucket(ctx, "default", "default"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	fileService := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllAuthz{})
+	body := "trusted content"
+	tampered := "altered content"
+	digest := md5.Sum([]byte(body))
+	object, err := fileService.Put(ctx, "default", "default", "corrupt.txt",
+		strings.NewReader(body), int64(len(body)),
+		service.PutOptions{ContentMD5: base64.StdEncoding.EncodeToString(digest[:])})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := store.Put(ctx, object.StorageKey, strings.NewReader(tampered), int64(len(tampered)), storage.PutOptions{}); err != nil {
+		t.Fatalf("tamper storage: %v", err)
+	}
+	var bufA bytes.Buffer
+	jobA := New(repo, store, time.Minute, false, time.Minute, []string{"default"},
+		slog.New(slog.NewTextHandler(&bufA, nil))).WithScrub(true, 100).
+		WithChunkCleaner(repositoryChunkCleaner{repo: repo})
+	jobA.sweep(ctx)
+	logA := bufA.String()
+	if !strings.Contains(logA, "reconcile sweep done") || !strings.Contains(logA, "scrub_corrupt=1") {
+		t.Fatalf("sweep log missing scrub_corrupt=1: %s", logA)
+	}
+
+	// 子场景 B：健康对象对照 → scrub_corrupt=0（字段恒携带）
+	repo2 := openTestRepo(t)
+	store2 := openTestStore(t)
+	if err := repo2.CreateBucket(ctx, "default", "default"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	fileService2 := service.NewFileService(store2, repo2, nil).WithAuthorizer(allowAllAuthz{})
+	digest2 := md5.Sum([]byte(body))
+	if _, err := fileService2.Put(ctx, "default", "default", "healthy.txt",
+		strings.NewReader(body), int64(len(body)),
+		service.PutOptions{ContentMD5: base64.StdEncoding.EncodeToString(digest2[:])}); err != nil {
+		t.Fatalf("put healthy: %v", err)
+	}
+	var bufB bytes.Buffer
+	jobB := New(repo2, store2, time.Minute, false, time.Minute, []string{"default"},
+		slog.New(slog.NewTextHandler(&bufB, nil))).WithScrub(true, 100)
+	jobB.sweep(ctx)
+	logB := bufB.String()
+	if !strings.Contains(logB, "reconcile sweep done") || !strings.Contains(logB, "scrub_corrupt=0") {
+		t.Fatalf("sweep log missing scrub_corrupt=0: %s", logB)
+	}
+
+	// 子场景 C（D3 回归护栏）：双租户各 1 损坏对象 → 累计 scrub_corrupt=2
+	repo3 := openTestRepo(t)
+	store3 := openTestStore(t)
+	tenants := []string{"tenantA", "tenantB"}
+	for _, t2 := range tenants {
+		if err := repo3.CreateBucket(ctx, t2, "default"); err != nil {
+			t.Fatalf("create bucket %s: %v", t2, err)
+		}
+		fs := service.NewFileService(store3, repo3, nil).WithAuthorizer(allowAllAuthz{})
+		d := md5.Sum([]byte(body))
+		obj, err := fs.Put(ctx, t2, "default", "corrupt.txt",
+			strings.NewReader(body), int64(len(body)),
+			service.PutOptions{ContentMD5: base64.StdEncoding.EncodeToString(d[:])})
+		if err != nil {
+			t.Fatalf("put %s: %v", t2, err)
+		}
+		if _, err := store3.Put(ctx, obj.StorageKey, strings.NewReader(tampered), int64(len(tampered)), storage.PutOptions{}); err != nil {
+			t.Fatalf("tamper %s: %v", t2, err)
+		}
+	}
+	var bufC bytes.Buffer
+	jobC := New(repo3, store3, time.Minute, false, time.Minute, tenants,
+		slog.New(slog.NewTextHandler(&bufC, nil))).WithScrub(true, 100)
+	jobC.sweep(ctx)
+	logC := bufC.String()
+	if !strings.Contains(logC, "scrub_corrupt=2") {
+		t.Fatalf("sweep log missing cumulative scrub_corrupt=2: %s", logC)
 	}
 }

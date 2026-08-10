@@ -106,8 +106,16 @@ func (l *LifecycleJob) handleExpiredObject(ctx context.Context, obj repository.O
 		if protected {
 			return false
 		}
-		if err := hardDeleteKey(ctx, l.repo, l.store, l.cleaner, obj, l.logger); err != nil {
-			l.logger.Warn("lifecycle hard delete", "key", obj.Key, "err", err)
+		// FR-3: ListExpired returns only the current version (deleted_at IS
+		// NULL). Purge that version alone; on versioned buckets the tombstone
+		// rows and their blobs stay under the noncurrent_days window and are
+		// only removed by sweepNonCurrentVersions.
+		if err := hardDeleteVersion(ctx, l.repo, l.store, l.cleaner, obj, l.logger); err != nil {
+			if errors.Is(err, errKeyProtected) {
+				l.logger.Warn("lifecycle hard delete skipped: protected", "key", obj.Key)
+			} else {
+				l.logger.Warn("lifecycle hard delete", "key", obj.Key, "err", err)
+			}
 			return false
 		}
 		return true
@@ -141,6 +149,8 @@ func (l *LifecycleJob) sweepNonCurrentVersions(ctx context.Context) int {
 		if err := hardDeleteVersion(ctx, l.repo, l.store, l.cleaner, v, l.logger); err != nil {
 			if errors.Is(err, repository.ErrLegalHoldActive) {
 				l.logger.Warn("lifecycle non-current version skipped: legal hold", "key", v.Key, "version", v.VersionID)
+			} else if errors.Is(err, errKeyProtected) {
+				l.logger.Warn("lifecycle non-current version skipped: protected", "key", v.Key, "version", v.VersionID)
 			} else {
 				l.logger.Warn("lifecycle non-current version hard delete", "key", v.Key, "version", v.VersionID, "err", err)
 			}
