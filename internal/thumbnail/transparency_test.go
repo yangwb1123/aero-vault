@@ -13,6 +13,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"runtime"
 	"strconv"
 	"testing"
 )
@@ -27,6 +28,12 @@ func uniformPNG(t *testing.T, w, h int, c color.Color) []byte {
 			img.Set(x, y, c)
 		}
 	}
+	return pngEncodeBytes(t, img)
+}
+
+// pngEncodeBytes PNG-encodes img and returns the bytes.
+func pngEncodeBytes(t *testing.T, img image.Image) []byte {
+	t.Helper()
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		t.Fatalf("encode png: %v", err)
@@ -204,4 +211,98 @@ func TestGenerateCompositesTransparentNRGBA64(t *testing.T) {
 		t.Fatalf("decode thumbnail: %v", err)
 	}
 	assertWhite(t, "nrgba64", got)
+}
+
+func TestGenerateCompositesHalfTransparentNoDownscale(t *testing.T) {
+	// C3 pin: the ratio≥1 fractional-alpha path (small-logo shape). The
+	// source is already within the output bounds, so scale returns it
+	// unchanged and compositeOnWhite runs on the undownscaled NRGBA.
+	// Half-transparent red over white composites to pink (255,127,127).
+	fixture := uniformPNG(t, 64, 64, color.NRGBA{255, 0, 0, 128})
+	out, err := Generate(bytes.NewReader(fixture), 64, 64)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	img, format, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode thumbnail: %v", err)
+	}
+	if format != "jpeg" {
+		t.Fatalf("expected jpeg, got %s", format)
+	}
+	b := img.Bounds()
+	if b.Dx() != 64 || b.Dy() != 64 {
+		t.Fatalf("expected 64x64, got %dx%d", b.Dx(), b.Dy())
+	}
+	r, g, bl, _ := img.At(b.Min.X+b.Dx()/2, b.Min.Y+b.Dy()/2).RGBA()
+	if r>>8 <= 200 {
+		t.Fatalf("center red = %d, want > 200 (buggy baseline: 127)", r>>8)
+	}
+	if g>>8 >= 200 || bl>>8 >= 200 {
+		t.Fatalf("center green/blue = %d/%d, want < 200 (white-fill bug: 255)", g>>8, bl>>8)
+	}
+}
+
+func TestCompositeOnWhiteNonZeroOrigin(t *testing.T) {
+	// C5 pin: compositeOnWhite must respect a non-zero Min origin — both the
+	// uniform fill and the source draw are anchored at the source bounds.
+	src := image.NewNRGBA(image.Rect(10, 20, 74, 84)) // 64×64 at origin (10,20)
+	for y := 20; y < 84; y++ {
+		for x := 10; x < 74; x++ {
+			src.Set(x, y, color.NRGBA{255, 0, 0, 128})
+		}
+	}
+	out := compositeOnWhite(src)
+	b := out.Bounds()
+	if b.Min.X != 10 || b.Min.Y != 20 || b.Dx() != 64 || b.Dy() != 64 {
+		t.Fatalf("bounds = %v, want origin (10,20) 64x64", b)
+	}
+	// A freshly filled RGBA is zero-initialized (black, alpha 0); the white
+	// fill must cover the full source rect, and the composite must leave the
+	// white underneath the half-transparent red.
+	for _, p := range []image.Point{{37, 52}, {10, 20}, {73, 83}} {
+		r, g, bl, a := out.At(p.X, p.Y).RGBA()
+		if a>>8 != 255 {
+			t.Fatalf("point %v alpha = %d, want 255 (opaque output)", p, a>>8)
+		}
+		if r>>8 <= 200 || g>>8 >= 200 || bl>>8 >= 200 {
+			t.Fatalf("point %v = (%d,%d,%d), want pink ~(255,127,127)", p, r>>8, g>>8, bl>>8)
+		}
+	}
+	// SubImage with non-zero offset must survive the composite unchanged in
+	// bounds and pixels.
+	sub := src.SubImage(image.Rect(20, 30, 60, 70))
+	out2 := compositeOnWhite(sub)
+	b2 := out2.Bounds()
+	if b2.Min.X != 20 || b2.Min.Y != 30 || b2.Dx() != 40 || b2.Dy() != 40 {
+		t.Fatalf("subimage bounds = %v, want origin (20,30) 40x40", b2)
+	}
+}
+
+func TestGenerateCompositeAllocationBounded(t *testing.T) {
+	// C4 pin: the composite path must not buffer or copy the payload — total
+	// allocation for a small transparent source stays O(w×h) (decode buffer
+	// + one composite output RGBA + jpeg encoder), far below a 1 MiB ceiling.
+	// Red on a path that buffers the payload or allocates per-channel copies.
+	// (A large source is deliberately avoided: decoding a 512² PNG legitimately
+	// allocates its pixel buffer, which would dominate the measurement.)
+	payload := uniformPNG(t, 64, 64, color.NRGBA{255, 0, 0, 128})
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	out, err := Generate(bytes.NewReader(payload), 64, 64)
+	runtime.ReadMemStats(&m1)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if d := m1.TotalAlloc - m0.TotalAlloc; d > 1<<20 {
+		t.Fatalf("allocated %d bytes, want ≤ 1 MiB (payload buffered?)", d)
+	}
+	img, _, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode thumbnail: %v", err)
+	}
+	r, g, bl, _ := img.At(32, 32).RGBA()
+	if r>>8 <= 200 || g>>8 >= 200 || bl>>8 >= 200 {
+		t.Fatalf("center = (%d,%d,%d), want pink ~(255,127,127)", r>>8, g>>8, bl>>8)
+	}
 }

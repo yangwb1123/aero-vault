@@ -165,3 +165,45 @@ func TestThumbnailOversizedMetadata(t *testing.T) {
 		t.Fatalf("expected code InvalidArgument, body: %s", body)
 	}
 }
+
+// transparentPNGBytes builds a w×h PNG whose every pixel is half-transparent
+// red (255,0,0,128) — the alpha-bearing fixture the opaque pngBytes omits.
+func transparentPNGBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.NRGBA{255, 0, 0, 128})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestThumbnailCompositesTransparencyHTTP(t *testing.T) {
+	// C6 pin: the HTTP-level read path must return a white-composited (pink)
+	// thumbnail for an alpha-bearing PNG — the opaque-only fixtures in the
+	// other REST tests would not catch the darkened-output regression.
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/alpha.png"
+	req(t, "PUT", u, transparentPNGBytes(t, 128, 128), map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", u+"/thumbnail?w=64&h=64", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("thumbnail status=%d", resp.StatusCode)
+	}
+	img, format, err := image.Decode(bytes.NewReader(body))
+	if err != nil || format != "jpeg" {
+		t.Fatalf("decode thumb: %v fmt=%s", err, format)
+	}
+	b := img.Bounds()
+	r, g, bl, _ := img.At(b.Min.X+b.Dx()/2, b.Min.Y+b.Dy()/2).RGBA()
+	if r>>8 <= 200 {
+		t.Fatalf("center red = %d, want > 200 (buggy baseline: 127)", r>>8)
+	}
+	if g>>8 >= 200 || bl>>8 >= 200 {
+		t.Fatalf("center green/blue = %d/%d, want < 200 (white-fill bug: 255)", g>>8, bl>>8)
+	}
+}
