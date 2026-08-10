@@ -38,9 +38,13 @@ var (
 	ErrBadDigest              = errors.New("content-md5 mismatch")
 	ErrSizeMismatch           = errors.New("size mismatch: actual bytes differ from Content-Length")
 	ErrObjectCorrupt          = errors.New("object is marked as corrupt")
-	ErrMetadataTooLarge       = errors.New("metadata too large: total exceeds 64 KiB")
-	ErrMetadataKeyTooLong     = errors.New("metadata key too long: max 256 bytes")
-	ErrMetadataValueTooLong   = errors.New("metadata value too long: max 64 KiB")
+	// ErrMetadataTooLarge is the object-metadata size limit (total bytes
+	// across all user metadata k/v). Do not confuse it with
+	// thumbnail.ErrMetadataTooLarge, the unrelated image-metadata budget for
+	// thumbnail decoding (internal/thumbnail/thumbnail.go).
+	ErrMetadataTooLarge     = errors.New("metadata too large: total exceeds 64 KiB")
+	ErrMetadataKeyTooLong   = errors.New("metadata key too long: max 256 bytes")
+	ErrMetadataValueTooLong = errors.New("metadata value too long: max 64 KiB")
 
 	// MaxMetadataSize is the maximum total bytes across all user metadata k/v.
 	MaxMetadataSize = 64 * 1024 // 64 KiB

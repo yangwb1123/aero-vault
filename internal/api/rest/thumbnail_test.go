@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
 	"net/http"
 	"testing"
@@ -47,6 +48,49 @@ func bombPNG(t *testing.T, w, h int) []byte {
 	binary.BigEndian.PutUint32(l[:], crc.Sum32())
 	buf.Write(l[:])
 	return buf.Bytes()
+}
+
+// appnPaddedJPEG builds an 8×8 baseline JPEG whose pre-SOF region carries
+// totalMetaBytes of APP1 segment payload (marker 0xE1). The 16-bit length
+// field caps a single APP1 at 65533 bytes, so many segments are emitted — the
+// verified metadata-flood shape for the thumbnail read path. Duplicated from
+// internal/thumbnail/thumbnail_test.go per this package's fixture pattern
+// (an exported test-fixture API would break the module's self-containment).
+func appnPaddedJPEG(t *testing.T, totalMetaBytes int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			img.Set(x, y, color.RGBA{uint8(x * 32), uint8(y * 32), 128, 255})
+		}
+	}
+	var base bytes.Buffer
+	if err := jpeg.Encode(&base, img, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatalf("encode base jpeg: %v", err)
+	}
+	b := base.Bytes()
+	if len(b) < 2 || b[0] != 0xFF || b[1] != 0xD8 {
+		t.Fatalf("unexpected jpeg header: % x", b[:2])
+	}
+	var out bytes.Buffer
+	out.Write(b[:2])            // SOI; APP1 segments splice in before the rest of the image.
+	const maxSegPayload = 65533 // 0xFFFF minus the 2 length bytes
+	payload := bytes.Repeat([]byte{0x42}, maxSegPayload)
+	remaining := totalMetaBytes
+	for remaining > 0 {
+		n := remaining
+		if n > maxSegPayload {
+			n = maxSegPayload
+		}
+		var seg [4]byte
+		seg[0], seg[1] = 0xFF, 0xE1 // APP1
+		binary.BigEndian.PutUint16(seg[2:4], uint16(n+2))
+		out.Write(seg[:])
+		out.Write(payload[:n])
+		remaining -= n
+	}
+	out.Write(b[2:])
+	return out.Bytes()
 }
 
 func TestThumbnailOversizedImage(t *testing.T) {
@@ -102,5 +146,22 @@ func TestThumbnailNonImage(t *testing.T) {
 	resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("thumbnail of non-image: status=%d want 400", resp.StatusCode)
+	}
+}
+
+func TestThumbnailOversizedMetadata(t *testing.T) {
+	// A JPEG with more pre-SOF metadata than the module's budget must map to
+	// HTTP 400 InvalidArgument through the generic error path — never 413
+	// (that is the dimension class) and never 500 (the raw sentinel has no
+	// classify case; the handler's ErrInvalidArgs wrap is what pins this).
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/meta.jpg"
+	req(t, "PUT", u, appnPaddedJPEG(t, 9<<20), map[string]string{"Content-Type": "image/jpeg"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("thumbnail with oversized metadata: status=%d want 400", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("expected code InvalidArgument, body: %s", body)
 	}
 }

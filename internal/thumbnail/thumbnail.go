@@ -24,6 +24,20 @@ var ErrUnsupported = errors.New("thumbnail: unsupported or invalid image")
 // a dimension-capped rejection from a corrupt or non-image input.
 var ErrImageTooLarge = errors.New("thumbnail: image dimensions exceed MaxSourceDim")
 
+// ErrMetadataTooLarge is returned when the bytes consumed by image.DecodeConfig
+// exceed MaxMetadataBytes (e.g. a JPEG whose pre-SOF region is packed with
+// attacker-chosen APPn/COM segments). It is distinct from ErrUnsupported
+// (corrupt/non-image) and ErrImageTooLarge (declared dimensions) so callers can
+// tell a metadata-budget rejection from either. Do not confuse it with
+// service.ErrMetadataTooLarge, which is the unrelated object-metadata size
+// limit (internal/service/file.go).
+var ErrMetadataTooLarge = errors.New("thumbnail: image metadata exceeds MaxMetadataBytes")
+
+// errMetadataBudgetExceeded is the internal overflow cause written by
+// limitedBuffer. Generate maps it to ErrMetadataTooLarge; keeping the cause
+// unexported matches the package's sentinel pattern.
+var errMetadataBudgetExceeded = errors.New("thumbnail: metadata budget exceeded")
+
 // DefaultMax bounds thumbnail dimensions when the caller passes 0.
 const (
 	DefaultMax = 256
@@ -33,9 +47,11 @@ const (
 	// MaxSourceDim caps each declared source dimension (pixels). Sources with
 	// any side above this are rejected from the header before any pixel buffer
 	// is allocated, bounding worst-case decode allocation to MaxSourceDim²×4 B
-	// ≈ 268 MiB (PNG RGBA). Images larger than this can no longer be
-	// thumbnailed; they are exactly the inputs that make the endpoint a
-	// memory-DoS sink, and the output is capped at HardMax anyway.
+	// ≈ 268 MiB (PNG RGBA); a progressive JPEG at this size reaches ~1.1 GiB
+	// per request (full-image coefficient buffers plus the decoded frame).
+	// Images larger than this can no longer be thumbnailed; they are exactly
+	// the inputs that make the endpoint a memory-DoS sink, and the output is
+	// capped at HardMax anyway.
 	//
 	// Note: the 268 MiB worst case is per request, and MAX_INFLIGHT_REQUESTS /
 	// PER_TENANT_CONCURRENCY_MAX both default to 0 (unlimited concurrency) —
@@ -51,7 +67,45 @@ const (
 	// appears before the cap decodes successfully even if the underlying
 	// object is larger.
 	MaxSourceBytes = 128 << 20
+
+	// MaxMetadataBytes caps what image.DecodeConfig may consume into the tee
+	// buffer (head) before Generate aborts with ErrMetadataTooLarge. The
+	// bound is necessary because image/jpeg's config scan reads every pre-SOF
+	// segment (APPn/COM/DHT/DQT/DRI) in full and the segment count is
+	// attacker-controlled, so head is not "metadata-size" by construction —
+	// without the cap it is bounded only by MaxSourceBytes (128 MiB), and the
+	// replay doubles that in memory. GIF/PNG DecodeConfig consume only tens
+	// of bytes by design, but they pass through the same tee, so the cap
+	// bounds any codec. 8 MiB covers the largest legitimate pre-SOF classes
+	// (ICC profiles, XMP, EXIF) with >=2x margin; images with more pre-SOF
+	// metadata can no longer be thumbnailed.
+	MaxMetadataBytes = 8 << 20
 )
+
+// limitedBuffer is an io.Writer that accepts writes while the total bytes
+// accepted stay within max, then fails every further write with
+// errMetadataBudgetExceeded — writing nothing for the overflowing write.
+// Failure is sticky: the first overflow zeroes the remaining budget, so every
+// subsequent write returns the same error. Returning (0, err) rather than a
+// partial write is load-bearing: image/jpeg's decoder fill treats a read that
+// returns n > 0 together with an error as success, so a partial write would
+// swallow the abort and reads would continue past the budget. io.TeeReader
+// propagates the writer error as the Read error, so image.DecodeConfig aborts
+// on the first read that crosses the budget.
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	remaining int
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	if len(p) > l.remaining {
+		l.remaining = 0
+		return 0, errMetadataBudgetExceeded
+	}
+	_, _ = l.buf.Write(p)
+	l.remaining -= len(p)
+	return len(p), nil
+}
 
 // Generate decodes an image from r and returns a JPEG thumbnail no larger than
 // maxW×maxH (aspect ratio preserved; never upscaled). Zero bounds default to
@@ -80,22 +134,27 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 	// drains it — so sharing a single buffered reader between DecodeConfig and
 	// Decode would lose the header bytes for small inputs. Instead, tee what
 	// DecodeConfig consumes into head, replay that exact prefix for Decode,
-	// and continue from the raw stream r (not the tee): head captures exactly
-	// the config reads and never grows with the payload; replaying head then r
+	// and continue from the raw stream r (not the tee): replaying head then r
 	// is byte-exact and keeps Decode streaming (the payload is read live from
-	// r, never buffered). head's bound is DecodeConfig's consumption, not the
-	// image's: one codec bufio fill (~4 KiB) plus any pre-SOF JPEG
-	// APPn/COM segments (EXIF etc.), i.e. metadata-size, never payload-size.
-	var head bytes.Buffer
-	cfgR := io.TeeReader(r, &head)
+	// r, never buffered). head is capped at MaxMetadataBytes: image/jpeg's
+	// config scan reads every pre-SOF segment (APPn/COM/DHT/DQT/DRI) in full
+	// and the segment count is attacker-controlled, so without the cap head
+	// would grow with the payload (bounded only by MaxSourceBytes); exceeding
+	// the budget aborts the config scan with ErrMetadataTooLarge before the
+	// payload is read further or any pixel buffer is allocated.
+	head := &limitedBuffer{remaining: MaxMetadataBytes}
+	cfgR := io.TeeReader(r, head)
 	cfg, _, err := image.DecodeConfig(cfgR)
 	if err != nil {
+		if errors.Is(err, errMetadataBudgetExceeded) {
+			return nil, ErrMetadataTooLarge
+		}
 		return nil, ErrUnsupported
 	}
 	if cfg.Width > MaxSourceDim || cfg.Height > MaxSourceDim {
 		return nil, ErrImageTooLarge // payload never read
 	}
-	src, _, err := image.Decode(io.MultiReader(bytes.NewReader(head.Bytes()), r))
+	src, _, err := image.Decode(io.MultiReader(bytes.NewReader(head.buf.Bytes()), r))
 	if err != nil {
 		return nil, ErrUnsupported
 	}
