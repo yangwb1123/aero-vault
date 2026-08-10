@@ -1,14 +1,14 @@
 # Declarative defaults for pi-batch.py (synced from ai-batch-runner).
 agent:
   bin: pi
-  default_timeout: 900
+  default_timeout: 1500
   default_workers: 4
   session_flags:
     start: ["--session-id", "{session}", "--name", "{name}"]
     continue: ["--session-id", "{session}"]
 
 defaults:
-  timeout: 900
+  timeout: 1500
   retries: 2
 
 evidence:

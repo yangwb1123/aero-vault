@@ -23,6 +23,11 @@ stages:
           similar name): read their DECISIONS.md and design-gate verdicts
           and resolve or explicitly disposition EVERY outstanding finding
           with evidence — the gate will re-check them.
+          Output the COMPLETE design as your final response text — the entire
+          design body, not a summary or pointer. Do NOT use the write tool
+          for the deliverable (the runner captures your final response to the
+          output file; a write-tool file gets overwritten by your response).
+          After producing the full design, STOP — no further commands.
           {input_content}
         output: docs/auto/design.md
 
@@ -80,6 +85,11 @@ stages:
           outstanding finding in code + tests (not just in prose).
           Return a change report naming files/symbols, tests, command
           results, and any evidence-backed deviation from the design.
+          Output the COMPLETE change report as your final response text —
+          the entire report, not a summary. Do NOT use the write tool for the
+          deliverable (the runner captures your final response to the output
+          file; a write-tool file gets overwritten by your response). After
+          producing the full report, STOP — no further commands.
           {input_content}
         output: docs/auto/implementation.md
 
