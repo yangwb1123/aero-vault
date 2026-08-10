@@ -2,6 +2,7 @@ package rest
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"hash/crc32"
 	"image"
@@ -9,7 +10,16 @@ import (
 	"image/jpeg"
 	"image/png"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/aero-vault/aero-vault/internal/auth"
+	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
 func pngBytes(t *testing.T, w, h int) []byte {
@@ -206,4 +216,226 @@ func TestThumbnailCompositesTransparencyHTTP(t *testing.T) {
 	if g>>8 >= 200 || bl>>8 >= 200 {
 		t.Fatalf("center green/blue = %d/%d, want < 200 (white-fill bug: 255)", g>>8, bl>>8)
 	}
+}
+
+// newRESTTestWithRepo mirrors newRESTTest (conditional_test.go) but also
+// returns the repository so tests can corrupt object metadata or toggle
+// bucket versioning directly.
+func newRESTTestWithRepo(t *testing.T) (*httptest.Server, repository.Repository) {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	h := NewHandler(service.NewFileService(store, repo, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+	return srv, repo
+}
+
+// newAuthRESTTestWithRepo mirrors newAuthRESTTest (acl_test.go) but also
+// returns the repository, so tests can toggle bucket versioning while keeping
+// the auth middleware + anonymous-public-read wiring.
+func newAuthRESTTestWithRepo(t *testing.T) (*httptest.Server, string, repository.Repository) {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "acl.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	h := NewHandler(service.NewFileService(store, repo, nil), nil)
+
+	reg, err := auth.Parse("k1:default:read+write")
+	if err != nil {
+		t.Fatalf("parse auth: %v", err)
+	}
+	reg.WithAnonymousPublicRead(true)
+
+	r := chi.NewRouter()
+	r.Use(reg.Middleware())
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+	return srv, "Bearer k1", repo
+}
+
+// enableVersioningForCoexistence turns on bucket versioning so that object
+// keys in a prefix relationship (e.g. "dir" and "dir/thumbnail") can coexist
+// on the local storage backend: blobs are then laid out as "<key>@v<id>",
+// which decouples the object path from the directory tree the nested key
+// needs. Without it the two PUTs collide physically (file vs directory).
+func enableVersioningForCoexistence(t *testing.T, repo repository.Repository) {
+	t.Helper()
+	if err := repo.SetBucketVersioning(context.Background(), "default", "default", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+}
+
+// TestThumbnailDoesNotShadowObjectKey pins FR-1: object keys ending in
+// "/thumbnail" are legal, and GET /v1/files/<key> must serve the object
+// itself whenever it exists — never a different object's thumbnail (AC-1).
+func TestThumbnailDoesNotShadowObjectKey(t *testing.T) {
+	t.Run("exact key wins over subresource", func(t *testing.T) {
+		s, repo := newRESTTestWithRepo(t)
+		enableVersioningForCoexistence(t, repo)
+		u := s.URL + "/v1/files/dir"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/thumbnail", []byte("object bytes"), map[string]string{"Content-Type": "text/plain"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+		}
+		resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET exact key: status=%d want 200", resp.StatusCode)
+		}
+		if !bytes.Equal(body, []byte("object bytes")) {
+			t.Fatalf("body=%q want the object bytes, not a thumbnail", body)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
+			t.Fatalf("content-type=%q want text/plain", ct)
+		}
+		if _, _, err := image.Decode(bytes.NewReader(body)); err == nil {
+			t.Fatal("body decoded as an image; must be the raw object")
+		}
+	})
+	t.Run("no spurious 404 when trimmed key absent", func(t *testing.T) {
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/dir/thumbnail"
+		req(t, "PUT", u, []byte("object bytes"), map[string]string{"Content-Type": "text/plain"})
+		resp, body := req(t, "GET", u, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET exact key: status=%d want 200", resp.StatusCode)
+		}
+		if !bytes.Equal(body, []byte("object bytes")) {
+			t.Fatalf("body=%q want the uploaded bytes", body)
+		}
+	})
+	t.Run("root-level key", func(t *testing.T) {
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/thumbnail"
+		req(t, "PUT", u, []byte("root bytes"), nil)
+		resp, body := req(t, "GET", u, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET root key: status=%d want 200", resp.StatusCode)
+		}
+		if !bytes.Equal(body, []byte("root bytes")) {
+			t.Fatalf("body=%q want the uploaded bytes", body)
+		}
+	})
+}
+
+// TestThumbnailDoubleSuffixStillWorks pins AC-2: with no object at the full
+// key "dir/thumbnail/thumbnail", the FR-2 fallback trims one suffix and
+// serves the thumbnail of "dir/thumbnail" unchanged.
+func TestThumbnailDoubleSuffixStillWorks(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/dir/thumbnail"
+	req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", u+"/thumbnail?w=100&h=100", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("double-suffix thumbnail: status=%d want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type=%q want image/jpeg", ct)
+	}
+	if resp.Header.Get("ETag") == "" {
+		t.Fatal("thumbnail missing ETag")
+	}
+	img, format, err := image.Decode(bytes.NewReader(body))
+	if err != nil || format != "jpeg" {
+		t.Fatalf("decode thumb: %v fmt=%s", err, format)
+	}
+	if img.Bounds().Dx() != 100 || img.Bounds().Dy() != 50 {
+		t.Fatalf("thumb dims %dx%d want 100x50", img.Bounds().Dx(), img.Bounds().Dy())
+	}
+}
+
+// TestThumbnailCorruptFullKeyPropagates pins FR-3: the dispatch pre-check
+// falls back to the subresource only on ErrNotFound. A scrub-marked corrupt
+// object at the exact key must surface as 410 ObjectCorrupt, never as the
+// trimmed key's thumbnail or a spurious 404.
+func TestThumbnailCorruptFullKeyPropagates(t *testing.T) {
+	s, repo := newRESTTestWithRepo(t)
+	u := s.URL + "/v1/files/dir/thumbnail"
+	req(t, "PUT", u, []byte("object bytes"), map[string]string{"Content-Type": "text/plain"})
+	if err := repo.SetObjectMetaKey(context.Background(), "default", "default", "dir/thumbnail", "_aero_scrub_status", "corrupt"); err != nil {
+		t.Fatalf("set scrub meta: %v", err)
+	}
+	resp, body := req(t, "GET", u, nil, nil)
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("GET corrupt exact key: status=%d want 410", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte(`"code":"ObjectCorrupt"`)) {
+		t.Fatalf("expected code ObjectCorrupt, body: %s", body)
+	}
+}
+
+// TestThumbnailAnonymousFullKeyGate pins FR-4: the anonymous gate must be
+// evaluated against the FULL key, so an anonymous caller can never receive
+// another object's thumbnail (or a public trimmed key's content) under the
+// requesting URL of a private full key.
+func TestThumbnailAnonymousFullKeyGate(t *testing.T) {
+	t.Run("private full key rejected", func(t *testing.T) {
+		s, tok := newAuthRESTTest(t)
+		u := s.URL + "/v1/files/dir/thumbnail"
+		req(t, "PUT", u, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok})
+		resp, _ := req(t, "GET", u, nil, nil)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("anonymous GET private full key: status=%d want 403", resp.StatusCode)
+		}
+	})
+	t.Run("public full key readable", func(t *testing.T) {
+		s, tok := newAuthRESTTest(t)
+		u := s.URL + "/v1/files/dir/thumbnail"
+		authH := map[string]string{"Authorization": tok}
+		req(t, "PUT", u, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok})
+		if resp, _ := req(t, "PUT", u+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set acl: %d", resp.StatusCode)
+		}
+		resp, body := req(t, "GET", u, nil, nil)
+		if resp.StatusCode != http.StatusOK || string(body) != "object bytes" {
+			t.Fatalf("anonymous GET public full key: status=%d body=%q", resp.StatusCode, body)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
+			t.Fatalf("content-type=%q want text/plain", ct)
+		}
+	})
+	t.Run("public trimmed key does not leak private full key", func(t *testing.T) {
+		s, tok, repo := newAuthRESTTestWithRepo(t)
+		enableVersioningForCoexistence(t, repo)
+		u := s.URL + "/v1/files/dir"
+		authH := map[string]string{"Authorization": tok}
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set acl: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/thumbnail", []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+		}
+		resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("anonymous GET private full key over public trimmed key: status=%d want 403 (body=%q)", resp.StatusCode, body)
+		}
+	})
 }

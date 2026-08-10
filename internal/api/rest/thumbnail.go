@@ -16,8 +16,39 @@ import (
 // Generates a JPEG thumbnail of an image object on demand. The response carries
 // a derived ETag (source ETag + dimensions) so repeat requests are cacheable
 // (304 via If-None-Match).
+//
+// Dispatch precedence: object keys ending in "/thumbnail" are legal. When an
+// object exists at the exact requested key, raw-download semantics win (FR-1)
+// and the subresource interpretation applies only when no object exists at
+// the full key (FR-2).
 func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
-	key := strings.TrimSuffix(keyFromPath(r), "/thumbnail")
+	fullKey := keyFromPath(r)
+	_, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, fullKey)
+	switch {
+	case err == nil:
+		// The exact key names a real object: raw download wins with full Get
+		// semantics (bucket policy, anonymous gate on the full key,
+		// conditional requests, Range, ?version=).
+		h.Get(w, r)
+		return
+	case errors.Is(err, service.ErrNotFound):
+		// No object at the full key: fall through to the subresource
+		// interpretation below.
+	case errors.Is(err, service.ErrForbidden):
+		// The full key names an existing object the caller cannot read with
+		// the pre-capability principal. Delegate to Get, which re-authorizes
+		// after allowAnonymous injects the canned-public-read capability, so
+		// anonymous reads of public objects keep working in access-enabled
+		// deployments; literal propagation would regress them to 403.
+		h.Get(w, r)
+		return
+	default:
+		// The key names a real object; propagate corrupt/other errors instead
+		// of falling back to derived content of a different key (FR-3).
+		h.writeError(w, r, err)
+		return
+	}
+	key := strings.TrimSuffix(fullKey, "/thumbnail")
 	if !h.allowAnonymous(w, r, key) {
 		return
 	}
