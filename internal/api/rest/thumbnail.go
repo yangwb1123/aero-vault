@@ -23,6 +23,15 @@ import (
 // the full key (FR-2).
 func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	fullKey := keyFromPath(r)
+	// A ?version= pin requests a specific historical version of the object
+	// at the full key. The pre-check/fallback machinery below must never
+	// shadow a version-pinned read with derived content of a different key,
+	// so delegate to Get (which resolves ?version= via GetSpecificVersion)
+	// unconditionally.
+	if r.URL.Query().Has("version") {
+		h.Get(w, r)
+		return
+	}
 	_, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, fullKey)
 	switch {
 	case err == nil:
@@ -42,6 +51,12 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		// deployments; literal propagation would regress them to 403.
 		h.Get(w, r)
 		return
+	case errors.Is(err, service.ErrInvalidArgs):
+		// A legal object key suffixed with "/thumbnail" can exceed the
+		// key-length cap (e.g. a 191-char image key + 10-char suffix). That
+		// is a dispatch artifact, not an object-state error: fall through to
+		// the subresource interpretation, which works on the trimmed
+		// (legal) key.
 	default:
 		// The key names a real object; propagate corrupt/other errors instead
 		// of falling back to derived content of a different key (FR-3).

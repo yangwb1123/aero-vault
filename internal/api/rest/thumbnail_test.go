@@ -9,14 +9,18 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/auth"
+	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
@@ -272,6 +276,7 @@ func newAuthRESTTestWithRepo(t *testing.T) (*httptest.Server, string, repository
 	r.Put("/v1/files/*", h.putKey)
 	r.Get("/v1/files/*", h.getKey)
 	r.Head("/v1/files/*", h.Head)
+	r.Delete("/v1/files/*", h.deleteKey)
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 	return srv, "Bearer k1", repo
@@ -438,4 +443,234 @@ func TestThumbnailAnonymousFullKeyGate(t *testing.T) {
 			t.Fatalf("anonymous GET private full key over public trimmed key: status=%d want 403 (body=%q)", resp.StatusCode, body)
 		}
 	})
+}
+
+// TestThumbnailVersionPinnedReadNotShadowed pins the ?version= mandate: a
+// version-pinned read of a soft-deleted object at the full key must serve the
+// pinned version's own bytes — never the trimmed key's derived thumbnail.
+func TestThumbnailVersionPinnedReadNotShadowed(t *testing.T) {
+	// Access-enabled harness: DELETE is fail-closed without an authorizer.
+	s, tok, repo := newThumbnailAccessHarness(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "dir/thumbnail")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	oldID := versions[0].VersionID
+	if resp, _ := req(t, "DELETE", uFull, nil, authH); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE dir/thumbnail: %d", resp.StatusCode)
+	}
+	resp, body := req(t, "GET", uFull+"?version="+oldID, nil, authH)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET version-pinned: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Equal(body, []byte("object bytes")) {
+		t.Fatalf("body=%q want the versioned object bytes, not a thumbnail", body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("content-type=%q want text/plain", ct)
+	}
+}
+
+// TestThumbnailLongKeySuffixFallsBack pins the ErrInvalidArgs mandate: an
+// image key so long that key+"/thumbnail" exceeds the key-length cap must
+// fall through to the subresource interpretation (thumbnail of the trimmed
+// legal key), not surface the dispatch artifact as a 400.
+func TestThumbnailLongKeySuffixFallsBack(t *testing.T) {
+	s := newRESTTest(t)
+	// The gate's reproduction: a legal 191-char image key; its
+	// "/thumbnail"-suffixed full key (201 chars) exceeds the key cap.
+	key191 := strings.Repeat("k", service.MaxKeyLen-9)  // 191 chars: legal
+	key190 := strings.Repeat("k", service.MaxKeyLen-10) // 190 chars: legal
+	fullKey200 := key190 + "/thumbnail"                 // 200 chars: legal
+	fullKey201 := key191 + "/thumbnail"                 // 201 chars: over cap
+	for _, k := range []string{key190, key191} {
+		if resp, _ := req(t, "PUT", s.URL+"/v1/files/"+k, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT long image key: %d", resp.StatusCode)
+		}
+	}
+	// The exact legal 200-char full key falls back to the trimmed key's
+	// thumbnail (no object exists at the full key).
+	resp, body := req(t, "GET", s.URL+"/v1/files/"+fullKey200+"?w=32&h=32", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET legal 200-char full key: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type=%q want image/jpeg", ct)
+	}
+	// An over-cap full key must fall back too, not 400 (ErrInvalidArgs).
+	resp, _ = req(t, "GET", s.URL+"/v1/files/"+fullKey201+"?w=32&h=32", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET over-cap full key: status=%d want 200", resp.StatusCode)
+	}
+}
+
+// TestThumbnailForbiddenFullKeyDelegatesToPublicRead pins the D3 arm: in an
+// access-enabled deployment an anonymous caller's Stat on the full key is
+// denied (missing principal), and the handler must delegate to Get so the
+// canned-public-read capability can be injected for a public-read object —
+// literal 403 propagation would regress public thumbnails-of-objects.
+func TestThumbnailForbiddenFullKeyDelegatesToPublicRead(t *testing.T) {
+	s, tok, repo := newThumbnailAccessHarness(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+	if resp, _ := req(t, "PUT", uFull+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+		t.Fatalf("set public-read acl: %d", resp.StatusCode)
+	}
+	// Anonymous read of a public object at the full key: the D3 delegation
+	// must succeed with the object's own bytes.
+	resp, body := req(t, "GET", uFull, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous GET public full key (access-enabled): status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Equal(body, []byte("object bytes")) {
+		t.Fatalf("body=%q want the object bytes, not a thumbnail", body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("content-type=%q want text/plain", ct)
+	}
+}
+
+// TestThumbnailExactKeyBucketPolicyDeny pins mandate 5: the exact-key arm
+// runs the bucket-policy gate (via Get) — a policy denying s3:GetObject for
+// the full key must surface as 403, never as the trimmed key's thumbnail.
+func TestThumbnailExactKeyBucketPolicyDeny(t *testing.T) {
+	s, tok, repo := newThumbnailAccessHarness(t)
+	adminH := map[string]string{"Authorization": "Bearer operator"}
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+	policyURL := s.URL + "/v1/buckets/default/policy"
+	denyGet := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::default/dir/thumbnail"}]}`
+	if resp, _ := req(t, "PUT", policyURL, bodyPolicy(denyGet), adminH); resp.StatusCode != http.StatusOK {
+		t.Fatalf("set deny policy: %d", resp.StatusCode)
+	}
+	resp, _ := req(t, "GET", uFull, nil, authH)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET denied full key: status=%d want 403", resp.StatusCode)
+	}
+}
+
+// TestThumbnailExactKeyConditionalAndRange pins mandate 6: the exact-key arm
+// inherits Get's full HTTP semantics — If-None-Match yields 304 and Range
+// yields 206 with Content-Range on the object's own bytes.
+func TestThumbnailExactKeyConditionalAndRange(t *testing.T) {
+	s, tok, repo := newAuthRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+	// ETag from a plain GET.
+	resp, body := req(t, "GET", uFull, nil, authH)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET exact key: %d", resp.StatusCode)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("exact-key GET missing ETag")
+	}
+	// If-None-Match → 304.
+	resp, _ = req(t, "GET", uFull, nil, map[string]string{"Authorization": tok, "If-None-Match": etag})
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("If-None-Match: status=%d want 304", resp.StatusCode)
+	}
+	// Range → 206 + Content-Range on the object bytes.
+	resp, body = req(t, "GET", uFull, nil, map[string]string{"Authorization": tok, "Range": "bytes=0-3"})
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("Range: status=%d want 206", resp.StatusCode)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "bytes 0-3/12" {
+		t.Fatalf("Content-Range=%q want bytes 0-3/12", cr)
+	}
+	if !bytes.Equal(body, []byte("obje")) {
+		t.Fatalf("range body=%q want %q", body, "obje")
+	}
+}
+
+// newThumbnailAccessHarness wires an access-enabled FileService (authorizer +
+// tenant status) with anonymous public-read admission — the combination that
+// makes the Thumbnail D3 delegation arm reachable. Routes are registered
+// directly (as in newAuthRESTTest), bypassing requireRESTScope, so anonymous
+// object reads are admitted by the registry middleware.
+func newThumbnailAccessHarness(t *testing.T) (*httptest.Server, string, repository.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "access.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	accessStore, ok := repo.(access.Store)
+	if !ok {
+		t.Fatal("repository does not implement access.Store")
+	}
+	manager, err := access.NewManager(accessStore, access.Config{
+		Enabled: true, DefaultPolicy: access.DefaultTenant,
+		ShareSecret: []byte("0123456789abcdef0123456789abcdef"),
+	})
+	if err != nil {
+		t.Fatalf("access manager: %v", err)
+	}
+	svc := service.NewFileService(store, repo, nil).
+		WithAuthorizer(manager).
+		WithTenantStatusEnforcement()
+	reg, err := auth.Parse("alice:default:read+write,operator:*:admin")
+	if err != nil {
+		t.Fatalf("parse auth: %v", err)
+	}
+	reg.WithAnonymousPublicRead(true)
+	h := NewHandler(svc, slog.Default())
+	h.WithAccessManager(manager, "")
+	r := chi.NewRouter()
+	r.Use(reg.Middleware())
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	r.Delete("/v1/files/*", h.deleteKey)
+	r.Put("/v1/buckets/{bucket}/policy", h.PutBucketPolicy)
+	tenantMW := mw.TenantWithStatus(func(ctx context.Context, tenant string) (string, bool, error) {
+		record, found, lookupErr := repo.GetTenant(ctx, tenant)
+		return record.Status, found, lookupErr
+	})
+	handler := reg.Middleware()(tenantMW(r))
+	srv := httptest.NewServer(handler)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+	return srv, "Bearer alice", repo
 }
