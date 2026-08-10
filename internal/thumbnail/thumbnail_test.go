@@ -208,11 +208,11 @@ func TestGenerateRejectsOversizedMetadata(t *testing.T) {
 	// (c) no payload buffering: total allocated bytes must stay below the
 	// payload size. Measured with runtime.ReadMemStats TotalAlloc (monotonic;
 	// testing.AllocsPerRun returns a malloc *count*, not bytes, and would be
-	// vacuous here). The 32 MiB fixture gives a deterministic 2× margin over
-	// the fixed-path allocation (~16 MiB: bytes.Buffer doubling up to the
-	// 8 MiB cap) and is red on the unbounded baseline (head doubling + replay
-	// ≥ the payload).
-	huge := appnPaddedJPEG(t, 32<<20)
+	// vacuous here). The 64 MiB fixture gives a deterministic margin over the
+	// fixed-path allocation (~16 MiB: bytes.Buffer doubling up to the
+	// 8 MiB cap) AND over -race detector overhead; it stays red on the
+	// unbounded baseline (head doubling + replay ≥ the payload).
+	huge := appnPaddedJPEG(t, 64<<20)
 	var m0, m1 runtime.MemStats
 	runtime.ReadMemStats(&m0)
 	img, err = Generate(bytes.NewReader(huge), 100, 100)
