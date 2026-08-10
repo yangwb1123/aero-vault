@@ -1,0 +1,16 @@
+#!/bin/bash
+# githooks/pre-commit — 提交前硬门禁
+#
+# 每次 git commit 前自动执行 make check（gofmt / vet / build / test /
+# cli-check / filesize，即 AGENTS.md 的合入门禁）。失败则拒绝本次提交。
+#
+# 跳过：git commit --no-verify（仅应急，不建议）。
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+echo "==> [pre-commit] make check ..."
+if ! make check; then
+    echo "==> [pre-commit] ❌ make check 未通过，提交已中止（确需强制提交请用 --no-verify）" >&2
+    exit 1
+fi
+echo "==> [pre-commit] ✅ make check 通过"
