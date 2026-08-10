@@ -107,6 +107,7 @@ type Repository interface {
 	RetryEventOutbox(ctx context.Context, id int64, owner, token, lastErr string, next time.Time, maxAttempts int) error
 	PruneEventOutbox(ctx context.Context, deliveredBefore, failedBefore time.Time) (int64, error)
 	HasEventOutboxFact(ctx context.Context, originID int64, eventType OutboxEventType) (bool, error)
+	CountPendingEventOutbox(ctx context.Context) (int64, error)
 
 	// ── AI Chunks ──
 	DeleteChunksForObject(ctx context.Context, objectID int64) error

@@ -60,6 +60,7 @@ var s3CodeStatus = map[string]int{
 	"IncompleteBody":               http.StatusBadRequest,
 	"AccessDenied":                 http.StatusForbidden,
 	"AccessDenied.Locked":          http.StatusForbidden,
+	"EntityTooLarge":               http.StatusBadRequest,
 	"ObjectCorrupt":                http.StatusGone,
 	"QuotaExceeded":                http.StatusForbidden,
 	"ServiceUnavailable":           http.StatusServiceUnavailable,
@@ -83,6 +84,7 @@ var s3CodeMessage = map[string]string{
 	"IncompleteBody":               "You did not provide the number of bytes specified by the Content-Length HTTP header.",
 	"AccessDenied":                 "Access denied.",
 	"AccessDenied.Locked":          "Object is under retention lock (WORM).",
+	"EntityTooLarge":               "Your proposed upload exceeds the maximum allowed object size.",
 	"ObjectCorrupt":                "Object is marked as corrupt.",
 	"QuotaExceeded":                "The tenant storage quota has been exceeded.",
 	"ServiceUnavailable":           "The tenant entitlement projection is unavailable.",
@@ -117,6 +119,7 @@ var errToS3Code = []struct {
 	{service.ErrEntitlementUnavailable, "ServiceUnavailable"},
 	{service.ErrForbidden, "AccessDenied"},
 	{service.ErrObjectCorrupt, "ObjectCorrupt"},
+	{mw.ErrBodyTooLarge, "EntityTooLarge"},
 }
 
 func s3ErrorCode(err error) string {

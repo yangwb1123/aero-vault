@@ -204,6 +204,11 @@ func validateACL(entry ACLEntry) error {
 	if !ValidAction(entry.Action) {
 		return fmt.Errorf("%w: unsupported action", ErrInvalidArgument)
 	}
+	if entry.ResourceKind == ResourceFolder &&
+		strings.ContainsAny(entry.Key, "%_") {
+		return fmt.Errorf("%w: folder ACL key %q must not contain %% or _ (SQL wildcard metacharacters)",
+			ErrInvalidArgument, entry.Key)
+	}
 	return nil
 }
 

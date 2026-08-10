@@ -55,7 +55,7 @@ func newTestServerWithSvc(t *testing.T) (*httptest.Server, *service.FileService)
 	if err != nil {
 		t.Fatalf("storage.NewLocal: %v", err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	// Wrap with the Tenant middleware exactly as cmd/server does: the WebDAV
 	// handler reads the tenant from the request context, which that middleware
 	// populates from the X-Aero-Tenant header (defaulting to "default").
@@ -853,7 +853,7 @@ func newRollbackServer(t *testing.T, failOn string) (*httptest.Server, *service.
 		t.Fatalf("storage.NewLocal: %v", err)
 	}
 	store := &deleteFailStorage{Storage: base, failOn: failOn}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	h := mw.Tenant(webdav.Handler("/webdav", svc, nil))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

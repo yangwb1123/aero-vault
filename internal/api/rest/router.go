@@ -348,6 +348,7 @@ func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.
 		r.Put("/admin/tenants/{tenant}/status", adm.SetTenantStatus)
 		r.Get("/admin/audit", adm.ListAudit)
 		r.Get("/admin/config", adm.GetConfig)
+		r.Delete("/admin/files/{tenant}/*", adm.DeleteFile)
 		if h.access != nil {
 			r.Post("/admin/departments", h.CreateDepartment)
 			r.Get("/admin/departments", h.ListDepartments)

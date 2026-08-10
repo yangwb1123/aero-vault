@@ -10,10 +10,11 @@ type S3CompatConfig struct {
 }
 
 type AccessConfig struct {
-	Enabled       bool
-	DefaultPolicy string
-	ShareSecret   string
-	PublicBaseURL string
+	Enabled          bool
+	DefaultPolicy    string
+	ShareSecret      string
+	PublicBaseURL    string
+	DeleteFailClosed bool // ACCESS_DELETE_FAIL_CLOSED; true = deny deletes when no authorizer is configured
 }
 
 type EventsConfig struct {

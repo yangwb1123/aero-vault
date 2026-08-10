@@ -125,12 +125,12 @@ func TestAuditSinkL2BindingsFile_Discipline(t *testing.T) {
 
 	t.Run("token hygiene: short/blank/duplicate rejected", func(t *testing.T) {
 		cases := []string{
-			`{"bindings":[{"tenant":"a","token":"short"}]}`,                       // < 16 chars
-			`{"bindings":[{"tenant":"a","token":"  ` + validL2Token + `  "}]}`,     // whitespace
-			`{"bindings":[{"tenant":"","token":"` + validL2Token + `"}]}`,          // blank tenant
+			`{"bindings":[{"tenant":"a","token":"short"}]}`,                                                               // < 16 chars
+			`{"bindings":[{"tenant":"a","token":"  ` + validL2Token + `  "}]}`,                                            // whitespace
+			`{"bindings":[{"tenant":"","token":"` + validL2Token + `"}]}`,                                                 // blank tenant
 			`{"bindings":[{"tenant":"a","token":"` + validL2Token + `"},{"tenant":"a","token":"` + validL2Token + `x"}]}`, // dup tenant
-			`{"bindings":[{"tenant":"a","token":"` + validL2Token + `"},{"tenant":"b","token":"` + validL2Token + `"}]}`, // dup token
-			`{"bindings":[{"tenant":"a","token_env":"AUDIT_SINK_L2_TOKEN_UNSET"}]}`, // env not set
+			`{"bindings":[{"tenant":"a","token":"` + validL2Token + `"},{"tenant":"b","token":"` + validL2Token + `"}]}`,  // dup token
+			`{"bindings":[{"tenant":"a","token_env":"AUDIT_SINK_L2_TOKEN_UNSET"}]}`,                                       // env not set
 		}
 		for _, body := range cases {
 			path := write(t, body, 0o600)

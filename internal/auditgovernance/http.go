@@ -191,7 +191,14 @@ func validateReceipt(response *http.Response, fact repository.AuditGovernanceFac
 		return ErrInvalidReceipt
 	}
 	var envelope receiptEnvelope
-	if json.Unmarshal(body, &envelope) != nil || !receiptMatches(envelope, fact) {
+	if json.Unmarshal(body, &envelope) != nil {
+		return ErrInvalidReceipt
+	}
+	receipt := envelope.Receipt
+	if receipt.Conflict {
+		return ErrConflictReceipt
+	}
+	if !receiptMatches(envelope, fact) {
 		return ErrInvalidReceipt
 	}
 	return nil
@@ -200,7 +207,7 @@ func validateReceipt(response *http.Response, fact repository.AuditGovernanceFac
 func receiptMatches(envelope receiptEnvelope, fact repository.AuditGovernanceFact) bool {
 	receipt := envelope.Receipt
 	if receipt.EventID != fact.ID || receipt.TenantID != fact.TenantID ||
-		receipt.AcceptedAt.IsZero() || receipt.Conflict {
+		receipt.AcceptedAt.IsZero() {
 		return false
 	}
 	return receipt.Status == "ledgered" || receipt.Status == "indexed" || receipt.Status == "archived"

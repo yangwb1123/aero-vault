@@ -221,7 +221,7 @@ func newPolicyTestServer(t *testing.T) (*httptest.Server, *service.FileService) 
 		t.Fatalf("storage: %v", err)
 	}
 	svc := service.NewFileService(store, repo, nil)
-	srv := httptest.NewServer(NewRouter(svc, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, nil)) // nil provider: delete gate defaults to deny; policy tests don't delete
 	t.Cleanup(func() {
 		srv.Close()
 		_ = repo.Close()

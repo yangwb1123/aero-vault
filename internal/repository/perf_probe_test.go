@@ -56,7 +56,7 @@ const currentSQL = `SELECT ` + probeCols + ` FROM resource_acls
  WHERE tenant_id=? AND bucket=? AND (
    resource_kind='bucket'
    OR (resource_kind='object' AND resource_key=?)
-   OR (resource_kind='folder' AND (resource_key=? OR (inherit_acl=1 AND ? LIKE resource_key || '%')))
+   OR (resource_kind='folder' AND (resource_key=? OR (inherit_acl=1 AND substr(?, 1, length(resource_key)) = resource_key)))
  ) ORDER BY LENGTH(resource_key) DESC, created_at, id`
 
 const fixedSQL = `SELECT ` + probeCols + ` FROM resource_acls

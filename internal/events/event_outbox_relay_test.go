@@ -631,4 +631,3 @@ func TestOutboxRelay_L2UnauthorizedFailsImmediately(t *testing.T) {
 		})
 	}
 }
-

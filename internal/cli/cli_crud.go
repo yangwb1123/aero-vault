@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -100,9 +101,28 @@ func (c *Client) cmdRemove(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr, "HTTP %d\n", resp.StatusCode)
+		// Surface the server's denial reason (e.g. "forbidden: default_deny")
+		// from the REST error envelope — a bare status hides the fail-closed
+		// reason operators need.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		var envelope struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		msg := ""
+		if json.Unmarshal(body, &envelope) == nil && envelope.Error.Message != "" {
+			msg = envelope.Error.Message
+		} else if s := strings.TrimSpace(string(body)); s != "" {
+			msg = s
+		}
+		if msg != "" {
+			fmt.Fprintf(os.Stderr, "HTTP %d: %s\n", resp.StatusCode, msg)
+		} else {
+			fmt.Fprintf(os.Stderr, "HTTP %d\n", resp.StatusCode)
+		}
 		return 1
 	}
 	return 0

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
@@ -49,7 +50,7 @@ func TestSignatureScannerTailBeyond32MiB(t *testing.T) {
 // property: tail malware is quarantined exactly like a small infected object
 // (soft-delete + quota released), never tagged clean.
 func TestScanObjectByIDTailEICARNeverClean_QuarantineOn(t *testing.T) {
-	ctx := context.Background()
+	ctx := access.AntivirusContext(context.Background(), "default")
 	repo, svc := setupSvc(t)
 	size := int64(32<<20 + len(EICAR))
 	body := io.MultiReader(bytes.NewReader(make([]byte, 32<<20)), strings.NewReader(EICAR))

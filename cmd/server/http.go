@@ -117,7 +117,7 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 		r.Head("/public/assets/*", publicAccess.Asset)
 	}
 	if cfg.S3Compat.Prefix != "" {
-		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger))
+		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger, accessManager))
 	}
 	mcpServer := mcp.NewServer(svc, repo, search, "default", logger)
 	if chat != nil {

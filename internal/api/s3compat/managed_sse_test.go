@@ -29,7 +29,7 @@ func newManagedSSETestServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewRouter(service.NewFileService(store, repo, nil), nil))
+	srv := httptest.NewServer(NewRouter(service.NewFileService(store, repo, nil), nil, nil)) // SSE PUT/GET only; delete gate irrelevant
 	t.Cleanup(func() {
 		srv.Close()
 		_ = repo.Close()

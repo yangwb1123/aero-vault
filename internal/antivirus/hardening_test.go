@@ -341,11 +341,11 @@ func (f *failController) SetObjectTagsByID(ctx context.Context, objectID int64, 
 	return f.FileService.SetObjectTagsByID(ctx, objectID, tags)
 }
 
-func (f *failController) QuarantineObjectByID(ctx context.Context, objectID int64, signature string) error {
+func (f *failController) QuarantineObjectByID(ctx context.Context, objectID int64) error {
 	if f.quarErr != nil {
 		return f.quarErr
 	}
-	return f.FileService.QuarantineObjectByID(ctx, objectID, signature)
+	return f.FileService.QuarantineObjectByID(ctx, objectID)
 }
 
 func TestScanObjectByIDTagWriteError(t *testing.T) {

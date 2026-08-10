@@ -89,6 +89,12 @@ func (s *FileService) authorize(
 		return err
 	}
 	if s.authorizer == nil {
+		if action == access.ActionDelete && !s.deleteFailOpen {
+			principal, _ := access.PrincipalFrom(ctx)
+			if !access.IsSystemDeleteExempt(principal, resource.TenantID) {
+				return fmt.Errorf("%w: no authorization provider configured", ErrForbidden)
+			}
+		}
 		return nil
 	}
 	principal, _ := access.PrincipalFrom(ctx)

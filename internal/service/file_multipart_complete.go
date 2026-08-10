@@ -211,6 +211,13 @@ func (s *FileService) finishMultipartCompletion(
 	if err != nil {
 		return repository.Object{}, s.releaseMultipartCompletion(ctx, scope, idemKey, err)
 	}
+	// FR-1a: account BEFORE the storage upload is consumed and the object row
+	// is committed. An accounting failure then leaves zero persistent
+	// footprint and releases the claim, so a retry is a fresh claim + a full
+	// clean re-run (multipart-complete-claim-release design §2.1).
+	if err := s.accountObjectUsage(ctx, u.TenantID, usage, total); err != nil {
+		return repository.Object{}, s.releaseMultipartCompletion(ctx, scope, idemKey, err)
+	}
 	info, err := s.completeStoredMultipart(ctx, u, storageParts, opts)
 	if err != nil {
 		wrapped := fmt.Errorf("storage complete: %w", err)
@@ -274,12 +281,9 @@ func (s *FileService) persistMultipartCompletion(
 	ctx context.Context,
 	u repository.Upload,
 	saved repository.Object,
-	usage objectWriteUsage,
+	usage objectWriteUsage, // D4: signature preserved; unused after FR-1c (accounting moved to finishMultipartCompletion)
 	idemKey string,
 ) error {
-	if err := s.accountObjectUsage(ctx, u.TenantID, usage, saved.Size); err != nil {
-		return err
-	}
 	body, _ := json.Marshal(saved)
 	if err := s.repo.CompleteIdempotencyKey(
 		ctx, u.TenantID, idemKey, http.StatusOK, body, "application/json", nil,

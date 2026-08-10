@@ -36,6 +36,19 @@ type scanPayload struct {
 	ObjectID int64 `json:"object_id"`
 }
 
+// byteCounter wraps a reader and counts every byte pulled from it — used to
+// detect an early-responding remote scanner (consumed < object size).
+type byteCounter struct {
+	io.Reader
+	n int64
+}
+
+func (c *byteCounter) Read(p []byte) (int, error) {
+	n, err := c.Reader.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // EncodeObjectID builds a virus_scan job payload.
 func EncodeObjectID(id int64) string {
 	b, _ := json.Marshal(scanPayload{ObjectID: id})
@@ -122,12 +135,22 @@ func (w *Worker) ScanObjectByID(ctx context.Context, objectID int64) error {
 	}
 	defer rc.Close()
 
-	res, err := w.scanner.Scan(ctx, rc)
+	counting := &byteCounter{Reader: rc}
+	res, err := w.scanner.Scan(ctx, counting)
 	if err != nil {
 		return fmt.Errorf("scan %q: %w", obj.Key, err)
 	}
-	_, _ = io.Copy(io.Discard, rc) // drain remainder
-
+	// The HTTP scanner streams the object to a remote engine: when the
+	// remote answers before reading the whole body, the transport stops
+	// early. Drain the remainder (client-side hygiene) and surface the
+	// early response to operators (F2). Local scanners that return before
+	// EOF are never drained — their consumption is authoritative.
+	if w.scanner.Name() == "http" && counting.n < obj.Size {
+		w.logger.Warn("antivirus: remote scanner responded before receiving the full object",
+			"tenant", obj.TenantID, "key", obj.Key,
+			"consumed", counting.n, "size", obj.Size)
+		_, _ = io.Copy(io.Discard, counting)
+	}
 	tags := map[string]string{}
 	for k, v := range obj.Tags {
 		tags[k] = v

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,13 @@ import (
 // with io.LimitReader so streaming reads also honour the cap.
 //
 // A maxBytes value of 0 or less disables limiting (zero-cost pass-through).
+// ErrBodyTooLarge is surfaced to the handler when an unknown-length
+// (chunked) request body exceeds MaxBodySize. A plain LimitReader silently
+// truncated oversize chunked bodies and stored corrupt objects with 200 +
+// ETag; the error reader fails the read instead, so the write path aborts
+// and maps the sentinel to 413 (REST BodyTooLarge / S3 EntityTooLarge).
+var ErrBodyTooLarge = errors.New("request body too large")
+
 func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 	if maxBytes <= 0 {
 		return func(next http.Handler) http.Handler { return next }
@@ -26,12 +34,41 @@ func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 					http.StatusRequestEntityTooLarge)
 				return
 			}
-			// Wrap the body with a LimitReader that silently stops at maxBytes.
-			// The handler / decoder will see an early EOF when the body is longer.
-			r.Body = io.NopCloser(io.LimitReader(r.Body, maxBytes))
+			// Unknown-length bodies flow through a reader that errors past
+			// maxBytes instead of reporting a silent EOF.
+			r.Body = io.NopCloser(&maxBytesReader{Reader: r.Body, remaining: maxBytes})
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// maxBytesReader delivers up to maxBytes bytes, then probes the source once:
+// any remaining byte fails the read with ErrBodyTooLarge (chunked bodies can
+// no longer truncate silently).
+type maxBytesReader struct {
+	io.Reader
+	remaining int64
+	over      bool
+}
+
+func (m *maxBytesReader) Read(p []byte) (int, error) {
+	if m.over {
+		return 0, ErrBodyTooLarge
+	}
+	if m.remaining <= 0 {
+		var probe [1]byte
+		if n, _ := m.Reader.Read(probe[:]); n > 0 {
+			m.over = true
+			return 0, ErrBodyTooLarge
+		}
+		return 0, io.EOF
+	}
+	if int64(len(p)) > m.remaining {
+		p = p[:m.remaining]
+	}
+	n, err := m.Reader.Read(p)
+	m.remaining -= int64(n)
+	return n, err
 }
 
 // SecureHeaders stamps a minimal set of security-related HTTP response headers

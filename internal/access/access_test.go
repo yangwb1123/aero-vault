@@ -13,6 +13,14 @@ import (
 )
 
 func testManager(t *testing.T, defaultPolicy string) (*access.Manager, context.Context) {
+	manager, _, ctx := testManagerWithStore(t, defaultPolicy)
+	return manager, ctx
+}
+
+// testManagerWithStore is testManager plus the repo-backed access.Store, for
+// tests that seed ACLs directly (e.g. the folder-wildcard leak test, where
+// REQ-2 forbids the manager path).
+func testManagerWithStore(t *testing.T, defaultPolicy string) (*access.Manager, repository.Repository, context.Context) {
 	t.Helper()
 	ctx := context.Background()
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "access.db"))
@@ -34,7 +42,7 @@ func testManager(t *testing.T, defaultPolicy string) (*access.Manager, context.C
 	if err != nil {
 		t.Fatal(err)
 	}
-	return manager, ctx
+	return manager, repo, ctx
 }
 
 func adminContext(ctx context.Context, tenant string) context.Context {
@@ -287,5 +295,58 @@ func TestObjectOwnerCanRevokeCollaboratorCapabilities(t *testing.T) {
 	}
 	if err := manager.UnpublishAsset(owner, "acme", asset.Slug); err != nil {
 		t.Fatalf("owner unpublish asset: %v", err)
+	}
+}
+
+// TestFolderACLWildcardDoesNotLeakToSiblings — AC-2 (REQ-2/REQ-3): a folder
+// ACL key containing _ is inert at match time (the store does a literal
+// prefix comparison, REQ-1), and manager.PutACL rejects such keys outright
+// (defense-in-depth). Seeded via the repo-backed store because REQ-2 forbids
+// the manager path for wildcard folder keys.
+func TestFolderACLWildcardDoesNotLeakToSiblings(t *testing.T) {
+	manager, repo, ctx := testManagerWithStore(t, access.DefaultDeny)
+	store, ok := repo.(access.Store)
+	if !ok {
+		t.Fatal("repository does not implement access.Store")
+	}
+
+	// REQ-2: the manager refuses wildcard folder keys with ErrInvalidArgument.
+	_, err := manager.PutACL(adminContext(ctx, "acme"), access.ACLEntry{
+		TenantID: "acme", Bucket: "default", Key: "a_/",
+		ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+		PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+	})
+	if !errors.Is(err, access.ErrInvalidArgument) {
+		t.Fatalf("PutACL wildcard folder key err=%v, want ErrInvalidArgument", err)
+	}
+
+	// Seed the wildcard-key folder ACL directly (pre-fix this leaked to
+	// siblings via SQL LIKE).
+	if err := store.PutACLEntry(ctx, access.ACLEntry{
+		TenantID: "acme", Bucket: "default", Key: "a_/",
+		ResourceKind: access.ResourceFolder, PrincipalType: access.PrincipalTypeUser,
+		PrincipalID: "alice", Action: access.ActionRead, Effect: access.EffectAllow,
+		Inherit: true, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed folder ACL: %v", err)
+	}
+
+	aliceCtx := access.WithPrincipal(ctx, access.Principal{
+		SubjectID: "alice", TenantID: "acme", Kind: access.PrincipalUser,
+	})
+	alicePrincipal, _ := access.PrincipalFrom(aliceCtx)
+	// Sibling must NOT match (the leak).
+	decision, err := manager.Authorize(aliceCtx, alicePrincipal, access.ActionRead, access.Resource{
+		TenantID: "acme", Bucket: "default", Key: "ab/x", Kind: access.ResourceObject,
+	})
+	if err != nil || decision.Allowed {
+		t.Fatalf("sibling %q allowed: decision=%+v err=%v", "ab/x", decision, err)
+	}
+	// Positive control: a genuine child still inherits.
+	decision, err = manager.Authorize(aliceCtx, alicePrincipal, access.ActionRead, access.Resource{
+		TenantID: "acme", Bucket: "default", Key: "a_/x", Kind: access.ResourceObject,
+	})
+	if err != nil || !decision.Allowed {
+		t.Fatalf("genuine child %q denied: decision=%+v err=%v", "a_/x", decision, err)
 	}
 }

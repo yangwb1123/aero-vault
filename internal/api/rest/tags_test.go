@@ -29,7 +29,7 @@ func TestTagsCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	h := NewHandler(service.NewFileService(store, repo, nil), nil)
+	h := NewHandler(service.NewFileService(store, repo, nil).WithDeleteFailOpen(true), nil)
 	r := chi.NewRouter()
 	r.Put("/v1/files/*", h.putKey)
 	r.Get("/v1/files/*", h.getKey)

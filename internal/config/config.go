@@ -213,10 +213,11 @@ func Load() (*Config, error) {
 			KeyCacheTTLSeconds:  getEnvInt("AUTH_KEY_CACHE_TTL_SECONDS", 0),
 		},
 		Access: AccessConfig{
-			Enabled:       getEnvBool("ACCESS_CONTROL_ENABLED", false),
-			DefaultPolicy: strings.ToLower(getEnv("ACCESS_DEFAULT_POLICY", "deny")),
-			ShareSecret:   getEnv("ACCESS_SHARE_SECRET", ""),
-			PublicBaseURL: strings.TrimRight(getEnv("ACCESS_PUBLIC_BASE_URL", ""), "/"),
+			Enabled:          getEnvBool("ACCESS_CONTROL_ENABLED", false),
+			DefaultPolicy:    strings.ToLower(getEnv("ACCESS_DEFAULT_POLICY", "deny")),
+			ShareSecret:      getEnv("ACCESS_SHARE_SECRET", ""),
+			PublicBaseURL:    strings.TrimRight(getEnv("ACCESS_PUBLIC_BASE_URL", ""), "/"),
+			DeleteFailClosed: getEnvBool("ACCESS_DELETE_FAIL_CLOSED", true),
 		},
 		Telemetry: TelemetryCfg{
 			PrometheusEnabled: getEnvBool("PROMETHEUS_ENABLED", false),

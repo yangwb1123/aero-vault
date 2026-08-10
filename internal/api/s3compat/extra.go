@@ -436,6 +436,12 @@ func (h *Handler) deleteObjects(w http.ResponseWriter, r *http.Request, bucket s
 	tenant := mw.TenantFrom(r.Context())
 	out := deleteResult{Xmlns: s3Namespace}
 	for _, o := range in.Objects {
+		if !h.authorizeDelete(r.Context(), tenant, bucket, o.Key) {
+			out.Errors = append(out.Errors, deleteErrItem{
+				Key: o.Key, VersionID: o.VersionID, Code: "AccessDenied", Message: "Access denied.",
+			})
+			continue
+		}
 		versionID, deleteMarker, err := h.deleteS3Object(
 			r.Context(), tenant, bucket, o.Key, o.VersionID,
 		)

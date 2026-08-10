@@ -436,13 +436,13 @@ func TestRuntimeReadyDegradesOnBacklogLag(t *testing.T) {
 	// Seed one pending fact that will never be delivered (server down). The
 	// backlog age is measured from the outbox row's created_at (insert
 	// time), so the test waits past maxLag (4s) to cross the degraded
-	// threshold.
-	if _, err := store.InsertEventWithGovernance(ctx, repository.Event{
+	// threshold. The wrapped repository is the production shape: it builds
+	// the fact (identity + redaction) from the event.
+	wrapped := WrapRepository(repo, runtime)
+	if _, err := wrapped.InsertEvent(ctx, repository.Event{
 		TenantID: "acme", Bucket: "b", Key: "k", Type: repository.EventCreated,
 		CreatedAt: time.Now().UTC(),
-	}, repository.AuditGovernanceFact{SourceID: "acme", TenantID: "acme",
-		OriginKind: repository.AuditOriginFile, FactKind: "file",
-		Action: "file.create", OccurredAt: time.Now().UTC()}); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(4500 * time.Millisecond)

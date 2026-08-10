@@ -189,7 +189,7 @@ func TestS3GetObject_VersionId(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
 	if err := svc.SetBucketVersioning(ctx, "default", "b", true); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestS3GetObject_VersionId(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewRouter(svc, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, allowAllProvider{}))
 	defer srv.Close()
 
 	// Current GET returns v2.

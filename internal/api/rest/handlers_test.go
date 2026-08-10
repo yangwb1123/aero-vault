@@ -37,7 +37,7 @@ func setupTest(t *testing.T) (*service.FileService, repository.Repository, *http
 	if err != nil {
 		t.Fatalf("new local storage: %v", err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	router := NewRouter(svc, repo, nil, nil, nil, nil, nil, slog.Default(), false, nil, nil, 0, false)
 	ts := httptest.NewServer(router)
 	t.Cleanup(func() { ts.Close(); _ = repo.Close() })

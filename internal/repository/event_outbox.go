@@ -381,6 +381,16 @@ WHERE status='failed' AND created_at_ns < $1`), prune.before.UTC().UnixNano())
 	return removed, tx.Commit()
 }
 
+// CountPendingEventOutbox counts outbox rows that have not reached a
+// terminal state (pending or inflight) — the live backlog the relay has not
+// yet drained.
+func (s *sqlStore) CountPendingEventOutbox(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM event_outbox
+WHERE status IN ('pending','inflight')`).Scan(&n)
+	return n, err
+}
+
 // HasEventOutboxFact reports whether any fact of the given type exists for the
 // origin object, regardless of status. Used by the Notifier (D2): when the
 // WithEvent transaction committed before s.emit, the row is visible, so the

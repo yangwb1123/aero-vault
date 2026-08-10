@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -81,6 +82,10 @@ func (r *Runtime) deliverFact(fact repository.AuditGovernanceFact) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
 	err := r.publisher.Publish(ctx, fact)
 	cancel()
+	if errors.Is(err, ErrConflictReceipt) {
+		r.failFact(fact, err)
+		return
+	}
 	if err != nil {
 		r.retryFact(fact, err)
 		return
@@ -92,6 +97,23 @@ func (r *Runtime) deliverFact(fact repository.AuditGovernanceFact) {
 		r.logger.Warn("audit governance acknowledgement lost",
 			"fact_ref", r.redactor.opaqueFact(fact), "error_class", "store")
 	}
+}
+
+// failFact terminals a fact on a permanent semantic conflict: the row is
+// parked with failed_at_ns (never re-claimed, never re-POSTed) and kept until
+// the failed-retention prune.
+func (r *Runtime) failFact(fact repository.AuditGovernanceFact, cause error) {
+	ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
+	err := r.store.FailAuditGovernance(ctx, fact.ID, fact.ClaimOwner, fact.ClaimToken,
+		cause.Error())
+	cancel()
+	if err != nil {
+		r.logger.Warn("audit governance terminal-fail persistence failed",
+			"fact_ref", r.redactor.opaqueFact(fact), "error_class", "store")
+		return
+	}
+	r.logger.Warn("audit governance fact terminally failed (conflict)",
+		"fact_ref", r.redactor.opaqueFact(fact), "attempt", fact.Attempts)
 }
 
 func (r *Runtime) retryFact(fact repository.AuditGovernanceFact, cause error) {
@@ -117,6 +139,10 @@ func (r *Runtime) cleanupDelivered() {
 	ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
 	count, err := r.store.CleanupDeliveredAuditGovernance(
 		ctx, now.Add(-r.retention), r.cleanupBatch)
+	if err == nil {
+		_, err = r.store.CleanupFailedAuditGovernance(
+			ctx, now.Add(-r.retention), r.cleanupBatch)
+	}
 	cancel()
 	if err != nil {
 		r.logger.Warn("audit governance delivered cleanup failed", "error_class", "store")
@@ -148,7 +174,9 @@ func boundedBackoff(id string, attempts int, initial, maximum time.Duration) tim
 func classifyRelayError(err error) string {
 	var status *httpStatusError
 	if errors.As(err, &status) {
-		return status.Error()
+		// Status only — the response body is untrusted input and may echo
+		// raw actor/target/secret values; it must never reach the logs.
+		return fmt.Sprintf("audit governance HTTP %d", status.Status)
 	}
 	if errors.Is(err, ErrInvalidEvent) || errors.Is(err, ErrInvalidReceipt) ||
 		errors.Is(err, ErrTokenUnavailable) {

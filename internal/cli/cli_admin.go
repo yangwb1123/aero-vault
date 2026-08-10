@@ -31,7 +31,8 @@ resources:
   buckets encryption <bucket> <algorithm> [--kms-key-id <id>]
   buckets website <bucket> --index <suffix> [--error <key>]
   buckets quota <bucket> <max_bytes> <max_objects>
-  buckets delete <bucket>`)
+  buckets delete <bucket>
+  files delete <tenant> <key> [--hard]`)
 }
 
 func (c *Client) cmdAdmin(args []string) int {
@@ -52,6 +53,8 @@ func (c *Client) cmdAdmin(args []string) int {
 		return c.cmdAdminAudit(action, rest)
 	case "buckets":
 		return c.cmdAdminBuckets(action, rest)
+	case "files":
+		return c.cmdAdminFiles(action, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown admin resource: %s\n", resource)
 		adminUsage()

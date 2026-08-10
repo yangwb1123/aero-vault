@@ -26,6 +26,50 @@ func (s *sqlStore) CleanupDeliveredAuditGovernance(
 	return s.cleanupDeliveredGovernanceSQLite(ctx, before, limit)
 }
 
+// CleanupFailedAuditGovernance prunes terminal-failed rows (failed_at_ns>0)
+// older than before — the mirror of CleanupDeliveredAuditGovernance for the
+// conflict-terminal state (migration 0042). Rows are selected by failed_at_ns
+// so a failed row is never re-claimed or re-posted, only eventually removed.
+func (s *sqlStore) CleanupFailedAuditGovernance(
+	ctx context.Context, before time.Time, limit int,
+) (int64, error) {
+	if before.IsZero() || limit <= 0 || limit > 500 {
+		return 0, errors.New("audit governance cleanup arguments are invalid")
+	}
+	if s.dialect == dialectPostgres {
+		return s.cleanupFailedGovernancePostgres(ctx, before, limit)
+	}
+	return s.cleanupFailedGovernanceSQLite(ctx, before, limit)
+}
+
+func (s *sqlStore) cleanupFailedGovernancePostgres(
+	ctx context.Context, before time.Time, limit int,
+) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM audit_governance_outbox o
+WHERE o.failed_at_ns>0 AND o.failed_at_ns <= $1 AND o.id IN (
+ SELECT id FROM audit_governance_outbox WHERE failed_at_ns>0
+ ORDER BY failed_at_ns,id LIMIT $2)`,
+		before.UTC().UnixNano(), limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *sqlStore) cleanupFailedGovernanceSQLite(
+	ctx context.Context, before time.Time, limit int,
+) (int64, error) {
+	result, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM audit_governance_outbox
+WHERE failed_at_ns>0 AND failed_at_ns <= $1 AND id IN (
+ SELECT id FROM audit_governance_outbox WHERE failed_at_ns>0
+ ORDER BY failed_at_ns,id LIMIT $2)`),
+		before.UTC().UnixNano(), limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (s *sqlStore) cleanupDeliveredGovernancePostgres(
 	ctx context.Context, before time.Time, limit int,
 ) (int64, error) {

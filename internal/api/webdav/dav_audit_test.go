@@ -22,12 +22,22 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	dav "github.com/aero-vault/aero-vault/internal/api/webdav"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
+
+// allowAllProvider is the access.Authorizer test double: every action is
+// allowed, so the WebDAV delete tests exercise the delete mechanics, not the
+// fail-closed delete gate (which has dedicated tests elsewhere).
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
+}
 
 // newTestServerWithSvcDSN is newTestServerWithSvc plus the SQLite DSN, for
 // tests that assert outbox fact state via raw SQL (the Repository interface

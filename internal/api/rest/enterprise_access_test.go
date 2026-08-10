@@ -49,7 +49,7 @@ func newEnterpriseRESTTest(t *testing.T) (*httptest.Server, string, string, repo
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := service.NewFileService(store, repo, nil).
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true).
 		WithAuthorizer(manager).
 		WithTenantStatusEnforcement()
 	reg, err := auth.Parse("alice:default:read+write,operator:*:admin")

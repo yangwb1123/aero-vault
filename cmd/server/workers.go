@@ -30,7 +30,7 @@ func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slo
 			if err != nil {
 				return err
 			}
-			return avw.ScanObjectByID(access.SystemContext(ctx, job.TenantID), id)
+			return avw.ScanObjectByID(access.AntivirusContext(ctx, job.TenantID), id)
 		})
 		avSub, _ := bus.Subscribe()
 		go avw.Run(ctx, avSub)
@@ -156,6 +156,13 @@ func startNotificationWorker(ctx context.Context, logger *slog.Logger, repo repo
 // (fail-fast, F6 — config.Validate already rejected it; this is the second
 // enforcement point).
 func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository) error {
+	if !cfg.EventOutbox.Enabled {
+		// Nil-repo-safe gate: the disabled branch must not touch the
+		// repository, so a nil repo (or a repo that is still initializing)
+		// is fine here.
+		logger.Info("event outbox relay disabled", "backlog", "unknown")
+		return nil
+	}
 	opts := events.EventOutboxRelayOptions{
 		PollInterval: time.Duration(cfg.EventOutbox.PollMilliseconds) * time.Millisecond,
 		BatchSize:    cfg.EventOutbox.BatchSize,
@@ -176,12 +183,22 @@ func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog
 	}
 	relay := events.NewEventOutboxRelay(repo, logger, opts)
 	go relay.Run(ctx)
+	// Live backlog before the first poll (nil-repo-safe; -1 = unknown).
+	backlog := int64(-1)
+	if repo != nil {
+		if n, err := repo.CountPendingEventOutbox(ctx); err == nil {
+			backlog = n
+		}
+	}
 	logger.Info("event outbox relay started",
 		"poll_ms", cfg.EventOutbox.PollMilliseconds,
 		"batch", cfg.EventOutbox.BatchSize,
 		"claim_ttl_s", cfg.EventOutbox.ClaimTTLSeconds,
 		"http_timeout_s", cfg.EventOutbox.HTTPTimeoutSeconds,
-		"max_attempts", cfg.EventOutbox.MaxAttempts)
+		"max_attempts", cfg.EventOutbox.MaxAttempts,
+		"backlog", backlog,
+		"delivered_retain_h", cfg.EventOutbox.DeliveredRetentionHours,
+		"failed_retain_h", cfg.EventOutbox.FailedRetentionHours)
 	return nil
 }
 

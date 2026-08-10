@@ -19,18 +19,31 @@ import (
 	"github.com/go-chi/chi/v5"
 	_ "modernc.org/sqlite"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/api/rest"
 	"github.com/aero-vault/aero-vault/internal/api/s3compat"
 	dav "github.com/aero-vault/aero-vault/internal/api/webdav"
 	"github.com/aero-vault/aero-vault/internal/auth"
+	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/events"
 	"github.com/aero-vault/aero-vault/internal/mcp"
 	"github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/server"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 	"github.com/aero-vault/aero-vault/internal/webui"
 )
+
+// allowAllProvider satisfies both access.Authorizer and
+// s3compat.AuthorizationProvider (identical method shape): everything is
+// allowed, so baseline harness tests exercise CRUD mechanics, not the
+// fail-closed delete gates (which have dedicated tests).
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
+}
 
 // fullServerHarness exposes the loopback server plus the repo/DSN the tests
 // need to assert outbox/audit state (AC-3/AC-5).
@@ -51,8 +64,25 @@ func startFullServer(t *testing.T) *httptest.Server {
 // the relay options (short poll, AuditSink) — the AC-3/AC-5 injection point
 // (the harness constructs the relay directly; no env-var indirection).
 func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOptions) *fullServerHarness {
+	return startFullServerWithConfig(t, relayOpts, "", &config.Config{})
+}
+
+// startFullServerWithAuthAndRelay is startFullServerWithRelay plus static
+// API-key auth (authKeys in Parse format, e.g. "opsecret:*:admin"); the
+// empty-string case is exactly the no-auth harness.
+func startFullServerWithAuthAndRelay(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string) *fullServerHarness {
+	return startFullServerWithConfig(t, relayOpts, authKeys, &config.Config{})
+}
+
+// startFullServerWithConfig is the parameterized core: relay options, static
+// API-key auth and a config override (currently only App.MaxBodySize feeds
+// the middleware chain).
+func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string, cfg *config.Config) *fullServerHarness {
 	t.Helper()
 	ctx := context.Background()
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 
 	dsn := "file:" + filepath.Join(t.TempDir(), "x.db")
 	repo, err := repository.Open(ctx, "sqlite", dsn)
@@ -70,9 +100,14 @@ func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOp
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.NewFileService(store, repo, logger)
+	// CI-baseline shape: no access control configured, so the fail-closed
+	// delete gate is opted out (ACCESS_DELETE_FAIL_CLOSED=false equivalent) —
+	// this harness exercises protocol/CRUD mechanics, not the gate.
+	svc := service.NewFileService(store, repo, logger).
+		WithTenantStatusEnforcement().
+		WithDeleteFailOpen(true)
 
-	authReg, _ := auth.Parse("")
+	authReg, _ := auth.Parse(authKeys)
 	authReg.WithPutPresigner(auth.NewPutPresigner("integration-presign-secret-32-bytes"))
 	var rl, aiRL *middleware.RateLimiter
 
@@ -92,7 +127,7 @@ func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOp
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
 	r.Mount("/v1", rest.NewRouter(svc, repo, nil, nil, nil, nil, authReg, logger, false, aiRL, nil, 0, false))
-	r.Mount("/s3", s3compat.NewRouter(svc, logger))
+	r.Mount("/s3", s3compat.NewRouter(svc, logger, allowAllProvider{}))
 
 	mcpServer := mcp.NewServer(svc, repo, nil, "default", logger)
 	r.Method(http.MethodPost, "/mcp", mcp.HTTPHandler(mcpServer))
@@ -108,17 +143,12 @@ func startFullServerWithRelay(t *testing.T, relayOpts *events.EventOutboxRelayOp
 	})
 
 	var finalHandler http.Handler = dispatcher
-	for _, m := range []func(http.Handler) http.Handler{
-		middleware.AccessLog(logger),
-		middleware.Recoverer(logger),
-		rl.Middleware(),
-		middleware.Tenant,
-		authReg.Middleware(),
-		middleware.CORS(middleware.CORSConfig{}),
-		middleware.RequestID,
-	} {
-		finalHandler = m(finalHandler)
-	}
+	// Production 12-ring chain via the shared assembly point: the harness and
+	// cmd/server cannot drift (internal-integration-harness-12ring-chain).
+	// MaxBodySize comes from the config override; rl/concurrency are the
+	// disabled (no-op) shapes.
+	finalHandler = server.ApplyMiddleware(finalHandler, repo, authReg, rl, cfg, logger,
+		middleware.NewConcurrencyLimiter(0).Middleware(), nil)
 
 	ts := httptest.NewServer(finalHandler)
 	t.Cleanup(ts.Close)

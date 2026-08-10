@@ -85,6 +85,8 @@ type AuditGovernanceStore interface {
 	OldestPendingAuditGovernance(context.Context) (time.Time, bool, error)
 	HasPendingDrainingAuditGovernance(context.Context) (bool, error)
 	CleanupDeliveredAuditGovernance(context.Context, time.Time, int) (int64, error)
+	FailAuditGovernance(context.Context, string, string, string, string) error
+	CleanupFailedAuditGovernance(context.Context, time.Time, int) (int64, error)
 }
 
 var _ AuditGovernanceStore = (*sqlStore)(nil)

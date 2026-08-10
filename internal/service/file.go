@@ -2,11 +2,11 @@ package service
 
 import (
 	"context"
-	"reflect"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path"
+	"reflect"
 	"strings"
 
 	"github.com/aero-vault/aero-vault/internal/access"
@@ -92,6 +92,7 @@ type FileService struct {
 	authorizer      access.Authorizer
 	tenantStatus    bool
 	usageAccountant UsageAccountant
+	deleteFailOpen  bool
 }
 
 // WithAuthorizer enables resource-level authorization at the FileService
@@ -111,6 +112,15 @@ func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService 
 		}
 	}
 	s.authorizer = authorizer
+	return s
+}
+
+// WithDeleteFailOpen opts out of the fail-closed delete gate. When no
+// authorizer is configured, ActionDelete is denied by default (FR-1); with
+// open=true the legacy CI/MVP baseline is restored (nil authorizer → allow).
+// The antivirus system actor stays exempt regardless (IsSystemDeleteExempt).
+func (s *FileService) WithDeleteFailOpen(open bool) *FileService {
+	s.deleteFailOpen = open
 	return s
 }
 

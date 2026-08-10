@@ -33,10 +33,18 @@ type Scanner interface {
 const EICAR = `X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*`
 
 // SignatureScanner flags content containing any of its byte signatures. It
-// always includes the EICAR test signature.
+// always includes the EICAR test signature. Scanning is streaming: the whole
+// object is consumed through a sliding window (clean only after EOF), so a
+// signature beyond 32 MiB is still detected while memory stays bounded by
+// maxSigLen + one 64 KiB chunk.
 type SignatureScanner struct {
-	sigs map[string][]byte
+	sigs      map[string][]byte
+	maxSigLen int // longest configured signature; 0 = no signatures configured
 }
+
+// scanChunkSize is the streaming read granularity; the matcher keeps one
+// chunk plus the maxSigLen tail that could still complete a signature.
+const scanChunkSize = 64 << 10
 
 // NewSignatureScanner builds the default scanner. extra maps a threat name to a
 // byte signature to additionally flag.
@@ -47,25 +55,86 @@ func NewSignatureScanner(extra map[string]string) *SignatureScanner {
 			s.sigs[name] = []byte(sig)
 		}
 	}
+	for _, sig := range s.sigs {
+		if len(sig) > s.maxSigLen {
+			s.maxSigLen = len(sig)
+		}
+	}
 	return s
 }
 
 func (s *SignatureScanner) Name() string { return "signature" }
 
+// Scan streams r through a sliding window and reports clean only after the
+// whole stream is consumed (EOF): tail malware beyond any fixed cap is still
+// detected. Signatures straddling chunk boundaries are matched via the
+// retained window. The zero value (no signatures configured) certifies clean
+// without reading anything.
 func (s *SignatureScanner) Scan(ctx context.Context, r io.Reader) (Result, error) {
-	// Bounded read: scan up to 32 MiB (signatures are small; large binaries are
-	// streamed past for a remote engine, not the local matcher).
-	const max = 32 << 20
-	data, err := io.ReadAll(io.LimitReader(r, max))
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	for name, sig := range s.sigs {
-		if bytes.Contains(data, sig) {
-			return Result{Clean: false, Signature: name}, nil
+	if s.maxSigLen == 0 {
+		return Result{Clean: true}, nil
+	}
+	chunk := make([]byte, scanChunkSize)
+	window := make([]byte, s.maxSigLen)
+	carried := 0
+	for {
+		n, err := r.Read(chunk)
+		if n > 0 {
+			if hit, name := s.match(chunk[:n], window[:carried]); hit {
+				return Result{Clean: false, Signature: name}, nil
+			}
+			// Retain the tail that could still complete a signature across
+			// the next chunk boundary (maxSigLen-1 bytes; in-place copy).
+			keep := s.maxSigLen - 1
+			if keep > n {
+				keep = n
+			}
+			copy(window, chunk[n-keep:n])
+			carried = keep
+		}
+		if err == io.EOF {
+			return Result{Clean: true}, nil
+		}
+		if err != nil {
+			return Result{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
 		}
 	}
-	return Result{Clean: true}, nil
+}
+
+// match reports whether any signature is contained in chunk or spans the
+// window→chunk junction (window holds the previous tail). The signature's
+// remainder is truncated to the chunk length: a signature may span several
+// chunks, and the retained window always holds its in-flight bytes
+// (window ≥ maxSigLen-1). Allocation-free.
+func (s *SignatureScanner) match(chunk, window []byte) (bool, string) {
+	for name, sig := range s.sigs {
+		if bytes.Contains(chunk, sig) {
+			return true, name
+		}
+		maxPref := len(sig) - 1
+		if maxPref > len(window) {
+			maxPref = len(window)
+		}
+		for pref := maxPref; pref > 0; pref-- {
+			if !bytes.Equal(window[len(window)-pref:], sig[:pref]) {
+				continue
+			}
+			rest := sig[pref:]
+			if len(rest) > len(chunk) {
+				rest = rest[:len(chunk)]
+			}
+			if bytes.HasPrefix(chunk, rest) {
+				return true, name
+			}
+		}
+	}
+	return false, ""
 }
 
 // HTTPScanner POSTs the object bytes to an external scanning service and expects
@@ -103,8 +172,14 @@ func (h *HTTPScanner) Scan(ctx context.Context, r io.Reader) (Result, error) {
 		Clean     bool   `json:"clean"`
 		Signature string `json:"signature"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// Bound the response: a hostile endpoint streaming >1 MiB of JSON is cut
+	// off, the decode fails and the scan fails closed — no unbounded
+	// allocation, no clean verdict from a garbage body.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxScanResponseBytes+1)).Decode(&body); err != nil {
 		return Result{}, errors.New("antivirus: malformed scanner response")
 	}
 	return Result{Clean: body.Clean, Signature: body.Signature}, nil
 }
+
+// maxScanResponseBytes bounds the remote scanner JSON reply (F4).
+const maxScanResponseBytes = 1 << 20

@@ -28,7 +28,7 @@ func newTestSvc(t *testing.T) (*FileService, repository.Repository) {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	return NewFileService(store, repo, nil), repo
+	return NewFileService(store, repo, nil).WithDeleteFailOpen(true), repo
 }
 
 func putTestObject(t *testing.T, svc *FileService, key, body string) repository.Object {

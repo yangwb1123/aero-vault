@@ -35,7 +35,7 @@ func (s *sqlStore) claimAuditGovernancePostgres(
 	query := `UPDATE audit_governance_outbox SET attempts=attempts+1,claim_owner=$1,
 claim_token=$2,lease_expires_at_ns=$3 WHERE id IN (
  SELECT o.id FROM audit_governance_outbox o JOIN audit_governance_bindings b
- ON b.tenant_id=o.tenant_id WHERE o.delivered_at_ns=0
+ ON b.tenant_id=o.tenant_id WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0
  AND o.available_at_ns <= $4 AND o.lease_expires_at_ns <= $5
  AND b.revision=$6
  ORDER BY o.available_at_ns,o.created_at_ns,o.id LIMIT $7 FOR UPDATE OF o SKIP LOCKED)
@@ -59,7 +59,7 @@ func (s *sqlStore) claimAuditGovernanceSQLite(
 	now := time.Now().UTC()
 	rows, err := tx.QueryContext(ctx, s.rebind(`SELECT o.id FROM audit_governance_outbox o
 JOIN audit_governance_bindings b ON b.tenant_id=o.tenant_id
-WHERE o.delivered_at_ns=0 AND o.available_at_ns <= $1 AND o.lease_expires_at_ns <= $2
+WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0 AND o.available_at_ns <= $1 AND o.lease_expires_at_ns <= $2
 AND b.revision=$3
 ORDER BY o.available_at_ns,o.created_at_ns,o.id LIMIT $4`),
 		now.UnixNano(), now.UnixNano(), revision, limit)
@@ -161,13 +161,32 @@ func requireGovernanceClaim(result sql.Result, err error) error {
 	return nil
 }
 
+// FailAuditGovernance marks a claimed fact terminal-failed: a permanent
+// semantic conflict (conflict:true receipt) cannot succeed by retrying, so
+// the row is parked with failed_at_ns set. Failed rows are excluded from
+// claim (failed_at_ns=0) and pending-backlog queries, and pruned by
+// CleanupFailedAuditGovernance after the retention window.
+func (s *sqlStore) FailAuditGovernance(
+	ctx context.Context, id, owner, token, reason string,
+) error {
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	result, err := s.db.ExecContext(ctx, s.rebind(`UPDATE audit_governance_outbox
+SET failed_at_ns=$1,claim_owner='',claim_token='',lease_expires_at_ns=0,last_error=$2
+WHERE id=$3 AND delivered_at_ns=0 AND failed_at_ns=0
+AND claim_owner=$4 AND claim_token=$5`), time.Now().UTC().UnixNano(),
+		strings.TrimSpace(reason), id, owner, token)
+	return requireGovernanceClaim(result, err)
+}
+
 func (s *sqlStore) OldestPendingAuditGovernance(
 	ctx context.Context,
 ) (time.Time, bool, error) {
 	var value sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT MIN(o.created_at_ns)
 FROM audit_governance_outbox o JOIN audit_governance_bindings b
- ON b.tenant_id=o.tenant_id WHERE o.delivered_at_ns=0`).Scan(&value)
+ ON b.tenant_id=o.tenant_id WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0`).Scan(&value)
 	if err != nil || !value.Valid {
 		return time.Time{}, false, err
 	}

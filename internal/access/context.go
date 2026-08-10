@@ -21,6 +21,17 @@ func SystemContext(ctx context.Context, tenant string) context.Context {
 	})
 }
 
+// AntivirusContext returns a context carrying the one system actor exempt
+// from the fail-closed delete gate (IsSystemDeleteExempt): the antivirus
+// quarantine path must keep working when no authorizer is configured.
+func AntivirusContext(ctx context.Context, tenant string) context.Context {
+	return WithPrincipal(ctx, Principal{
+		SubjectID: SystemActorAntivirus,
+		TenantID:  tenant,
+		Kind:      PrincipalSystem,
+	})
+}
+
 func CapabilityPrincipal(kind PrincipalKind, capability Capability) Principal {
 	return Principal{
 		SubjectID:  string(kind) + ":" + capability.ID,

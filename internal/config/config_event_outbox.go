@@ -10,26 +10,34 @@ import (
 // outbox precedents; the relay always starts (core deletion atomicity is not
 // gated) and is a silent no-op without notification rules.
 type EventOutboxConfig struct {
-	PollMilliseconds   int // EVENT_OUTBOX_POLL_INTERVAL_MILLIS
-	BatchSize          int // EVENT_OUTBOX_BATCH_SIZE
-	ClaimTTLSeconds    int // EVENT_OUTBOX_CLAIM_TTL_SECONDS
-	HTTPTimeoutSeconds int // EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS
-	MaxAttempts        int // EVENT_OUTBOX_MAX_ATTEMPTS
+	Enabled                 bool // EVENT_OUTBOX_ENABLED; false gates the relay loop entirely
+	PollMilliseconds        int  // EVENT_OUTBOX_POLL_INTERVAL_MILLIS
+	BatchSize               int  // EVENT_OUTBOX_BATCH_SIZE
+	ClaimTTLSeconds         int  // EVENT_OUTBOX_CLAIM_TTL_SECONDS
+	HTTPTimeoutSeconds      int  // EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS
+	MaxAttempts             int  // EVENT_OUTBOX_MAX_ATTEMPTS
+	DeliveredRetentionHours int  // EVENT_OUTBOX_DELIVERED_RETENTION_HOURS
+	FailedRetentionHours    int  // EVENT_OUTBOX_FAILED_RETENTION_HOURS
 }
 
 func loadEventOutboxConfig() EventOutboxConfig {
 	return EventOutboxConfig{
-		PollMilliseconds:   getEnvInt("EVENT_OUTBOX_POLL_INTERVAL_MILLIS", 1000),
-		BatchSize:          getEnvInt("EVENT_OUTBOX_BATCH_SIZE", 32),
-		ClaimTTLSeconds:    getEnvInt("EVENT_OUTBOX_CLAIM_TTL_SECONDS", 30),
-		HTTPTimeoutSeconds: getEnvInt("EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS", 5),
-		MaxAttempts:        getEnvInt("EVENT_OUTBOX_MAX_ATTEMPTS", 10),
+		Enabled:                 getEnvBool("EVENT_OUTBOX_ENABLED", true),
+		PollMilliseconds:        getEnvInt("EVENT_OUTBOX_POLL_INTERVAL_MILLIS", 1000),
+		BatchSize:               getEnvInt("EVENT_OUTBOX_BATCH_SIZE", 32),
+		ClaimTTLSeconds:         getEnvInt("EVENT_OUTBOX_CLAIM_TTL_SECONDS", 30),
+		HTTPTimeoutSeconds:      getEnvInt("EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS", 5),
+		MaxAttempts:             getEnvInt("EVENT_OUTBOX_MAX_ATTEMPTS", 10),
+		DeliveredRetentionHours: getEnvInt("EVENT_OUTBOX_DELIVERED_RETENTION_HOURS", 24),
+		FailedRetentionHours:    getEnvInt("EVENT_OUTBOX_FAILED_RETENTION_HOURS", 168),
 	}
 }
 
 // withDefaults fills zero fields with the billing-mirrored defaults, so a
 // hand-built zero config validates like the env-loaded one (Load always
-// populates every field).
+// populates every field). Enabled is left untouched: it is env-driven
+// (EVENT_OUTBOX_ENABLED, default true) and must not be flipped back by
+// validation.
 func (c EventOutboxConfig) withDefaults() EventOutboxConfig {
 	if c.PollMilliseconds == 0 {
 		c.PollMilliseconds = 1000
@@ -45,6 +53,12 @@ func (c EventOutboxConfig) withDefaults() EventOutboxConfig {
 	}
 	if c.MaxAttempts == 0 {
 		c.MaxAttempts = 10
+	}
+	if c.DeliveredRetentionHours == 0 {
+		c.DeliveredRetentionHours = 24
+	}
+	if c.FailedRetentionHours == 0 {
+		c.FailedRetentionHours = 168
 	}
 	return c
 }
@@ -73,6 +87,12 @@ func (c EventOutboxConfig) Validate() error {
 	}
 	if c.MaxAttempts <= 0 || c.MaxAttempts > 1000 {
 		return errors.New("EVENT_OUTBOX_MAX_ATTEMPTS must be within 1..1000")
+	}
+	if c.DeliveredRetentionHours <= 0 || c.DeliveredRetentionHours > 8760 {
+		return errors.New("EVENT_OUTBOX_DELIVERED_RETENTION_HOURS must be within 1..8760")
+	}
+	if c.FailedRetentionHours <= 0 || c.FailedRetentionHours > 8760 {
+		return errors.New("EVENT_OUTBOX_FAILED_RETENTION_HOURS must be within 1..8760")
 	}
 	return nil
 }

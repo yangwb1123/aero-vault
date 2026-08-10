@@ -19,6 +19,16 @@ import (
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
+// allowAllProvider is the access.Authorizer test double used by the admin
+// delete suite: no authorizer (or a nil manager) keeps the CI baseline so
+// these behavioral tests exercise the admin endpoint, not the fail-closed
+// delete gate (covered by dedicated tests).
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
+}
+
 // TestRESTDeleteDenied_403_NoOutbox — AC-2/AC-3 (T7/T9): at the HTTP boundary a
 // fail-closed denied delete answers 403 AccessDenied with the denial reason in
 // message and leaves the outbox table untouched. Harness mirrors

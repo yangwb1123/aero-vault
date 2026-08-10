@@ -21,9 +21,14 @@ const (
 )
 
 var (
-	ErrInvalidConfig    = errors.New("audit governance configuration is invalid")
-	ErrInvalidEvent     = errors.New("audit governance event is invalid")
-	ErrInvalidReceipt   = errors.New("audit governance receipt is invalid")
+	ErrInvalidConfig  = errors.New("audit governance configuration is invalid")
+	ErrInvalidEvent   = errors.New("audit governance event is invalid")
+	ErrInvalidReceipt = errors.New("audit governance receipt is invalid")
+	// ErrConflictReceipt marks a receipt with conflict:true — a permanent
+	// semantic conflict (the fact is already ledgered with a different
+	// identity). Retry cannot succeed, so the relay terminals the fact
+	// (failed_at_ns) instead of rescheduling it forever (migration 0042).
+	ErrConflictReceipt  = errors.New("audit governance receipt is a permanent conflict")
 	ErrTokenUnavailable = errors.New("audit governance token is unavailable")
 )
 

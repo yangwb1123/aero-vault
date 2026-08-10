@@ -30,7 +30,7 @@ func newTestServer(t *testing.T, search *ai.Search) (*Server, *service.FileServi
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	srv := NewServer(svc, repo, search, "default", nil)
 	return srv, svc, repo
 }
