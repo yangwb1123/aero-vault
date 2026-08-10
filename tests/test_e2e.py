@@ -268,6 +268,11 @@ def test_bucket_policy():
     assert status == 200, f"PutBucketPolicy: got {status}"
     print(f"  ✅ PUT /v1/buckets/default/policy -> 200")
 
+    # Enforcement: the Deny (plus no Allow) must block GET on /v1 as well.
+    status, _ = request("GET", f"/v1/files/{key}")
+    assert status == 403, f"GET after deny policy: got {status}, want 403"
+    print(f"  ✅ GET /v1/files/{key} -> 403 (policy enforced)")
+
     # Delete policy
     status, _ = request("DELETE", "/v1/buckets/default/policy")
     assert status == 200, f"DeleteBucketPolicy: got {status}"
