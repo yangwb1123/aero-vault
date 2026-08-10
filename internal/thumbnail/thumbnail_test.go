@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-func makePNG(t *testing.T, w, h int) []byte {
+func makePNG(t testing.TB, w, h int) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
@@ -32,7 +32,7 @@ func makePNG(t *testing.T, w, h int) []byte {
 // headerOnlyPNG builds a PNG containing only the signature + IHDR chunk
 // (valid CRC) — no IDAT/IEND — so no pixel buffer is ever allocated. The
 // declared dimensions are attacker-controlled.
-func headerOnlyPNG(t *testing.T, w, h int) []byte {
+func headerOnlyPNG(t testing.TB, w, h int) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	buf.Write([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}) // signature
@@ -156,7 +156,7 @@ func TestGenerateDefaults(t *testing.T) {
 // the 16-bit length field caps a single APP1 at 65533 bytes so many segments
 // are needed. The result is still a valid image — decoders skip the APP1
 // payload as metadata.
-func appnPaddedJPEG(t *testing.T, totalMetaBytes int) []byte {
+func appnPaddedJPEG(t testing.TB, totalMetaBytes int) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
 	for y := 0; y < 8; y++ {
@@ -340,8 +340,103 @@ func TestGenerateMetadataAtExactBudget(t *testing.T) {
 	}
 }
 
+// maxSourceBytesJPEGPayload emits a valid JPEG prefix (SOI through the end of
+// the SOS header) followed by endless zero bytes — a stream that passes
+// DecodeConfig, completes the 8×8 scan, then feeds image/jpeg's liberal marker
+// scan (extraneous non-marker data is silently ignored, stdlib reader.go)
+// until the source cap. It never EOFs.
+type maxSourceBytesJPEGPayload struct {
+	prefix []byte
+	off    int
+}
+
+func (s *maxSourceBytesJPEGPayload) Read(p []byte) (int, error) {
+	n := copy(p, s.prefix[s.off:])
+	s.off += n
+	for i := n; i < len(p); i++ {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// TestGenerateSourceBytesBound pins the MaxSourceBytes (128 MiB) read cap —
+// the only budget branch the 64 KiB fuzz cap cannot reach. A payload that
+// never terminates must abort at the cap with ErrUnsupported and bounded
+// reads (no hang, no unbounded consumption). Deleting the LimitReader in
+// Generate would fail this test and no other.
+func TestGenerateSourceBytesBound(t *testing.T) {
+	base := appnPaddedJPEG(t, 0) // plain 8×8 JPEG, zero APP1 segments
+	i := bytes.Index(base, []byte{0xFF, 0xDA})
+	if i < 0 {
+		t.Fatal("no SOS marker in fixture")
+	}
+	n := int(binary.BigEndian.Uint16(base[i+2 : i+4]))
+	prefix := base[:i+2+n] // entropy data cut; replaced by endless zeros
+	cnt := &countingReader{r: &maxSourceBytesJPEGPayload{prefix: prefix}}
+	img, err := Generate(cnt, 100, 100)
+	if img != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("expected ErrUnsupported with nil payload, got img!=nil=%v err=%v", img != nil, err)
+	}
+	if cnt.n > MaxSourceBytes+64<<10 {
+		t.Fatalf("read %d bytes, want <= %d", cnt.n, MaxSourceBytes+64<<10)
+	}
+	if cnt.n < MaxSourceBytes-1<<20 {
+		t.Fatalf("read %d bytes: cap not reached (want ~%d)", cnt.n, MaxSourceBytes)
+	}
+}
+
 func TestGenerateRejectsNonImage(t *testing.T) {
 	if _, err := Generate(bytes.NewReader([]byte("not an image")), 100, 100); err != ErrUnsupported {
 		t.Fatalf("expected ErrUnsupported, got %v", err)
 	}
+}
+
+// FuzzGenerate drives Generate with arbitrary mutations of the existing
+// fixture shapes, asserting the package's documented contract: no panic;
+// errors are always nil or one of the three sentinels; a nil error yields a
+// decodable JPEG no larger than the requested bounds. The 64 KiB input cap
+// bounds per-iteration work (a hang surfaces as a fuzz worker timeout); the
+// module's MaxSourceBytes/MaxMetadataBytes budgets and the MaxSourceDim
+// pre-check bound the decoder side regardless of mutation. ErrMetadataTooLarge
+// is unreachable under the 64 KiB cap (budget is 8 MiB) and is pinned by
+// TestGenerateRejectsOversizedMetadata* / TestGenerateEndlessMetadata; it
+// stays in the accepted set so coverage becomes automatic if budgets change.
+// The error-set assertion depends on jpeg.Encode's error being unreachable:
+// both of its error sources (the dims guard at >= 1<<16 and the sink write
+// path) are structurally impossible here — post-scale bounds are <= 64x64
+// and the decoded source is <= MaxSourceDim < 1<<16, and a bytes.Buffer
+// never fails. Re-open deliberately if the sink or the scale bounds change.
+// Run: go test -fuzz=FuzzGenerate -fuzztime=60s ./internal/thumbnail/
+func FuzzGenerate(f *testing.F) {
+	// Fixture builders are typed testing.TB (REQ-8) so *testing.F and
+	// *testing.T both work (F embeds common, not T).
+	f.Add(headerOnlyPNG(f, 8, 8))           // ErrUnsupported: no IDAT
+	f.Add(headerOnlyPNG(f, 100000, 100000)) // ErrImageTooLarge: dims > MaxSourceDim (33 B)
+	f.Add(appnPaddedJPEG(f, 1<<16))         // APP1 flood, truncated at the input cap
+	prefix := make([]byte, 64<<10)
+	_, _ = io.ReadFull(&endlessAPP1Stream{}, prefix) // streaming-flood shape, finite prefix
+	f.Add(prefix)
+	png := makePNG(f, 400, 200) // 744 B: known-good decode + downscale seed (REQ-4)
+	f.Add(png)
+	f.Add(png[:len(png)/2]) // mid-IDAT truncation
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)
+		if err != nil {
+			if !errors.Is(err, ErrUnsupported) && !errors.Is(err, ErrImageTooLarge) &&
+				!errors.Is(err, ErrMetadataTooLarge) {
+				t.Fatalf("Generate returned non-sentinel error: %v", err)
+			}
+			return
+		}
+		img, format, derr := image.Decode(bytes.NewReader(out))
+		if derr != nil || format != "jpeg" || img == nil ||
+			img.Bounds().Dx() > 64 || img.Bounds().Dy() > 64 {
+			dims := "nil"
+			if img != nil {
+				dims = img.Bounds().String()
+			}
+			t.Fatalf("invalid thumbnail: format=%q dims=%s decodeErr=%v", format, dims, derr)
+		}
+	})
 }
