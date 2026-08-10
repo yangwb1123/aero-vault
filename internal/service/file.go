@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"reflect"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -96,6 +97,19 @@ type FileService struct {
 // WithAuthorizer enables resource-level authorization at the FileService
 // boundary. A nil authorizer preserves the CI/MVP baseline.
 func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService {
+	// nil 防御：接口持有的 (*Manager)(nil) 会让 `authorizer != nil` 误判为
+	// true，随后 authorize() 调用 nil 方法 panic（真实事故：PUT /v1/files 500，
+	// access 禁用时 minimal 部署必现）。两层防御：具体类型 nil + 反射兜底。
+	if authorizer == nil {
+		return s
+	}
+	value := reflect.ValueOf(authorizer)
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func:
+		if value.IsNil() {
+			return s
+		}
+	}
 	s.authorizer = authorizer
 	return s
 }
