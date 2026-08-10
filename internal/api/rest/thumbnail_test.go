@@ -2,6 +2,8 @@ package rest
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -20,6 +22,45 @@ func pngBytes(t *testing.T, w, h int) []byte {
 	var buf bytes.Buffer
 	_ = png.Encode(&buf, img)
 	return buf.Bytes()
+}
+
+// bombPNG builds a PNG declaring w×h pixels with only a signature + IHDR
+// chunk (valid CRC): 33 bytes, no pixel data, no allocation.
+func bombPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}) // signature
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], uint32(w))
+	binary.BigEndian.PutUint32(ihdr[4:8], uint32(h))
+	// depth 8, color type 6 (RGBA), compression 0, filter 0, interlace 0.
+	ihdr[8], ihdr[9], ihdr[10], ihdr[11], ihdr[12] = 8, 6, 0, 0, 0
+	var chunk bytes.Buffer
+	chunk.WriteString("IHDR")
+	chunk.Write(ihdr)
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], 13)
+	buf.Write(l[:])
+	buf.Write(chunk.Bytes())
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write(chunk.Bytes())
+	binary.BigEndian.PutUint32(l[:], crc.Sum32())
+	buf.Write(l[:])
+	return buf.Bytes()
+}
+
+func TestThumbnailOversizedImage(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/bomb.png"
+	// Tiny 33-byte PUT passes the (disabled-by-default) MaxBodySize cap.
+	req(t, "PUT", u, bombPNG(t, 100000, 100000), map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("thumbnail of oversized image: status=%d want 413", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte(`"code":"ImageTooLarge"`)) {
+		t.Fatalf("expected code ImageTooLarge, body: %s", body)
+	}
 }
 
 func TestThumbnailEndpoint(t *testing.T) {

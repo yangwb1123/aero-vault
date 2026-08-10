@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -49,6 +50,10 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close()
 	img, err := thumbnail.Generate(rc, maxW, maxH)
 	if err != nil {
+		if errors.Is(err, thumbnail.ErrImageTooLarge) {
+			h.writeError(w, r, thumbnail.ErrImageTooLarge)
+			return
+		}
 		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
 		return
 	}

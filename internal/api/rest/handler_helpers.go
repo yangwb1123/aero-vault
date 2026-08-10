@@ -12,6 +12,7 @@ import (
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
 // ── Error handling ─────────────────────────────────────────────────────────────
@@ -38,6 +39,15 @@ func classify(err error) (string, string, int) {
 		return "NotFound", "object not found", http.StatusNotFound
 	case errors.Is(err, service.ErrUploadNotFound), errors.Is(err, repository.ErrUploadNotFound):
 		return "NoSuchUpload", "upload not found", http.StatusNotFound
+	case errors.Is(err, thumbnail.ErrImageTooLarge):
+		// Defensive ordering (not load-bearing): the thumbnail handler unwraps
+		// the raw sentinel before classifying (that unwrap is the load-bearing
+		// defense), and errors.Is on the raw sentinel never matches
+		// ErrInvalidArgs — so the 413 outcome holds regardless of this case's
+		// position. Keeping it ahead of ErrInvalidArgs only matters for a
+		// hypothetical wrapped ErrInvalidArgs %w ErrImageTooLarge from a
+		// future call site.
+		return "ImageTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrInvalidArgs):
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrBadDigest):
