@@ -4,6 +4,26 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ---
 
+## 2026-08-10
+
+### Added
+- **Thumbnail: transparent PNG/GIF composited onto white before JPEG encode** (`internal/thumbnail/thumbnail.go`, `internal/thumbnail/transparency_test.go`, `internal/api/rest/thumbnail_test.go`)
+  - `Generate` now runs `compositeOnWhite(dst)` before `jpeg.Encode`: JPEG has no alpha, and the generic encoder path serializes premultiplied `RGBA()` values verbatim, rendering transparent regions black (or darkened). Fully opaque sources are returned unchanged (the skip is load-bearing, not an optimization); the composite is O(w×h) with a ≤1 MiB allocation pin, origin-safe for sub-images. Half-transparent red now renders pink (255,127,127) instead of darkened red (127,0,0).
+  - Gate-condition pins: corrected spec assertion (`g,b<200` — the exact composite value is 127; the original `<60` failed correct code and passed the buggy baseline), semi-transparent no-downscale (ratio≥1) path, composite allocation bound, non-zero-origin `SubImage` fidelity, HTTP-level alpha pixel test. `-race` clean.
+- **Thumbnail: decode memory bounds — dimension pre-check, input/metadata caps, package-level decode semaphore** (`internal/thumbnail/thumbnail.go`, `internal/thumbnail/semaphore_test.go`, `Makefile`, `.github/workflows/ci.yml`)
+  - `MaxSourceDim` 8192 header pre-check (`ErrImageTooLarge` → 413 before any pixel buffer), `MaxSourceBytes` 128 MiB `LimitReader`, `MaxMetadataBytes` 8 MiB sticky `limitedBuffer` tee (`ErrMetadataTooLarge`, protects the config scan from APPn/COM/XMP flood), and a package-level semaphore capping concurrent `Generate` decode sections at `maxConcurrentDecodes = 4` (aggregate ≈1.1 GiB worst case for PNG RGBA, independent of per-request concurrency settings). Waiters hold only a stream reader and allocate nothing.
+  - Deterministic contract pins: `maxConcurrentDecodes == 4` constant pin + absolute 2 GiB live-heap ceiling (a silent 4→8→16 raise now fails tests), blocking-before-`DecodeConfig` / release-on-error / release-on-panic slot tests, 120 s watchdog on the aggregate test (slot leak fails fast instead of a 10-min `go test` timeout), `testing.Short()` skip for the ~1.2 GiB aggregate test, and CI race coverage (`test-race-thumbnail` in `make check`, race step in GitHub Actions).
+- **Thumbnail: Go fuzz target over the network-facing decode path** (`internal/thumbnail/thumbnail_test.go`) — `FuzzGenerate` with seeds for header-only PNG, over-`MaxSourceDim` dims, APP1-flooded JPEG, and truncated inputs; nil-coherent error surface, fixture builders typed `testing.TB`.
+- **Thumbnail REST dispatch: version-pinned reads never shadowed; over-cap keys fall back** (`internal/api/rest/thumbnail.go`, `internal/api/rest/thumbnail_test.go`)
+  - `?version=` on the thumbnail route now delegates unconditionally to `Get` (which resolves the pinned version): a version-pinned read of a soft-deleted object at a key ending in `/thumbnail` served the trimmed key's derived thumbnail (wrong-object content) — now serves the pinned version's own bytes.
+  - `Stat` returning `ErrInvalidArgs` (a legal object key whose `/thumbnail` suffix exceeds the 200-char cap, e.g. 191-char keys) now falls through to the subresource interpretation instead of surfacing a 400 regression.
+  - Test pins for the full dispatch contract: exact-key bucket-policy Deny → 403 (never the trimmed key's thumbnail); exact-key arm inherits `If-None-Match` 304 and `Range` 206/`Content-Range`; D3 delegation arm reachable (access-enabled authorizer + anonymous public-read harness — anonymous reads of public objects at the full key keep working); 200/201-char full-key fallback.
+
+### Fixed
+- **Thumbnail: `TestSemaphoreBlocksBeforeDecodeConfig` leaked a slot-holding goroutine** — the parked `Generate` is now unblocked via a signal reader and its exit awaited before the slots are released, so no slot or goroutine leaks into later tests (the leaked goroutine wedged `TestSemaphoreReleasesOnError` under `-race`).
+
+---
+
 ## 2026-08-08
 
 ### Added
