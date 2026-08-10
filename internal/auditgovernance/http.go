@@ -178,8 +178,9 @@ func governancePayload(fact repository.AuditGovernanceFact) map[string]any {
 func validateReceipt(response *http.Response, fact repository.AuditGovernanceFact) error {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusAccepted {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
-		return &httpStatusError{Status: response.StatusCode}
+		// 调试：403/4xx 时保留响应体供人工诊断（生产无敏感信息）
+		body, _ := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
+		return &httpStatusError{Status: response.StatusCode, Detail: string(body)}
 	}
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {

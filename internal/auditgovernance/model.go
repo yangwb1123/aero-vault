@@ -29,9 +29,13 @@ var (
 
 type httpStatusError struct {
 	Status int
+	Detail string
 }
 
 func (e *httpStatusError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("audit governance HTTP %d: %s", e.Status, e.Detail)
+	}
 	return fmt.Sprintf("audit governance HTTP %d", e.Status)
 }
 
