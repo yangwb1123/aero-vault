@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -97,18 +98,20 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	if !strings.HasPrefix(obj.ContentType, "image/") {
+	// Media-type gate, normalized per RFC 9110 §8.3.1 (media types are
+	// case-insensitive and may carry parameters): mime.ParseMediaType
+	// lowercases the type/subtype and strips parameters, so "Image/JPEG" and
+	// "image/jpeg; charset=utf-8" both normalize to image/jpeg and pass.
+	// The prefix check (400) is the client-argument class — the object is not
+	// an image at all; the exact decodable-set check (415) is the
+	// server-capability class — a valid image the pipeline's registered
+	// decoders (gif/jpeg/png) cannot decode, per RFC 9110 §15.5.16.
+	mediaType, _, perr := mime.ParseMediaType(obj.ContentType)
+	if perr != nil || !strings.HasPrefix(mediaType, "image/") {
 		h.writeError(w, r, fmt.Errorf("%w: object is not an image (content-type %q)", service.ErrInvalidArgs, obj.ContentType))
 		return
 	}
-	// Exact-match gate on the three types the pipeline's registered decoders
-	// can actually decode (side-effect imports of image/gif, image/jpeg,
-	// image/png in internal/thumbnail). A valid image the server simply
-	// cannot decode (webp/bmp/avif/tiff, or aliases like image/jpg) is a
-	// server-capability matter, not a client argument error: 415 with the
-	// supported list, via thumbnail.ErrUnsupportedFormat — distinct from the
-	// byte-level ErrUnsupported, which stays 400 for corrupt/non-image bytes.
-	switch obj.ContentType {
+	switch mediaType {
 	case "image/jpeg", "image/png", "image/gif":
 	default:
 		h.writeError(w, r, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",

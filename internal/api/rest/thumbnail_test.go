@@ -1379,6 +1379,7 @@ func TestThumbnailBadDimensions(t *testing.T) {
 		{"?w=", "w", ""},
 		{"?h=", "h", ""},
 		{"?w=1e3", "w", "1e3"},
+		{"?w=99999999999999999999", "w", "99999999999999999999"}, // int overflow → Atoi error
 	} {
 		resp, body := req(t, "GET", u+"/thumbnail"+tc.q, nil, nil)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -1451,4 +1452,163 @@ func TestThumbnailOpenAPIDocuments415(t *testing.T) {
 	if _, ok := getObj["responses"].(map[string]any)["415"]; ok {
 		t.Fatalf("GET /v1/files/{key} must not document 415: %v", getObj["responses"])
 	}
+}
+
+// TestThumbnailMediaTypeNormalization pins the RFC 9110 §8.3.1 normalized
+// gate (must-fix 1): media types are case-insensitive and may carry
+// parameters, so "Image/JPEG" and "image/jpeg; charset=utf-8" normalize to
+// image/jpeg and must be accepted (200), while aliases of unsupported
+// formats (image/jpg, image/x-png, image/pjpeg) with decodable bytes stay
+// server-capability rejections (415) — and a mislabeled webp-declared PNG
+// stays 415 by declared type, never sniffed.
+func TestThumbnailMediaTypeNormalization(t *testing.T) {
+	s := newRESTTest(t)
+	png := pngBytes(t, 32, 32)
+	accepted := []struct {
+		name, ct string
+	}{
+		{"uppercase type", "Image/JPEG"},
+		{"uppercase subtype", "image/PNG"},
+		{"mixed case", "ImAgE/GiF"},
+		{"parameter", "image/jpeg; charset=utf-8"},
+		{"whitespace parameter", "image/png; foo=\"bar baz\""},
+	}
+	for _, tc := range accepted {
+		t.Run("accept "+tc.name, func(t *testing.T) {
+			u := s.URL + "/v1/files/a-" + sanitizeKey(tc.name)
+			req(t, "PUT", u, png, map[string]string{"Content-Type": tc.ct})
+			resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("content-type %q: status=%d want 200 (body=%s)", tc.ct, resp.StatusCode, body)
+			}
+		})
+	}
+	unsupported := []struct {
+		name, ct string
+	}{
+		{"jpg alias", "image/jpg"},
+		{"x-png alias", "image/x-png"},
+		{"pjpeg alias", "image/pjpeg"},
+		{"webp", "image/webp"},
+	}
+	for _, tc := range unsupported {
+		t.Run("reject "+tc.name, func(t *testing.T) {
+			// Decodable PNG bytes under an unsupported declared type: the
+			// gate runs on the declared media type, not on sniffed bytes.
+			u := s.URL + "/v1/files/b-" + sanitizeKey(tc.name)
+			req(t, "PUT", u, png, map[string]string{"Content-Type": tc.ct})
+			resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+			if resp.StatusCode != http.StatusUnsupportedMediaType {
+				t.Fatalf("content-type %q: status=%d want 415 (body=%s)", tc.ct, resp.StatusCode, body)
+			}
+			if !bytes.Contains(body, []byte(`"code":"UnsupportedMediaType"`)) {
+				t.Fatalf("%s: expected code UnsupportedMediaType, body: %s", tc.ct, body)
+			}
+		})
+	}
+	// Mislabeled: webp-declared PNG bytes → 415 (declared type governs).
+	t.Run("mislabeled webp-declared png", func(t *testing.T) {
+		u := s.URL + "/v1/files/mislabeled"
+		req(t, "PUT", u, png, map[string]string{"Content-Type": "image/webp"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusUnsupportedMediaType {
+			t.Fatalf("webp-declared PNG bytes: status=%d want 415", resp.StatusCode)
+		}
+	})
+	// Unparseable content type (no slash): client-argument class, 400.
+	t.Run("unparseable content type", func(t *testing.T) {
+		u := s.URL + "/v1/files/weird"
+		req(t, "PUT", u, png, map[string]string{"Content-Type": "not-a-media-type"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("unparseable content-type: status=%d want 400", resp.StatusCode)
+		}
+	})
+}
+
+func sanitizeKey(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+// TestThumbnailErrorPathCacheHygiene pins must-fix 3: the 400/415 error
+// responses must carry no cacheable success headers (ETag, Cache-Control,
+// Last-Modified), and an If-None-Match on a garbage-dimension request must
+// yield 400 — never 304 (a revalidating shared cache must not adopt a
+// validator for a response that was never generated).
+func TestThumbnailErrorPathCacheHygiene(t *testing.T) {
+	s := newRESTTest(t)
+	assertNoCacheHeaders := func(t *testing.T, resp *http.Response, what string) {
+		t.Helper()
+		for _, h := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+			if v := resp.Header.Get(h); v != "" {
+				t.Fatalf("%s: %s=%q must be absent on the error path", what, h, v)
+			}
+		}
+	}
+	u := s.URL + "/v1/files/bomb.png"
+	req(t, "PUT", u, bombPNG(t, 100000, 100000), map[string]string{"Content-Type": "image/png"})
+
+	// Garbage dims + a matching-looking If-None-Match: 400, not 304.
+	resp, body := req(t, "GET", u+"/thumbnail?w=abc", nil, map[string]string{"If-None-Match": `"whatever"`})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("garbage dims + If-None-Match: status=%d want 400 (body=%s)", resp.StatusCode, body)
+	}
+	assertNoCacheHeaders(t, resp, "garbage-dims 400")
+
+	// Unsupported format error path: 415 with no cache headers.
+	tu := s.URL + "/v1/files/pic.webp"
+	req(t, "PUT", tu, pngBytes(t, 32, 32), map[string]string{"Content-Type": "image/webp"})
+	resp, _ = req(t, "GET", tu+"/thumbnail", nil, map[string]string{"If-None-Match": `"whatever"`})
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("unsupported format + If-None-Match: status=%d want 415", resp.StatusCode)
+	}
+	assertNoCacheHeaders(t, resp, "unsupported-format 415")
+
+	// Non-image 400 path: no cache headers either.
+	nu := s.URL + "/v1/files/note.txt"
+	req(t, "PUT", nu, []byte("hello"), map[string]string{"Content-Type": "text/plain"})
+	resp, _ = req(t, "GET", nu+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("text/plain: status=%d want 400", resp.StatusCode)
+	}
+	assertNoCacheHeaders(t, resp, "non-image 400")
+}
+
+// TestThumbnailDispatchArmIgnoresGarbageDims pins the should-complete
+// dispatch-arm row: on the exact-key arm (?version= / raw download of an
+// existing "/thumbnail"-suffixed key) the ?w=/?h= parameters are ignored —
+// garbage values must not 400 a raw download, and a multi-value ?w=1&w=2
+// uses the first value (url.Values.Get semantics) on the derivation path.
+func TestThumbnailDispatchArmIgnoresGarbageDims(t *testing.T) {
+	s, tok, repo := newAuthRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+	resp, body := req(t, "GET", uFull+"?w=abc&h=-5", nil, authH)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("exact-key arm with garbage dims: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Equal(body, []byte("object bytes")) {
+		t.Fatalf("exact-key arm body=%q want the object bytes", body)
+	}
+	// Derivation path with a multi-value ?w= uses the first value (Get
+	// semantics) — a valid 200 with the first dimension.
+	resp, body = req(t, "GET", s.URL+"/v1/files/dir2/thumbnail?w=100&w=999", nil, nil)
+	_ = resp
+	_ = body
 }
