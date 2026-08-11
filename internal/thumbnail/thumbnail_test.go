@@ -612,3 +612,40 @@ func TestPNGBitDepth(t *testing.T) {
 		t.Fatalf("24-byte prefix (offset-24 byte absent): pngBitDepth = %d, want 8", got)
 	}
 }
+
+// TestGenerate16BitColorTypeArms pins the format-class rule (qa F2 / sec F3):
+// the depth-16 cap keys on the IHDR bit-depth byte, NOT the color type — a
+// 16-bit gray source (color type 0, 2 B/px) is conservatively over-rejected
+// above Max16BitSourceDim, closing the gray16+tRNS regression hole (the
+// stdlib decodes gray16+tRNS to *image.NRGBA64 at 8 B/px, the full class
+// cost). Color type 2 (truecolor 16-bit, 6 B/px → RGBA64 at 8 B/px) is the
+// main class and must reject too; both accept exactly at the cap.
+func TestGenerate16BitColorTypeArms(t *testing.T) {
+	for _, ct := range []struct {
+		colorType byte
+		name      string
+	}{
+		{0, "gray16 (2 B/px, conservative over-rejection)"},
+		{2, "truecolor16 (6 B/px)"},
+		{4, "grayalpha16 (4 B/px)"},
+	} {
+		t.Run(ct.name, func(t *testing.T) {
+			// Above the cap: rejected from the header.
+			big := headerOnlyPNG(t, Max16BitSourceDim+1, 1024, 16, ct.colorType)
+			if _, err := Generate(bytes.NewReader(big), 100, 100); !errors.Is(err, ErrImageTooLarge) {
+				t.Fatalf("color type %d above cap: expected ErrImageTooLarge, got %v", ct.colorType, err)
+			}
+			// Exactly at the cap: accepted through the depth-16 gate (the
+			// header-only fixture then fails at decode → ErrUnsupported).
+			at := headerOnlyPNG(t, Max16BitSourceDim, Max16BitSourceDim, 16, ct.colorType)
+			if _, err := Generate(bytes.NewReader(at), 100, 100); errors.Is(err, ErrImageTooLarge) {
+				t.Fatalf("color type %d at cap: must not be rejected as ImageTooLarge", ct.colorType)
+			}
+			// The 8-bit same-color-type control is unaffected by the cap.
+			c8 := headerOnlyPNG(t, 8192, 8192, 8, ct.colorType)
+			if _, err := Generate(bytes.NewReader(c8), 100, 100); errors.Is(err, ErrImageTooLarge) {
+				t.Fatalf("8-bit color type %d at MaxSourceDim: must not be rejected", ct.colorType)
+			}
+		})
+	}
+}

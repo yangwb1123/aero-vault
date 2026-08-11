@@ -1612,3 +1612,55 @@ func TestThumbnailDispatchArmIgnoresGarbageDims(t *testing.T) {
 	_ = resp
 	_ = body
 }
+
+// TestThumbnailDepth16Oversized413 pins P1-1: the depth-16 dimension cap
+// (thumbnail.Max16BitSourceDim) surfaces as 413 ImageTooLarge at the HTTP
+// seam — a 16-bit PNG with declared dims above the cap is rejected from the
+// header before any pixel buffer, exactly like the progressive-JPEG class.
+func TestThumbnailDepth16Oversized413(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/deep.png"
+	req(t, "PUT", u, headerOnlyPNGBytes(t, thumbnail.Max16BitSourceDim+1, 1024, 16, 6), map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("depth-16 oversized thumbnail: status=%d want 413 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"ImageTooLarge"`)) {
+		t.Fatalf("expected code ImageTooLarge, body: %s", body)
+	}
+	// Control: depth-16 at exactly the cap is not 413 — it falls through to
+	// full decode and fails there (header-only fixture) as InvalidArgument.
+	req(t, "PUT", s.URL+"/v1/files/deep-ok.png", headerOnlyPNGBytes(t, thumbnail.Max16BitSourceDim, 100, 16, 6), map[string]string{"Content-Type": "image/png"})
+	resp, body = req(t, "GET", s.URL+"/v1/files/deep-ok.png/thumbnail", nil, nil)
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		t.Fatalf("depth-16 at cap: status=%d — must not reject as ImageTooLarge", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("depth-16 at cap: expected InvalidArgument (decode of header-only fixture), body: %s", body)
+	}
+}
+
+// headerOnlyPNGBytes builds a header-only PNG with declared w×h and the
+// given IHDR bit depth / color type — the protocol-boundary analogue of the
+// thumbnail package's fixture.
+func headerOnlyPNGBytes(t *testing.T, w, h int, bitDepth, colorType byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}) // signature
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], uint32(w))
+	binary.BigEndian.PutUint32(ihdr[4:8], uint32(h))
+	ihdr[8], ihdr[9], ihdr[10], ihdr[11], ihdr[12] = bitDepth, colorType, 0, 0, 0
+	var chunk bytes.Buffer
+	chunk.WriteString("IHDR")
+	chunk.Write(ihdr)
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], 13)
+	buf.Write(l[:])
+	buf.Write(chunk.Bytes())
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write(chunk.Bytes())
+	binary.BigEndian.PutUint32(l[:], crc.Sum32())
+	buf.Write(l[:])
+	return buf.Bytes()
+}
