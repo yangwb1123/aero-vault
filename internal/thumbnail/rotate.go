@@ -1,6 +1,9 @@
 package thumbnail
 
-import "image"
+import (
+	"context"
+	"image"
+)
 
 // orientIndex maps EXIF orientation values 1–8 to the source pixel
 // (sr, sc) for a destination pixel (r, c) of a w×h source, per the standard
@@ -35,9 +38,13 @@ var orientIndex = [9]func(r, c, w, h int) (sr, sc int){
 // composite copy 1:1 in the per-request live peak). Correct for 1×1, 1×N,
 // N×1 and HardMax² frames: source indices derive from the table formulas
 // over w/h bounds, so no read can go out of range.
-func applyOrientation(img image.Image, o int) image.Image {
+//
+// It consults ctx at the top of every cancelCheckRows-th row and returns
+// (nil, ctx.Err()) unwrapped on a done context; the o ≤ 1 / o ≥ 9 fast paths
+// return (img, nil) without consulting ctx.
+func applyOrientation(ctx context.Context, img image.Image, o int) (image.Image, error) {
 	if o <= 1 || o >= 9 {
-		return img
+		return img, nil
 	}
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -48,10 +55,15 @@ func applyOrientation(img image.Image, o int) image.Image {
 	idx := orientIndex[o]
 	dst := image.NewRGBA(image.Rect(0, 0, outW, outH))
 	for r := 0; r < outH; r++ {
+		if r%cancelCheckRows == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
+		}
 		for c := 0; c < outW; c++ {
 			sr, sc := idx(r, c, w, h)
 			dst.Set(c, r, img.At(b.Min.X+sc, b.Min.Y+sr))
 		}
 	}
-	return dst
+	return dst, nil
 }

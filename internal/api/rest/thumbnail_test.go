@@ -963,6 +963,63 @@ type stallReadCloser struct {
 
 func (s *stallReadCloser) Read(p []byte) (int, error) { return s.r.Read(p) }
 
+// drainGateStore delegates every Storage method except Get: Get returns the
+// real object stream wrapped in a drainGateReadCloser, which serves every
+// byte of the fixture and parks (closes consumed, blocks on release) on the
+// read that delivers the final byte. The decoder is therefore provably parked
+// mid-pipeline with the object fully consumed — a cancel/deadline that lands
+// then fires at the post-read boundary checks (C1/C2) or inside
+// scale/rotation, exercising the post-consumption error path end to end:
+// the same exact-sentinel classification the in-phase checks return.
+type drainGateStore struct {
+	storage.Storage
+	img      []byte
+	consumed chan struct{}
+	release  chan struct{}
+}
+
+func (s *drainGateStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.ObjectInfo, error) {
+	rc, info, err := s.Storage.Get(ctx, key)
+	if err != nil {
+		return nil, info, err
+	}
+	return &drainGateReadCloser{
+		ReadCloser: rc,
+		data:       s.img,
+		consumed:   s.consumed,
+		release:    s.release,
+	}, info, nil
+}
+
+// drainGateReadCloser serves data from memory; the read that delivers the
+// final byte closes consumed (once) and blocks until release. All bytes are
+// served before the park, so the stream is fully drained when consumed fires
+// (mirrors phaseGateReader's gateAt == len(data) pattern at the REST
+// boundary).
+type drainGateReadCloser struct {
+	io.ReadCloser
+	data     []byte
+	off      int
+	consumed chan struct{}
+	release  chan struct{}
+	signal   sync.Once
+}
+
+func (r *drainGateReadCloser) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	if r.off+len(p) > len(r.data) {
+		p = p[:len(r.data)-r.off] // serve up to the final byte in this call
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	if r.off >= len(r.data) {
+		r.signal.Do(func() { close(r.consumed); <-r.release })
+	}
+	return n, nil
+}
+
 // TestThumbnailMidDecodeDeadlineIs504 pins the mid-decode deadline path
 // (AC-2): a request-scoped timeout that fires while the storage stream is
 // read inside the decode section — after slot acquisition — must surface as
@@ -1064,6 +1121,145 @@ func TestThumbnailMidDecodeCancelWritesNothing(t *testing.T) {
 	if rec.Header().Get("ETag") != "" || rec.Header().Get("Content-Length") != "" {
 		t.Fatalf("mid-decode cancel: wrote success headers (ETag=%q CL=%q), want nothing written",
 			rec.Header().Get("ETag"), rec.Header().Get("Content-Length"))
+	}
+}
+
+// TestThumbnailMidDecodePostReadCancelWritesNothing pins the post-consumption
+// cancel path (sibling-run QA F3 closure): the object stream is fully drained
+// (drainGateStore parks on the final-byte read) when the request context is
+// canceled, so the abort fires at the post-read boundary checks or inside the
+// CPU phases — never at the stream-error branches — and the handler must
+// still return without writing anything: no 4xx to a dead connection. The
+// wire contract is identical for every abort site (all surface the exact
+// context sentinel), so the test cannot false-fail on where the check fires.
+func TestThumbnailMidDecodePostReadCancelWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "dl.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	consumed := make(chan struct{})
+	release := make(chan struct{})
+	h := NewHandler(service.NewFileService(&drainGateStore{
+		Storage:  store,
+		img:      pngBytes(t, 64, 64),
+		consumed: consumed,
+		release:  release,
+	}, repo, nil), nil)
+	// No route-level deadline: the request context itself binds the request.
+	h.thumbnailTimeout = 0
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+
+	putReq := httptest.NewRequest("PUT", "/v1/files/img.png", bytes.NewReader(pngBytes(t, 64, 64)))
+	putReq.Header.Set("Content-Type", "image/png")
+	r.ServeHTTP(httptest.NewRecorder(), putReq)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rq := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		r.ServeHTTP(rec, rq)
+		close(done)
+	}()
+	select {
+	case <-consumed: // stream fully drained; the decoder is parked on the final-byte read
+	case <-time.After(5 * time.Second):
+		t.Fatal("thumbnail never drained the stream")
+	}
+	cancel()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("thumbnail handler did not return after post-read cancel")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("post-read cancel: status=%d want no write (recorder default 200)", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("post-read cancel: wrote %d bytes, want nothing (body=%q)", rec.Body.Len(), rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "" {
+		t.Fatalf("post-read cancel: wrote Content-Type %q, want nothing written", ct)
+	}
+	if rec.Header().Get("ETag") != "" || rec.Header().Get("Content-Length") != "" {
+		t.Fatalf("post-read cancel: wrote success headers (ETag=%q CL=%q), want nothing written",
+			rec.Header().Get("ETag"), rec.Header().Get("Content-Length"))
+	}
+}
+
+// TestThumbnailMidDecodePostReadDeadlineIs504 pins the post-consumption
+// deadline path: the stream is fully drained when the server-side route
+// deadline fires; the abort must surface as HTTP 504 Timeout (never 400
+// InvalidArgument). The request context carries the same deadline so the test
+// can observe it deterministically (the handler's scoped context derives from
+// it and fires at the same instant).
+func TestThumbnailMidDecodePostReadDeadlineIs504(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "dl.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	consumed := make(chan struct{})
+	release := make(chan struct{})
+	h := NewHandler(service.NewFileService(&drainGateStore{
+		Storage:  store,
+		img:      pngBytes(t, 64, 64),
+		consumed: consumed,
+		release:  release,
+	}, repo, nil), nil)
+	// Short enough that the gate provably parks before the deadline fires.
+	h.thumbnailTimeout = 100 * time.Millisecond
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+
+	putReq := httptest.NewRequest("PUT", "/v1/files/img.png", bytes.NewReader(pngBytes(t, 64, 64)))
+	putReq.Header.Set("Content-Type", "image/png")
+	r.ServeHTTP(httptest.NewRecorder(), putReq)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	rq := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		r.ServeHTTP(rec, rq)
+		close(done)
+	}()
+	select {
+	case <-consumed: // stream fully drained; the decoder is parked on the final-byte read
+	case <-time.After(5 * time.Second):
+		t.Fatal("thumbnail never drained the stream")
+	}
+	select {
+	case <-ctx.Done(): // the handler's scoped deadline derives from this context
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadline never fired while the decoder was parked")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("thumbnail handler did not return after post-read deadline")
+	}
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("post-read deadline: status=%d want 504 (body=%q)", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"code":"Timeout"`)) {
+		t.Fatalf("expected code Timeout, body: %s", rec.Body.String())
 	}
 }
 

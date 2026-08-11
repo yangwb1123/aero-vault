@@ -435,13 +435,14 @@ S3/OSS/COS GET), for any request concurrency. Waiters acquire a slot via a
 `REQUEST_TIMEOUT_SECONDS` deadline applied to the `/thumbnail` route) releases
 a parked waiter immediately with `context.Canceled`/`context.DeadlineExceeded`,
 without opening a stream and without consuming a slot. In-flight decodes abort
-at the next phase boundary (post-config, post-decode, pre-encode) when the
-request context is done; the decode slot is released immediately and the
-(already-open) stream is closed. Stream failures caused by the request context
-surface as the context error (504 `Timeout` for a server-side deadline, silent
-return on client disconnect), never as an invalid-image error; object-stream
-open failures classify as the underlying object error (404/403/409/…), never
-as an image error.
+at the next phase boundary (post-config, post-decode, pre-encode) — and inside
+the scale/rotation phases within `cancelCheckRows` (64) rows of pixel work —
+when the request context is done; the decode slot is released immediately and
+the (already-open) stream is closed. Stream failures caused by the request
+context surface as the context error (504 `Timeout` for a server-side deadline,
+silent return on client disconnect), never as an invalid-image error;
+object-stream open failures classify as the underlying object error
+(404/403/409/…), never as an image error.
 
 **Deployment prerequisite:** set `MAX_INFLIGHT_REQUESTS` and/or `RATE_LIMIT_RPS`
 > 0 in production. The semaphore bounds in-flight *decodes* (4), not the number

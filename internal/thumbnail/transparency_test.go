@@ -8,6 +8,7 @@ package thumbnail
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/color"
 	"image/gif"
@@ -143,7 +144,11 @@ func TestGenerateOpaqueSourceOutputUnchanged(t *testing.T) {
 
 	// Downscale path: reference is jpeg.Encode of scale's output.
 	ref.Reset()
-	if err := jpeg.Encode(&ref, scale(decoded, 32, 32), &jpeg.Options{Quality: quality}); err != nil {
+	scaled, err := scale(context.Background(), decoded, 32, 32)
+	if err != nil {
+		t.Fatalf("scale reference: %v", err)
+	}
+	if err := jpeg.Encode(&ref, scaled, &jpeg.Options{Quality: quality}); err != nil {
 		t.Fatalf("encode reference: %v", err)
 	}
 	got, err = Generate(bytes.NewReader(fixture), 32, 32)

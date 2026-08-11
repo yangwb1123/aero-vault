@@ -32,6 +32,7 @@ package thumbnail
 // discriminated under -race.
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/color"
 	"runtime"
@@ -138,7 +139,10 @@ func TestGenerateLargeTransparentAllocationBounded(t *testing.T) {
 			if o, ok := decoded.(interface{ Opaque() bool }); !ok || o.Opaque() {
 				t.Fatal("decoded fixture is opaque — composite is a no-op")
 			}
-			scaled := scale(decoded, HardMax, HardMax)
+			scaled, err := scale(context.Background(), decoded, HardMax, HardMax)
+			if err != nil {
+				t.Fatalf("scale: %v", err)
+			}
 			if o, ok := scaled.(interface{ Opaque() bool }); !ok || o.Opaque() {
 				t.Fatal("scaled fixture is opaque — the composite would be vacuous (transparent region lost in downscale)")
 			}
@@ -211,12 +215,18 @@ func TestCompositeOrderingFeatheredByteLevel(t *testing.T) {
 			src.SetNRGBA(x, y, color.NRGBA{R: 255 - a, G: 255 - a, B: 255 - a, A: a})
 		}
 	}
-	scaled := scale(src, 16, 16)
+	scaled, err := scale(context.Background(), src, 16, 16)
+	if err != nil {
+		t.Fatalf("scale: %v", err)
+	}
 	if o, ok := scaled.(interface{ Opaque() bool }); !ok || o.Opaque() {
 		t.Fatal("scaled fixture is opaque — composite is a no-op, pin vacuous")
 	}
-	post := compositeOnWhite(scaled)            // production order
-	pre := scale(compositeOnWhite(src), 16, 16) // regression order
+	post := compositeOnWhite(scaled)                                       // production order
+	pre, err := scale(context.Background(), compositeOnWhite(src), 16, 16) // regression order
+	if err != nil {
+		t.Fatalf("scale: %v", err)
+	}
 
 	var brighter, darker int
 	for y := 0; y < 16; y++ {

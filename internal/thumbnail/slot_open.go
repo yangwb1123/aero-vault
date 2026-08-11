@@ -67,7 +67,8 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 // slot: GenerateContext and GenerateContextWithOpener both hold the slot
 // across the call. Clamping was relocated here from GenerateContext's entry
 // (pure integer arithmetic; byte-identical output). Cancellation is honored
-// at the same phase boundaries as before.
+// at the same phase boundaries as before and additionally inside
+// scale/applyOrientation (every cancelCheckRows rows).
 func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
 	if maxW <= 0 {
 		maxW = DefaultMax
@@ -183,9 +184,15 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	if orient >= 5 {
 		boxW, boxH = maxH, maxW
 	}
-	dst := scale(src, boxW, boxH)
+	dst, err := scale(ctx, src, boxW, boxH)
+	if err != nil {
+		return nil, err // ctx sentinel propagates unwrapped
+	}
 	if orient > 1 {
-		dst = applyOrientation(dst, orient)
+		dst, err = applyOrientation(ctx, dst, orient)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Ordering is load-bearing (pinned by TestGenerateLargeTransparentAllocationBounded
 	// and TestCompositeOrderingFeatheredByteLevel): the white composite must run on

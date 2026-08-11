@@ -2,6 +2,7 @@ package thumbnail
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"image"
 	"image/color"
@@ -208,11 +209,16 @@ func TestApplyOrientationTable(t *testing.T) {
 	for p, c := range pixels {
 		src.Set(p[0], p[1], c)
 	}
-	if got := applyOrientation(src, 1); got != src {
+	if got, err := applyOrientation(context.Background(), src, 1); err != nil {
+		t.Fatalf("orientation 1: %v", err)
+	} else if got != src {
 		t.Fatal("orientation 1 must return the input unchanged (same pointer)")
 	}
 	for o := 2; o <= 8; o++ {
-		out := applyOrientation(src, o)
+		out, err := applyOrientation(context.Background(), src, o)
+		if err != nil {
+			t.Fatalf("orientation %d: %v", o, err)
+		}
 		ow, oh := w, h
 		if o >= 5 {
 			ow, oh = h, w
@@ -246,7 +252,10 @@ func TestApplyOrientationEdgeDims(t *testing.T) {
 			}
 		}
 		for o := 2; o <= 8; o++ {
-			out := applyOrientation(src, o)
+			out, err := applyOrientation(context.Background(), src, o)
+			if err != nil {
+				t.Fatalf("orientation %d: %v", o, err)
+			}
 			ow, oh := w, h
 			if o >= 5 {
 				ow, oh = h, w
@@ -258,7 +267,9 @@ func TestApplyOrientationEdgeDims(t *testing.T) {
 	}
 	src := image.NewRGBA(image.Rect(0, 0, 2, 2))
 	for _, o := range []int{0, 9, -1} {
-		if got := applyOrientation(src, o); got != src {
+		if got, err := applyOrientation(context.Background(), src, o); err != nil {
+			t.Fatalf("orientation %d: %v", o, err)
+		} else if got != src {
 			t.Fatalf("orientation %d must be a safe no-op (same pointer)", o)
 		}
 	}
@@ -500,7 +511,10 @@ func TestApplyOrientationLiteralMatrices(t *testing.T) {
 	}
 	for o, want := range expect {
 		t.Run("o"+string(rune('0'+o)), func(t *testing.T) {
-			got := applyOrientation(src, o)
+			got, err := applyOrientation(context.Background(), src, o)
+			if err != nil {
+				t.Fatalf("orientation %d: %v", o, err)
+			}
 			if got.Bounds().Dx() != len(want.out[0]) || got.Bounds().Dy() != len(want.out) {
 				t.Fatalf("o%d out dims %dx%d want %dx%d", o, got.Bounds().Dx(), got.Bounds().Dy(), len(want.out[0]), len(want.out))
 			}
@@ -515,10 +529,14 @@ func TestApplyOrientationLiteralMatrices(t *testing.T) {
 		})
 	}
 	// o1 identity: same dims, byte-identical buffer reference (no copy).
-	if got := applyOrientation(src, 1); got != image.Image(src) {
+	if got, err := applyOrientation(context.Background(), src, 1); err != nil {
+		t.Fatalf("orientation 1: %v", err)
+	} else if got != image.Image(src) {
 		t.Fatal("o1 must return the source unchanged")
 	}
-	if got := applyOrientation(src, 0); got != image.Image(src) {
+	if got, err := applyOrientation(context.Background(), src, 0); err != nil {
+		t.Fatalf("orientation 0: %v", err)
+	} else if got != image.Image(src) {
 		t.Fatal("out-of-range orientation must return the source unchanged")
 	}
 }

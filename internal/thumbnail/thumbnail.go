@@ -50,6 +50,14 @@ const (
 	HardMax    = 2048
 	quality    = 82
 
+	// cancelCheckRows bounds post-cancel CPU work inside the pixel phases:
+	// scale and applyOrientation consult ctx.Err() at the top of every
+	// cancelCheckRows-th row, so a canceled or deadline-expired request
+	// aborts within at most cancelCheckRows rows of pixel work (≤
+	// cancelCheckRows × HardMax × 4 ≈ 0.5M src.At calls at the HardMax
+	// frame, low-ms).
+	cancelCheckRows = 64
+
 	// MaxSourceDim caps each declared source dimension (pixels). Sources with
 	// any side above this are rejected from the header before any pixel buffer
 	// is allocated, bounding worst-case decode allocation to MaxSourceDim²×4 B
@@ -204,7 +212,8 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // failure caused by the context's deadline or cancellation is surfaced as
 // the context error, never reclassified as ErrUnsupported. After the stream
 // is fully read, a decode aborts at the next phase boundary (post-config,
-// post-decode, pre-encode) and releases its decode slot.
+// post-decode, pre-encode) — and, inside the scale and rotation phases,
+// within cancelCheckRows rows of pixel work — and releases its decode slot.
 //
 // GenerateContext acquires the decode slot itself. Callers that must hold the
 // slot across an object-stream open (e.g. the REST thumbnail handler, whose
@@ -289,16 +298,21 @@ func compositeOnWhite(img image.Image) image.Image {
 }
 
 // scale downsamples src to fit within maxW×maxH using bilinear interpolation,
-// preserving aspect ratio. Images already within bounds are returned unchanged.
-func scale(src image.Image, maxW, maxH int) image.Image {
+// preserving aspect ratio. Images already within bounds are returned
+// unchanged. It consults ctx at the top of every cancelCheckRows-th row and
+// returns (nil, ctx.Err()) unwrapped on a done context, so a canceled or
+// deadline-expired request aborts within cancelCheckRows rows of pixel work;
+// the no-op paths (empty or in-bounds src) return (src, nil) without
+// consulting ctx.
+func scale(ctx context.Context, src image.Image, maxW, maxH int) (image.Image, error) {
 	b := src.Bounds()
 	sw, sh := b.Dx(), b.Dy()
 	if sw == 0 || sh == 0 {
-		return src
+		return src, nil
 	}
 	ratio := minF(float64(maxW)/float64(sw), float64(maxH)/float64(sh))
 	if ratio >= 1 {
-		return src // never upscale
+		return src, nil // never upscale
 	}
 	tw := int(float64(sw) * ratio)
 	th := int(float64(sh) * ratio)
@@ -311,6 +325,11 @@ func scale(src image.Image, maxW, maxH int) image.Image {
 
 	dst := image.NewRGBA(image.Rect(0, 0, tw, th))
 	for y := 0; y < th; y++ {
+		if y%cancelCheckRows == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
+		}
 		// map destination pixel center back into source space
 		fy := (float64(y)+0.5)*float64(sh)/float64(th) - 0.5
 		for x := 0; x < tw; x++ {
@@ -318,7 +337,7 @@ func scale(src image.Image, maxW, maxH int) image.Image {
 			dst.Set(x, y, bilinear(src, b.Min.X, b.Min.Y, sw, sh, fx, fy))
 		}
 	}
-	return dst
+	return dst, nil
 }
 
 func bilinear(src image.Image, ox, oy, sw, sh int, fx, fy float64) (c rgba16) {

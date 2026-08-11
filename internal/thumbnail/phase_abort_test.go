@@ -219,9 +219,9 @@ func TestGenerateContextAbortsAfterStreamConsumed(t *testing.T) {
 // TestGenerateContextAbortsAtConfigBoundary pins the post-config check (C1):
 // a cancel that lands after DecodeConfig succeeded (gateAt == 33 parks the
 // read that completes the PNG config scan, no read-ahead) must abort before
-// any pixel data is read — no pixel buffer is ever allocated for a dead
-// request, and the stream is provably not fully decoded. Pre-fix this fails:
-// without C1 the decode runs and a JPEG comes back.
+// any pixel data is read — the stream is provably not fully decoded
+// (reader.off == 33), the test's proxy for no full-frame allocation. Pre-fix
+// this fails: without C1 the decode runs and a JPEG comes back.
 func TestGenerateContextAbortsAtConfigBoundary(t *testing.T) {
 	data := makePNG(t, 2048, 2048)
 	consumed := make(chan struct{})
@@ -259,14 +259,16 @@ func TestGenerateContextAbortsAtConfigBoundary(t *testing.T) {
 	recoverSlots(t)
 }
 
-// TestGenerateContextAbortsBeforeEncode pins the pre-encode check (C3): with
-// a 4096x4096 source scaled to 2048x2048, the post-EOF scale phase (~100-400
-// ms) is orders of magnitude longer than the signal-to-cancel round trip
-// (~10-100 µs), so a cancel that lands after the stream drained aborts
-// mid-scale at C3 — C1 and C2 have already run with a live ctx. Pre-fix this
-// fails: the pipeline completes and a JPEG comes back. The only residual
-// timing direction is a false failure (cancel landing after C3, during
-// encode), never a false pass.
+// TestGenerateContextAbortsBeforeEncode pins the post-decode/scale-phase
+// abort (C2/C3 as safety nets): with a 4096x4096 source scaled to 2048x2048,
+// the scale phase (~100-400 ms) is orders of magnitude longer than the
+// signal-to-cancel round trip (~10-100 µs), so a cancel that lands after the
+// stream drained aborts at the post-decode check or inside scale within
+// cancelCheckRows rows of pixel work (the deterministic mid-scale pin lives
+// in cpu_cancel_test.go's gateImage unit tests); C3 remains the pre-encode
+// safety net. Pre-fix this fails: the pipeline completes and a JPEG comes
+// back. The only residual timing direction is a false failure (cancel
+// landing after the abort point, during encode), never a false pass.
 func TestGenerateContextAbortsBeforeEncode(t *testing.T) {
 	data := makePNG(t, 4096, 4096)
 	consumed := make(chan struct{})
