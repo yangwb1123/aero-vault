@@ -189,9 +189,12 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // done while the caller is waiting for a decode slot, it returns ctx.Err()
 // without reading from r and without consuming a slot. A nil ctx is a caller
 // bug (stdlib convention); the wrapper and the REST handler always pass a
-// non-nil context. Cancellation is honored only at acquisition: an in-flight
-// decode runs to completion (bounded to maxConcurrentDecodes by the
-// semaphore).
+// non-nil context. Cancellation is honored at acquisition (returns ctx.Err()
+// without reading the stream or consuming a slot) and mid-decode: a stream
+// failure caused by the context's deadline or cancellation is surfaced as
+// the context error, never reclassified as ErrUnsupported. An in-flight
+// decode not interacting with the context still runs to completion (bounded
+// to maxConcurrentDecodes by the semaphore).
 func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
 	if maxW <= 0 {
 		maxW = DefaultMax
@@ -242,6 +245,21 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		if errors.Is(err, errMetadataBudgetExceeded) {
 			return nil, ErrMetadataTooLarge
 		}
+		// A ctx-bound storage stream fails exactly when the request context is
+		// done: surface the context error (DeadlineExceeded/Canceled) instead
+		// of reclassifying it as ErrUnsupported, so the REST layer can answer
+		// 504 to a still-connected client or write nothing to a dead one. The
+		// ctx.Err() check precedes the sentinel fallback because ctx.Err() is
+		// authoritative for context-bound streams; the errors.Is fallback
+		// covers streams that surface a literal/wrapped sentinel while
+		// ctx.Err() is momentarily nil (e.g. SDK error paths that captured
+		// the error before re-reading the ctx).
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return nil, err
+		}
 		return nil, ErrUnsupported
 	}
 	if cfg.Width > MaxSourceDim || cfg.Height > MaxSourceDim {
@@ -261,6 +279,17 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 	}
 	src, _, err := image.Decode(io.MultiReader(bytes.NewReader(head.buf.Bytes()), r))
 	if err != nil {
+		// Same identity preservation as the DecodeConfig branch above: a
+		// deadline/cancellation that fires while the payload is read from the
+		// ctx-bound stream is surfaced as the context error, never flattened
+		// to ErrUnsupported. ctx.Err() wins over a coincident genuine decode
+		// error: the request was aborted regardless.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return nil, err
+		}
 		return nil, ErrUnsupported
 	}
 	dst := scale(src, maxW, maxH)

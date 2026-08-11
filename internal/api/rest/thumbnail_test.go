@@ -9,11 +9,13 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -804,6 +806,157 @@ func TestThumbnailDeadlineScoping(t *testing.T) {
 	code, _, status = classify(context.DeadlineExceeded)
 	if code != "Timeout" || status != http.StatusGatewayTimeout {
 		t.Fatalf("classify(DeadlineExceeded) = (%q, %d) want (Timeout, 504)", code, status)
+	}
+}
+
+// stallReader serves the first 33 bytes of data (PNG signature + IHDR —
+// exactly what image/png's DecodeConfig consumes, with no read-ahead), then
+// blocks on ctx.Done() and returns ctx.Err(). blocked (optional) is closed
+// once, exactly when the first post-data Read is attempted — deterministically
+// in the Decode phase, never during DecodeConfig. It models a slow S3 backend
+// whose read aborts with the request-context error mid-decode.
+type stallReader struct {
+	ctx     context.Context
+	data    []byte
+	off     int
+	blocked chan struct{} // may be nil
+	signal  sync.Once
+}
+
+func (r *stallReader) Read(p []byte) (int, error) {
+	if r.off < len(r.data) {
+		n := copy(p, r.data[r.off:])
+		r.off += n
+		return n, nil
+	}
+	if r.blocked != nil {
+		r.signal.Do(func() { close(r.blocked) })
+	}
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+// stallStore delegates every Storage method except Get: Get returns the real
+// object stream wrapped in a stallReader, so a deadline or cancellation that
+// fires mid-decode surfaces through the storage stream exactly like a slow
+// backend read. All other methods (Put/Stat/Delete/…) delegate to the real
+// local store, so fixtures upload normally.
+type stallStore struct {
+	storage.Storage
+	img     []byte
+	blocked chan struct{} // may be nil
+}
+
+func (s *stallStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.ObjectInfo, error) {
+	rc, info, err := s.Storage.Get(ctx, key)
+	if err != nil {
+		return nil, info, err
+	}
+	return &stallReadCloser{
+		ReadCloser: rc,
+		r:          &stallReader{ctx: ctx, data: s.img[:33], blocked: s.blocked},
+	}, info, nil
+}
+
+// stallReadCloser keeps the underlying stream's Close (releasing the pinned
+// object) while routing Read through the stall reader.
+type stallReadCloser struct {
+	io.ReadCloser
+	r io.Reader
+}
+
+func (s *stallReadCloser) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+// TestThumbnailMidDecodeDeadlineIs504 pins the mid-decode deadline path
+// (AC-2): a request-scoped timeout that fires while the storage stream is
+// read inside the decode section — after slot acquisition — must surface as
+// HTTP 504 Timeout via the handler's DeadlineExceeded branch, never as 400
+// InvalidArgument ("invalid image").
+func TestThumbnailMidDecodeDeadlineIs504(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "dl.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	h := NewHandler(service.NewFileService(&stallStore{Storage: store, img: pngBytes(t, 64, 64)}, repo, nil), nil)
+	// Long enough that slot acquisition and the 33-byte header read succeed,
+	// short enough that the stall guarantees the deadline fires mid-decode.
+	h.thumbnailTimeout = 100 * time.Millisecond
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/img.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT img.png: %d", resp.StatusCode)
+	}
+	resp, body := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, nil)
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("mid-decode deadline: status=%d want 504 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"Timeout"`)) {
+		t.Fatalf("expected code Timeout, body: %s", body)
+	}
+}
+
+// TestThumbnailMidDecodeCancelWritesNothing pins the client-disconnect path
+// (AC-3): a cancel that fires while the storage stream is read inside the
+// decode section must make the handler return without writing anything — no
+// 4xx to a dead connection. Fully handshake-driven: the stall reader signals
+// when it is blocked mid-decode, then the test cancels and joins.
+func TestThumbnailMidDecodeCancelWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "dl.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	blocked := make(chan struct{})
+	h := NewHandler(service.NewFileService(&stallStore{Storage: store, img: pngBytes(t, 64, 64), blocked: blocked}, repo, nil), nil)
+	// No route-level deadline: the request context itself binds the stream.
+	h.thumbnailTimeout = 0
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+
+	// Seed the object through the same router (real storage underneath).
+	putReq := httptest.NewRequest("PUT", "/v1/files/img.png", bytes.NewReader(pngBytes(t, 64, 64)))
+	putReq.Header.Set("Content-Type", "image/png")
+	r.ServeHTTP(httptest.NewRecorder(), putReq)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rq := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		r.ServeHTTP(rec, rq)
+		close(done)
+	}()
+	<-blocked // stall reader is mid-decode, parked on the request context
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("thumbnail handler did not return after mid-decode cancel")
+	}
+	// httptest.NewRecorder leaves Code at its 200 default when WriteHeader is
+	// never called; the load-bearing assertions are: no bytes written and no
+	// 4xx classification (the pre-fix behavior wrote 400 InvalidArgument).
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mid-decode cancel: status=%d want no write (recorder default 200; old behavior 400)", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("mid-decode cancel: wrote %d bytes, want nothing (body=%q)", rec.Body.Len(), rec.Body.String())
 	}
 }
 

@@ -430,7 +430,10 @@ request context — cancellation (client disconnect, or the `REQUEST_TIMEOUT_SEC
 deadline applied to the `/thumbnail` route) releases a parked waiter immediately
 with `context.Canceled`/`context.DeadlineExceeded`, and its deferred close then
 releases the pinned object stream. In-flight decodes run to completion (bounded
-to 4 by the semaphore); cancellation is not honored mid-decode.
+to 4 by the semaphore) unless the stream itself fails because the request
+context was canceled or its deadline passed — such failures surface as the
+context error (504 `Timeout` for a server-side deadline, silent return on
+client disconnect), never as an invalid-image error.
 
 **Deployment prerequisite:** set `MAX_INFLIGHT_REQUESTS` and/or `RATE_LIMIT_RPS`
 > 0 in production. The semaphore bounds in-flight *decodes* (4), not the number

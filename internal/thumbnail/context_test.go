@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,90 @@ type readTracker struct {
 func (t *readTracker) Read([]byte) (int, error) {
 	t.read.Store(true)
 	return 0, io.EOF
+}
+
+// ctxBlockingReader serves data, then blocks on ctx.Done() and returns
+// ctx.Err(). blocked (optional) is closed once, exactly when the first
+// post-data Read is attempted.
+//
+// The data prefix must be exactly what image/png's DecodeConfig consumes (PNG
+// signature + IHDR = 33 bytes, no read-ahead), so the block deterministically
+// occurs in the Decode phase — mid-decode-section — never during the config
+// scan, and the slot is genuinely held (unlike the acquisition tests, which
+// park before the decode starts).
+type ctxBlockingReader struct {
+	ctx     context.Context
+	data    []byte
+	off     int
+	blocked chan struct{} // may be nil
+	signal  sync.Once
+}
+
+func (r *ctxBlockingReader) Read(p []byte) (int, error) {
+	if r.off < len(r.data) {
+		n := copy(p, r.data[r.off:])
+		r.off += n
+		return n, nil
+	}
+	if r.blocked != nil {
+		r.signal.Do(func() { close(r.blocked) })
+	}
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+// TestGenerateContextPreservesDeadlineMidDecode pins the mid-decode deadline
+// path (FR-1/AC-1): a deadline that fires while Decode reads the stream —
+// after slot acquisition — must surface as context.DeadlineExceeded, never be
+// flattened to ErrUnsupported. Unlike the acquisition tests, no slots are
+// held: the decode must genuinely start. The deadline self-fires (bounded
+// ~50 ms, mirroring TestGenerateContextDeadlineExceededWhileParked).
+func TestGenerateContextPreservesDeadlineMidDecode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	reader := &ctxBlockingReader{ctx: ctx, data: makePNG(t, 64, 64)[:33]}
+
+	_, err := GenerateContext(ctx, reader, 32, 32)
+	if err == nil {
+		t.Fatal("GenerateContext succeeded, want context.DeadlineExceeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if errors.Is(err, ErrUnsupported) {
+		t.Fatalf("err = %v, must not be reclassified as ErrUnsupported", err)
+	}
+}
+
+// TestGenerateContextPreservesCancelMidDecode is the cancellation companion
+// (backs the REST silent-return contract): a cancel that fires mid-decode must
+// surface as context.Canceled, never ErrUnsupported. Fully handshake-driven
+// (no sleeps): the reader signals when it is blocked inside Decode, then the
+// test cancels and joins.
+func TestGenerateContextPreservesCancelMidDecode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocked := make(chan struct{})
+	reader := &ctxBlockingReader{ctx: ctx, data: makePNG(t, 64, 64)[:33], blocked: blocked}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := GenerateContext(ctx, reader, 32, 32)
+		done <- err
+	}()
+	<-blocked // reader is mid-decode, parked on the context
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, ErrUnsupported) {
+			t.Fatalf("err = %v, must not be reclassified as ErrUnsupported", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GenerateContext did not unblock on mid-decode cancel")
+	}
 }
 
 // releaseAndRecoverSlots releases the slots held by the calling test (which
