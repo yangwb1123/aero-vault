@@ -69,12 +69,25 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// (policy → anonymous): a policy denying s3:GetObject on the trimmed key
 	// must not be bypassable by requesting its derived thumbnail (which
 	// returns near-lossless image bytes of the same object). Fail-closed like
-	// every other object read surface.
+	// every other object read surface. Run before the deadline scope: the
+	// gates are cheap and fail-closed either way.
 	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
 		return
 	}
 	if !h.allowAnonymous(w, r, key) {
 		return
+	}
+	// Server-side bound on the derivation pipeline, including the decode-slot
+	// park: REQUEST_TIMEOUT_SECONDS (same knob as the AI group) cancels a
+	// scoped context that GenerateContext honors while parked. Scoped HERE —
+	// after the delegation checks and gates — so the arms above that
+	// raw-download "/thumbnail"-suffixed keys (?version= pin, exact-key,
+	// ErrForbidden) are never collateralized by the thumbnail deadline (F1).
+	// No-op at 0.
+	if h.thumbnailTimeout > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), h.thumbnailTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
 	}
 	tenant := mw.TenantFrom(r.Context())
 	obj, err := h.svc.Stat(r.Context(), tenant, service.DefaultBucket, key)
@@ -105,12 +118,18 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close() // releases the pinned stream once a parked wait unblocks
 	img, err := thumbnail.GenerateContext(r.Context(), rc, maxW, maxH)
 	if err != nil {
-		// Client gone or the route deadline fired while waiting for a
-		// decode slot: the deferred Close releases the stream; do not
-		// classify a canceled request as a 400 client error and do not
-		// write to a dead connection. MUST precede the ErrImageTooLarge
+		// Server-side route deadline fired while waiting for a decode slot:
+		// the client may still be connected — surface a visible 504 (F2)
+		// instead of a silent empty 200. MUST precede the ErrImageTooLarge
 		// branch so classification order cannot re-wrap context errors.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			h.writeError(w, r, service.ErrTimeout)
+			return
+		}
+		// Client gone (request context canceled by disconnect): the deferred
+		// Close releases the stream; do not write to a dead connection and
+		// do not classify a canceled request as a 400 client error.
+		if errors.Is(err, context.Canceled) {
 			return
 		}
 		if errors.Is(err, thumbnail.ErrImageTooLarge) {

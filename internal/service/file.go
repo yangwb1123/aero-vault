@@ -31,13 +31,18 @@ var (
 	ErrLocked                 = errors.New("object is under retention lock")
 	ErrQuotaExceeded          = errors.New("tenant quota exceeded")
 	ErrEntitlementUnavailable = errors.New("tenant entitlement unavailable")
-	ErrRangeNotSatisfiable    = errors.New("requested range not satisfiable")
-	ErrPreconditionFailed     = errors.New("precondition failed")
-	ErrForbidden              = errors.New("forbidden")
-	ErrTenantDisabled         = errors.New("tenant is disabled")
-	ErrBadDigest              = errors.New("content-md5 mismatch")
-	ErrSizeMismatch           = errors.New("size mismatch: actual bytes differ from Content-Length")
-	ErrObjectCorrupt          = errors.New("object is marked as corrupt")
+	// ErrTimeout is the server-side request deadline sentinel (thumbnail
+	// derivation path and any future bounded pipeline): the client may still
+	// be connected, so it surfaces as a visible 504 Gateway Timeout rather
+	// than a silent empty response.
+	ErrTimeout             = errors.New("request timed out")
+	ErrRangeNotSatisfiable = errors.New("requested range not satisfiable")
+	ErrPreconditionFailed  = errors.New("precondition failed")
+	ErrForbidden           = errors.New("forbidden")
+	ErrTenantDisabled      = errors.New("tenant is disabled")
+	ErrBadDigest           = errors.New("content-md5 mismatch")
+	ErrSizeMismatch        = errors.New("size mismatch: actual bytes differ from Content-Length")
+	ErrObjectCorrupt       = errors.New("object is marked as corrupt")
 	// ErrMetadataTooLarge is the object-metadata size limit (total bytes
 	// across all user metadata k/v). Do not confuse it with
 	// thumbnail.ErrMetadataTooLarge, the unrelated image-metadata budget for

@@ -428,11 +428,11 @@ func (h *Handler) getKey(w http.ResponseWriter, r *http.Request) {
 		}
 		h.GetMetadata(w, r)
 	case strings.HasSuffix(r.URL.Path, "/thumbnail"):
-		// Server-side bound on the whole thumbnail pipeline, including the
-		// decode-slot park: REQUEST_TIMEOUT_SECONDS (same knob as the AI
-		// group) cancels the request context, which GenerateContext honors
-		// while parked. No-op when the timeout is 0.
-		mw.RequestTimeout(h.thumbnailTimeout)(http.HandlerFunc(h.Thumbnail)).ServeHTTP(w, r)
+		// The derivation branch applies its own server-side bound inside the
+		// handler (thumbnail.go), scoped so delegation arms that raw-download
+		// "/thumbnail"-suffixed keys are never collateralized by the
+		// thumbnail deadline.
+		h.Thumbnail(w, r)
 	default:
 		h.Get(w, r)
 	}

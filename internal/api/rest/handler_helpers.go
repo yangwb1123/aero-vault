@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,10 @@ func classify(err error) (string, string, int) {
 		return code, msg, status
 	}
 	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, service.ErrTimeout):
+		// Server-side request deadline: the client may still be connected, so
+		// the abort must be visible (504), never a silent empty response.
+		return "Timeout", "request timed out", http.StatusGatewayTimeout
 	case errors.Is(err, service.ErrTenantDisabled):
 		return "TenantDisabled", service.ErrTenantDisabled.Error(), http.StatusForbidden
 	case errors.Is(err, service.ErrEntitlementUnavailable):

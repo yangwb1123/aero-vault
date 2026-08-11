@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -708,5 +709,99 @@ func TestThumbnailDerivationPathBucketPolicyDeny(t *testing.T) {
 	resp, body = req(t, "GET", u+"/thumbnail?w=100&h=100", nil, authH)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("GET denied thumbnail: status=%d want 403 (body=%q)", resp.StatusCode, body)
+	}
+}
+
+// TestThumbnailDeadlineScoping pins the F1/F2 conditions of the context-aware
+// slot direction:
+//   - F2: a server-side derivation deadline surfaces a visible 504 Timeout,
+//     never a silent empty 200 (a still-connected client must see the abort).
+//   - F1: the deadline is scoped to the derivation branch — the delegation
+//     arms (?version= pin, exact-key raw download) run on the original
+//     request context and are never collateralized by the thumbnail timeout.
+func TestThumbnailDeadlineScoping(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "dl.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	h := NewHandler(service.NewFileService(store, repo, nil), nil)
+	// Arms a route deadline that is already expired by the time any handler
+	// work begins — the discriminating setup for both conditions.
+	h.thumbnailTimeout = time.Nanosecond
+	// "dir" and "dir/thumbnail" must coexist physically (file vs directory
+	// on the local backend) — versioned layout decouples the blob paths.
+	if err := repo.SetBucketVersioning(context.Background(), "default", "default", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/dir2"
+	// Derivation source: an image at "dir2", with NO object at "dir2/thumbnail"
+	// so the request below exercises the derivation branch.
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir2: %d", resp.StatusCode)
+	}
+	// Exact-key fixture: an object at "dir" plus a real object at
+	// "dir/thumbnail" for the delegation arms.
+	if resp, _ := req(t, "PUT", srv.URL+"/v1/files/dir", pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := srv.URL + "/v1/files/dir/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+
+	// F2: the derivation request must fail visibly with 504 — the old code
+	// returned a silent empty 200 when the deadline fired.
+	resp, body := req(t, "GET", srv.URL+"/v1/files/dir2/thumbnail?w=32&h=32", nil, nil)
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("derivation under expired deadline: status=%d want 504 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"Timeout"`)) {
+		t.Fatalf("expected code Timeout, body: %s", body)
+	}
+
+	// F1: the exact-key delegation arm must ignore the thumbnail deadline and
+	// raw-download the object — under the old whole-dispatch wrap this request
+	// failed on the already-expired context.
+	resp, body = req(t, "GET", uFull, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("exact-key download under thumbnail deadline: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Equal(body, []byte("object bytes")) {
+		t.Fatalf("exact-key body=%q want the object bytes", body)
+	}
+
+	// F1 (version-pinned arm): same for ?version= — the pinned read must not
+	// be collateralized by the thumbnail deadline.
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "dir/thumbnail")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	resp, body = req(t, "GET", uFull+"?version="+versions[0].VersionID, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("version-pinned download under thumbnail deadline: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Equal(body, []byte("object bytes")) {
+		t.Fatalf("version-pinned body=%q want the object bytes", body)
+	}
+
+	// classify() must map the deadline sentinel to 504 at the error seam.
+	code, msg, status := classify(service.ErrTimeout)
+	if code != "Timeout" || status != http.StatusGatewayTimeout || msg == "" {
+		t.Fatalf("classify(ErrTimeout) = (%q, %q, %d) want (Timeout, _, 504)", code, msg, status)
+	}
+	code, _, status = classify(context.DeadlineExceeded)
+	if code != "Timeout" || status != http.StatusGatewayTimeout {
+		t.Fatalf("classify(DeadlineExceeded) = (%q, %d) want (Timeout, 504)", code, status)
 	}
 }
