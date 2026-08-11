@@ -213,6 +213,7 @@ func init() {
 // NewRouter returns a sub-router mounted at /v1.
 func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger, idemHashBody bool, aiRL, adminRL *mw.RateLimiter, aiTimeout time.Duration, aiDegraded bool, opts ...func(*Handler)) chi.Router {
 	h := NewHandler(svc, logger)
+	h.thumbnailTimeout = aiTimeout // REQUEST_TIMEOUT_SECONDS; 0 = disabled
 	if reg != nil {
 		h.WithPutPresigner(reg.PutPresigner())
 	}
@@ -427,7 +428,11 @@ func (h *Handler) getKey(w http.ResponseWriter, r *http.Request) {
 		}
 		h.GetMetadata(w, r)
 	case strings.HasSuffix(r.URL.Path, "/thumbnail"):
-		h.Thumbnail(w, r)
+		// Server-side bound on the whole thumbnail pipeline, including the
+		// decode-slot park: REQUEST_TIMEOUT_SECONDS (same knob as the AI
+		// group) cancels the request context, which GenerateContext honors
+		// while parked. No-op when the timeout is 0.
+		mw.RequestTimeout(h.thumbnailTimeout)(http.HandlerFunc(h.Thumbnail)).ServeHTTP(w, r)
 	default:
 		h.Get(w, r)
 	}

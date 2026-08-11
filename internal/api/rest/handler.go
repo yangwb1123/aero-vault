@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -21,12 +22,13 @@ import (
 
 // Handler binds REST routes to the FileService.
 type Handler struct {
-	svc           *service.FileService
-	logger        *slog.Logger
-	corsProvider  mw.BucketCORSProvider
-	putPresigner  *auth.PutPresigner
-	access        *access.Manager
-	publicBaseURL string
+	svc              *service.FileService
+	logger           *slog.Logger
+	corsProvider     mw.BucketCORSProvider
+	putPresigner     *auth.PutPresigner
+	access           *access.Manager
+	publicBaseURL    string
+	thumbnailTimeout time.Duration // REQUEST_TIMEOUT_SECONDS; 0 = disabled
 }
 
 func (h *Handler) WithAccessManager(manager *access.Manager, publicBaseURL string) *Handler {

@@ -5,6 +5,7 @@ package thumbnail
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -97,13 +98,38 @@ const maxConcurrentDecodes = 4
 
 // decodeSlots is the package-level blocking semaphore backing
 // maxConcurrentDecodes (buffered-channel idiom; cf. middleware.ConcurrencyLimiter).
+// A waiter's park is bounded by its request context (client disconnect or
+// server deadline) — see acquireDecodeSlotContext — not by queue drain;
+// waiters still allocate nothing.
 var decodeSlots = make(chan struct{}, maxConcurrentDecodes)
 
-// acquireDecodeSlot blocks until a slot is free. The caller must pair it with
+// acquireDecodeSlot blocks until a slot is free. It is the context-less
+// variant pinned by the deterministic semaphore tests; production entry
+// points use acquireDecodeSlotContext. The caller must pair it with
 // releaseDecodeSlot (defer), which runs on both normal return and panic.
 func acquireDecodeSlot() { decodeSlots <- struct{}{} }
 
-// releaseDecodeSlot returns a slot acquired by acquireDecodeSlot.
+// acquireDecodeSlotContext acquires a slot, honoring ctx: it returns ctx.Err()
+// without consuming a slot when ctx is done before the call or while the
+// caller waits. After a winning send it re-checks ctx: a canceled context can
+// race a ready buffer (both select branches ready), and the caller must not
+// decode for a dead request — the slot is returned and the error propagated
+// instead.
+func acquireDecodeSlotContext(ctx context.Context) error {
+	select {
+	case decodeSlots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		<-decodeSlots // return the slot taken by the winning send
+		return err
+	}
+	return nil
+}
+
+// releaseDecodeSlot returns a slot acquired by acquireDecodeSlot or
+// acquireDecodeSlotContext.
 func releaseDecodeSlot() { <-decodeSlots }
 
 // limitedBuffer is an io.Writer that accepts writes while the total bytes
@@ -134,7 +160,22 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 // Generate decodes an image from r and returns a JPEG thumbnail no larger than
 // maxW×maxH (aspect ratio preserved; never upscaled). Zero bounds default to
 // DefaultMax; bounds are clamped to HardMax.
+//
+// Generate is equivalent to GenerateContext with context.Background(); it
+// exists so non-cancellation callers and the deterministic semaphore tests
+// keep today's semantics.
 func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
+	return GenerateContext(context.Background(), r, maxW, maxH)
+}
+
+// GenerateContext is Generate with cancellation: if the caller's context is
+// done while the caller is waiting for a decode slot, it returns ctx.Err()
+// without reading from r and without consuming a slot. A nil ctx is a caller
+// bug (stdlib convention); the wrapper and the REST handler always pass a
+// non-nil context. Cancellation is honored only at acquisition: an in-flight
+// decode runs to completion (bounded to maxConcurrentDecodes by the
+// semaphore).
+func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
 	if maxW <= 0 {
 		maxW = DefaultMax
 	}
@@ -148,11 +189,15 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 		maxH = HardMax
 	}
 
-	// Aggregate bound: at most maxConcurrentDecodes Generate calls may hold
-	// the allocation-bearing section below (config scan, decode, scale,
-	// composite, encode) at once. Held for the entire section so the bound
-	// is airtight; waiters allocate nothing.
-	acquireDecodeSlot()
+	// Aggregate bound (unchanged contract): at most maxConcurrentDecodes
+	// calls hold the allocation-bearing section below (config scan, decode,
+	// scale, composite, encode) at once. Held for the entire section so the
+	// bound is airtight. The wait now honors ctx — a parked caller unblocks
+	// on cancellation and never reaches the decode section; waiters allocate
+	// nothing.
+	if err := acquireDecodeSlotContext(ctx); err != nil {
+		return nil, err // before LimitReader: stream untouched, no slot consumed
+	}
 	defer releaseDecodeSlot()
 
 	// Bound the compressed input consumed per call; this also governs the

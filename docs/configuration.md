@@ -34,7 +34,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `APP_TLS_ENABLED` | `false` | Enable TLS/HTTPS. Requires `APP_TLS_CERT_FILE` and `APP_TLS_KEY_FILE`. |
 | `APP_TLS_CERT_FILE` | _(empty)_ | Path to TLS certificate file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `APP_TLS_KEY_FILE` | _(empty)_ | Path to TLS private key file (PEM). Required when `APP_TLS_ENABLED=true`. |
-| `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`). Set to `0` to disable. |
+| `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`) **and the `/thumbnail` route** (bounding the decode-slot wait, see "Thumbnail decode budget"). Set to `0` to disable. |
 | `MAX_INFLIGHT_REQUESTS` | `0` | Global weighted in-flight request limit (reads cost 1, writes cost 2); `0` disables. |
 | `PER_TENANT_CONCURRENCY_MAX` | `0` | Optional per-tenant in-flight limit used alongside the global cap; `0` disables per-tenant partitioning. |
 | `EVENTS_SUB_BUFFER` | `64` | Per-subscriber in-process event channel buffer depth. Increase if subscribers fall behind under high event throughput. Set to `0` to use the default. |
@@ -402,6 +402,38 @@ File delete (`FileService.Delete`, hard and soft) commits the metadata delete an
 |----------|---------|-------------|
 | `WEBDAV_PREFIX` | _(empty = disabled)_ | Mount prefix for WebDAV, e.g. `/webdav`. Empty disables WebDAV. |
 | `WEBUI_ENABLED` | `true` | Serve the static web UI at `/ui`. |
+
+---
+
+## Thumbnail decode budget
+
+`/v1/files/<key>/thumbnail` (and the S3-compatible derivation path) decodes images
+with only the standard library. The decode pipeline is bounded by package-level
+constants (`internal/thumbnail`):
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `MaxSourceDim` | `8192` px | Declared source dimensions above this are rejected from the header before any pixel buffer is allocated |
+| `MaxSourceBytes` | `128 MiB` | Compressed input consumed per request |
+| `MaxMetadataBytes` | `8 MiB` | Pre-image metadata (JPEG APPn/COM segments) accepted before `ErrMetadataTooLarge` |
+| `maxConcurrentDecodes` | `4` | In-flight decode calls at once (package-level semaphore) |
+| `quality` | `82` | JPEG encode quality |
+
+Per-request worst-case decode allocation: ≈ 268 MiB (PNG RGBA at `MaxSourceDim`) to
+≈ 1.1 GiB (progressive JPEG). Aggregate ceilings: ≈ 1.1 GiB (PNG RGBA) / ≈ 4.4 GiB
+(progressive JPEG) across all concurrent decodes.
+
+**Decode-slot wait contract:** waiters acquire a slot via a `select` on the
+request context — cancellation (client disconnect, or the `REQUEST_TIMEOUT_SECONDS`
+deadline applied to the `/thumbnail` route) releases a parked waiter immediately
+with `context.Canceled`/`context.DeadlineExceeded`, and its deferred close then
+releases the pinned object stream. In-flight decodes run to completion (bounded
+to 4 by the semaphore); cancellation is not honored mid-decode.
+
+**Deployment prerequisite:** set `MAX_INFLIGHT_REQUESTS` and/or `RATE_LIMIT_RPS`
+> 0 in production. The semaphore bounds in-flight *decodes* (4), not the number
+of *waiters*; the request-context lifetime bounds each wait, but admission
+control is the outer bound on concurrent waiters (defaults are 0 = unlimited).
 
 ---
 

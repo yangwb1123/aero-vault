@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -101,9 +102,17 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	defer rc.Close()
-	img, err := thumbnail.Generate(rc, maxW, maxH)
+	defer rc.Close() // releases the pinned stream once a parked wait unblocks
+	img, err := thumbnail.GenerateContext(r.Context(), rc, maxW, maxH)
 	if err != nil {
+		// Client gone or the route deadline fired while waiting for a
+		// decode slot: the deferred Close releases the stream; do not
+		// classify a canceled request as a 400 client error and do not
+		// write to a dead connection. MUST precede the ErrImageTooLarge
+		// branch so classification order cannot re-wrap context errors.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		if errors.Is(err, thumbnail.ErrImageTooLarge) {
 			h.writeError(w, r, thumbnail.ErrImageTooLarge)
 			return
