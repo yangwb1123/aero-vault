@@ -2461,3 +2461,81 @@ func TestThumbnailDeadlineWhileParkedIs504(t *testing.T) {
 		}
 	}
 }
+
+// TestThumbnailMetadataTooLargeClassifySeam pins the classify() seam for the
+// metadata-budget sentinel: the raw sentinel maps to 413 MetadataTooLarge
+// (RFC 9110 §15.5.17 Payload Too Large — the request's declared metadata
+// exceeds the server's processing budget), while a wrapped ErrInvalidArgs
+// stays 400 InvalidArgument — the two classes must not blur.
+func TestThumbnailMetadataTooLargeClassifySeam(t *testing.T) {
+	code, msg, status := classify(thumbnail.ErrMetadataTooLarge)
+	if code != "MetadataTooLarge" || status != http.StatusRequestEntityTooLarge || msg == "" {
+		t.Fatalf("classify(ErrMetadataTooLarge) = (%q, %q, %d) want (MetadataTooLarge, _, 413)", code, msg, status)
+	}
+	// The wrapped form (generic handler wrap) must NOT reach the 413 arm.
+	wrapped := fmt.Errorf("%w: oversized metadata", service.ErrInvalidArgs)
+	code, _, status = classify(wrapped)
+	if code != "InvalidArgument" || status != http.StatusBadRequest {
+		t.Fatalf("classify(wrapped ErrInvalidArgs) = (%q, %d) want (InvalidArgument, 400)", code, status)
+	}
+	// The REST 413 arm must be cache-hygienic like every other error path:
+	// no ETag/Cache-Control/Last-Modified on the metadata-budget 413.
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/meta.jpg"
+	req(t, "PUT", u, oversizedMetadataJPEG(t), map[string]string{"Content-Type": "image/jpeg"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, map[string]string{"If-None-Match": `"whatever"`})
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("metadata-budget thumbnail: status=%d want 413 (body=%s)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"MetadataTooLarge"`)) {
+		t.Fatalf("expected code MetadataTooLarge, body: %s", body)
+	}
+	for _, h := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+		if v := resp.Header.Get(h); v != "" {
+			t.Fatalf("413 MetadataTooLarge: %s=%q must be absent (cache hygiene)", h, v)
+		}
+	}
+}
+
+// oversizedMetadataJPEG builds a JPEG whose pre-SOF APPn metadata exceeds the
+// 8 MiB thumbnail metadata budget — mirroring the package-level fixture at
+// the protocol boundary (see internal/thumbnail/appnPaddedJPEG).
+func oversizedMetadataJPEG(t *testing.T) []byte {
+	t.Helper()
+	base := pngBytes(t, 32, 32)
+	_ = base
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8}) // SOI
+	const maxSegPayload = 65533
+	remaining := thumbnail.MaxMetadataBytes + 64<<10
+	for remaining > 0 {
+		n := remaining
+		if n > maxSegPayload {
+			n = maxSegPayload
+		}
+		var seg [4]byte
+		seg[0], seg[1] = 0xFF, 0xE1 // APP1
+		binary.BigEndian.PutUint16(seg[2:4], uint16(n+2))
+		buf.Write(seg[:])
+		payload := make([]byte, n)
+		for i := range payload {
+			payload[i] = 0x42
+		}
+		buf.Write(payload)
+		remaining -= n
+	}
+	// SOF0 (baseline 32×32) + SOS to make DecodeConfig succeed and the
+	// metadata budget the only failure.
+	sof := []byte{8, 0, 32, 0, 32, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1}
+	buf.Write([]byte{0xFF, 0xC0})
+	var l [2]byte
+	binary.BigEndian.PutUint16(l[:], uint16(len(sof)+2))
+	buf.Write(l[:])
+	buf.Write(sof)
+	sos := []byte{3, 1, 0, 2, 0, 3, 0, 0, 63, 0}
+	buf.Write([]byte{0xFF, 0xDA})
+	binary.BigEndian.PutUint16(l[:], uint16(len(sos)+2))
+	buf.Write(l[:])
+	buf.Write(sos)
+	return buf.Bytes()
+}

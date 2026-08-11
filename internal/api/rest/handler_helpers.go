@@ -64,7 +64,10 @@ func classify(err error) (string, string, int) {
 		// sentinel before classifying (that unwrap is the load-bearing
 		// defense), and errors.Is on the raw sentinel never matches
 		// ErrInvalidArgs — without this case the raw sentinel would fall
-		// through to default → 500 InternalError.
+		// through to default → 500 InternalError. The class is 413 per RFC
+		// 9110 §15.5.17 (Payload Too Large): the request's declared
+		// image metadata exceeds the server's processing budget (8 MiB),
+		// before any pixel buffer is allocated.
 		return "MetadataTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrInvalidArgs):
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
