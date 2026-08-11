@@ -361,3 +361,224 @@ func mutatedU32(p []byte, i int, v uint32) []byte {
 	binary.LittleEndian.PutUint32(q[i:i+4], v)
 	return q
 }
+
+// jpegWithPostSOFExif builds a JPEG whose APP1-EXIF segment appears AFTER a
+// SOF0 frame header: SOI + SOF0 + APP1(Exif) + EOI. In a non-JFIF JPEG the
+// post-SOF region is scan-adjacent data, not metadata — the walker must stop
+// at the SOF family and never read the orientation tag (sec F-1).
+func jpegWithPostSOFExif(payload []byte) []byte {
+	var out bytes.Buffer
+	out.Write([]byte{0xFF, 0xD8}) // SOI
+	// SOF0 (baseline): precision 8, 64×64, 3 components.
+	sof := []byte{8, 0, 64, 0, 64, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1}
+	out.Write([]byte{0xFF, 0xC0})
+	var seg [2]byte
+	binary.BigEndian.PutUint16(seg[:], uint16(len(sof)+2))
+	out.Write(seg[:])
+	out.Write(sof)
+	// Post-SOF APP1 carrying a valid orientation-6 EXIF payload.
+	var seg4 [4]byte
+	seg4[0], seg4[1] = 0xFF, 0xE1
+	binary.BigEndian.PutUint16(seg4[2:4], uint16(len(payload)+2))
+	out.Write(seg4[:])
+	out.Write(payload)
+	out.Write([]byte{0xFF, 0xD9}) // EOI
+	return out.Bytes()
+}
+
+// TestExifOrientationPostSOFStops pins sec F-1: the EXIF walk stops at the
+// SOF family, so a post-SOF APP1 (scan-adjacent data in non-JFIF JPEGs) is
+// never parsed. A pre-SOF APP1 with the same payload still wins.
+func TestExifOrientationPostSOFStops(t *testing.T) {
+	validLE := exifPayload(6, binary.LittleEndian)
+	if got := exifOrientation(jpegWithPostSOFExif(validLE)); got != 1 {
+		t.Fatalf("post-SOF APP1 orientation = %d want 1 (metadata-only walk)", got)
+	}
+	// SOF before APP1 in the OTHER order (APP1 first) still parses.
+	pre := jpegWithAPP1(validLE)
+	if got := exifOrientation(pre); got != 6 {
+		t.Fatalf("pre-SOF APP1 orientation = %d want 6", got)
+	}
+	// A SOF-family stop also holds for SOF2 (progressive) and SOF1.
+	for _, sof := range []byte{0xC0, 0xC1, 0xC2} {
+		raw := append([]byte{0xFF, 0xD8, 0xFF, sof, 0x00, 0x11}, bytes.Repeat([]byte{0x42}, 15)...)
+		raw = append(raw, []byte{0xFF, 0xE1}...)
+		var seg [2]byte
+		binary.BigEndian.PutUint16(seg[:], uint16(len(validLE)+2))
+		raw = append(raw, seg[:]...)
+		raw = append(raw, validLE...)
+		if got := exifOrientation(raw); got != 1 {
+			t.Fatalf("post-SOF%02X APP1 orientation = %d want 1", sof, got)
+		}
+	}
+}
+
+// TestExifOrientationDefensiveOOB pins qa F3: wraparound-class IFD0 offsets,
+// out-of-bounds value-offset follows, and duplicate 0x0112 tags all resolve
+// safely — 1 for malformed structures, first-tag-wins for duplicates.
+func TestExifOrientationDefensiveOOB(t *testing.T) {
+	validLE := exifPayload(6, binary.LittleEndian)
+	// 0xFFFFFFFF IFD0 offset: the int conversion must not wrap and the
+	// bounds check must reject.
+	huge := jpegWithAPP1(mutatedU32(validLE, 10, 0xFFFFFFFF))
+	if got := exifOrientation(huge); got != 1 {
+		t.Fatalf("0xFFFFFFFF IFD0 offset = %d want 1", got)
+	}
+	// OOB value-offset follow: count 2 with the value offset pointing past
+	// the payload.
+	oobPayload := func() []byte {
+		p := make([]byte, 30)
+		copy(p, exifSignature)
+		p[6], p[7] = 'I', 'I'
+		binary.LittleEndian.PutUint16(p[8:10], 0x2A)
+		binary.LittleEndian.PutUint32(p[10:14], 8)
+		binary.LittleEndian.PutUint16(p[14:16], 1)
+		binary.LittleEndian.PutUint16(p[16:18], 0x0112)
+		binary.LittleEndian.PutUint16(p[18:20], 3)
+		binary.LittleEndian.PutUint32(p[20:24], 2)          // count 2 → offset-follow
+		binary.LittleEndian.PutUint32(p[24:28], 0x7FFFFFFF) // way past EOF
+		return p
+	}()
+	if got := exifOrientation(jpegWithAPP1(oobPayload)); got != 1 {
+		t.Fatalf("OOB value-offset follow = %d want 1", got)
+	}
+	// Duplicate 0x0112 tags: the first entry wins (orientation 6, not 8).
+	dup := func() []byte {
+		p := make([]byte, 40)
+		copy(p, exifSignature)
+		p[6], p[7] = 'I', 'I'
+		binary.LittleEndian.PutUint16(p[8:10], 0x2A)
+		binary.LittleEndian.PutUint32(p[10:14], 8)
+		binary.LittleEndian.PutUint16(p[14:16], 2) // two entries
+		binary.LittleEndian.PutUint16(p[16:18], 0x0112)
+		binary.LittleEndian.PutUint16(p[18:20], 3)
+		binary.LittleEndian.PutUint32(p[20:24], 1)
+		binary.LittleEndian.PutUint16(p[24:26], 6)
+		binary.LittleEndian.PutUint16(p[28:30], 0x0112)
+		binary.LittleEndian.PutUint16(p[30:32], 3)
+		binary.LittleEndian.PutUint32(p[32:36], 1)
+		binary.LittleEndian.PutUint16(p[36:38], 8)
+		return p
+	}()
+	if got := exifOrientation(jpegWithAPP1(dup)); got != 6 {
+		t.Fatalf("duplicate 0x0112 = %d want 6 (first-tag-wins)", got)
+	}
+}
+
+// TestApplyOrientationLiteralMatrices pins qa F4: orientations 2–8 use
+// literal expected matrices (independent of orientIndex) on a 2×3 labeled
+// source, so a regression in the index table itself cannot pass the pin.
+// Source pixels are labeled 1..6 row-major (w=2, h=3); orientations 5–8
+// swap the output axes to 3×2:
+//
+//	1 2      (o2) 2 1        (o3) 6 5        (o4) 5 6
+//	3 4      =    4 3        =    4 3        =    3 4
+//	5 6           6 5             2 1             1 2
+//
+//	(o5) 1 3 5   (o6) 5 3 1   (o7) 6 4 2   (o8) 2 4 6
+//	=    2 4 6   =    6 4 2   =    5 3 1   =    1 3 5
+func TestApplyOrientationLiteralMatrices(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 2, 3)) // w=2, h=3
+	for r := 0; r < 3; r++ {
+		for c := 0; c < 2; c++ {
+			v := uint8(r*2 + c + 1) // 1..6 row-major
+			src.SetNRGBA(c, r, color.NRGBA{R: v, G: 0, B: 0, A: 255})
+		}
+	}
+	type matrix [][]int
+	rows := func(rs ...[]int) matrix { return rs }
+	expect := map[int]struct {
+		out matrix
+	}{
+		2: {rows([]int{2, 1}, []int{4, 3}, []int{6, 5})},
+		3: {rows([]int{6, 5}, []int{4, 3}, []int{2, 1})},
+		4: {rows([]int{5, 6}, []int{3, 4}, []int{1, 2})},
+		5: {rows([]int{1, 3, 5}, []int{2, 4, 6})},
+		6: {rows([]int{5, 3, 1}, []int{6, 4, 2})},
+		7: {rows([]int{6, 4, 2}, []int{5, 3, 1})},
+		8: {rows([]int{2, 4, 6}, []int{1, 3, 5})},
+	}
+	for o, want := range expect {
+		t.Run("o"+string(rune('0'+o)), func(t *testing.T) {
+			got := applyOrientation(src, o)
+			if got.Bounds().Dx() != len(want.out[0]) || got.Bounds().Dy() != len(want.out) {
+				t.Fatalf("o%d out dims %dx%d want %dx%d", o, got.Bounds().Dx(), got.Bounds().Dy(), len(want.out[0]), len(want.out))
+			}
+			for r, row := range want.out {
+				for c, v := range row {
+					gotV := got.At(c, r).(color.RGBA).R
+					if gotV != uint8(v) {
+						t.Fatalf("o%d at (%d,%d) = %d want %d", o, r, c, gotV, v)
+					}
+				}
+			}
+		})
+	}
+	// o1 identity: same dims, byte-identical buffer reference (no copy).
+	if got := applyOrientation(src, 1); got != image.Image(src) {
+		t.Fatal("o1 must return the source unchanged")
+	}
+	if got := applyOrientation(src, 0); got != image.Image(src) {
+		t.Fatal("out-of-range orientation must return the source unchanged")
+	}
+}
+
+// TestGenerateOrientationRatioGe1YCbCr pins qa F5: a real JPEG source (YCbCr)
+// no larger than the requested box takes the ratio ≥ 1 path (scale returns the
+// source unchanged) and still rotates per EXIF orientation 6 — the upright
+// 75×100 output with the blue/red quadrants preserved.
+func TestGenerateOrientationRatioGe1YCbCr(t *testing.T) {
+	// 50×75 JPEG, right-half red / left-half blue (decodes to *image.YCbCr).
+	img := image.NewRGBA(image.Rect(0, 0, 50, 75))
+	for y := 0; y < 75; y++ {
+		for x := 0; x < 50; x++ {
+			if x < 25 {
+				img.Set(x, y, color.RGBA{0, 0, 255, 255})
+			} else {
+				img.Set(x, y, color.RGBA{255, 0, 0, 255})
+			}
+		}
+	}
+	var jpg bytes.Buffer
+	if err := jpeg.Encode(&jpg, img, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	// Splice the EXIF orientation-6 APP1 between SOI and the rest.
+	body := jpg.Bytes()[2:] // past SOI
+	var out bytes.Buffer
+	out.Write([]byte{0xFF, 0xD8})
+	payload := exifPayload(6, binary.LittleEndian)
+	var seg [4]byte
+	seg[0], seg[1] = 0xFF, 0xE1
+	binary.BigEndian.PutUint16(seg[2:4], uint16(len(payload)+2))
+	out.Write(seg[:])
+	out.Write(payload)
+	out.Write(body)
+
+	// Box 256×256 ≥ source 50×75: ratio ≥ 1 → scale returns src unchanged,
+	// then orientation 6 rotates 90° CW → 75×50... wait, orientation 5–8
+	// swap the box: box becomes 256×256 for 50×75? No — boxW,boxH = maxH,maxW
+	// for o≥5 → (256,256). scale(50×75 → 256×256) is ratio < 1 in one axis?
+	// 50→256 is upscale (ratio ≥ 1 → unchanged), 75→256 likewise. Both axes
+	// ratio ≥ 1 → source returned unchanged (50×75 YCbCr). Then o6 rotates
+	// to 75×50, upright (blue top, red bottom).
+	got, err := Generate(bytes.NewReader(out.Bytes()), 256, 256)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	dec, format, err := image.Decode(bytes.NewReader(got))
+	if err != nil || format != "jpeg" {
+		t.Fatalf("decode: %v fmt=%q", err, format)
+	}
+	if dec.Bounds().Dx() != 75 || dec.Bounds().Dy() != 50 {
+		t.Fatalf("out dims %dx%d want 75x50 (rotated upright)", dec.Bounds().Dx(), dec.Bounds().Dy())
+	}
+	// After 90° CW: the source's left (blue) half becomes the top.
+	top := dec.At(37, 5)
+	bot := dec.At(37, 45)
+	tr, _, tb, _ := top.RGBA()
+	br, _, bb, _ := bot.RGBA()
+	if tb <= tr || bb >= br {
+		t.Fatalf("top=(%d,%d) bottom=(%d,%d): want top blue-dominant, bottom red-dominant", tr, tb, br, bb)
+	}
+}

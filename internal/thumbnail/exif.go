@@ -40,6 +40,14 @@ func exifOrientation(buf []byte) int {
 			return 1
 		case m == 0xD8, m == 0xD9, m == 0xDA: // SOI/EOI/SOS: stop before entropy
 			return 1
+		case m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC:
+			// SOF-family markers (SOF0–SOF15; 0xC4 DHT / 0xC8 JPG / 0xCC DAC
+			// are tables, not frames): EXIF is a pre-SOF segment. A JPEG with
+			// no JFIF APP0 can legally carry APPn after the SOF, where the
+			// bytes are scan-adjacent data rather than metadata — stopping
+			// here keeps the walk metadata-only (mirrors the stdlib's
+			// configOnly && d.jfif rule).
+			return 1
 		case m == 0x01, m >= 0xD0 && m <= 0xD7: // standalone: TEM, RSTn
 		default: // segment marker: skip payload by 16-bit length
 			if i+2 > len(buf) {

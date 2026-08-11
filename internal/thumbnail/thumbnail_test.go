@@ -421,6 +421,26 @@ func FuzzGenerate(f *testing.F) {
 	f.Add(png[:len(png)/2])                         // mid-IDAT truncation
 	f.Add(headerOnlyProgressiveJPEG(f, 8192, 8192)) // ErrImageTooLarge: progressive > MaxProgressiveSourceDim (~130 B)
 	f.Add(realProgressiveJPEG(f, 8, 8))             // valid progressive decode seed (338 B)
+	// EXIF-carrying seeds (qa F2): a real JPEG with a valid orientation-6
+	// APP1 spliced before the scan, and the same payload after a SOF0 header
+	// (the walker must stop at the SOF family and ignore it).
+	if jpg := realBaselineJPEG(f, 16, 16, 82); len(jpg) > 2 {
+		payload := exifPayload(6, binary.LittleEndian)
+		var exifJPEG []byte
+		{
+			var b bytes.Buffer
+			b.Write([]byte{0xFF, 0xD8})
+			var seg [4]byte
+			seg[0], seg[1] = 0xFF, 0xE1
+			binary.BigEndian.PutUint16(seg[2:4], uint16(len(payload)+2))
+			b.Write(seg[:])
+			b.Write(payload)
+			b.Write(jpg[2:])
+			exifJPEG = b.Bytes()
+		}
+		f.Add(exifJPEG)                     // valid decode + orientation-6 applied
+		f.Add(jpegWithPostSOFExif(payload)) // post-SOF APP1 must be ignored
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)
