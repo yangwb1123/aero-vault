@@ -1,27 +1,35 @@
 package thumbnail
 
-// Allocation-pin for the scale→composite ordering at real MaxSourceDim
-// scale, and a byte-level ordering pin that also discriminates under -race.
+// Allocation-pin for the scale→composite ordering at real source scale
+// (V8 at MaxSourceDim; V16 at Max16BitSourceDim — the depth-16 cap, the
+// legal maximum for the 8 B/px decode class), and a byte-level ordering pin
+// that also discriminates under -race.
 //
 // Measured plain-mode TotalAlloc stage table (go1.26.5, in-package probes;
-// cumulative deltas for one Generate(8192² transparent, HardMax box)):
+// cumulative deltas for one Generate(transparent, HardMax box)):
 //
-//	stage      | V8 (NRGBA, 4 B/px) | V16 (NRGBA64, 8 B/px)
-//	decode     |      256.1 MiB     |      512.2 MiB
-//	scale      |      144.0 MiB     |      208.0 MiB  (transient bilinear churn)
-//	composite  |       16.0 MiB     |       16.0 MiB  (post-scale copy)
-//	jpeg encode|        0.3 MiB     |        0.3 MiB
-//	total      |      416.4 MiB     |      736.4 MiB
+//	stage      | V8 (NRGBA, 4 B/px, 8192²) | V16 (NRGBA64, 8 B/px, 4096²)
+//	decode     |           256.1 MiB       |           128.1 MiB
+//	scale      |           144.0 MiB       |           208.0 MiB  (transient bilinear churn)
+//	composite  |            16.0 MiB       |            16.0 MiB  (post-scale copy)
+//	jpeg encode|             0.3 MiB       |             0.3 MiB
+//	total      |           416.4 MiB       |           352.4 MiB
 //
 // The pre-scale composite regression (compositeOnWhite before scale) adds a
 // full-frame copy at source resolution and measures ≈ 656.4 MiB (V8) /
-// ≈ 912.5 MiB (V16) — totals, decode included (non-decode ≈ 400.3 MiB /
-// ≈ 400.3 MiB). All figures are cumulative TotalAlloc deltas; the live-peak
-// contract (what the decode semaphore bounds) is different and is documented
-// in thumbnail.go. Under -race the detector's bookkeeping inflates the
-// correct-path deltas (measured V8 416.4 → 672.6 MiB, V16 736.4 → 928.7 MiB,
-// ≈ 1.62×/1.26×), so the allocation pin runs in plain mode only; the
-// feathered byte-level pin keeps the ordering discriminated under -race.
+// ≈ 336.4 MiB (V16) — totals, decode included. The V16 regression is NOT
+// larger than the correct path at the depth-16 cap: the full-frame composite
+// copies the 4096² frame to a 4 B/px RGBA (64 MiB) and the subsequent scale
+// churns the cheaper 4 B/px class (~144 MiB), netting ≈ 16 MiB below the
+// correct order — the cap itself is what defangs the pre-scale regression at
+// 8 B/px, so V16 ordering discrimination is carried by the V8 arm (unchanged
+// at 8192²) and the byte-level pin. All figures are cumulative TotalAlloc
+// deltas; the live-peak contract (what the decode semaphore bounds) is
+// different and is documented in thumbnail.go. Under -race the detector's
+// bookkeeping inflates the correct-path deltas (measured V8 416.4 →
+// 672.6 MiB, V16 352.4 → 544.6 MiB, ≈ 1.62×/1.55×), so the allocation pin
+// runs in plain mode only; the feathered byte-level pin keeps the ordering
+// discriminated under -race.
 import (
 	"bytes"
 	"image"
@@ -67,14 +75,15 @@ func transparentHalfNRGBA(t *testing.T) []byte {
 	return pngEncodeBytes(t, img)
 }
 
-// transparentHalfNRGBA64 is the depth-16 analogue: the stdlib decodes it to
-// *image.NRGBA64 at 8 B/px.
+// transparentHalfNRGBA64 is the depth-16 analogue, built at Max16BitSourceDim
+// (the legal maximum for the 8 B/px decode class since the depth-16 cap): the
+// stdlib decodes it to *image.NRGBA64 at 8 B/px.
 func transparentHalfNRGBA64(t *testing.T) []byte {
 	t.Helper()
-	img := image.NewNRGBA64(image.Rect(0, 0, MaxSourceDim, MaxSourceDim))
-	for y := 0; y < MaxSourceDim; y++ {
-		for x := 0; x < MaxSourceDim; x++ {
-			if x < MaxSourceDim/2 {
+	img := image.NewNRGBA64(image.Rect(0, 0, Max16BitSourceDim, Max16BitSourceDim))
+	for y := 0; y < Max16BitSourceDim; y++ {
+		for x := 0; x < Max16BitSourceDim; x++ {
+			if x < Max16BitSourceDim/2 {
 				img.SetNRGBA64(x, y, color.NRGBA64{0xffff, 0, 0, 0})
 			} else {
 				img.SetNRGBA64(x, y, color.NRGBA64{0xffff, 0, 0, 0xffff})
@@ -96,31 +105,32 @@ func TestGenerateLargeTransparentAllocationBounded(t *testing.T) {
 		t.Skip("8192² transparent fixtures need ~1.5 GiB transient heap; run without -short")
 	}
 	if raceEnabled {
-		t.Skip("TotalAlloc-delta is race-inflated (measured V8 416.4→672.6 MiB, V16 736.4→928.7 MiB); the feathered byte-level pin keeps ordering discriminated under -race")
+		t.Skip("TotalAlloc-delta is race-inflated (measured V8 416.4→672.6 MiB, V16 352.4→544.6 MiB); the feathered byte-level pin keeps ordering discriminated under -race")
 	}
 	cases := []struct {
 		name        string
 		fixture     func(t *testing.T) []byte
 		decodeBytes uint64
 		typ         string // expected decoded concrete type
+		wantRect    image.Rectangle
 	}{
-		{name: "V8", fixture: transparentHalfNRGBA, decodeBytes: uint64(MaxSourceDim) * MaxSourceDim * 4, typ: "*image.NRGBA"},
-		{name: "V16", fixture: transparentHalfNRGBA64, decodeBytes: uint64(MaxSourceDim) * MaxSourceDim * 8, typ: "*image.NRGBA64"},
+		{name: "V8", fixture: transparentHalfNRGBA, decodeBytes: uint64(MaxSourceDim) * MaxSourceDim * 4, typ: "*image.NRGBA", wantRect: image.Rect(0, 0, MaxSourceDim, MaxSourceDim)},
+		{name: "V16", fixture: transparentHalfNRGBA64, decodeBytes: uint64(Max16BitSourceDim) * Max16BitSourceDim * 8, typ: "*image.NRGBA64", wantRect: image.Rect(0, 0, Max16BitSourceDim, Max16BitSourceDim)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			payload := tc.fixture(t)
 
 			// Engagement guards: the fixture must decode to the exact
-			// MaxSourceDim frame of the expected bit depth, be genuinely
+			// cap-sized frame of the expected bit depth, be genuinely
 			// transparent, and — load-bearing — stay non-opaque AFTER the
 			// downscale, because the composite's input is the scaled buffer.
 			decoded, format, err := image.Decode(bytes.NewReader(payload))
 			if err != nil || format != "png" {
 				t.Fatalf("decode fixture: %v fmt=%q", err, format)
 			}
-			if b := decoded.Bounds(); b != image.Rect(0, 0, MaxSourceDim, MaxSourceDim) {
-				t.Fatalf("decoded bounds %v, want (0,0,%d,%d) — fixture shrink makes the pin vacuous", b, MaxSourceDim, MaxSourceDim)
+			if b := decoded.Bounds(); b != tc.wantRect {
+				t.Fatalf("decoded bounds %v, want %v — fixture shrink makes the pin vacuous", b, tc.wantRect)
 			}
 			if got := imageType(decoded); got != tc.typ {
 				t.Fatalf("decoded type %s, want %s", got, tc.typ)

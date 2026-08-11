@@ -25,9 +25,10 @@ import (
 var ErrUnsupported = errors.New("thumbnail: unsupported or invalid image")
 
 // ErrImageTooLarge is returned when the source image's declared dimensions
-// exceed MaxSourceDim, or exceed MaxProgressiveSourceDim for progressive
-// (SOF2) JPEG sources. It is distinct from ErrUnsupported so callers can tell
-// a dimension-capped rejection from a corrupt or non-image input.
+// exceed MaxSourceDim, exceed MaxProgressiveSourceDim for progressive (SOF2)
+// JPEG sources, or exceed Max16BitSourceDim for depth-16 PNG sources. It is
+// distinct from ErrUnsupported so callers can tell a dimension-capped
+// rejection from a corrupt or non-image input.
 var ErrImageTooLarge = errors.New("thumbnail: image dimensions exceed MaxSourceDim")
 
 // ErrMetadataTooLarge is returned when the bytes consumed by image.DecodeConfig
@@ -53,32 +54,23 @@ const (
 	// MaxSourceDim caps each declared source dimension (pixels). Sources with
 	// any side above this are rejected from the header before any pixel buffer
 	// is allocated, bounding worst-case decode allocation to MaxSourceDim²×4 B
-	// = 256 MiB (8-bit PNG RGBA/NRGBA); depth-16 PNG sources decode to
-	// *image.NRGBA64 at 8 B/px (stdlib image/png), i.e. MaxSourceDim²×8 B =
-	// 512 MiB. Progressive JPEG sources are additionally capped by
-	// MaxProgressiveSourceDim (below): their per-request worst case is
-	// ~275 MiB (full-image coefficient buffers plus the decoded frame).
-	// Images larger than this can no longer be thumbnailed; they are exactly
-	// the inputs that make the endpoint a memory-DoS sink, and the output is
-	// capped at HardMax anyway.
+	// = 256 MiB (8-bit PNG RGBA/NRGBA). Depth-16 PNG and progressive JPEG
+	// sources are additionally capped below by Max16BitSourceDim and
+	// MaxProgressiveSourceDim. Images larger than this can no longer be
+	// thumbnailed; they are exactly the inputs that make the endpoint a
+	// memory-DoS sink, and the output is capped at HardMax anyway.
 	//
 	// Live per-request totals (what the semaphore bounds): decode + scale dst
 	// (≤ HardMax²×4 B = 16 MiB) + white-composite copy (≤ 16 MiB, post-scale
 	// — see the scale→composite ordering note) + EXIF-rotation frame (≤
 	// HardMax²×4 B = 16 MiB, JPEG-with-orientation path only; that path
-	// skips the composite copy 1:1 — the rotated frame is opaque, so the
-	// ≈ 288 MiB (8-bit) / ≈ 544 MiB (16-bit) figures still hold). These are
-	// live-peak figures; cumulative TotalAlloc also
-	// includes transient bilinear-stage churn (see
-	// large_transparent_allocation_test.go) — do not confuse the two.
-	//
-	// Note: the worst cases above are per request. Aggregate in-flight decode
-	// memory is capped by the package-level semaphore maxConcurrentDecodes:
-	// at most maxConcurrentDecodes Generate calls hold their allocation-bearing
-	// section at once, so live decode allocation across all calls is bounded
-	// by maxConcurrentDecodes × per-request worst case (≈ 4 × 288 MiB ≈
-	// 1.125 GiB 8-bit; ≈ 4 × 544 MiB ≈ 2.125 GiB 16-bit) regardless of
-	// MAX_INFLIGHT_REQUESTS / PER_TENANT_CONCURRENCY_MAX / rate limits.
+	// skips the composite copy 1:1, so ≈ 288 MiB (8-bit) / ≈ 160 MiB
+	// (16-bit at Max16BitSourceDim) live still hold). These are live-peak
+	// figures; cumulative TotalAlloc also includes transient bilinear-stage
+	// churn (see large_transparent_allocation_test.go). The aggregate
+	// in-flight decode memory bound lives in maxConcurrentDecodes' doc
+	// comment: the depth-16 aggregate (≈ 4 × 128 MiB ≈ 512 MiB) is now
+	// inside the 2 GiB ceiling pinned in semaphore_test.go.
 	MaxSourceDim = 8192
 
 	// MaxProgressiveSourceDim caps each declared source dimension (pixels)
@@ -120,14 +112,13 @@ const (
 // maxConcurrentDecodes caps how many Generate calls may be inside their
 // allocation-bearing section (DecodeConfig through jpeg.Encode) at once.
 // Aggregate live decode memory is therefore bounded by
-// maxConcurrentDecodes × per-request worst case (≈ 4 × 288 MiB ≈ 1.125 GiB
-// for 8-bit PNG RGBA; ≈ 4 × 544 MiB ≈ 2.125 GiB for depth-16 PNG at
-// MaxSourceDim — note this 16-bit aggregate exceeds the 2 GiB absolute
-// ceiling pinned in semaphore_test.go, which is scoped to the 8-bit
-// baseline; ≈ 4 × ~275 MiB ≈ 1.1 GiB for progressive JPEG at
-// MaxProgressiveSourceDim) regardless of MAX_INFLIGHT_REQUESTS /
-// PER_TENANT_CONCURRENCY_MAX / rate limits. Waiters hold only a stream reader
-// and allocate nothing.
+// maxConcurrentDecodes × per-request worst case: ≈ 4 × 288 MiB ≈
+// 1.125 GiB (8-bit PNG RGBA); ≈ 4 × 128 MiB ≈ 512 MiB (depth-16 PNG at
+// Max16BitSourceDim); ≈ 4 × ~275 MiB ≈ 1.1 GiB (progressive JPEG at
+// MaxProgressiveSourceDim) — all inside the 2 GiB absolute ceiling
+// pinned in semaphore_test.go, regardless of MAX_INFLIGHT_REQUESTS /
+// PER_TENANT_CONCURRENCY_MAX / rate limits. Waiters hold only a stream
+// reader and allocate nothing.
 const maxConcurrentDecodes = 4
 
 // decodeSlots is the package-level blocking semaphore backing
@@ -288,6 +279,14 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 	if format == "jpeg" &&
 		(cfg.Width > MaxProgressiveSourceDim || cfg.Height > MaxProgressiveSourceDim) &&
 		progressiveJPEG(head.buf.Bytes()) {
+		return nil, ErrImageTooLarge // payload never read
+	}
+	// Depth-16 PNG sources decode at 8 B/px (stdlib image/png), so they get
+	// the same lower bound as progressive JPEGs: above Max16BitSourceDim
+	// they are rejected from the header, before any pixel buffer is
+	// allocated (see png16.go for the IHDR byte location and rules).
+	if format == "png" && pngBitDepth(head.buf.Bytes()) == 16 &&
+		(cfg.Width > Max16BitSourceDim || cfg.Height > Max16BitSourceDim) {
 		return nil, ErrImageTooLarge // payload never read
 	}
 	if cerr := ctx.Err(); cerr != nil {

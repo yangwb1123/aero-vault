@@ -38,10 +38,10 @@ func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
 	// 4 × 256 MiB ≈ 1 GiB for 8-bit PNG RGBA (live per-request worst case ≈
 	// 288 MiB incl. scale dst + composite copy → ≈ 1.125 GiB aggregate; see
 	// the bit-depth-aware accounting in thumbnail.go). The 2 GiB ceiling
-	// below is scoped to this 8-bit baseline — depth-16 sources (8 B/px)
-	// legitimately aggregate to ≈ 2.125 GiB, documented separately. A silent
-	// raise (4→8→16) must fail this test rather than silently growing the
-	// allowed peak.
+	// below covers every format class: depth-16 PNG sources are capped at
+	// Max16BitSourceDim (≈ 4 × 128 MiB ≈ 512 MiB aggregate; see png16.go),
+	// so no class can breach the pin. A silent raise (4→8→16) must fail this
+	// test rather than silently growing the allowed peak.
 	if maxConcurrentDecodes != 4 {
 		t.Fatalf("maxConcurrentDecodes = %d, want 4 (design pin: 4×256MiB ≈ 1GiB 8-bit baseline)", maxConcurrentDecodes)
 	}
@@ -128,9 +128,9 @@ func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
 		t.Fatalf("peak live heap %d bytes exceeds semaphore bound %d", peak, limit)
 	}
 	// C1 absolute ceiling: even if the constant were raised, live decode
-	// memory must never approach the 2 GiB design ceiling (8-bit baseline;
-	// the depth-16 aggregate ≈ 2.125 GiB is documented in thumbnail.go and
-	// intentionally not subject to this 8-bit-scoped pin).
+	// memory must never approach the 2 GiB design ceiling (the depth-16
+	// class is capped at Max16BitSourceDim — ≈ 512 MiB aggregate — so the
+	// pin covers every format class).
 	if peak > 2<<30 {
 		t.Fatalf("peak live heap %d bytes exceeds absolute 2 GiB ceiling", peak)
 	}
