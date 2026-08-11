@@ -59,6 +59,13 @@ func classify(err error) (string, string, int) {
 		// ErrInvalidArgs), so errors.Is on the raw sentinel cannot match the
 		// ErrInvalidArgs case regardless of this case's position.
 		return "UnsupportedMediaType", err.Error(), http.StatusUnsupportedMediaType
+	case errors.Is(err, thumbnail.ErrMetadataTooLarge):
+		// Required, not defensive: the thumbnail handler unwraps the raw
+		// sentinel before classifying (that unwrap is the load-bearing
+		// defense), and errors.Is on the raw sentinel never matches
+		// ErrInvalidArgs — without this case the raw sentinel would fall
+		// through to default → 500 InternalError.
+		return "MetadataTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrInvalidArgs):
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrBadDigest):

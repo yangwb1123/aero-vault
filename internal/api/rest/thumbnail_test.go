@@ -172,20 +172,129 @@ func TestThumbnailNonImage(t *testing.T) {
 	}
 }
 
-func TestThumbnailOversizedMetadata(t *testing.T) {
-	// A JPEG with more pre-SOF metadata than the module's budget must map to
-	// HTTP 400 InvalidArgument through the generic error path — never 413
-	// (that is the dimension class) and never 500 (the raw sentinel has no
-	// classify case; the handler's ErrInvalidArgs wrap is what pins this).
+func TestThumbnailMetadataBudget413(t *testing.T) {
+	// A JPEG with more pre-SOF metadata than the module's budget maps to
+	// HTTP 413 MetadataTooLarge — a second 413 class, sibling to the
+	// dimension class (ImageTooLarge), not a 400 client-argument error.
 	s := newRESTTest(t)
 	u := s.URL + "/v1/files/meta.jpg"
 	req(t, "PUT", u, appnPaddedJPEG(t, 9<<20), map[string]string{"Content-Type": "image/jpeg"})
 	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("thumbnail with oversized metadata: status=%d want 413", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte(`"code":"MetadataTooLarge"`)) {
+		t.Fatalf("expected code MetadataTooLarge, body: %s", body)
+	}
+	if bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("metadata class must not be InvalidArgument, body: %s", body)
+	}
+}
+
+// countingReader counts the bytes pulled from an underlying reader; used to
+// pin the exact DecodeConfig consumption of the at-cap fixture.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+func TestThumbnailMetadataBudgetAtExactCap(t *testing.T) {
+	// Boundary-inclusive at the consumption level: a fixture whose
+	// DecodeConfig consumption lands exactly on MaxMetadataBytes still
+	// thumbnails (200); one byte more rejects with 413 MetadataTooLarge.
+	// Consumption = SOI(2) + 128×APP1(4n+P) + DQT(134) + SOF0(19) + DHT(420)
+	// + SOS header(4) = P + 4n + 579, measured against the Go 1.26 stdlib
+	// jpeg.Encode output (no JFIF APP0, so the config scan runs to the SOS
+	// header). The fixture-derived invariants below fail loudly if the
+	// stdlib layout drifts.
+	const n = 128 // APP1 segments; 127×65533 < P ≤ 128×65533 keeps the split valid
+	P := thumbnail.MaxMetadataBytes - 4*n - 579
+	fixture := appnPaddedJPEG(t, P)
+
+	// Invariant 1: the SOS marker pair sits exactly MaxMetadataBytes-4 bytes
+	// into the fixture, i.e. the 4 SOS-header bytes end the budget.
+	sosIndex := bytes.Index(fixture, []byte{0xFF, 0xDA})
+	if sosIndex < 0 {
+		t.Fatal("fixture has no SOS marker")
+	}
+	if sosIndex+4 != thumbnail.MaxMetadataBytes {
+		t.Fatalf("sosIndex+4=%d want %d (stdlib jpeg layout drift?)", sosIndex+4, thumbnail.MaxMetadataBytes)
+	}
+
+	// Invariant 2: image.DecodeConfig consumes exactly the budget from a
+	// counting reader (2048 × 4096-byte bufio fills; budget = 2048×4096).
+	cnt := &countingReader{r: bytes.NewReader(fixture)}
+	if _, _, err := image.DecodeConfig(cnt); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if cnt.n != int64(thumbnail.MaxMetadataBytes) {
+		t.Fatalf("DecodeConfig consumed %d bytes, want exactly %d", cnt.n, thumbnail.MaxMetadataBytes)
+	}
+
+	// HTTP: the at-cap object thumbnails successfully and decodes as JPEG.
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/exact.jpg"
+	req(t, "PUT", u, fixture, map[string]string{"Content-Type": "image/jpeg"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("at-cap thumbnail: status=%d want 200 (body=%s)", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("at-cap thumbnail: content-type=%q want image/jpeg", ct)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(body)); err != nil || format != "jpeg" {
+		t.Fatalf("decode at-cap thumb: %v fmt=%s", err, format)
+	}
+
+	// Discriminating control: one payload byte more spills the SOS header
+	// into a 2049th fill, which overflows the budget → 413 MetadataTooLarge.
+	u2 := s.URL + "/v1/files/over.jpg"
+	req(t, "PUT", u2, appnPaddedJPEG(t, P+1), map[string]string{"Content-Type": "image/jpeg"})
+	resp2, body2 := req(t, "GET", u2+"/thumbnail", nil, nil)
+	if resp2.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over-by-one thumbnail: status=%d want 413 (body=%s)", resp2.StatusCode, body2)
+	}
+	if !bytes.Contains(body2, []byte(`"code":"MetadataTooLarge"`)) {
+		t.Fatalf("over-by-one: expected code MetadataTooLarge, body: %s", body2)
+	}
+}
+
+func TestThumbnailInvalidW(t *testing.T) {
+	// The metadata-budget class (413 MetadataTooLarge) and the garbage-
+	// dimension class (400 InvalidArgument) must remain distinct: garbage
+	// ?w= on a valid image is a client argument error, while a metadata
+	// flood over the budget is an entity-too-large rejection — never 400.
+	s := newRESTTest(t)
+	p := s.URL + "/v1/files/pic.png"
+	req(t, "PUT", p, pngBytes(t, 16, 16), map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", p+"/thumbnail?w=abc", nil, nil)
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("thumbnail with oversized metadata: status=%d want 400", resp.StatusCode)
+		t.Fatalf("?w=abc on valid image: status=%d want 400 (body=%s)", resp.StatusCode, body)
 	}
 	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
-		t.Fatalf("expected code InvalidArgument, body: %s", body)
+		t.Fatalf("?w=abc: expected code InvalidArgument, body: %s", body)
+	}
+	if !bytes.Contains(body, []byte("w")) {
+		t.Fatalf("?w=abc: message must name the w parameter, body: %s", body)
+	}
+
+	m := s.URL + "/v1/files/meta.jpg"
+	req(t, "PUT", m, appnPaddedJPEG(t, 9<<20), map[string]string{"Content-Type": "image/jpeg"})
+	resp2, body2 := req(t, "GET", m+"/thumbnail", nil, nil)
+	if resp2.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("metadata bomb: status=%d want 413 (body=%s)", resp2.StatusCode, body2)
+	}
+	if !bytes.Contains(body2, []byte(`"code":"MetadataTooLarge"`)) {
+		t.Fatalf("metadata bomb: expected code MetadataTooLarge, body: %s", body2)
+	}
+	if bytes.Contains(body2, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("metadata bomb must not be InvalidArgument, body: %s", body2)
 	}
 }
 

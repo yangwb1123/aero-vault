@@ -200,6 +200,13 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, r, thumbnail.ErrImageTooLarge)
 			return
 		}
+		if errors.Is(err, thumbnail.ErrMetadataTooLarge) {
+			// The metadata-budget sentinel must reach classify() raw: the
+			// generic wrap below stringifies it via %v, so errors.Is would
+			// never match downstream. Same unwrap pattern as ErrImageTooLarge.
+			h.writeError(w, r, thumbnail.ErrMetadataTooLarge)
+			return
+		}
 		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
 		return
 	}
