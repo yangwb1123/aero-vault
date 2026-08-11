@@ -418,7 +418,9 @@ func FuzzGenerate(f *testing.F) {
 	f.Add(prefix)
 	png := makePNG(f, 400, 200) // 744 B: known-good decode + downscale seed (REQ-4)
 	f.Add(png)
-	f.Add(png[:len(png)/2]) // mid-IDAT truncation
+	f.Add(png[:len(png)/2])                         // mid-IDAT truncation
+	f.Add(headerOnlyProgressiveJPEG(f, 8192, 8192)) // ErrImageTooLarge: progressive > MaxProgressiveSourceDim (~130 B)
+	f.Add(realProgressiveJPEG(f, 8, 8))             // valid progressive decode seed (338 B)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)

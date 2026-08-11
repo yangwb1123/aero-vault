@@ -414,14 +414,16 @@ constants (`internal/thumbnail`):
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `MaxSourceDim` | `8192` px | Declared source dimensions above this are rejected from the header before any pixel buffer is allocated |
+| `MaxProgressiveSourceDim` | `4096` px | Declared source dimensions above this are rejected from the header for progressive (SOF2) JPEG sources |
 | `MaxSourceBytes` | `128 MiB` | Compressed input consumed per request |
 | `MaxMetadataBytes` | `8 MiB` | Pre-image metadata (JPEG APPn/COM segments) accepted before `ErrMetadataTooLarge` |
 | `maxConcurrentDecodes` | `4` | In-flight decode calls at once (package-level semaphore) |
 | `quality` | `82` | JPEG encode quality |
 
-Per-request worst-case decode allocation: ≈ 268 MiB (PNG RGBA at `MaxSourceDim`) to
-≈ 1.1 GiB (progressive JPEG). Aggregate ceilings: ≈ 1.1 GiB (PNG RGBA) / ≈ 4.4 GiB
-(progressive JPEG) across all concurrent decodes.
+Per-request worst-case decode allocation: ≈ 268 MiB (PNG RGBA at `MaxSourceDim`);
+≈ 275 MiB (progressive JPEG, capped at `MaxProgressiveSourceDim`). Aggregate
+ceilings: ≈ 1.1 GiB (PNG RGBA) / ≈ 1.1 GiB (progressive JPEG) across all
+concurrent decodes.
 
 **Decode-slot wait contract:** waiters acquire a slot via a `select` on the
 request context — cancellation (client disconnect, or the `REQUEST_TIMEOUT_SECONDS`

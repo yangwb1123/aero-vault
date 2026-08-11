@@ -23,7 +23,8 @@ import (
 var ErrUnsupported = errors.New("thumbnail: unsupported or invalid image")
 
 // ErrImageTooLarge is returned when the source image's declared dimensions
-// exceed MaxSourceDim. It is distinct from ErrUnsupported so callers can tell
+// exceed MaxSourceDim, or exceed MaxProgressiveSourceDim for progressive
+// (SOF2) JPEG sources. It is distinct from ErrUnsupported so callers can tell
 // a dimension-capped rejection from a corrupt or non-image input.
 var ErrImageTooLarge = errors.New("thumbnail: image dimensions exceed MaxSourceDim")
 
@@ -50,8 +51,9 @@ const (
 	// MaxSourceDim caps each declared source dimension (pixels). Sources with
 	// any side above this are rejected from the header before any pixel buffer
 	// is allocated, bounding worst-case decode allocation to MaxSourceDim²×4 B
-	// ≈ 268 MiB (PNG RGBA); a progressive JPEG at this size reaches ~1.1 GiB
-	// per request (full-image coefficient buffers plus the decoded frame).
+	// ≈ 268 MiB (PNG RGBA); progressive JPEG sources are additionally capped
+	// by MaxProgressiveSourceDim (below): their per-request worst case is
+	// ~275 MiB (full-image coefficient buffers plus the decoded frame).
 	// Images larger than this can no longer be thumbnailed; they are exactly
 	// the inputs that make the endpoint a memory-DoS sink, and the output is
 	// capped at HardMax anyway.
@@ -61,9 +63,23 @@ const (
 	// at most maxConcurrentDecodes Generate calls hold their allocation-bearing
 	// section at once, so live decode allocation across all calls is bounded
 	// by maxConcurrentDecodes × per-request worst case (≈ 1.1 GiB PNG RGBA;
-	// ≈ 4.4 GiB progressive JPEG at the current constant) regardless of
+	// ≈ 4 × ~275 MiB ≈ 1.1 GiB progressive JPEG) regardless of
 	// MAX_INFLIGHT_REQUESTS / PER_TENANT_CONCURRENCY_MAX / rate limits.
 	MaxSourceDim = 8192
+
+	// MaxProgressiveSourceDim caps each declared source dimension (pixels)
+	// for progressive (SOF2) JPEG sources, below MaxSourceDim. Progressive
+	// JPEGs carry full-image coefficient buffers per scan band, so a
+	// progressive source at MaxSourceDim allocates ~1.1 GiB per request —
+	// 4× the PNG RGBA baseline. Rejecting progressive sources above this
+	// bound from the header (before any pixel buffer) cuts the per-request
+	// progressive worst case 4× (4096²/8192²) to ~275 MiB, and with it the
+	// aggregate ceiling (maxConcurrentDecodes × per-request) to ~1.1 GiB —
+	// the same class as the PNG RGBA baseline — while common progressive
+	// web exports (≤ 2048, e.g. Chrome/Android) and 4K-class sources up to
+	// 4096 keep working. Baseline (SOF0/SOF1) sources are unaffected and
+	// may still reach MaxSourceDim.
+	MaxProgressiveSourceDim = 4096
 
 	// MaxSourceBytes caps the compressed input consumed per Generate call.
 	// A stream that ends before a complete image decodes within this cap
@@ -91,9 +107,10 @@ const (
 // allocation-bearing section (DecodeConfig through jpeg.Encode) at once.
 // Aggregate live decode memory is therefore bounded by
 // maxConcurrentDecodes × per-request worst case (≈ 4 × 268 MiB ≈ 1.1 GiB for
-// PNG RGBA; ≈ 4 × ~1.1 GiB ≈ 4.4 GiB for progressive JPEG at MaxSourceDim)
-// regardless of MAX_INFLIGHT_REQUESTS / PER_TENANT_CONCURRENCY_MAX / rate
-// limits. Waiters hold only a stream reader and allocate nothing.
+// PNG RGBA; ≈ 4 × ~275 MiB ≈ 1.1 GiB for progressive JPEG at
+// MaxProgressiveSourceDim) regardless of MAX_INFLIGHT_REQUESTS /
+// PER_TENANT_CONCURRENCY_MAX / rate limits. Waiters hold only a stream reader
+// and allocate nothing.
 const maxConcurrentDecodes = 4
 
 // decodeSlots is the package-level blocking semaphore backing
@@ -220,7 +237,7 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 	// payload is read further or any pixel buffer is allocated.
 	head := &limitedBuffer{remaining: MaxMetadataBytes}
 	cfgR := io.TeeReader(r, head)
-	cfg, _, err := image.DecodeConfig(cfgR)
+	cfg, format, err := image.DecodeConfig(cfgR)
 	if err != nil {
 		if errors.Is(err, errMetadataBudgetExceeded) {
 			return nil, ErrMetadataTooLarge
@@ -228,6 +245,18 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		return nil, ErrUnsupported
 	}
 	if cfg.Width > MaxSourceDim || cfg.Height > MaxSourceDim {
+		return nil, ErrImageTooLarge // payload never read
+	}
+	// Progressive (SOF2) sources carry full-image coefficient buffers per
+	// scan band, so they get a lower dimension bound than baseline sources:
+	// a progressive JPEG above MaxProgressiveSourceDim is rejected from the
+	// header with the same sentinel, before any pixel buffer is allocated.
+	// The SOF2 marker is already inside head (DecodeConfig consumed it), so
+	// the detection walk is free and is skipped entirely for the common
+	// small-image path (the format/dims gates run first).
+	if format == "jpeg" &&
+		(cfg.Width > MaxProgressiveSourceDim || cfg.Height > MaxProgressiveSourceDim) &&
+		progressiveJPEG(head.buf.Bytes()) {
 		return nil, ErrImageTooLarge // payload never read
 	}
 	src, _, err := image.Decode(io.MultiReader(bytes.NewReader(head.buf.Bytes()), r))
@@ -242,6 +271,55 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// progressiveJPEG reports whether the JPEG header in buf declares a
+// progressive (SOF2) start-of-frame marker. It walks markers segment-aware —
+// skipping each segment's payload via its 16-bit big-endian length field —
+// and stops at the first SOF-family marker (SOF0/SOF1/SOF2) or at SOS,
+// never scanning past the SOS header into entropy-coded data, where
+// coincidental 0xFF 0xC2 byte pairs are ordinary data. (A naive
+// bytes.Contains would false-positive on APPn payloads such as XMP/EXIF/ICC
+// or on read-ahead entropy bytes, wrongly rejecting baseline sources with
+// dims in (MaxProgressiveSourceDim, MaxSourceDim].) On any parse anomaly the
+// walk reports false — behavior equals today's; unreachable in practice
+// because image.DecodeConfig validated the same structure. buf is the
+// budget-capped DecodeConfig tee buffer (head), so the walk is bounded by
+// MaxMetadataBytes by construction and allocates nothing.
+func progressiveJPEG(buf []byte) bool {
+	if len(buf) < 2 || buf[0] != 0xFF || buf[1] != 0xD8 {
+		return false // no SOI: not a parseable JPEG header
+	}
+	i := 2 // past SOI
+	for i < len(buf) {
+		for i < len(buf) && buf[i] == 0xFF { // marker fill (Annex B)
+			i++
+		}
+		if i >= len(buf) {
+			return false
+		}
+		m := buf[i]
+		i++
+		switch {
+		case m == 0x00: // byte-stuffed 0xFF 0x00 at marker level: unparseable
+			return false
+		case m == 0xC0 || m == 0xC1 || m == 0xC2: // first SOF: the verdict
+			return m == 0xC2
+		case m == 0xD8, m == 0xD9, m == 0xDA: // SOI/EOI/SOS before SOF: stop
+			return false
+		case m == 0x01, m >= 0xD0 && m <= 0xD7: // standalone: TEM, RSTn
+		default: // segment marker: skip payload by 16-bit length
+			if i+2 > len(buf) {
+				return false
+			}
+			n := int(buf[i])<<8 | int(buf[i+1])
+			if n < 2 || i+n > len(buf) {
+				return false
+			}
+			i += n // length includes its own 2 bytes
+		}
+	}
+	return false
 }
 
 // compositeOnWhite returns img unchanged when it is fully opaque; otherwise it
