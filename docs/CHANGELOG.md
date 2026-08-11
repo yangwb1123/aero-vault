@@ -4,6 +4,17 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ---
 
+## 2026-08-11
+
+### Added
+- **Thumbnail REST: 415 for unsupported image types; 400 for invalid `?w=`/`?h=`** (`internal/thumbnail/errors.go`, `internal/api/rest/thumbnail.go`, `internal/api/rest/handler_helpers.go`, `internal/api/rest/specgen.go`, `internal/api/rest/router.go`)
+  - `GET /v1/files/{key}/thumbnail` now returns **415 UnsupportedMediaType** for `image/*` content types outside `image/jpeg`/`image/png`/`image/gif` (webp/bmp/avif/tiff and aliases like `image/jpg`, `image/x-png`, `image/jpeg; charset=utf-8`), via the new sentinel `thumbnail.ErrUnsupportedFormat`, with the supported-type list in the message. Previously these surfaced as 400 `InvalidArgument` (a valid image the server cannot decode is a capability matter, not a client argument error). Non-image content types keep the existing 400 "object is not an image" path; corrupt bytes of a whitelisted type stay 400 via the unchanged byte-level `ErrUnsupported`.
+  - `?w=`/`?h=` values that are not non-negative integers (`?w=abc`, `?h=-1`, `?w=` empty, overflow) now return **400 InvalidArgument** naming the parameter, validated before the ETag/`If-None-Match` handling and before any decode — previously they were silently ignored and produced a default 256px thumbnail whose garbage-derived ETag polluted shared caches. `?w=0`/absent still means default 256; `> 2048` still clamps server-side.
+  - `/openapi.json` documents the thumbnail route's 415 response (`apiRoute.Responses` extension; all other routes' specs are byte-identical).
+  - Deliberate compatibility note: objects stored with alias/parameterized image content types whose bytes were decodable previously produced working 200 thumbnails (decoders key off bytes); they now return 415 with the supported list — the declared Content-Type is the contract the gate keys off (no byte sniffing).
+
+---
+
 ## 2026-08-10
 
 ### Added

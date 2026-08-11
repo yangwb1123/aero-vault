@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"hash/crc32"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"io"
@@ -1289,4 +1292,163 @@ func TestThumbnailCacheControlPrivacy(t *testing.T) {
 			t.Fatalf("auth 304 Cache-Control=%q want %q", cc, private)
 		}
 	})
+}
+
+// webpBytes is a verified 1×1 RGB WebP produced by Pillow's WEBP encoder
+// (opens as WEBP (1,1)). The server must never decode it — the content-type
+// gate rejects it with 415 — but the bytes are genuinely image/webp, so a
+// future webp-capable pipeline could claim them.
+var webpBytes = func() []byte {
+	b, err := hex.DecodeString("524946463c000000574542505650382030000000d001009d012a0100010001402625a00274ba01f80003b000fef2eb7ffcd815cd73eff7ffd2e0fd2e0fd2e0ffd2900000")
+	if err != nil {
+		panic(err)
+	}
+	return b
+}()
+
+// gifBytes builds a 1×1 GIF with the stdlib encoder.
+func gifBytes(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewPaletted(image.Rect(0, 0, 1, 1), color.Palette{color.RGBA{255, 0, 0, 255}})
+	img.Set(0, 0, color.RGBA{255, 0, 0, 255})
+	var buf bytes.Buffer
+	if err := gif.Encode(&buf, img, nil); err != nil {
+		t.Fatalf("encode gif: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestThumbnailUnsupportedFormat(t *testing.T) {
+	s := newRESTTest(t)
+
+	// A valid-but-unsupported image type must be a server-capability
+	// rejection (415 UnsupportedMediaType), not a client argument error
+	// (400 InvalidArgument).
+	u := s.URL + "/v1/files/pic.webp"
+	req(t, "PUT", u, webpBytes, map[string]string{"Content-Type": "image/webp"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("webp thumbnail: status=%d want 415 (body=%s)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"UnsupportedMediaType"`)) {
+		t.Fatalf("webp thumbnail: expected code UnsupportedMediaType, body: %s", body)
+	}
+	if !bytes.Contains(body, []byte("image/webp")) || !bytes.Contains(body, []byte("image/jpeg")) {
+		t.Fatalf("webp thumbnail: message must name the content type and supported types, body: %s", body)
+	}
+
+	// Direct classify seam: the raw sentinel maps to 415 without any wrapping.
+	code, msg, status := classify(thumbnail.ErrUnsupportedFormat)
+	if code != "UnsupportedMediaType" || status != http.StatusUnsupportedMediaType || msg == "" {
+		t.Fatalf("classify(ErrUnsupportedFormat) = (%q, %q, %d) want (UnsupportedMediaType, _, 415)", code, msg, status)
+	}
+
+	// Non-image content types keep the existing 400 path (unchanged).
+	tu := s.URL + "/v1/files/note.txt"
+	req(t, "PUT", tu, []byte("hello"), map[string]string{"Content-Type": "text/plain"})
+	resp, body = req(t, "GET", tu+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("text/plain thumbnail: status=%d want 400 (body=%s)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("text/plain thumbnail: expected code InvalidArgument, body: %s", body)
+	}
+
+	// GIF is the third whitelist member: unchanged 200.
+	gu := s.URL + "/v1/files/pic.gif"
+	req(t, "PUT", gu, gifBytes(t), map[string]string{"Content-Type": "image/gif"})
+	resp, body = req(t, "GET", gu+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gif thumbnail: status=%d want 200 (body=%s)", resp.StatusCode, body)
+	}
+}
+
+func TestThumbnailBadDimensions(t *testing.T) {
+	s := newRESTTest(t)
+
+	// The bomb object proves validation fires before any decode: decoding it
+	// is rejected as ImageTooLarge (413), so a 400 for garbage dimensions can
+	// only mean the dimension validation ran first.
+	u := s.URL + "/v1/files/bomb.png"
+	req(t, "PUT", u, bombPNG(t, 100000, 100000), map[string]string{"Content-Type": "image/png"})
+	for _, tc := range []struct {
+		q, param, val string
+	}{
+		{"?w=abc", "w", "abc"},
+		{"?h=-1", "h", "-1"},
+		{"?w=", "w", ""},
+		{"?h=", "h", ""},
+		{"?w=1e3", "w", "1e3"},
+	} {
+		resp, body := req(t, "GET", u+"/thumbnail"+tc.q, nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET .../thumbnail%s: status=%d want 400 (body=%s)", tc.q, resp.StatusCode, body)
+		}
+		if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+			t.Fatalf("%s: expected code InvalidArgument, body: %s", tc.q, body)
+		}
+		if !bytes.Contains(body, []byte(tc.param)) {
+			t.Fatalf("%s: message must name the %q parameter, body: %s", tc.q, tc.param, body)
+		}
+		if bytes.Contains(body, []byte(`"code":"ImageTooLarge"`)) {
+			t.Fatalf("%s: decode must not be attempted (got ImageTooLarge), body: %s", tc.q, body)
+		}
+	}
+	// Control: valid dimensions DO reach the decode pipeline, so the same
+	// bomb object yields 413 ImageTooLarge — the 400s above are purely the
+	// validation path.
+	resp, body := req(t, "GET", u+"/thumbnail?w=100", nil, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("bomb control: status=%d want 413 (body=%s)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"ImageTooLarge"`)) {
+		t.Fatalf("bomb control: expected code ImageTooLarge, body: %s", body)
+	}
+
+	// Valid values must not be over-rejected: 0 → default, > HardMax → clamp.
+	// (These assertions use a small valid PNG: on the bomb object a valid
+	// dimension would legitimately reach the decode pipeline and be rejected
+	// as 413 ImageTooLarge, which is the control above, not an over-rejection.)
+	p := s.URL + "/v1/files/pic.png"
+	req(t, "PUT", p, pngBytes(t, 16, 16), map[string]string{"Content-Type": "image/png"})
+	for _, q := range []string{"?w=0", "?w=4096", "?w=0&h=0", "?w=128&h=64"} {
+		resp, body := req(t, "GET", p+"/thumbnail"+q, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET .../thumbnail%s: status=%d want 200 (body=%s)", q, resp.StatusCode, body)
+		}
+	}
+}
+
+func TestThumbnailOpenAPIDocuments415(t *testing.T) {
+	h := OpenAPISpecHandler()
+	srv := httptest.NewServer(http.HandlerFunc(h.ServeHTTP))
+	defer srv.Close()
+
+	resp, body := req(t, "GET", srv.URL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("openapi: status=%d want 200", resp.StatusCode)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(body, &spec); err != nil {
+		t.Fatalf("openapi: decode: %v", err)
+	}
+	paths := spec["paths"].(map[string]any)
+
+	// The thumbnail route documents the 415 response with a description.
+	thumbGet := paths["/v1/files/{key}/thumbnail"].(map[string]any)["get"].(map[string]any)
+	resps := thumbGet["responses"].(map[string]any)
+	r415, ok := resps["415"].(map[string]any)
+	if !ok {
+		t.Fatalf("thumbnail route must document 415, responses=%v", resps)
+	}
+	desc, _ := r415["description"].(string)
+	if desc == "" || !strings.Contains(desc, "image/jpeg") {
+		t.Fatalf("thumbnail 415 description=%q want a non-empty supported-types message", desc)
+	}
+
+	// Unrelated routes must not gain a 415 key (nil-map isolation).
+	getObj := paths["/v1/files/{key}"].(map[string]any)["get"].(map[string]any)
+	if _, ok := getObj["responses"].(map[string]any)["415"]; ok {
+		t.Fatalf("GET /v1/files/{key} must not document 415: %v", getObj["responses"])
+	}
 }

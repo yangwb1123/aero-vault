@@ -54,7 +54,8 @@ func init() {
 		{Method: "DELETE", Path: "/v1/files/{key}/metadata", Summary: "Delete metadata key", Tag: "files", Status: 200},
 		{Method: "POST", Path: "/v1/files/{key}/restore", Summary: "Restore soft-deleted object", Tag: "files", Status: 200},
 		{Method: "POST", Path: "/v1/files/{key}/lock", Summary: "Set object retention lock", Tag: "files", Status: 200},
-		{Method: "GET", Path: "/v1/files/{key}/thumbnail", Summary: "Get thumbnail (JPEG)", Tag: "files", Status: 200},
+		{Method: "GET", Path: "/v1/files/{key}/thumbnail", Summary: "Get thumbnail (JPEG)", Tag: "files", Status: 200,
+			Responses: map[int]string{http.StatusUnsupportedMediaType: "Object content-type is not one of the supported image formats (image/jpeg, image/png, image/gif)"}},
 		{
 			Method: "POST", Path: "/v1/files/{key}/presign",
 			Summary: "Generate presigned URL", Tag: "files", Status: 200,

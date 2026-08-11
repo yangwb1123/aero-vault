@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -100,8 +101,36 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, fmt.Errorf("%w: object is not an image (content-type %q)", service.ErrInvalidArgs, obj.ContentType))
 		return
 	}
-	maxW, _ := strconv.Atoi(r.URL.Query().Get("w"))
-	maxH, _ := strconv.Atoi(r.URL.Query().Get("h"))
+	// Exact-match gate on the three types the pipeline's registered decoders
+	// can actually decode (side-effect imports of image/gif, image/jpeg,
+	// image/png in internal/thumbnail). A valid image the server simply
+	// cannot decode (webp/bmp/avif/tiff, or aliases like image/jpg) is a
+	// server-capability matter, not a client argument error: 415 with the
+	// supported list, via thumbnail.ErrUnsupportedFormat — distinct from the
+	// byte-level ErrUnsupported, which stays 400 for corrupt/non-image bytes.
+	switch obj.ContentType {
+	case "image/jpeg", "image/png", "image/gif":
+	default:
+		h.writeError(w, r, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
+			thumbnail.ErrUnsupportedFormat, obj.ContentType))
+		return
+	}
+	// Validate ?w=/?h= before the ETag derivation, the If-None-Match/304
+	// branch, the object-stream open, and the decode pipeline: garbage
+	// dimensions are client argument errors (400) and must not produce a
+	// silently-defaulted 200 whose garbage-derived ETag pollutes shared
+	// caches.
+	q := r.URL.Query()
+	maxW, err := parseThumbDim(q, "w")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	maxH, err := parseThumbDim(q, "h")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
 
 	etag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, maxW, maxH)
 	// Shared-cache directive: public only when this very request was admitted
@@ -160,4 +189,22 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", cacheControl)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(img)
+}
+
+// parseThumbDim validates one ?w=/?h= thumbnail dimension parameter. An
+// absent parameter yields 0 (default-size semantics per Generate's contract).
+// Present values must parse as a non-negative integer; parse errors and
+// negatives are client argument errors that the caller maps to 400 before any
+// cache validator is emitted or the decode pipeline is entered.
+func parseThumbDim(q url.Values, name string) (int, error) {
+	if !q.Has(name) {
+		return 0, nil
+	}
+	v := q.Get(name)
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%w: invalid ?%s value %q (must be a non-negative integer)",
+			service.ErrInvalidArgs, name, v)
+	}
+	return n, nil
 }

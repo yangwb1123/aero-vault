@@ -53,6 +53,12 @@ func classify(err error) (string, string, int) {
 		// hypothetical wrapped ErrInvalidArgs %w ErrImageTooLarge from a
 		// future call site.
 		return "ImageTooLarge", err.Error(), http.StatusRequestEntityTooLarge
+	case errors.Is(err, thumbnail.ErrUnsupportedFormat):
+		// Defensive ordering (not load-bearing), mirroring ErrImageTooLarge:
+		// the thumbnail handler wraps only ErrUnsupportedFormat (never
+		// ErrInvalidArgs), so errors.Is on the raw sentinel cannot match the
+		// ErrInvalidArgs case regardless of this case's position.
+		return "UnsupportedMediaType", err.Error(), http.StatusUnsupportedMediaType
 	case errors.Is(err, service.ErrInvalidArgs):
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrBadDigest):

@@ -2,6 +2,7 @@ package rest
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -17,8 +18,13 @@ type apiRoute struct {
 	Status      int    // success HTTP status
 	Response    string // example JSON response, or "" for empty
 	Response200 string // example 200 response when Status != 200
-	AdminOnly   bool
-	Public      bool
+	// Responses documents additional (non-success) response statuses for this
+	// route, keyed by numeric status, value = human description. Keys must not
+	// collide with the success status (the map is emitted under strconv.Itoa
+	// so unrecognized codes cannot collapse onto "200"). Nil for most routes.
+	Responses map[int]string
+	AdminOnly bool
+	Public    bool
 }
 
 type apiQueryParameter struct {
@@ -225,6 +231,14 @@ func (s *specBuilder) responses(r apiRoute, sch map[string]any) map[string]any {
 		}
 	}
 	resps[code] = resp
+
+	// Additional documented statuses (e.g. 415 for the thumbnail route),
+	// description-only: the default entry already carries the error schema.
+	// strconv.Itoa is load-bearing — fmtStatus collapses unrecognized codes
+	// to "200" and would emit a bogus duplicate success key.
+	for status, desc := range r.Responses {
+		resps[strconv.Itoa(status)] = map[string]any{"description": desc}
+	}
 
 	// Add default error response.
 	resps["default"] = map[string]any{
