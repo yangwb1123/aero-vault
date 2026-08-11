@@ -51,19 +51,28 @@ const (
 	// MaxSourceDim caps each declared source dimension (pixels). Sources with
 	// any side above this are rejected from the header before any pixel buffer
 	// is allocated, bounding worst-case decode allocation to MaxSourceDim²×4 B
-	// ≈ 268 MiB (PNG RGBA); progressive JPEG sources are additionally capped
-	// by MaxProgressiveSourceDim (below): their per-request worst case is
+	// = 256 MiB (8-bit PNG RGBA/NRGBA); depth-16 PNG sources decode to
+	// *image.NRGBA64 at 8 B/px (stdlib image/png), i.e. MaxSourceDim²×8 B =
+	// 512 MiB. Progressive JPEG sources are additionally capped by
+	// MaxProgressiveSourceDim (below): their per-request worst case is
 	// ~275 MiB (full-image coefficient buffers plus the decoded frame).
 	// Images larger than this can no longer be thumbnailed; they are exactly
 	// the inputs that make the endpoint a memory-DoS sink, and the output is
 	// capped at HardMax anyway.
 	//
+	// Live per-request totals (what the semaphore bounds): decode + scale dst
+	// (≤ HardMax²×4 B = 16 MiB) + white-composite copy (≤ 16 MiB, post-scale
+	// — see the scale→composite ordering note) ≈ 288 MiB (8-bit) / ≈ 544 MiB
+	// (16-bit). These are live-peak figures; cumulative TotalAlloc also
+	// includes transient bilinear-stage churn (see
+	// large_transparent_allocation_test.go) — do not confuse the two.
+	//
 	// Note: the worst cases above are per request. Aggregate in-flight decode
 	// memory is capped by the package-level semaphore maxConcurrentDecodes:
 	// at most maxConcurrentDecodes Generate calls hold their allocation-bearing
 	// section at once, so live decode allocation across all calls is bounded
-	// by maxConcurrentDecodes × per-request worst case (≈ 1.1 GiB PNG RGBA;
-	// ≈ 4 × ~275 MiB ≈ 1.1 GiB progressive JPEG) regardless of
+	// by maxConcurrentDecodes × per-request worst case (≈ 4 × 288 MiB ≈
+	// 1.125 GiB 8-bit; ≈ 4 × 544 MiB ≈ 2.125 GiB 16-bit) regardless of
 	// MAX_INFLIGHT_REQUESTS / PER_TENANT_CONCURRENCY_MAX / rate limits.
 	MaxSourceDim = 8192
 
@@ -106,8 +115,11 @@ const (
 // maxConcurrentDecodes caps how many Generate calls may be inside their
 // allocation-bearing section (DecodeConfig through jpeg.Encode) at once.
 // Aggregate live decode memory is therefore bounded by
-// maxConcurrentDecodes × per-request worst case (≈ 4 × 268 MiB ≈ 1.1 GiB for
-// PNG RGBA; ≈ 4 × ~275 MiB ≈ 1.1 GiB for progressive JPEG at
+// maxConcurrentDecodes × per-request worst case (≈ 4 × 288 MiB ≈ 1.125 GiB
+// for 8-bit PNG RGBA; ≈ 4 × 544 MiB ≈ 2.125 GiB for depth-16 PNG at
+// MaxSourceDim — note this 16-bit aggregate exceeds the 2 GiB absolute
+// ceiling pinned in semaphore_test.go, which is scoped to the 8-bit
+// baseline; ≈ 4 × ~275 MiB ≈ 1.1 GiB for progressive JPEG at
 // MaxProgressiveSourceDim) regardless of MAX_INFLIGHT_REQUESTS /
 // PER_TENANT_CONCURRENCY_MAX / rate limits. Waiters hold only a stream reader
 // and allocate nothing.
@@ -293,6 +305,13 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		return nil, ErrUnsupported
 	}
 	dst := scale(src, maxW, maxH)
+	// Ordering is load-bearing (pinned by TestGenerateLargeTransparentAllocationBounded
+	// and TestCompositeOrderingFeatheredByteLevel): the white composite must run on
+	// the scaled dst (≤ HardMax², ≤ 16 MiB copy), never on the full-resolution src —
+	// Opaque() is attacker-controlled (one transparent pixel at the decoded scale
+	// suffices) and a pre-scale composite would copy the full decoded frame
+	// (256/512 MiB) plus scale churn, ≈ 656/912 MiB per request, invalidating the
+	// documented ceiling.
 	dst = compositeOnWhite(dst) // JPEG has no alpha; flatten transparency before encode.
 
 	var buf bytes.Buffer

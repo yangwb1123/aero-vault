@@ -375,7 +375,7 @@ func TestGenerateBaselineAboveProgressiveBoundDecodes(t *testing.T) {
 // TestGenerateBaselineAtMaxSourceDimDecodes is acceptance AC2, boundary arm:
 // the MaxSourceDim boundary itself must remain baseline-decodable — the SOF2
 // cap must not collateralize SOF0 sources at the top of the range. The
-// transient (~268 MiB source + ~268 MiB decode frame, ≈ 0.5–1 GiB peak) is
+// transient (~275 MiB progressive coefficient buffers + ~256 MiB decoded 8-bit frame, ≈ 0.5–1 GiB peak) is
 // inherent to proving the boundary and runs once per go test; it is skipped
 // under -short so make check's race arm (test-race-thumbnail, -race -short
 // -timeout 120s) stays within budget — same convention as the aggregate

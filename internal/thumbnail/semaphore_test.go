@@ -27,7 +27,7 @@ import (
 )
 
 func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
-	// C3: this test needs ~1.2 GiB live heap (16 × 268 MiB worst-case decodes)
+	// C3: this test needs ~1.2 GiB live heap (16 × 256 MiB worst-case decodes)
 	// and ~97s under -race; it must not run in short/CI-race mode. The
 	// deterministic C2 tests below still pin the semaphore contract there.
 	if testing.Short() {
@@ -35,13 +35,18 @@ func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
 	}
 
 	// C1 pin: the concurrency constant is part of the memory ceiling contract.
-	// 4 × 268 MiB ≈ 1.1 GiB for PNG RGBA; a silent raise (4→8→16) must fail
-	// this test rather than silently growing the allowed peak.
+	// 4 × 256 MiB ≈ 1 GiB for 8-bit PNG RGBA (live per-request worst case ≈
+	// 288 MiB incl. scale dst + composite copy → ≈ 1.125 GiB aggregate; see
+	// the bit-depth-aware accounting in thumbnail.go). The 2 GiB ceiling
+	// below is scoped to this 8-bit baseline — depth-16 sources (8 B/px)
+	// legitimately aggregate to ≈ 2.125 GiB, documented separately. A silent
+	// raise (4→8→16) must fail this test rather than silently growing the
+	// allowed peak.
 	if maxConcurrentDecodes != 4 {
-		t.Fatalf("maxConcurrentDecodes = %d, want 4 (design pin: 4×268MiB ≈ 1.1GiB)", maxConcurrentDecodes)
+		t.Fatalf("maxConcurrentDecodes = %d, want 4 (design pin: 4×256MiB ≈ 1GiB 8-bit baseline)", maxConcurrentDecodes)
 	}
 
-	// 8192² uniform NRGBA: tiny compressed fixture, full 268 MiB decode —
+	// 8192² uniform NRGBA: tiny compressed fixture, full 256 MiB decode —
 	// the documented worst case exactly at the MaxSourceDim boundary
 	// (pre-check is `> MaxSourceDim`, so 8192 passes).
 	fixture := uniformPNG(t, MaxSourceDim, MaxSourceDim, color.NRGBA{R: 12, G: 34, B: 56, A: 255})
@@ -123,7 +128,9 @@ func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
 		t.Fatalf("peak live heap %d bytes exceeds semaphore bound %d", peak, limit)
 	}
 	// C1 absolute ceiling: even if the constant were raised, live decode
-	// memory must never approach the 2 GiB design ceiling.
+	// memory must never approach the 2 GiB design ceiling (8-bit baseline;
+	// the depth-16 aggregate ≈ 2.125 GiB is documented in thumbnail.go and
+	// intentionally not subject to this 8-bit-scoped pin).
 	if peak > 2<<30 {
 		t.Fatalf("peak live heap %d bytes exceeds absolute 2 GiB ceiling", peak)
 	}
@@ -234,7 +241,7 @@ func TestSemaphoreReleasesOnPanic(t *testing.T) {
 // calibrateSingleWorstPeak runs three sequential single Generate calls on
 // fixture, sampling the forced-GC live-heap peak during each, and returns the
 // maximum peak observed. The sampler polls at ≤ 2 ms (GC time included): the
-// 268 MiB decode buffer is live for the entire decode→scale→encode span, so a
+// 256 MiB decode buffer is live for the entire decode→scale→encode span, so a
 // tight poll cannot miss it; the caller's 100 MiB floor guard fails the test
 // if it ever does.
 func calibrateSingleWorstPeak(t *testing.T, fixture []byte) uint64 {
