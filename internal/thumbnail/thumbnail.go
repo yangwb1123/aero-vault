@@ -1,6 +1,8 @@
 // Package thumbnail generates downscaled JPEG previews of images using only the
 // Go standard library (no external image dependencies). Supported source
-// formats: JPEG, PNG, GIF.
+// formats: JPEG, PNG, GIF. JPEG sources carrying a valid EXIF orientation
+// (APP1 tag 0x0112) are rotated/flipped before encoding so thumbnails render
+// upright.
 package thumbnail
 
 import (
@@ -62,8 +64,11 @@ const (
 	//
 	// Live per-request totals (what the semaphore bounds): decode + scale dst
 	// (≤ HardMax²×4 B = 16 MiB) + white-composite copy (≤ 16 MiB, post-scale
-	// — see the scale→composite ordering note) ≈ 288 MiB (8-bit) / ≈ 544 MiB
-	// (16-bit). These are live-peak figures; cumulative TotalAlloc also
+	// — see the scale→composite ordering note) + EXIF-rotation frame (≤
+	// HardMax²×4 B = 16 MiB, JPEG-with-orientation path only; that path
+	// skips the composite copy 1:1 — the rotated frame is opaque, so the
+	// ≈ 288 MiB (8-bit) / ≈ 544 MiB (16-bit) figures still hold). These are
+	// live-peak figures; cumulative TotalAlloc also
 	// includes transient bilinear-stage churn (see
 	// large_transparent_allocation_test.go) — do not confuse the two.
 	//
@@ -304,7 +309,24 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		}
 		return nil, ErrUnsupported
 	}
-	dst := scale(src, maxW, maxH)
+	// EXIF orientation (JPEG only): the tag lives in the APP1 segment that
+	// DecodeConfig consumed into head (its config scan reads every pre-SOS
+	// segment in full), so extraction is free and bounded by MaxMetadataBytes.
+	// Orientations 5–8 swap the box so the rotated frame still fits maxW×maxH;
+	// the rotation runs post-scale, pre-composite, and the rotated frame is
+	// opaque, so compositeOnWhite's fast path keeps the ≈ 288 MiB ceiling.
+	orient := 1
+	if format == "jpeg" {
+		orient = exifOrientation(head.buf.Bytes())
+	}
+	boxW, boxH := maxW, maxH
+	if orient >= 5 {
+		boxW, boxH = maxH, maxW
+	}
+	dst := scale(src, boxW, boxH)
+	if orient > 1 {
+		dst = applyOrientation(dst, orient)
+	}
 	// Ordering is load-bearing (pinned by TestGenerateLargeTransparentAllocationBounded
 	// and TestCompositeOrderingFeatheredByteLevel): the white composite must run on
 	// the scaled dst (≤ HardMax², ≤ 16 MiB copy), never on the full-resolution src —

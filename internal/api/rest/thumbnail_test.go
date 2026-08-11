@@ -226,6 +226,96 @@ func TestThumbnailCompositesTransparencyHTTP(t *testing.T) {
 	}
 }
 
+// exifOrientationJPEG builds a 400×200 red-top/blue-bottom baseline JPEG
+// spliced with an EXIF APP1 declaring orient (1–8; 0 = no APP1), the AC-1
+// fixture shape. Duplicated from internal/thumbnail/exif_test.go per this
+// package's fixture pattern (an exported test-fixture API would break the
+// module's self-containment).
+func exifOrientationJPEG(t *testing.T, orient int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 400, 200))
+	for y := 0; y < 200; y++ {
+		c := color.RGBA{255, 0, 0, 255}
+		if y >= 100 {
+			c = color.RGBA{0, 0, 255, 255}
+		}
+		for x := 0; x < 400; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	var base bytes.Buffer
+	if err := jpeg.Encode(&base, img, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatalf("encode base jpeg: %v", err)
+	}
+	if orient < 1 || orient > 8 {
+		return base.Bytes()
+	}
+	// "Exif\x00\x00" + little-endian TIFF (II, magic 0x2A, IFD0 at offset
+	// 8, one SHORT entry for tag 0x0112, next-IFD 0).
+	payload := make([]byte, 32)
+	copy(payload, "Exif\x00\x00")
+	payload[6], payload[7] = 'I', 'I'
+	binary.LittleEndian.PutUint16(payload[8:10], 0x2A)
+	binary.LittleEndian.PutUint32(payload[10:14], 8)
+	binary.LittleEndian.PutUint16(payload[14:16], 1)
+	binary.LittleEndian.PutUint16(payload[16:18], 0x0112)
+	binary.LittleEndian.PutUint16(payload[18:20], 3)
+	binary.LittleEndian.PutUint32(payload[20:24], 1)
+	binary.LittleEndian.PutUint16(payload[24:26], uint16(orient))
+	b := base.Bytes()
+	var out bytes.Buffer
+	out.Write(b[:2]) // SOI; the EXIF APP1 splices in before the rest.
+	var seg [4]byte
+	seg[0], seg[1] = 0xFF, 0xE1
+	binary.BigEndian.PutUint16(seg[2:4], uint16(len(payload)+2))
+	out.Write(seg[:])
+	out.Write(payload)
+	out.Write(b[2:])
+	return out.Bytes()
+}
+
+// TestThumbnailAppliesEXIFOrientation pins AC-4: an orientation-6 camera
+// JPEG must produce an upright thumbnail at the REST layer — exactly
+// 128×256 in a 128×256 box (the pre-fix output was a sideways 128×64
+// landscape crammed into the portrait box), blue on the left, red on the
+// right (90° CW).
+func TestThumbnailAppliesEXIFOrientation(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/cam.jpg"
+	req(t, "PUT", u, exifOrientationJPEG(t, 6), map[string]string{"Content-Type": "image/jpeg"})
+	resp, body := req(t, "GET", u+"/thumbnail?w=128&h=256", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("thumbnail status=%d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type=%q want image/jpeg", ct)
+	}
+	img, format, err := image.Decode(bytes.NewReader(body))
+	if err != nil || format != "jpeg" {
+		t.Fatalf("decode thumb: %v fmt=%s", err, format)
+	}
+	if img.Bounds().Dx() != 128 || img.Bounds().Dy() != 256 {
+		t.Fatalf("thumb dims %dx%d want 128x256 (upright portrait)", img.Bounds().Dx(), img.Bounds().Dy())
+	}
+	// Orientation 6 = rotate 90° CW: the scaled source is 256×128 (red rows
+	// 0–63, blue 64–127) and out(r,c) = in(127-c, r), so the left half is
+	// blue and the right half red, boundary at c=64. Interior sampling at
+	// the middle row, away from the boundary and the chroma bleed.
+	b := img.Bounds()
+	for _, c := range []int{0, 8, 16, 24, 31} {
+		r, g, bl, _ := img.At(b.Min.X+c, b.Min.Y+128).RGBA()
+		if bl>>8 <= 180 || r>>8 >= 100 {
+			t.Fatalf("col %d: r=%d g=%d b=%d want blue (left half)", c, r>>8, g>>8, bl>>8)
+		}
+	}
+	for _, c := range []int{96, 104, 112, 120, 127} {
+		r, g, bl, _ := img.At(b.Min.X+c, b.Min.Y+128).RGBA()
+		if r>>8 <= 180 || bl>>8 >= 100 {
+			t.Fatalf("col %d: r=%d g=%d b=%d want red (right half)", c, r>>8, g>>8, bl>>8)
+		}
+	}
+}
+
 // newRESTTestWithRepo mirrors newRESTTest (conditional_test.go) but also
 // returns the repository so tests can corrupt object metadata or toggle
 // bucket versioning directly.
