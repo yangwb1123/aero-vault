@@ -958,6 +958,17 @@ func TestThumbnailMidDecodeCancelWritesNothing(t *testing.T) {
 	if rec.Body.Len() != 0 {
 		t.Fatalf("mid-decode cancel: wrote %d bytes, want nothing (body=%q)", rec.Body.Len(), rec.Body.String())
 	}
+	// The happy path sets Content-Type/ETag/Content-Length before
+	// WriteHeader(200) (thumbnail.go:144-149); a regression where
+	// GenerateContext returns (nil, empty) would otherwise produce 200 +
+	// empty body and pass the assertions above undetected (QA-1 residual).
+	if ct := rec.Header().Get("Content-Type"); ct != "" {
+		t.Fatalf("mid-decode cancel: wrote Content-Type %q, want nothing written", ct)
+	}
+	if rec.Header().Get("ETag") != "" || rec.Header().Get("Content-Length") != "" {
+		t.Fatalf("mid-decode cancel: wrote success headers (ETag=%q CL=%q), want nothing written",
+			rec.Header().Get("ETag"), rec.Header().Get("Content-Length"))
+	}
 }
 
 // TestThumbnailProgressiveOversized413 pins the HTTP-level progressive chain:
