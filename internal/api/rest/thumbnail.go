@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
@@ -103,9 +104,23 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	maxH, _ := strconv.Atoi(r.URL.Query().Get("h"))
 
 	etag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, maxW, maxH)
+	// Shared-cache directive: public only when this very request was admitted
+	// anonymously — allowAnonymous admits anonymous readers solely for
+	// genuinely public-readable objects, so the bytes are fetchable by any
+	// external anonymous caller under the current policy. An authenticated
+	// request proves nothing about public readability (the caller may hold
+	// private access), so its response is private (client-local cache only).
+	cacheControl := "private, max-age=86400"
+	if auth.IsAnonymous(r.Context()) {
+		cacheControl = "public, max-age=86400"
+	}
 	if etagListMatches(r.Header.Get("If-None-Match"), etag) {
 		w.Header().Set("ETag", `"`+etag+`"`)
 		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+		// The 304 must mirror the 200's directive (RFC 9111 §3.2/§3.4): a
+		// shared cache revalidating a private thumb would otherwise adopt
+		// the 304's (absent) directive and store the previous public body.
+		w.Header().Set("Cache-Control", cacheControl)
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -142,7 +157,7 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.Header().Set("Content-Length", strconv.Itoa(len(img)))
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Cache-Control", cacheControl)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(img)
 }

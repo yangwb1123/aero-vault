@@ -669,6 +669,7 @@ func newThumbnailAccessHarness(t *testing.T) (*httptest.Server, string, reposito
 	r.Head("/v1/files/*", h.Head)
 	r.Delete("/v1/files/*", h.deleteKey)
 	r.Put("/v1/buckets/{bucket}/policy", h.PutBucketPolicy)
+	r.Put("/v1/buckets/{bucket}/acl", h.PutBucketACL)
 	tenantMW := mw.TenantWithStatus(func(ctx context.Context, tenant string) (string, bool, error) {
 		record, found, lookupErr := repo.GetTenant(ctx, tenant)
 		return record.Status, found, lookupErr
@@ -1064,4 +1065,138 @@ func headerOnlyBaselineJPEGBytes(t *testing.T, w, h int) []byte {
 	buf.Write(seg[:])
 	buf.Write(sos)
 	return buf.Bytes()
+}
+
+// TestThumbnailCacheControlPrivacy pins the per-object cache directive
+// (R-1..R-6): the thumbnail derivation response is shared-cacheable
+// ("public") only when the request itself was admitted anonymously — which
+// allowAnonymous grants solely for genuinely public-readable objects.
+// Authenticated derivations are "private" (client-local cache only): the
+// caller may hold private access, and a shared cache must never store bytes
+// that an external anonymous caller could not fetch from origin.
+func TestThumbnailCacheControlPrivacy(t *testing.T) {
+	const public = "public, max-age=86400"
+	const private = "private, max-age=86400"
+
+	t.Run("unauthenticated harness is private", func(t *testing.T) {
+		// No auth middleware: IsAnonymous is false, so the directive must
+		// never be public (the pre-fix code always emitted public).
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/img"
+		req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("thumbnail: %d", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != private {
+			t.Fatalf("no-auth derivation Cache-Control=%q want %q", cc, private)
+		}
+	})
+
+	t.Run("authenticated derivation is private", func(t *testing.T) {
+		s, tok, repo := newThumbnailAccessHarness(t)
+		enableVersioningForCoexistence(t, repo)
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/img"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, authH)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("thumbnail: %d", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != private {
+			t.Fatalf("authenticated derivation Cache-Control=%q want %q", cc, private)
+		}
+	})
+
+	t.Run("anonymous public-read object is public", func(t *testing.T) {
+		s, tok := newAuthRESTTest(t)
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/img"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set acl: %d", resp.StatusCode)
+		}
+		// Anonymous (admitted via the public-read ACL) → public.
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("anonymous thumbnail: %d", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != public {
+			t.Fatalf("anonymous public-read derivation Cache-Control=%q want %q", cc, public)
+		}
+		// Same object, authenticated principal → private (the caller's
+		// private access does not make the bytes public).
+		resp, _ = req(t, "GET", u+"/thumbnail", nil, authH)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("auth thumbnail: %d", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != private {
+			t.Fatalf("authenticated public-object derivation Cache-Control=%q want %q", cc, private)
+		}
+	})
+
+	t.Run("anonymous bucket-ACL public is public", func(t *testing.T) {
+		// QA P1-2: the bucket-ACL fallback of ObjectPublicReadable must be
+		// pinned (object ACL private, bucket ACL public-read).
+		s, tok, repo := newThumbnailAccessHarness(t)
+		enableVersioningForCoexistence(t, repo)
+		u := s.URL + "/v1/files/img"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", s.URL+"/v1/buckets/default/acl", []byte(`{"acl":"public-read"}`), map[string]string{"Authorization": "Bearer operator"}); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set bucket acl: %d", resp.StatusCode)
+		}
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("anonymous bucket-ACL thumbnail: %d", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != public {
+			t.Fatalf("anonymous bucket-ACL derivation Cache-Control=%q want %q", cc, public)
+		}
+	})
+
+	t.Run("304 mirrors the 200 directive", func(t *testing.T) {
+		// RFC 9111 §3.2/§3.4: a revalidating shared cache adopts the 304's
+		// directive — a private 304 must never follow a public 200.
+		s, tok := newAuthRESTTest(t)
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/img"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set acl: %d", resp.StatusCode)
+		}
+		// Anonymous: 200 public → 304 must also be public.
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		etag := resp.Header.Get("ETag")
+		if resp.Header.Get("Cache-Control") != public || etag == "" {
+			t.Fatalf("anon 200: cc=%q etag=%q", resp.Header.Get("Cache-Control"), etag)
+		}
+		resp, _ = req(t, "GET", u+"/thumbnail", nil, map[string]string{"If-None-Match": etag})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("anon 304: %d", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != public {
+			t.Fatalf("anon 304 Cache-Control=%q want %q", cc, public)
+		}
+		// Authenticated: 200 private → 304 must also be private.
+		resp, _ = req(t, "GET", u+"/thumbnail", nil, authH)
+		etag = resp.Header.Get("ETag")
+		if resp.Header.Get("Cache-Control") != private || etag == "" {
+			t.Fatalf("auth 200: cc=%q etag=%q", resp.Header.Get("Cache-Control"), etag)
+		}
+		resp, _ = req(t, "GET", u+"/thumbnail", nil, map[string]string{"Authorization": tok, "If-None-Match": etag})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("auth 304: %d", resp.StatusCode)
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != private {
+			t.Fatalf("auth 304 Cache-Control=%q want %q", cc, private)
+		}
+	})
 }

@@ -21,6 +21,10 @@ All functional changes, in reverse-chronological order. Dates are UTC.
   - `Stat` returning `ErrInvalidArgs` (a legal object key whose `/thumbnail` suffix exceeds the 200-char cap, e.g. 191-char keys) now falls through to the subresource interpretation instead of surfacing a 400 regression.
   - Test pins for the full dispatch contract: exact-key bucket-policy Deny → 403 (never the trimmed key's thumbnail); exact-key arm inherits `If-None-Match` 304 and `Range` 206/`Content-Range`; D3 delegation arm reachable (access-enabled authorizer + anonymous public-read harness — anonymous reads of public objects at the full key keep working); 200/201-char full-key fallback.
 
+- **Thumbnail REST: per-object cache directive — `public` only for genuinely anonymous-readable derivations** (`internal/api/rest/thumbnail.go`)
+  - The derivation path previously emitted `Cache-Control: public, max-age=86400` unconditionally, so shared caches stored private-object thumbnails that an external anonymous caller could never fetch from origin. The directive is now `private, max-age=86400` unless the request itself was admitted anonymously — `allowAnonymous` admits anonymous readers solely for public-readable objects (object ACL or bucket-ACL fallback), so `public` is safe exactly then; authenticated callers (who may hold private access) get `private`. The 304 mirrors the 200's directive (RFC 9111 §3.2/§3.4) so a revalidating shared cache can never adopt a conflicting directive.
+  - Pins: no-auth harness → private; authenticated → private; anonymous + object public-read ACL → public; anonymous + bucket-ACL public-read → public; authenticated on a public object → private; 304 equality both ways.
+
 ### Fixed
 - **Thumbnail: `TestSemaphoreBlocksBeforeDecodeConfig` leaked a slot-holding goroutine** — the parked `Generate` is now unblocked via a signal reader and its exit awaited before the slots are released, so no slot or goroutine leaks into later tests (the leaked goroutine wedged `TestSemaphoreReleasesOnError` under `-race`).
 
