@@ -64,6 +64,14 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := strings.TrimSuffix(fullKey, "/thumbnail")
+	// Bucket-policy gate on the derivation path, mirroring Get's ordering
+	// (policy → anonymous): a policy denying s3:GetObject on the trimmed key
+	// must not be bypassable by requesting its derived thumbnail (which
+	// returns near-lossless image bytes of the same object). Fail-closed like
+	// every other object read surface.
+	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
+		return
+	}
 	if !h.allowAnonymous(w, r, key) {
 		return
 	}

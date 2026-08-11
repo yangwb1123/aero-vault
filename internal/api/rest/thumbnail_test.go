@@ -674,3 +674,39 @@ func newThumbnailAccessHarness(t *testing.T) (*httptest.Server, string, reposito
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 	return srv, "Bearer alice", repo
 }
+
+// TestThumbnailDerivationPathBucketPolicyDeny pins the derivation-arm policy
+// gate: a bucket policy denying s3:GetObject on the trimmed key must block
+// the derived thumbnail too (the fallback arm used to bypass checkBucketPolicy
+// entirely, returning near-lossless image bytes of a policy-denied object).
+func TestThumbnailDerivationPathBucketPolicyDeny(t *testing.T) {
+	s, tok, repo := newThumbnailAccessHarness(t)
+	_ = repo
+	adminH := map[string]string{"Authorization": "Bearer operator"}
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/secret"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT secret image: %d", resp.StatusCode)
+	}
+	// Control: thumbnail derivation works while the policy is absent.
+	resp, body := req(t, "GET", u+"/thumbnail?w=100&h=100", nil, authH)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("control GET thumbnail: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	// Deny s3:GetObject on the trimmed key ("secret"), not the full key.
+	policyURL := s.URL + "/v1/buckets/default/policy"
+	denyGet := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::default/secret"}]}`
+	if resp, _ := req(t, "PUT", policyURL, bodyPolicy(denyGet), adminH); resp.StatusCode != http.StatusOK {
+		t.Fatalf("set deny policy: %d", resp.StatusCode)
+	}
+	// The raw object read is denied...
+	resp, _ = req(t, "GET", u, nil, authH)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET denied object: status=%d want 403", resp.StatusCode)
+	}
+	// ...and so is the derived thumbnail (no bypass).
+	resp, body = req(t, "GET", u+"/thumbnail?w=100&h=100", nil, authH)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET denied thumbnail: status=%d want 403 (body=%q)", resp.StatusCode, body)
+	}
+}
