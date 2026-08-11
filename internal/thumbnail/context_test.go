@@ -12,8 +12,10 @@ package thumbnail
 // the canceled-ctx outcome deterministic in every channel state.
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -115,6 +117,192 @@ func TestGenerateContextPreservesCancelMidDecode(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("GenerateContext did not unblock on mid-decode cancel")
+	}
+}
+
+// gifConfigPrefix is the first 13 bytes of a GIF89a stream: the 6-byte
+// signature and the 7-byte Logical Screen Descriptor, with the global color
+// table flag set (packed 0x80, gctSize 0 → 2 entries). image/gif's
+// DecodeConfig consumes exactly these bytes before it must read the global
+// color table (Go 1.26 reader.go: readHeaderAndScreenDescriptor reads the 13
+// header+LSD bytes, then readColorTable reads 3·2^(gctSize+1) = 6 more), so
+// serving this prefix and blocking makes the block land deterministically
+// inside the config scan — at the global-color-table read, never in Decode.
+func gifConfigPrefix() []byte {
+	return []byte{
+		'G', 'I', 'F', '8', '9', 'a', // signature
+		0x40, 0x00, // width 64 (LE)
+		0x40, 0x00, // height 64 (LE)
+		0x80, // packed: global color table flag, gctSize 0 → 2 entries
+		0x00, // background color index
+		0x00, // pixel aspect ratio
+	}
+}
+
+// TestGenerateContextPreservesDeadlineMidDecodeConfig pins the
+// DecodeConfig-site ctx branches (QA-2): a deadline that fires while the
+// config scan is blocked reading the GIF global color table must surface as
+// context.DeadlineExceeded, never ErrUnsupported — the same identity
+// contract the mid-Decode tests pin, on the config-scan path (the path the
+// MaxMetadataBytes budget exists to bound). Unlike the acquisition tests, no
+// slots are held: the decode genuinely starts. The deadline self-fires
+// (~50 ms, mirroring TestGenerateContextPreservesDeadlineMidDecode).
+func TestGenerateContextPreservesDeadlineMidDecodeConfig(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	reader := &ctxBlockingReader{ctx: ctx, data: gifConfigPrefix()}
+
+	_, err := GenerateContext(ctx, reader, 32, 32)
+	if err == nil {
+		t.Fatal("GenerateContext succeeded, want context.DeadlineExceeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if errors.Is(err, ErrUnsupported) {
+		t.Fatalf("err = %v, must not be reclassified as ErrUnsupported", err)
+	}
+}
+
+// errAfterDataReader serves data, then returns a fixed error on every
+// further read — the QA-3 fallback shape: the stream fails with a wrapped
+// context sentinel while the context itself stays healthy, so only the
+// errors.Is fallback branches in GenerateContext can classify it.
+// image/png propagates the reader error unwrapped at both decode sites
+// (Go 1.26 reader.go: checkHeader/parseChunk return the io.ReadFull error
+// as-is; only io.EOF is substituted), so identity survives to the module
+// boundary.
+//
+// The served prefix must be shorter than what the decoder needs: 8 bytes
+// (PNG signature only) fails DecodeConfig at the chunk-header read, 33
+// bytes (signature + IHDR, exactly what the config scan consumes) lets
+// DecodeConfig succeed and fails image.Decode on the post-IHDR chunk read.
+type errAfterDataReader struct {
+	data []byte
+	off  int
+	err  error
+}
+
+func (r *errAfterDataReader) Read(p []byte) (int, error) {
+	if r.off < len(r.data) {
+		n := copy(p, r.data[r.off:])
+		r.off += n
+		return n, nil
+	}
+	return 0, r.err
+}
+
+// TestGenerateContextPreservesWrappedErrorMidDecodeConfig pins the errors.Is
+// fallback at the DecodeConfig site (QA-3): a stream that fails with a
+// wrapped context sentinel while the context is healthy must surface the
+// same wrapped instance — never ErrUnsupported and never a re-wrapped or
+// bare copy. A wrong implementation that returned a bare sentinel (ctx.Err()
+// path) or flattened to ErrUnsupported fails the instance equality
+// assertion.
+func TestGenerateContextPreservesWrappedErrorMidDecodeConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sentinel error
+	}{
+		{"DeadlineExceeded", context.DeadlineExceeded},
+		{"Canceled", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := fmt.Errorf("wrapped: %w", tc.sentinel)
+			reader := &errAfterDataReader{data: makePNG(t, 64, 64)[:8], err: want}
+			_, err := GenerateContext(context.Background(), reader, 32, 32)
+			if err != want {
+				t.Fatalf("err = %v, want the same wrapped instance %v", err, want)
+			}
+			if errors.Is(err, ErrUnsupported) {
+				t.Fatalf("err = %v, must not be reclassified as ErrUnsupported", err)
+			}
+		})
+	}
+}
+
+// TestGenerateContextPreservesWrappedErrorMidDecode pins the same fallback
+// at the Decode site (QA-3): the full 33-byte config prefix is served
+// (DecodeConfig succeeds), then the stream fails with the wrapped sentinel
+// on the first post-header read inside image.Decode. Same instance
+// assertion as the DecodeConfig-site variant.
+func TestGenerateContextPreservesWrappedErrorMidDecode(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sentinel error
+	}{
+		{"DeadlineExceeded", context.DeadlineExceeded},
+		{"Canceled", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := fmt.Errorf("wrapped: %w", tc.sentinel)
+			reader := &errAfterDataReader{data: makePNG(t, 64, 64)[:33], err: want}
+			_, err := GenerateContext(context.Background(), reader, 32, 32)
+			if err != want {
+				t.Fatalf("err = %v, want the same wrapped instance %v", err, want)
+			}
+			if errors.Is(err, ErrUnsupported) {
+				t.Fatalf("err = %v, must not be reclassified as ErrUnsupported", err)
+			}
+		})
+	}
+}
+
+// gatedReader serves r's bytes but holds the first Read on proceed (closing
+// blocked once, on the first Read attempt). It makes a deadline/cancel
+// deterministically precede the decode outcome it must be ordered against:
+// no stream bytes flow until the test opens the gate, so the ordering
+// assertion never depends on wall-clock races between the reader and the
+// test.
+type gatedReader struct {
+	r       io.Reader
+	blocked chan struct{}
+	proceed chan struct{}
+	signal  sync.Once
+	gate    sync.Once
+}
+
+func (g *gatedReader) Read(p []byte) (int, error) {
+	g.signal.Do(func() { close(g.blocked) })
+	g.gate.Do(func() { <-g.proceed })
+	return g.r.Read(p)
+}
+
+// TestGenerateContextMetadataBudgetWinsOverDeadline pins the D3 ordering at
+// the DecodeConfig site (QA-4): when the metadata budget overflows at the
+// same time the request deadline has already fired, ErrMetadataTooLarge must
+// win — the budget abort is an internal contract distinct from request
+// lifecycle, and its priority predates this fix. The gate makes the overlap
+// deterministic: the reader refuses to serve the 9 MiB APP1-padded fixture
+// until the deadline has fired, so ctx.Err() is guaranteed non-nil when the
+// tee overflows at MaxMetadataBytes. A reordering that checked ctx before
+// the budget would return the deadline error and fail this test.
+func TestGenerateContextMetadataBudgetWinsOverDeadline(t *testing.T) {
+	payload := appnPaddedJPEG(t, MaxMetadataBytes+1<<20)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	blocked := make(chan struct{})
+	proceed := make(chan struct{})
+	reader := &gatedReader{r: bytes.NewReader(payload), blocked: blocked, proceed: proceed}
+	done := make(chan error, 1)
+	go func() {
+		_, err := GenerateContext(ctx, reader, 100, 100)
+		done <- err
+	}()
+	select {
+	case <-blocked: // first read attempted: slot acquired, config scan started
+	case <-time.After(5 * time.Second):
+		t.Fatal("GenerateContext never started reading (acquire did not return)")
+	}
+	<-ctx.Done() // let the deadline fire while the reader is gated
+	close(proceed)
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrMetadataTooLarge) {
+			t.Fatalf("err = %v, want ErrMetadataTooLarge (budget wins over the expired deadline)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GenerateContext did not return after budget overflow")
 	}
 }
 

@@ -93,6 +93,14 @@ jobs:
         # (blocking/release-on-error/release-on-panic) still run.
         run: go test -race -short -count=1 -timeout 120s ./internal/thumbnail/
 
+      - name: Test (race — thumbnail mid-decode ctx identity, REST)
+        # The mid-decode REST tests (TestThumbnailMidDecode*) drive the
+        # handler through a ctx-bound storage stream with goroutine+handshake
+        # concurrency — exactly the pattern the race detector exists for
+        # (QA-5). Scoped via -run so the full REST package is not covered
+        # here.
+        run: go test -race -short -count=1 -timeout 120s ./internal/api/rest/ -run 'TestThumbnailMidDecode'
+
       - name: Coverage
         run: |
           echo "::group::覆盖率报告"
