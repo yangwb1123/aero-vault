@@ -397,3 +397,129 @@ func TestGenerateBaselineAtMaxSourceDimDecodes(t *testing.T) {
 		t.Fatalf("thumbnail exceeds bounds: %s", img.Bounds())
 	}
 }
+
+// TestProgressiveJPEGDefensiveBranches pins the six defensive branches of
+// the marker walk (T1): each malformed header must be rejected as
+// not-progressive (behavior equals today's), never panic, never scan into
+// entropy data, and never reach a SOF verdict through a truncated/abnormal
+// path.
+func TestProgressiveJPEGDefensiveBranches(t *testing.T) {
+	cases := []struct {
+		name string
+		head []byte
+	}{
+		{
+			// Fill-run tail: the 0xFF run consumes the buffer, i >= len.
+			name: "fill-run tail",
+			head: []byte{0xFF, 0xD8, 0xFF, 0xFF, 0xFF},
+		},
+		{
+			// Byte-stuffed 0xFF 0x00 at marker level: unparseable.
+			name: "byte-stuffed marker",
+			head: []byte{0xFF, 0xD8, 0xFF, 0x00, 0xFF, 0xC2},
+		},
+		{
+			// EOI before any SOF: the walk stops, never a verdict.
+			name: "EOI before SOF",
+			head: []byte{0xFF, 0xD8, 0xFF, 0xD9, 0xFF, 0xC2},
+		},
+		{
+			// SOS before any SOF: never scan past the SOS header into
+			// entropy-coded data where 0xFF 0xC2 is ordinary data.
+			name: "SOS before SOF",
+			head: []byte{0xFF, 0xD8, 0xFF, 0xDA, 0xFF, 0xC2},
+		},
+		{
+			// Standalone marker (TEM): skipped, the walk continues and the
+			// SOF0 verdict wins.
+			name: "TEM then SOF0",
+			head: []byte{0xFF, 0xD8, 0xFF, 0x01, 0xFF, 0xC0},
+		},
+		{
+			// Truncated segment length: i+2 overruns the buffer.
+			name: "truncated length",
+			head: []byte{0xFF, 0xD8, 0xFF, 0xE1, 0x00},
+		},
+		{
+			// Segment claims a length shorter than its own length field
+			// (n < 2).
+			name: "impossible length",
+			head: []byte{0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x01},
+		},
+		{
+			// Segment length overruns the buffer (i+n > len).
+			name: "length overrun",
+			head: []byte{0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x04},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if progressiveJPEG(tc.head) {
+				t.Fatalf("malformed header % x reported progressive", tc.head)
+			}
+		})
+	}
+}
+
+// headerOnlySOF1JPEG builds a header-only JPEG declaring SOF1 (extended
+// sequential) with attacker-controlled dimensions — the SOF1 control for the
+// progressive cap: SOF1 in (MaxProgressiveSourceDim, MaxSourceDim] must NOT
+// be rejected as progressive. Mirrors headerOnlyProgressiveJPEG's structure
+// (APP0 + SOS included; the stdlib config scan reads through SOS).
+func headerOnlySOF1JPEG(t testing.TB, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8}) // SOI
+	app0 := []byte{'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0}
+	buf.Write([]byte{0xFF, 0xE0})
+	var seg [2]byte
+	binary.BigEndian.PutUint16(seg[:], uint16(len(app0)+2))
+	buf.Write(seg[:])
+	buf.Write(app0)
+	// SOF1 (extended sequential): precision 8, height, width, 3 components.
+	sof := []byte{8, byte(h >> 8), byte(h), byte(w >> 8), byte(w), 3,
+		1, 0x22, 0,
+		2, 0x11, 1,
+		3, 0x11, 1}
+	buf.Write([]byte{0xFF, 0xC1})
+	binary.BigEndian.PutUint16(seg[:], uint16(len(sof)+2))
+	buf.Write(seg[:])
+	buf.Write(sof)
+	sos := []byte{3, 1, 0, 2, 0, 3, 0, 0, 63, 0}
+	buf.Write([]byte{0xFF, 0xDA})
+	binary.BigEndian.PutUint16(seg[:], uint16(len(sos)+2))
+	buf.Write(seg[:])
+	buf.Write(sos)
+	return buf.Bytes()
+}
+
+// TestGenerateAllowsSOF1AboveProgressiveDim pins the SOF1 control (C2): the
+// progressive cap is specific to SOF2. A header-only SOF1 JPEG with dims in
+// (MaxProgressiveSourceDim, MaxSourceDim] must pass the progressive gate and
+// reach full decode (which fails on the missing tables → ErrUnsupported),
+// never ErrImageTooLarge.
+func TestGenerateAllowsSOF1AboveProgressiveDim(t *testing.T) {
+	fix := headerOnlySOF1JPEG(t, MaxProgressiveSourceDim+1, 100)
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(fix))
+	if err != nil || format != "jpeg" || cfg.Width != MaxProgressiveSourceDim+1 {
+		t.Fatalf("fixture self-check: got %dx%d %q err=%v", cfg.Width, cfg.Height, format, err)
+	}
+	img, err := Generate(bytes.NewReader(fix), 100, 100)
+	if img != nil || errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("SOF1 %dx%d: img!=nil=%v err=%v — want non-ErrImageTooLarge (passes the progressive gate, fails later on missing tables)", cfg.Width, cfg.Height, img != nil, err)
+	}
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("SOF1 err=%v want ErrUnsupported (header-only fixture decodes nowhere)", err)
+	}
+	// The same dims as SOF2 must still reject (control direction).
+	prog := headerOnlyProgressiveJPEG(t, MaxProgressiveSourceDim+1, 100)
+	if _, err := Generate(bytes.NewReader(prog), 100, 100); !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("SOF2 same dims: err=%v want ErrImageTooLarge", err)
+	}
+	// At or below the cap, SOF2 is allowed through the gate (fails later on
+	// missing tables, proving the rejection is dims-driven, not marker-only).
+	progOK := headerOnlyProgressiveJPEG(t, MaxProgressiveSourceDim, 100)
+	if _, err := Generate(bytes.NewReader(progOK), 100, 100); errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("SOF2 at cap: err=%v — must not reject", err)
+	}
+}

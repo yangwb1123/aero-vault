@@ -25,6 +25,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
+	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
 func pngBytes(t *testing.T, w, h int) []byte {
@@ -804,4 +805,99 @@ func TestThumbnailDeadlineScoping(t *testing.T) {
 	if code != "Timeout" || status != http.StatusGatewayTimeout {
 		t.Fatalf("classify(DeadlineExceeded) = (%q, %d) want (Timeout, 504)", code, status)
 	}
+}
+
+// TestThumbnailProgressiveOversized413 pins the HTTP-level progressive chain:
+// a progressive (SOF2) JPEG whose declared dims exceed
+// thumbnail.MaxProgressiveSourceDim rejects with 413 ImageTooLarge at the
+// protocol boundary — the same sentinel as the dimension bomb, so the
+// user-visible surface is pinned end to end.
+func TestThumbnailProgressiveOversized413(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/prog.jpg"
+	// Header-only progressive fixture (no DQT/entropy — zero pixel buffers):
+	// the declared dims drive the rejection.
+	req(t, "PUT", u, headerOnlyProgressiveJPEGBytes(t, 8192, 8192), map[string]string{"Content-Type": "image/jpeg"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("progressive oversized thumbnail: status=%d want 413 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"ImageTooLarge"`)) {
+		t.Fatalf("expected code ImageTooLarge, body: %s", body)
+	}
+	// Baseline SOF0 at the same dims still 413s via the dimension gate (the
+	// progressive cap is a tighter ceiling, not a looser path).
+	req(t, "PUT", s.URL+"/v1/files/baseline.jpg", headerOnlyBaselineJPEGBytes(t, 9000, 9000), map[string]string{"Content-Type": "image/jpeg"})
+	resp, _ = req(t, "GET", s.URL+"/v1/files/baseline.jpg/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("baseline oversized thumbnail: status=%d want 413", resp.StatusCode)
+	}
+	// A progressive JPEG at 4096 (at the cap) must NOT 413 — it falls
+	// through to full decode and fails there (header-only fixture) as a 400
+	// InvalidArgument, never ImageTooLarge.
+	req(t, "PUT", s.URL+"/v1/files/prog-ok.jpg", headerOnlyProgressiveJPEGBytes(t, thumbnail.MaxProgressiveSourceDim, 100), map[string]string{"Content-Type": "image/jpeg"})
+	resp, body = req(t, "GET", s.URL+"/v1/files/prog-ok.jpg/thumbnail", nil, nil)
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		t.Fatalf("progressive at cap: status=%d — must not reject as ImageTooLarge", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("progressive at cap: expected InvalidArgument (decode of header-only fixture), body: %s", body)
+	}
+}
+
+// headerOnlyProgressiveJPEGBytes builds a header-only progressive (SOF2) JPEG
+// with attacker-controlled declared dims, mirroring the thumbnail package's
+// test fixture at the protocol boundary.
+func headerOnlyProgressiveJPEGBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8}) // SOI
+	app0 := []byte{'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0}
+	buf.Write([]byte{0xFF, 0xE0})
+	var seg [2]byte
+	binary.BigEndian.PutUint16(seg[:], uint16(len(app0)+2))
+	buf.Write(seg[:])
+	buf.Write(app0)
+	sof := []byte{8, byte(h >> 8), byte(h), byte(w >> 8), byte(w), 3,
+		1, 0x22, 0,
+		2, 0x11, 1,
+		3, 0x11, 1}
+	buf.Write([]byte{0xFF, 0xC2}) // SOF2: progressive
+	binary.BigEndian.PutUint16(seg[:], uint16(len(sof)+2))
+	buf.Write(seg[:])
+	buf.Write(sof)
+	sos := []byte{3, 1, 0, 2, 0, 3, 0, 0, 63, 0}
+	buf.Write([]byte{0xFF, 0xDA})
+	binary.BigEndian.PutUint16(seg[:], uint16(len(sos)+2))
+	buf.Write(seg[:])
+	buf.Write(sos)
+	return buf.Bytes()
+}
+
+// headerOnlyBaselineJPEGBytes is the SOF0 analogue: same structure, baseline
+// marker, declared dims only.
+func headerOnlyBaselineJPEGBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8}) // SOI
+	app0 := []byte{'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0}
+	buf.Write([]byte{0xFF, 0xE0})
+	var seg [2]byte
+	binary.BigEndian.PutUint16(seg[:], uint16(len(app0)+2))
+	buf.Write(seg[:])
+	buf.Write(app0)
+	sof := []byte{8, byte(h >> 8), byte(h), byte(w >> 8), byte(w), 3,
+		1, 0x22, 0,
+		2, 0x11, 1,
+		3, 0x11, 1}
+	buf.Write([]byte{0xFF, 0xC0}) // SOF0: baseline sequential
+	binary.BigEndian.PutUint16(seg[:], uint16(len(sof)+2))
+	buf.Write(seg[:])
+	buf.Write(sof)
+	sos := []byte{3, 1, 0, 2, 0, 3, 0, 0, 63, 0}
+	buf.Write([]byte{0xFF, 0xDA})
+	binary.BigEndian.PutUint16(seg[:], uint16(len(sos)+2))
+	buf.Write(seg[:])
+	buf.Write(sos)
+	return buf.Bytes()
 }
