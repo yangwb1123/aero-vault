@@ -12,7 +12,6 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
-	"image/jpeg"
 	"io"
 
 	// Register decoders for the supported formats (side-effect imports).
@@ -117,15 +116,18 @@ const (
 // Max16BitSourceDim); ≈ 4 × ~275 MiB ≈ 1.1 GiB (progressive JPEG at
 // MaxProgressiveSourceDim) — all inside the 2 GiB absolute ceiling
 // pinned in semaphore_test.go, regardless of MAX_INFLIGHT_REQUESTS /
-// PER_TENANT_CONCURRENCY_MAX / rate limits. Waiters hold only a stream
-// reader and allocate nothing.
+// PER_TENANT_CONCURRENCY_MAX / rate limits. Waiters hold no stream at
+// all: the REST thumbnail path acquires the slot before opening the
+// object stream (GenerateContextWithOpener), so the semaphore also bounds
+// concurrently open object streams / in-flight storage GETs to
+// maxConcurrentDecodes.
 const maxConcurrentDecodes = 4
 
 // decodeSlots is the package-level blocking semaphore backing
 // maxConcurrentDecodes (buffered-channel idiom; cf. middleware.ConcurrencyLimiter).
 // A waiter's park is bounded by its request context (client disconnect or
 // server deadline) — see acquireDecodeSlotContext — not by queue drain;
-// waiters still allocate nothing.
+// waiters still allocate nothing and hold no stream.
 var decodeSlots = make(chan struct{}, maxConcurrentDecodes)
 
 // acquireDecodeSlot blocks until a slot is free. It is the context-less
@@ -203,146 +205,20 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // the context error, never reclassified as ErrUnsupported. After the stream
 // is fully read, a decode aborts at the next phase boundary (post-config,
 // post-decode, pre-encode) and releases its decode slot.
+//
+// GenerateContext acquires the decode slot itself. Callers that must hold the
+// slot across an object-stream open (e.g. the REST thumbnail handler, whose
+// invariant is that no request parks on the semaphore while holding an open
+// stream) should use GenerateContextWithOpener instead: it acquires the slot,
+// invokes the opener, and runs this exact decode pipeline with a single
+// acquisition, so at most maxConcurrentDecodes object streams are open at
+// once and waiters hold no stream.
 func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
-	if maxW <= 0 {
-		maxW = DefaultMax
-	}
-	if maxH <= 0 {
-		maxH = DefaultMax
-	}
-	if maxW > HardMax {
-		maxW = HardMax
-	}
-	if maxH > HardMax {
-		maxH = HardMax
-	}
-
-	// Aggregate bound (unchanged contract): at most maxConcurrentDecodes calls
-	// hold the allocation-bearing section below (config scan, decode, scale,
-	// composite, encode) at once; held for the entire section so the bound is
-	// airtight. The wait now honors ctx — a parked caller unblocks on cancel
-	// and never reaches the decode section; waiters allocate nothing.
 	if err := acquireDecodeSlotContext(ctx); err != nil {
-		return nil, err // before LimitReader: stream untouched, no slot consumed
+		return nil, err // before generateLocked: stream untouched, no slot consumed
 	}
 	defer releaseDecodeSlot()
-
-	// Bound the compressed input consumed per call; governs DecodeConfig reads too.
-	r = io.LimitReader(r, MaxSourceBytes)
-
-	// Header-only dimension pre-check: no pixel buffer is ever allocated for
-	// oversized sources. image.DecodeConfig consumes from the stream, and each
-	// codec additionally wraps the reader in its own bufio whose read-ahead
-	// drains it — so sharing a single buffered reader between DecodeConfig and
-	// Decode would lose the header bytes for small inputs. Instead, tee what
-	// DecodeConfig consumes into head, replay that exact prefix for Decode,
-	// and continue from the raw stream r (not the tee): replaying head then r
-	// is byte-exact and keeps Decode streaming (the payload is read live from
-	// r, never buffered). head is capped at MaxMetadataBytes: image/jpeg's
-	// config scan reads every pre-SOF segment (APPn/COM/DHT/DQT/DRI) in full
-	// and the segment count is attacker-controlled, so without the cap head
-	// would grow with the payload (bounded only by MaxSourceBytes); exceeding
-	// the budget aborts the config scan with ErrMetadataTooLarge before the
-	// payload is read further or any pixel buffer is allocated.
-	head := &limitedBuffer{remaining: MaxMetadataBytes}
-	cfgR := io.TeeReader(r, head)
-	cfg, format, err := image.DecodeConfig(cfgR)
-	if err != nil {
-		if errors.Is(err, errMetadataBudgetExceeded) {
-			return nil, ErrMetadataTooLarge
-		}
-		// A ctx-bound storage stream fails exactly when the request context is
-		// done: surface the context error (DeadlineExceeded/Canceled) instead
-		// of reclassifying it as ErrUnsupported (REST maps it to 504 or a
-		// silent return). The ctx.Err() check precedes the sentinel fallback —
-		// ctx.Err() is authoritative; the errors.Is fallback covers streams
-		// that surface a literal/wrapped sentinel while ctx.Err() is
-		// momentarily nil (e.g. SDK error paths captured the error earlier).
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
-		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return nil, err
-		}
-		return nil, ErrUnsupported
-	}
-	if cfg.Width > MaxSourceDim || cfg.Height > MaxSourceDim {
-		return nil, ErrImageTooLarge // payload never read
-	}
-	// Progressive (SOF2) sources carry full-image coefficient buffers per
-	// scan band, so they get a lower dimension bound than baseline sources:
-	// a progressive JPEG above MaxProgressiveSourceDim is rejected from the
-	// header with the same sentinel, before any pixel buffer is allocated.
-	// The SOF2 marker is already inside head (DecodeConfig consumed it), so
-	// the detection walk is free and is skipped entirely for the common
-	// small-image path (the format/dims gates run first).
-	if format == "jpeg" &&
-		(cfg.Width > MaxProgressiveSourceDim || cfg.Height > MaxProgressiveSourceDim) &&
-		progressiveJPEG(head.buf.Bytes()) {
-		return nil, ErrImageTooLarge // payload never read
-	}
-	// Depth-16 PNG sources decode at 8 B/px (stdlib image/png), so they get
-	// the same lower bound as progressive JPEGs: above Max16BitSourceDim
-	// they are rejected from the header, before any pixel buffer is
-	// allocated (see png16.go for the IHDR byte location and rules).
-	if format == "png" && pngBitDepth(head.buf.Bytes()) == 16 &&
-		(cfg.Width > Max16BitSourceDim || cfg.Height > Max16BitSourceDim) {
-		return nil, ErrImageTooLarge // payload never read
-	}
-	if cerr := ctx.Err(); cerr != nil {
-		return nil, cerr
-	}
-	src, _, err := image.Decode(io.MultiReader(bytes.NewReader(head.buf.Bytes()), r))
-	if err != nil {
-		// Same identity preservation as the DecodeConfig branch above: a
-		// deadline/cancellation that fires while the payload is read is
-		// surfaced as the context error, never flattened to ErrUnsupported;
-		// ctx.Err() wins over a coincident genuine decode error.
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
-		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return nil, err
-		}
-		return nil, ErrUnsupported
-	}
-	if cerr := ctx.Err(); cerr != nil {
-		return nil, cerr
-	}
-	// EXIF orientation (JPEG only): the tag lives in the APP1 segment that
-	// DecodeConfig consumed into head (its config scan reads every pre-SOS
-	// segment in full), so extraction is free and bounded by MaxMetadataBytes.
-	// Orientations 5–8 swap the box so the rotated frame still fits maxW×maxH.
-	// Rotation runs post-scale, pre-composite; the rotated frame is opaque, so
-	// compositeOnWhite's fast path keeps the ≈ 288 MiB ceiling.
-	orient := 1
-	if format == "jpeg" {
-		orient = exifOrientation(head.buf.Bytes())
-	}
-	boxW, boxH := maxW, maxH
-	if orient >= 5 {
-		boxW, boxH = maxH, maxW
-	}
-	dst := scale(src, boxW, boxH)
-	if orient > 1 {
-		dst = applyOrientation(dst, orient)
-	}
-	// Ordering is load-bearing (pinned by TestGenerateLargeTransparentAllocationBounded
-	// and TestCompositeOrderingFeatheredByteLevel): the white composite must run on
-	// the scaled dst (≤ HardMax², ≤ 16 MiB copy), never on the full-resolution src —
-	// Opaque() is attacker-controlled (one transparent pixel at the decoded scale
-	// suffices) and a pre-scale composite would copy the full decoded frame
-	// (256/512 MiB) plus scale churn, ≈ 656/912 MiB per request, invalidating the
-	// documented ceiling.
-	dst = compositeOnWhite(dst) // JPEG has no alpha; flatten transparency before encode.
-	if cerr := ctx.Err(); cerr != nil {
-		return nil, cerr
-	}
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return generateLocked(ctx, r, maxW, maxH)
 }
 
 // progressiveJPEG reports whether the JPEG header in buf declares a

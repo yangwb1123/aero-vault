@@ -425,15 +425,23 @@ Per-request worst-case decode allocation: ≈ 268 MiB (PNG RGBA at `MaxSourceDim
 ceilings: ≈ 1.1 GiB (PNG RGBA) / ≈ 1.1 GiB (progressive JPEG) across all
 concurrent decodes.
 
-**Decode-slot wait contract:** waiters acquire a slot via a `select` on the
-request context — cancellation (client disconnect, or the `REQUEST_TIMEOUT_SECONDS`
-deadline applied to the `/thumbnail` route) releases a parked waiter immediately
-with `context.Canceled`/`context.DeadlineExceeded`, and its deferred close then
-releases the pinned object stream. In-flight decodes abort at the next phase
-boundary (post-config, post-decode, pre-encode) when the request context is
-done; the decode slot is released immediately. Stream failures caused by the
-request context surface as the context error (504 `Timeout` for a server-side
-deadline, silent return on client disconnect), never as an invalid-image error.
+**Decode-slot wait contract:** on the REST derivation path the decode slot is
+acquired **before** the object stream opens (`thumbnail.GenerateContextWithOpener`
+acquires, then invokes the opener, then decodes), so a request parked on the
+semaphore holds no stream at all — at most `maxConcurrentDecodes` (4) object
+streams are concurrently open for thumbnailing on **any** backend (local fd /
+S3/OSS/COS GET), for any request concurrency. Waiters acquire a slot via a
+`select` on the request context — cancellation (client disconnect, or the
+`REQUEST_TIMEOUT_SECONDS` deadline applied to the `/thumbnail` route) releases
+a parked waiter immediately with `context.Canceled`/`context.DeadlineExceeded`,
+without opening a stream and without consuming a slot. In-flight decodes abort
+at the next phase boundary (post-config, post-decode, pre-encode) when the
+request context is done; the decode slot is released immediately and the
+(already-open) stream is closed. Stream failures caused by the request context
+surface as the context error (504 `Timeout` for a server-side deadline, silent
+return on client disconnect), never as an invalid-image error; object-stream
+open failures classify as the underlying object error (404/403/409/…), never
+as an image error.
 
 **Deployment prerequisite:** set `MAX_INFLIGHT_REQUESTS` and/or `RATE_LIMIT_RPS`
 > 0 in production. The semaphore bounds in-flight *decodes* (4), not the number

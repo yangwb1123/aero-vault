@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"net/url"
@@ -157,14 +158,29 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rc, _, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
+	// The decode slot is acquired BEFORE the object stream opens —
+	// GenerateContextWithOpener acquires, then invokes the opener (svc.Get),
+	// then decodes — so at most maxConcurrentDecodes object streams are open
+	// at once, and a request parked on the semaphore holds no stream at all
+	// (waiter holds nothing: no fd, no in-flight storage GET). Open failures
+	// surface as *OpenError and keep today's writeError classification
+	// verbatim; decode and context errors keep the branch below. The stream
+	// lifecycle (close on every path, close-before-release) lives inside the
+	// API.
+	img, err := thumbnail.GenerateContextWithOpener(r.Context(), maxW, maxH, func() (io.ReadCloser, error) {
+		rc, _, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
+		return rc, err
+	})
 	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	defer rc.Close() // releases the pinned stream once a parked wait unblocks
-	img, err := thumbnail.GenerateContext(r.Context(), rc, maxW, maxH)
-	if err != nil {
+		// The OpenError unwrap MUST precede the context-error checks: an
+		// opener that failed with a canceled ctx is a Get-path failure and
+		// classifies exactly as today (writeError → classify), never as a
+		// silent return. Load-bearing ordering, pinned by tests.
+		var oe *thumbnail.OpenError
+		if errors.As(err, &oe) {
+			h.writeError(w, r, oe.Err)
+			return
+		}
 		// Server-side route deadline fired while waiting for a decode slot:
 		// the client may still be connected — surface a visible 504 (F2)
 		// instead of a silent empty 200. MUST precede the ErrImageTooLarge
@@ -173,9 +189,10 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, r, service.ErrTimeout)
 			return
 		}
-		// Client gone (request context canceled by disconnect): the deferred
-		// Close releases the stream; do not write to a dead connection and
-		// do not classify a canceled request as a 400 client error.
+		// Client gone (request context canceled by disconnect): no stream is
+		// open here (any opened stream was closed inside the API before the
+		// slot was released); do not write to a dead connection and do not
+		// classify a canceled request as a 400 client error.
 		if errors.Is(err, context.Canceled) {
 			return
 		}

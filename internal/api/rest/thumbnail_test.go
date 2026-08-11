@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"hash/crc32"
 	"image"
 	"image/color"
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1663,4 +1665,425 @@ func headerOnlyPNGBytes(t *testing.T, w, h int, bitDepth, colorType byte) []byte
 	binary.BigEndian.PutUint32(l[:], crc.Sum32())
 	buf.Write(l[:])
 	return buf.Bytes()
+}
+
+// ── Slot-before-open (burst/ordering) tests ──────────────────────────────────
+// Direction: "Release the object stream before parking on the decode-slot
+// semaphore". The handler now derives thumbnails via
+// thumbnail.GenerateContextWithOpener, which acquires the decode slot BEFORE
+// the object stream opens — so at most maxConcurrentDecodes (4, pinned in
+// internal/thumbnail) object streams are open at once for any request
+// concurrency, and a request parked on the semaphore holds no stream.
+
+// thumbnailDecodeSlots mirrors thumbnail.maxConcurrentDecodes (unexported):
+// the semaphore capacity this package's ordering tests rely on. Keep in sync
+// with internal/thumbnail/thumbnail.go.
+const thumbnailDecodeSlots = 4
+
+// burstStore delegates every Storage method except Get (the verified
+// stream-open hook at FileService.openObjectWithOptions). While armed, Get
+// counts the currently-open streams, tracks the high-water mark, and returns
+// the real stream wrapped in a reader that (i) serves the first 33 bytes
+// (PNG signature + IHDR — exactly what image/png's DecodeConfig consumes),
+// then blocks Read on release — deterministically holding the decode slot
+// mid-decode — and (ii) decrements the open counter on Close. Unarmed, Get
+// behaves like the real store (used to seed fixtures and capture validators
+// without perturbing the counters).
+type burstStore struct {
+	storage.Storage
+	opens   atomic.Int64  // currently-open streams (armed phase only)
+	high    atomic.Int64  // high-water mark of concurrently-open streams
+	total   atomic.Int64  // total Get calls in the armed phase
+	release chan struct{} // closed to unblock blocked decodes (may be nil)
+	arm     atomic.Bool   // when false, Get returns the raw stream uncounted
+}
+
+func (s *burstStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.ObjectInfo, error) {
+	rc, info, err := s.Storage.Get(ctx, key)
+	if err != nil {
+		return nil, info, err
+	}
+	if !s.arm.Load() {
+		return rc, info, nil
+	}
+	n := s.opens.Add(1)
+	s.total.Add(1)
+	for {
+		cur := s.high.Load()
+		if n <= cur || s.high.CompareAndSwap(cur, n) {
+			break
+		}
+	}
+	if s.release == nil {
+		return rc, info, nil
+	}
+	head := make([]byte, 33)
+	if _, err := io.ReadFull(rc, head); err != nil {
+		_ = rc.Close()
+		s.opens.Add(-1)
+		return nil, info, err
+	}
+	return &burstReadCloser{ReadCloser: rc, head: head, release: s.release, store: s}, info, nil
+}
+
+// burstReadCloser keeps the underlying stream's Close (releasing the pinned
+// object) while routing Read through the head-then-block-then-continue
+// sequence described on burstStore.
+type burstReadCloser struct {
+	io.ReadCloser
+	head    []byte
+	off     int
+	release <-chan struct{}
+	store   *burstStore
+}
+
+func (r *burstReadCloser) Read(p []byte) (int, error) {
+	if r.off < len(r.head) {
+		n := copy(p, r.head[r.off:])
+		r.off += n
+		return n, nil
+	}
+	<-r.release // decode parks here: the slot is held until the test drains
+	return r.ReadCloser.Read(p)
+}
+
+func (r *burstReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.store.opens.Add(-1)
+	return err
+}
+
+// waitOpenStreams polls until opens reaches want (or fails after 5s). Once
+// the release channel is closed, no decode can complete, so an opens count
+// that reaches want stays there — the assertion is structurally
+// deterministic, not timing-based. On failure it closes release first, so
+// the blocked decodes drain and the test unwinds (srv.Close waits for
+// in-flight requests) instead of hanging on a 25s timeout.
+func waitOpenStreams(t *testing.T, s *burstStore, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.opens.Load() != want && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.opens.Load(); got != want {
+		close(s.release)
+		t.Fatalf("opens = %d, want %d — slot-before-open ordering regressed?", got, want)
+	}
+}
+
+// TestThumbnailBurstPeakOpenStreams is the FD/connection-count proxy (AC-4,
+// NFR-1): 100 concurrent thumbnail requests against a saturated decode slot
+// must never hold more than thumbnailDecodeSlots (4) concurrently-open
+// object streams. Pre-fix, opens precede slot acquisition and this test
+// observes a high-water mark of ~100 and fails; post-fix it is structural.
+func TestThumbnailBurstPeakOpenStreams(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "b.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	cs := &burstStore{Storage: store, release: make(chan struct{})}
+	h := NewHandler(service.NewFileService(cs, repo, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/img.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT img.png: %d", resp.StatusCode)
+	}
+	cs.arm.Store(true)
+
+	const n = 100
+	statuses := make(chan int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(u + "/thumbnail?w=32&h=32")
+			if err != nil {
+				statuses <- -1
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			statuses <- resp.StatusCode
+		}()
+	}
+	// All 4 slots are held by blocked decodes; every other request parks on
+	// the semaphore WITHOUT opening a stream (the fix's core property).
+	waitOpenStreams(t, cs, thumbnailDecodeSlots)
+	close(cs.release)
+	wg.Wait()
+	close(statuses)
+	for s := range statuses {
+		if s != http.StatusOK {
+			t.Fatalf("burst request: status %d, want 200", s)
+		}
+	}
+	if got := cs.opens.Load(); got != 0 {
+		t.Fatalf("opens not drained after burst: %d", got)
+	}
+	if got := cs.total.Load(); got != n {
+		t.Fatalf("total opens = %d, want %d (exactly one open per request)", got, n)
+	}
+	if got := cs.high.Load(); got > thumbnailDecodeSlots {
+		t.Fatalf("peak concurrently-open streams = %d, want ≤ %d — the fix's core bound", got, thumbnailDecodeSlots)
+	}
+}
+
+// TestThumbnailCancelWhileParkedWritesNothing pins FR-3 at the HTTP level: a
+// 5th request parked on the saturated semaphore holds no stream, honors
+// client cancellation, and writes nothing — mirroring
+// TestThumbnailMidDecodeCancelWritesNothing's handshake discipline at the
+// park point.
+func TestThumbnailCancelWhileParkedWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "cp.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	cs := &burstStore{Storage: store, release: make(chan struct{})}
+	h := NewHandler(service.NewFileService(cs, repo, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+
+	putReq := httptest.NewRequest("PUT", "/v1/files/img.png", bytes.NewReader(pngBytes(t, 64, 64)))
+	putReq.Header.Set("Content-Type", "image/png")
+	r.ServeHTTP(httptest.NewRecorder(), putReq)
+	cs.arm.Store(true)
+
+	// 4 saturating requests: each blocks mid-decode holding a slot + stream.
+	results := make(chan int, thumbnailDecodeSlots)
+	var wg sync.WaitGroup
+	for i := 0; i < thumbnailDecodeSlots; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rq := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, rq)
+			results <- rec.Code
+		}()
+	}
+	waitOpenStreams(t, cs, thumbnailDecodeSlots)
+
+	// 5th request on a cancelable client context: parks on the semaphore.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rq := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		r.ServeHTTP(rec, rq)
+		close(done)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("5th request completed while parked — it must hold nothing")
+	default:
+	}
+	if got := cs.opens.Load(); got != thumbnailDecodeSlots {
+		t.Fatalf("parked 5th request opened a stream: opens=%d, want %d", got, thumbnailDecodeSlots)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked request did not return after cancel")
+	}
+	// httptest.NewRecorder leaves Code at its 200 default when WriteHeader is
+	// never called: the load-bearing assertions are no bytes written and no
+	// 4xx classification, mirroring TestThumbnailMidDecodeCancelWritesNothing.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("parked cancel: status=%d want no write (recorder default 200)", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("parked cancel: wrote %d bytes, want nothing (body=%q)", rec.Body.Len(), rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "" {
+		t.Fatalf("parked cancel: wrote Content-Type %q, want nothing written", ct)
+	}
+
+	close(cs.release)
+	wg.Wait()
+	close(results)
+	for s := range results {
+		if s != http.StatusOK {
+			t.Fatalf("saturating request: status %d, want 200", s)
+		}
+	}
+	if got := cs.opens.Load(); got != 0 {
+		t.Fatalf("opens not drained: %d", got)
+	}
+	if got := cs.high.Load(); got > thumbnailDecodeSlots {
+		t.Fatalf("peak concurrently-open streams = %d, want ≤ %d", got, thumbnailDecodeSlots)
+	}
+}
+
+// TestThumbnail304UnderSaturation pins FR-5: the If-None-Match/304 fast path
+// runs before slot acquisition and stream open, so under full saturation a
+// matching revalidation returns 304 promptly without touching a stream.
+func TestThumbnail304UnderSaturation(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "304.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	cs := &burstStore{Storage: store, release: make(chan struct{})}
+	h := NewHandler(service.NewFileService(cs, repo, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/img.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT img.png: %d", resp.StatusCode)
+	}
+	// Unarmed: capture the derived thumbnail ETag from a normal 200 request.
+	resp, _ := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed thumbnail: %d", resp.StatusCode)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("seed thumbnail: no ETag header")
+	}
+
+	cs.arm.Store(true)
+	// 4 saturating requests hold all slots + streams mid-decode.
+	statuses := make(chan int, thumbnailDecodeSlots)
+	var wg sync.WaitGroup
+	for i := 0; i < thumbnailDecodeSlots; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(u + "/thumbnail?w=32&h=32")
+			if err != nil {
+				statuses <- -1
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			statuses <- resp.StatusCode
+		}()
+	}
+	waitOpenStreams(t, cs, thumbnailDecodeSlots)
+
+	// The 304 must complete without a slot and without opening a stream.
+	start := time.Now()
+	rq, _ := http.NewRequest("GET", u+"/thumbnail?w=32&h=32", nil)
+	rq.Header.Set("If-None-Match", etag)
+	resp304, err := http.DefaultClient.Do(rq)
+	if err != nil {
+		t.Fatalf("304 request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp304.Body)
+	resp304.Body.Close()
+	if resp304.StatusCode != http.StatusNotModified {
+		t.Fatalf("304 under saturation: status=%d, want 304", resp304.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("304 under saturation took %v — the cache fast path must not need a slot", elapsed)
+	}
+	if got := cs.opens.Load(); got != thumbnailDecodeSlots {
+		t.Fatalf("304 request opened a stream: opens=%d, want %d", got, thumbnailDecodeSlots)
+	}
+
+	close(cs.release)
+	wg.Wait()
+	close(statuses)
+	for s := range statuses {
+		if s != http.StatusOK {
+			t.Fatalf("saturating request: status %d, want 200", s)
+		}
+	}
+	if got := cs.opens.Load(); got != 0 {
+		t.Fatalf("opens not drained: %d", got)
+	}
+}
+
+// failingGetStore delegates every Storage method except Get, which fails
+// with a fixed error — modeling the object-deleted-between-Stat-and-Get race
+// and other open-time storage failures behind the decode slot.
+type failingGetStore struct {
+	storage.Storage
+	err error
+}
+
+func (s *failingGetStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.ObjectInfo, error) {
+	return nil, storage.ObjectInfo{}, s.err
+}
+
+// TestThumbnailOpenErrorAfterStatRace404 pins FR-4 outcome parity: an object
+// that passes the Stat pre-check but fails at open time (deleted between
+// Stat and Get) surfaces through *OpenError as today's writeError
+// classification (404), never as an image error — and an open-time context
+// error is classified (500 via writeError), never silently dropped.
+func TestThumbnailOpenErrorAfterStatRace404(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "oe.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	fs := &failingGetStore{Storage: store, err: storage.ErrNotFound}
+	h := NewHandler(service.NewFileService(fs, repo, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+
+	// Seed the object (Put delegates to the real store; Stat reads metadata,
+	// so the thumbnail derivation passes the pre-checks, acquires the slot,
+	// and only then hits the open failure).
+	putReq := httptest.NewRequest("PUT", "/v1/files/img.png", bytes.NewReader(pngBytes(t, 64, 64)))
+	putReq.Header.Set("Content-Type", "image/png")
+	r.ServeHTTP(httptest.NewRecorder(), putReq)
+
+	rq := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, rq)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("open failure after Stat: status=%d want 404 (body=%q)", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"code":"NotFound"`)) {
+		t.Fatalf("open failure after Stat: expected NotFound body, got %q", rec.Body.String())
+	}
+
+	// Open-time context error (e.g. a backend aborting with the request
+	// context's Canceled): must still be writeError-classified (500 default),
+	// never a silent return and never reclassified as an image error —
+	// pins the OpenError-first ordering at the HTTP level.
+	fs.err = fmt.Errorf("%w: storage read aborted", context.Canceled)
+	rq2 := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil)
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, rq2)
+	if rec2.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled open: status=%d want 500 (body=%q)", rec2.Code, rec2.Body.String())
+	}
+	if !bytes.Contains(rec2.Body.Bytes(), []byte(`"code":"InternalError"`)) {
+		t.Fatalf("canceled open: expected JSON error body, got %q", rec2.Body.String())
+	}
 }
