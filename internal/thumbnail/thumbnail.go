@@ -209,9 +209,9 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // non-nil context. Cancellation is honored at acquisition (returns ctx.Err()
 // without reading the stream or consuming a slot) and mid-decode: a stream
 // failure caused by the context's deadline or cancellation is surfaced as
-// the context error, never reclassified as ErrUnsupported. An in-flight
-// decode not interacting with the context still runs to completion (bounded
-// to maxConcurrentDecodes by the semaphore).
+// the context error, never reclassified as ErrUnsupported. After the stream
+// is fully read, a decode aborts at the next phase boundary (post-config,
+// post-decode, pre-encode) and releases its decode slot.
 func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
 	if maxW <= 0 {
 		maxW = DefaultMax
@@ -226,19 +226,17 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		maxH = HardMax
 	}
 
-	// Aggregate bound (unchanged contract): at most maxConcurrentDecodes
-	// calls hold the allocation-bearing section below (config scan, decode,
-	// scale, composite, encode) at once. Held for the entire section so the
-	// bound is airtight. The wait now honors ctx — a parked caller unblocks
-	// on cancellation and never reaches the decode section; waiters allocate
-	// nothing.
+	// Aggregate bound (unchanged contract): at most maxConcurrentDecodes calls
+	// hold the allocation-bearing section below (config scan, decode, scale,
+	// composite, encode) at once; held for the entire section so the bound is
+	// airtight. The wait now honors ctx — a parked caller unblocks on cancel
+	// and never reaches the decode section; waiters allocate nothing.
 	if err := acquireDecodeSlotContext(ctx); err != nil {
 		return nil, err // before LimitReader: stream untouched, no slot consumed
 	}
 	defer releaseDecodeSlot()
 
-	// Bound the compressed input consumed per call; this also governs the
-	// DecodeConfig reads below so no caller can drive unbounded reads.
+	// Bound the compressed input consumed per call; governs DecodeConfig reads too.
 	r = io.LimitReader(r, MaxSourceBytes)
 
 	// Header-only dimension pre-check: no pixel buffer is ever allocated for
@@ -264,13 +262,11 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		}
 		// A ctx-bound storage stream fails exactly when the request context is
 		// done: surface the context error (DeadlineExceeded/Canceled) instead
-		// of reclassifying it as ErrUnsupported, so the REST layer can answer
-		// 504 to a still-connected client or write nothing to a dead one. The
-		// ctx.Err() check precedes the sentinel fallback because ctx.Err() is
-		// authoritative for context-bound streams; the errors.Is fallback
-		// covers streams that surface a literal/wrapped sentinel while
-		// ctx.Err() is momentarily nil (e.g. SDK error paths that captured
-		// the error before re-reading the ctx).
+		// of reclassifying it as ErrUnsupported (REST maps it to 504 or a
+		// silent return). The ctx.Err() check precedes the sentinel fallback —
+		// ctx.Err() is authoritative; the errors.Is fallback covers streams
+		// that surface a literal/wrapped sentinel while ctx.Err() is
+		// momentarily nil (e.g. SDK error paths captured the error earlier).
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
@@ -294,13 +290,15 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		progressiveJPEG(head.buf.Bytes()) {
 		return nil, ErrImageTooLarge // payload never read
 	}
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	src, _, err := image.Decode(io.MultiReader(bytes.NewReader(head.buf.Bytes()), r))
 	if err != nil {
 		// Same identity preservation as the DecodeConfig branch above: a
-		// deadline/cancellation that fires while the payload is read from the
-		// ctx-bound stream is surfaced as the context error, never flattened
-		// to ErrUnsupported. ctx.Err() wins over a coincident genuine decode
-		// error: the request was aborted regardless.
+		// deadline/cancellation that fires while the payload is read is
+		// surfaced as the context error, never flattened to ErrUnsupported;
+		// ctx.Err() wins over a coincident genuine decode error.
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
@@ -309,12 +307,15 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 		}
 		return nil, ErrUnsupported
 	}
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	// EXIF orientation (JPEG only): the tag lives in the APP1 segment that
 	// DecodeConfig consumed into head (its config scan reads every pre-SOS
 	// segment in full), so extraction is free and bounded by MaxMetadataBytes.
-	// Orientations 5–8 swap the box so the rotated frame still fits maxW×maxH;
-	// the rotation runs post-scale, pre-composite, and the rotated frame is
-	// opaque, so compositeOnWhite's fast path keeps the ≈ 288 MiB ceiling.
+	// Orientations 5–8 swap the box so the rotated frame still fits maxW×maxH.
+	// Rotation runs post-scale, pre-composite; the rotated frame is opaque, so
+	// compositeOnWhite's fast path keeps the ≈ 288 MiB ceiling.
 	orient := 1
 	if format == "jpeg" {
 		orient = exifOrientation(head.buf.Bytes())
@@ -335,7 +336,9 @@ func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, 
 	// (256/512 MiB) plus scale churn, ≈ 656/912 MiB per request, invalidating the
 	// documented ceiling.
 	dst = compositeOnWhite(dst) // JPEG has no alpha; flatten transparency before encode.
-
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality}); err != nil {
 		return nil, err
