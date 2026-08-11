@@ -45,6 +45,12 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 	defer releaseDecodeSlot() // registered first → runs LAST
 	rc, err := open()
 	if err != nil {
+		// Defensive close: an opener may return a non-nil stream together
+		// with an error; the stream must not leak. The close error is
+		// subordinate to the open error (the open failure is the contract).
+		if rc != nil {
+			_ = rc.Close()
+		}
 		return nil, &OpenError{Err: err}
 	}
 	if rc == nil {

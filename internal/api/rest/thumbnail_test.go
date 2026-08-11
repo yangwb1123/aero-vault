@@ -2087,3 +2087,72 @@ func TestThumbnailOpenErrorAfterStatRace404(t *testing.T) {
 		t.Fatalf("canceled open: expected JSON error body, got %q", rec2.Body.String())
 	}
 }
+
+// TestThumbnailDeadlineWhileParkedIs504 pins C1: with all 4 decode slots held
+// by concurrent slow decodes, a 5th request (still-connected client) parks at
+// slot acquisition and must surface the scoped server deadline as 504
+// Timeout — the acquire-error → handler-504 composition, end to end.
+func TestThumbnailDeadlineWhileParkedIs504(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "park.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	h := NewHandler(service.NewFileService(store, repo, nil), nil)
+	h.thumbnailTimeout = 300 * time.Millisecond
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	// A real 8192² PNG: each decode holds its slot for ~1 s.
+	u := srv.URL + "/v1/files/big"
+	big := pngBytes(t, 8192, 8192)
+	if resp, _ := req(t, "PUT", u, big, map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT big: %d", resp.StatusCode)
+	}
+	uThumb := u + "/thumbnail?w=256&h=256"
+
+	// Saturate all 4 slots with concurrent slow decodes.
+	var wg sync.WaitGroup
+	statuses := make([]int, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, _ := http.Get(uThumb)
+			if resp != nil {
+				statuses[i] = resp.StatusCode
+				resp.Body.Close()
+			}
+		}(i)
+	}
+	// Wait until all 4 slots are provably held: the 5th request parks at
+	// acquisition only when the holders have entered the decode section.
+	// The acquire happens before the stream opens, so a parked 5th request
+	// holds no stream. Give the 4 decodes a head start, then fire the 5th.
+	time.Sleep(150 * time.Millisecond)
+	resp, body := req(t, "GET", uThumb, nil, nil)
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("parked 5th request: status=%d want 504 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"Timeout"`)) {
+		t.Fatalf("expected code Timeout, body: %s", body)
+	}
+	wg.Wait()
+	for i, st := range statuses {
+		// Holders may also hit the 300 ms route deadline mid-decode (their
+		// 8192² decode exceeds it) → 504 is the correct outcome for them
+		// too; 200 is possible only if the decode won the race. The pin is
+		// the parked 5th request's 504 above; holders must merely complete
+		// with a well-formed status.
+		if st != http.StatusOK && st != http.StatusGatewayTimeout {
+			t.Fatalf("holder %d status=%d want 200 or 504", i, st)
+		}
+	}
+}

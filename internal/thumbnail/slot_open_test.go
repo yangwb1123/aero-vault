@@ -304,3 +304,39 @@ func TestSlotOutputParityWithGenerateContext(t *testing.T) {
 		assertSlotsReleased(t)
 	}
 }
+
+// countingCloser wraps a stream and counts Close calls — the defensive-close
+// probe for the (rc, err) opener result.
+type countingCloser struct {
+	rc     io.ReadCloser
+	closed atomic.Int32
+}
+
+func (c *countingCloser) Read(p []byte) (int, error) { return c.rc.Read(p) }
+func (c *countingCloser) Close() error {
+	c.closed.Add(1)
+	return c.rc.Close()
+}
+
+// TestSlotOpenErrorWithStreamDefensiveClose pins C2: an opener that returns
+// BOTH a non-nil stream and an error must have the stream closed exactly
+// once — the exported contract "if a stream was opened, the stream is
+// closed" holds on the error path too, and the slot is recovered.
+func TestSlotOpenErrorWithStreamDefensiveClose(t *testing.T) {
+	sentinel := errors.New("open failed after stream")
+	stream := &countingCloser{rc: io.NopCloser(bytes.NewReader(makePNG(t, 8, 8)))}
+	_, err := GenerateContextWithOpener(context.Background(), 16, 16, func() (io.ReadCloser, error) {
+		return stream, sentinel
+	})
+	var oe *OpenError
+	if !errors.As(err, &oe) {
+		t.Fatalf("err = %v, want *OpenError", err)
+	}
+	if !errors.Is(oe.Err, sentinel) {
+		t.Fatalf("oe.Err = %v, want the opener sentinel", oe.Err)
+	}
+	if got := stream.closed.Load(); got != 1 {
+		t.Fatalf("stream closed %d times, want exactly 1 (defensive close on (rc, err))", got)
+	}
+	assertSlotsReleased(t)
+}
