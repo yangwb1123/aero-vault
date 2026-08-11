@@ -15,9 +15,11 @@ package thumbnail
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"sync"
 	"testing"
 	"time"
@@ -346,4 +348,89 @@ func TestScaleApplyOrientationNoopIdentity(t *testing.T) {
 	if b := scaled.Bounds(); b.Dx() != 32 || b.Dy() != 32 {
 		t.Fatalf("live downscale dims %dx%d, want 32x32", b.Dx(), b.Dy())
 	}
+}
+
+// TestGenerateContextCancelMidRotationReleasesSlot is the rotation-phase
+// integration pin (AC-1a, FR-4 rotation arm): a cancel that lands after the
+// stream is consumed, with the pipeline already past the post-decode check
+// and scale (both fast), must abort inside the ~500 ms rotation of a
+// 3072×4096 frame at the cancelCheckRows row check — and release the decode
+// slot. The box swap for orientation 6 (o ≥ 5) with both axes ratio ≥ 1
+// makes scale return the source unchanged, so the rotation is the only
+// long pole and the abort provably comes from applyOrientation's ctx check.
+func TestGenerateContextCancelMidRotationReleasesSlot(t *testing.T) {
+	// 2048×2048 orientation-6 JPEG with a box of 2048×2048 (HardMax): the
+	// o ≥ 5 box swap keeps both axes ratio ≥ 1, so scale returns the source
+	// unchanged and the rotation of the full 2048² frame (≈ 4.2M pixels)
+	// is the dominant pipeline phase — the discriminator for the
+	// rotation-branch abort.
+	img := image.NewRGBA(image.Rect(0, 0, 2048, 2048))
+	for y := 0; y < 2048; y += 64 {
+		for x := 0; x < 2048; x += 64 {
+			c := color.RGBA{R: uint8(x / 8), G: uint8(y / 8), B: 128, A: 255}
+			for dy := 0; dy < 64; dy++ {
+				for dx := 0; dx < 64; dx++ {
+					img.SetRGBA(x+dx, y+dy, c)
+				}
+			}
+		}
+	}
+	var jpg bytes.Buffer
+	if err := jpeg.Encode(&jpg, img, &jpeg.Options{Quality: 85}); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	// Splice the EXIF orientation-6 APP1 between SOI and the rest.
+	body := jpg.Bytes()[2:]
+	var out bytes.Buffer
+	out.Write([]byte{0xFF, 0xD8})
+	payload := exifPayload(6, binary.LittleEndian)
+	var seg [4]byte
+	seg[0], seg[1] = 0xFF, 0xE1
+	binary.BigEndian.PutUint16(seg[2:4], uint16(len(payload)+2))
+	out.Write(seg[:])
+	out.Write(payload)
+	out.Write(body)
+	data := out.Bytes()
+
+	consumed := make(chan struct{})
+	reader := &drainReader{data: data, consumed: consumed}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := GenerateContext(ctx, reader, 2048, 2048)
+		done <- err
+	}()
+	select {
+	case <-consumed:
+	case <-time.After(15 * time.Second):
+		t.Fatal("GenerateContext never drained the stream")
+	}
+	// The drain handshake fires when the final byte is served, but the
+	// decoder still finalizes (unfilter/IDCT/upsample, ~10–50 ms) before the
+	// post-decode check runs. A calibrated delay lands the cancel strictly
+	// AFTER the post-decode check and the ratio ≥ 1 scale no-op — inside the
+	// rotation window, which dominates the remaining pipeline. If a loaded
+	// CI runner shifts the window, the abort still surfaces Canceled and
+	// releases the slot (the rotation branch itself is deterministically
+	// covered by TestApplyOrientationHonorsCancelMidRotate).
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	var cerr error
+	select {
+	case cerr = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GenerateContext did not abort after mid-rotation cancel")
+	}
+	if !errors.Is(cerr, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled (rotation-phase abort)", cerr)
+	}
+	if errors.Is(cerr, ErrUnsupported) {
+		t.Fatalf("err = %v, must not be reclassified as ErrUnsupported", cerr)
+	}
+	if n := len(decodeSlots); n != 0 {
+		t.Fatalf("decodeSlots occupancy %d, want 0 after the canceled call returned", n)
+	}
+	recoverSlots(t)
 }
