@@ -3017,17 +3017,23 @@ func TestThumbnailClampedETagComposition(t *testing.T) {
 // single target key: on the swapCall-th such call it returns the real row
 // with ETag forced to stale (the "Stat view" of an object that a concurrent
 // PUT has since replaced); every other call delegates to the real row (the
-// "opened view"). The discriminator is per-key, so the dispatch pre-check
-// Stat ("pic.png/thumbnail") and GetBucketConfig never perturb the count.
-// This is the repository-seam analogue of the burstStore storage wrapper: no
+// "opened view"). failErr/failCall make the call return an error instead of
+// the row (deterministic deleted/corrupt re-Stat); staleUpdated swaps only
+// UpdatedAt on the swap call (deterministic Last-Modified provenance). The
+// discriminator is per-key, so the dispatch pre-check Stat
+// ("pic.png/thumbnail") and GetBucketConfig never perturb the count. This is
+// the repository-seam analogue of the burstStore storage wrapper: no
 // goroutines, no sleeps — the race is simulated by the call sequence itself.
 type etagSwapRepo struct {
 	repository.Repository
-	mu       sync.Mutex
-	target   string // "pic.png"
-	stale    string // ETag served on the swap call ("" = disarmed)
-	swapCall int    // 1-based GetObject call number for target to swap on
-	calls    int    // GetObject calls observed for target
+	mu           sync.Mutex
+	target       string    // "pic.png"
+	stale        string    // ETag served on the swap call ("" = disarmed)
+	staleUpdated time.Time // UpdatedAt served on the swap call (zero = keep the row's)
+	swapCall     int       // 1-based GetObject call number for target to swap on
+	failErr      error     // when non-nil, GetObject for target returns it on failCall
+	failCall     int       // 1-based GetObject call number for target to fail on
+	calls        int       // GetObject calls observed for target
 }
 
 func (r *etagSwapRepo) GetObject(ctx context.Context, tenant, bucket, key string) (repository.Object, error) {
@@ -3036,13 +3042,23 @@ func (r *etagSwapRepo) GetObject(ctx context.Context, tenant, bucket, key string
 	if isTarget {
 		r.calls++
 	}
-	swap := isTarget && r.stale != "" && r.calls == r.swapCall
+	fail := isTarget && r.failErr != nil && r.calls == r.failCall
+	swap := isTarget && !fail && r.stale != "" && r.calls == r.swapCall
+	swapUpdated := isTarget && !fail && !r.staleUpdated.IsZero() && r.calls == r.swapCall
 	r.mu.Unlock()
+	if fail {
+		return repository.Object{}, r.failErr
+	}
 	obj, err := r.Repository.GetObject(ctx, tenant, bucket, key)
-	if err != nil || !swap {
+	if err != nil || (!swap && !swapUpdated) {
 		return obj, err
 	}
-	obj.ETag = r.stale // same row, stale validator: models "PUT landed between Stat and Get"
+	if swap {
+		obj.ETag = r.stale // same row, stale validator: models "PUT landed between Stat and Get"
+	}
+	if swapUpdated {
+		obj.UpdatedAt = r.staleUpdated // same row, older timestamp: pins the 304's Last-Modified provenance
+	}
 	return obj, nil
 }
 
@@ -3146,12 +3162,15 @@ func TestThumbnailETagDerivedFromOpenedObject(t *testing.T) {
 	}
 }
 
-// TestThumbnail304ShortCircuitsBeforeOpen pins FR-2: a matching If-None-Match
+// TestThumbnail304ShortCircuitsBeforeOpen pins FR-4: a matching If-None-Match
 // short-circuits on the Stat-derived validator BEFORE the opener's svc.Get
-// runs — the object stream never opens. The hook's target-key GetObject count
-// is the structural proof (no timers, no sleeps): exactly 1 (the Stat read),
-// never 2. The row is seeded directly through the concrete repo so PUT's
-// overwrite-protection GetObject does not perturb the counter.
+// runs — the object stream never opens and no decode slot is touched. The
+// hook's target-key GetObject count is the structural proof (no timers, no
+// sleeps): exactly 2 — the pre-open Stat plus the fix's re-Stat that
+// re-observes the object immediately before certifying Not Modified — never
+// the opener (which would be the third target-key call). The row is seeded
+// directly through the concrete repo so PUT's overwrite-protection GetObject
+// does not perturb the counter.
 func TestThumbnail304ShortCircuitsBeforeOpen(t *testing.T) {
 	dir := t.TempDir()
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
@@ -3175,39 +3194,436 @@ func TestThumbnail304ShortCircuitsBeforeOpen(t *testing.T) {
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 
 	// Seed the object row directly (bypassing the wrapper's counter): the 304
-	// path never opens the blob, so no storage write is required.
+	// path never opens the blob, so no storage write is required. The seeded
+	// ETag matches the client's validator below, so the re-Stat confirms the
+	// match and the 304 fires — the seam stays disarmed.
 	if _, err := repo.UpsertObject(context.Background(), repository.Object{
 		TenantID:    "default",
 		Bucket:      "default",
 		Key:         "pic.png",
 		StorageKey:  "default/default/pic.png",
 		Size:        1,
-		ETag:        "seed-etag-v2",
+		ETag:        "seed-etag",
 		ContentType: "image/png",
 		Metadata:    map[string]string{},
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Arm the hook: the next target-key Stat sees the stale validator — the
-	// exact validator a client holding a pre-race response would send back.
-	wrapped.mu.Lock()
-	wrapped.stale, wrapped.swapCall = "stale-etag-a", wrapped.calls+1
-	wrapped.mu.Unlock()
-
 	ew, eh := thumbnail.EffectiveDims(100, 100)
 	suffix := fmt.Sprintf("%dx%d", ew, eh)
 	u := srv.URL + "/v1/files/pic.png/thumbnail?w=100&h=100"
-	resp, _ := req(t, "GET", u, nil, map[string]string{"If-None-Match": `"stale-etag-a-thumb-` + suffix + `"`})
+
+	// Matching validator: the 304 fast path completes with exactly 2
+	// target-key repository reads (pre-open Stat + re-Stat) and never opens
+	// the stream / never touches a decode slot.
+	resp, _ := req(t, "GET", u, nil, map[string]string{"If-None-Match": `"seed-etag-thumb-` + suffix + `"`})
 	if resp.StatusCode != http.StatusNotModified {
 		t.Fatalf("If-None-Match: status=%d want 304", resp.StatusCode)
 	}
 	wrapped.mu.Lock()
 	calls := wrapped.calls
 	wrapped.mu.Unlock()
-	if calls != 1 {
-		t.Fatalf("target-key GetObject calls = %d, want 1 — the 304 must short-circuit before the opener runs", calls)
+	if calls != 2 {
+		t.Fatalf("target-key GetObject calls = %d, want 2 (pre-open Stat + re-Stat) — the 304 must short-circuit before the opener runs", calls)
 	}
+
+	// Non-matching validator (FR-5 confinement): the re-Stat runs ONLY when
+	// the pre-open Stat's validator matches, so a non-matching If-None-Match
+	// costs the same 2 target-key reads as the 200 path always did (Stat +
+	// opener) — no third read. The opener then fails on the missing seeded
+	// blob (404), never a 304 for a validator the request did not match.
+	resp, _ = req(t, "GET", u, nil, map[string]string{"If-None-Match": `"zzz-thumb-` + suffix + `"`})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-matching If-None-Match: status=%d want 404 (seeded row has no blob; the 200 path's open fails), never 304", resp.StatusCode)
+	}
+	wrapped.mu.Lock()
+	calls = wrapped.calls
+	wrapped.mu.Unlock()
+	if calls != 4 {
+		t.Fatalf("target-key GetObject calls after non-matching request = %d, want 4 (2 + Stat + opener) — the re-Stat must be skipped", calls)
+	}
+}
+
+// thumbnail304Harness wires the fixtures shared by the 304-revalidation
+// regression tests: a real SQLite repository behind etagSwapRepo, a
+// local-storage FileService, and a chi router serving putKey/getKey/Head —
+// the same wiring TestThumbnailETagDerivedFromOpenedObject uses. Seeding goes
+// through the concrete repo so it never perturbs the seam's target-key
+// counter; arming is always relative to the current counter position.
+type thumbnail304Harness struct {
+	t       *testing.T
+	srv     *httptest.Server
+	wrapped *etagSwapRepo
+	repo    repository.Repository
+	u       string // base object URL: srv.URL + /v1/files/pic.png
+}
+
+func newThumbnail304Harness(t *testing.T) *thumbnail304Harness {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	wrapped := &etagSwapRepo{Repository: repo, target: "pic.png"}
+	h := NewHandler(service.NewFileService(store, wrapped, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+	return &thumbnail304Harness{t: t, srv: srv, wrapped: wrapped, repo: repo, u: srv.URL + "/v1/files/pic.png"}
+}
+
+// primeVersions PUTs two PNG versions through the API (v1 300×150, v2
+// 320×160), captures both validators and the v2 control thumbnail, and
+// asserts the seam counter landed on 8: 2 PUT overwrite-protection reads + 2
+// HEAD reads + 2 control-GET Stat/open pairs. The assertion fails loudly here
+// if the service's read pattern ever changes, instead of corrupting the
+// relative arming of every later arm.
+func (h *thumbnail304Harness) primeVersions() (staleV1, etagB200, suffix string, bodyB []byte) {
+	t := h.t
+	if resp, _ := req(t, "PUT", h.u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	staleV1 = h.headETag()
+	if staleV1 == "" {
+		t.Fatal("HEAD v1: empty ETag")
+	}
+	thumbURL := h.u + "/thumbnail?w=100&h=100"
+	if resp, _ := req(t, "GET", thumbURL, nil, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("control v1 thumbnail: %d", resp.StatusCode)
+	}
+	if resp, _ := req(t, "PUT", h.u, pngBytes(t, 320, 160), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	etagB := h.headETag()
+	if etagB == "" || etagB == staleV1 {
+		t.Fatalf("v2 ETag %q must differ from v1 %q (same StorageKey rewrite)", etagB, staleV1)
+	}
+	resp, bodyB := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("control v2 thumbnail: %d", resp.StatusCode)
+	}
+	ew, eh := thumbnail.EffectiveDims(100, 100)
+	suffix = fmt.Sprintf("%dx%d", ew, eh)
+	etagB200 = `"` + etagB + "-thumb-" + suffix + `"`
+	if got := resp.Header.Get("ETag"); got != etagB200 {
+		t.Fatalf("control v2 ETag=%q want %q", got, etagB200)
+	}
+	h.wrapped.mu.Lock()
+	calls := h.wrapped.calls
+	h.wrapped.mu.Unlock()
+	if calls != 12 {
+		t.Fatalf("primeVersions: target-key GetObject calls = %d, want 12 (2 PUTs × 3 reads [preparePutAccess + checkOverwriteProtection + objectWriteUsage] + 2 HEAD Stats + 2 control-GET Stat/open pairs)", calls)
+	}
+	return staleV1, etagB200, suffix, bodyB
+}
+
+func (h *thumbnail304Harness) headETag() string {
+	t := h.t
+	resp, _ := req(t, "HEAD", h.u, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD: %d", resp.StatusCode)
+	}
+	return strings.Trim(resp.Header.Get("ETag"), `"`)
+}
+
+// armStatSwap makes the next target-key GetObject (the racing request's
+// pre-open Stat) return the stale v1 validator; the re-Stat and opener still
+// see the real v2 row — the deterministic analogue of a PUT landing between
+// the pre-open Stat and the 304 emission.
+func armStatSwap(h *thumbnail304Harness, staleETag string) {
+	h.wrapped.mu.Lock()
+	h.wrapped.stale, h.wrapped.swapCall = staleETag, h.wrapped.calls+1
+	h.wrapped.mu.Unlock()
+}
+
+// armStatUpdated makes the next target-key GetObject return the real row with
+// UpdatedAt forced to stale (same ETag, older timestamp), so a 304's
+// Last-Modified provenance is pinned to the re-Stat, not the pre-open Stat.
+func armStatUpdated(h *thumbnail304Harness, stale time.Time) {
+	h.wrapped.mu.Lock()
+	h.wrapped.staleUpdated, h.wrapped.swapCall = stale, h.wrapped.calls+1
+	h.wrapped.mu.Unlock()
+}
+
+// assertNoCacheHeaders pins that error responses carry no cacheable success
+// headers: a revalidating shared cache must never adopt a validator for a
+// response that was never generated.
+func assertNoCacheHeaders(t *testing.T, resp *http.Response, what string) {
+	t.Helper()
+	for _, h := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+		if v := resp.Header.Get(h); v != "" {
+			t.Fatalf("%s: %s=%q must be absent on the error path", what, h, v)
+		}
+	}
+}
+
+// TestThumbnail304RevalidatesAfterStat pins the fix for the 304 fast-path
+// stale-validator race (FR-1/FR-2/FR-6): the 304 branch re-Stats the current
+// version before certifying Not Modified, re-evaluates If-None-Match against
+// the fresh validator, and — when the object changed between the two Stats —
+// falls through to the 200 path, whose validator names the opened object.
+// Every arm arms the etagSwapRepo seam so the racing request's pre-open Stat
+// observes the stale v1 row while the re-Stat/opener observe the real v2 row.
+func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
+	thumbURL := func(h *thumbnail304Harness) string { return h.u + "/thumbnail?w=100&h=100" }
+	assertCalls := func(t *testing.T, h *thumbnail304Harness, want int, what string) {
+		t.Helper()
+		h.wrapped.mu.Lock()
+		calls := h.wrapped.calls
+		h.wrapped.mu.Unlock()
+		if calls != want {
+			t.Fatalf("%s: target-key GetObject calls = %d, want %d", what, calls, want)
+		}
+	}
+
+	t.Run("changed object forces 200 with current validator", func(t *testing.T) {
+		// AC-1: a PUT between the pre-open Stat and the 304 emission must
+		// yield a 200 carrying the current-state validator — never a stale
+		// 304 (pre-fix this request returns 304 and this arm fails).
+		h := newThumbnail304Harness(t)
+		staleV1, etagB200, suffix, bodyB := h.primeVersions()
+		armStatSwap(h, staleV1)
+		resp, body := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": `"` + staleV1 + "-thumb-" + suffix + `"`})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d want 200 — the object changed between the two Stats, never a stale 304", resp.StatusCode)
+		}
+		if !bytes.Equal(body, bodyB) {
+			t.Fatal("body differs from the v2 control — both must decode the same v2 blob")
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q (validator must name current state)", got, etagB200)
+		}
+		assertCalls(t, h, 15, "changed-object 200 path (12 prime + Stat + re-Stat + opener)")
+	})
+
+	t.Run("stable object still 304s with fresh validator", func(t *testing.T) {
+		// AC-2 Arm A: no mutation between requests; the 304 carries the
+		// current derived validator and a parseable Last-Modified, and costs
+		// exactly 2 target-key reads (pre-open Stat + re-Stat).
+		h := newThumbnail304Harness(t)
+		_, etagB200, _, _ := h.primeVersions()
+		resp, body := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": etagB200})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("status=%d want 304 for the unchanged object", resp.StatusCode)
+		}
+		if len(body) != 0 {
+			t.Fatalf("304 body must be empty, got %d bytes", len(body))
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q (fresh validator)", got, etagB200)
+		}
+		if lm := resp.Header.Get("Last-Modified"); lm == "" {
+			t.Fatal("Last-Modified must be set on the 304 (from the re-Stat observation)")
+		} else if _, err := http.ParseTime(lm); err != nil {
+			t.Fatalf("Last-Modified %q does not parse: %v", lm, err)
+		}
+		assertCalls(t, h, 14, "stable 304 (12 prime + Stat + re-Stat)")
+	})
+
+	t.Run("multi-token If-None-Match re-evaluates against the fresh validator", func(t *testing.T) {
+		// AC-2 Arm B: the client's cached validator (stale v1) and the
+		// current validator (v2) both appear in the list; the re-Stat moved
+		// the object v1→v2, yet the re-evaluated match still 304s — with the
+		// FRESH validator. A naive statETag != freshETag → 200 comparator
+		// fails this arm.
+		h := newThumbnail304Harness(t)
+		staleV1, etagB200, suffix, _ := h.primeVersions()
+		armStatSwap(h, staleV1)
+		inm := `"` + staleV1 + "-thumb-" + suffix + `", ` + etagB200
+		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": inm})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("status=%d want 304 (re-evaluated match against the fresh validator); INM=%s", resp.StatusCode, inm)
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q (the fresh validator, not the stale one)", got, etagB200)
+		}
+	})
+
+	t.Run("wildcard If-None-Match 304s with the fresh validator", func(t *testing.T) {
+		h := newThumbnail304Harness(t)
+		staleV1, etagB200, _, _ := h.primeVersions()
+		armStatSwap(h, staleV1)
+		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": "*"})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("status=%d want 304 for If-None-Match: *", resp.StatusCode)
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q (the fresh validator — a shared cache freshens from it, RFC 9111 §4.3.4)", got, etagB200)
+		}
+	})
+
+	t.Run("weak validator detects drift", func(t *testing.T) {
+		// QA F5: etagListMatches strips W/ before comparison, so a weak token
+		// matching the stale Stat still falls through to 200 when the fresh
+		// validator no longer matches.
+		h := newThumbnail304Harness(t)
+		staleV1, etagB200, suffix, _ := h.primeVersions()
+		armStatSwap(h, staleV1)
+		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": `W/` + `"` + staleV1 + "-thumb-" + suffix + `"`})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d want 200 — a weak match on the stale Stat must not certify 304 after drift", resp.StatusCode)
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q", got, etagB200)
+		}
+	})
+
+	t.Run("weak validator stable object 304s", func(t *testing.T) {
+		h := newThumbnail304Harness(t)
+		_, etagB200, _, _ := h.primeVersions()
+		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": `W/` + etagB200})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("status=%d want 304 — a weak validator of the current state still revalidates", resp.StatusCode)
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q", got, etagB200)
+		}
+	})
+
+	t.Run("304 Last-Modified comes from the re-Stat observation", func(t *testing.T) {
+		// QA F7: the seam forces the pre-open Stat's UpdatedAt one hour into
+		// the past while keeping the same ETag; the 304 must carry the fresh
+		// row's Last-Modified, never the stale one.
+		h := newThumbnail304Harness(t)
+		_, etagB200, _, _ := h.primeVersions()
+		obj, err := h.repo.GetObject(context.Background(), "default", "default", "pic.png")
+		if err != nil {
+			t.Fatalf("read real row: %v", err)
+		}
+		fresh := obj.UpdatedAt.UTC().Format(http.TimeFormat)
+		stale := obj.UpdatedAt.Add(-time.Hour).UTC().Format(http.TimeFormat)
+		armStatUpdated(h, obj.UpdatedAt.Add(-time.Hour))
+		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": etagB200})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("status=%d want 304 (same ETag, so the re-evaluated match holds)", resp.StatusCode)
+		}
+		if lm := resp.Header.Get("Last-Modified"); lm != fresh {
+			t.Fatalf("Last-Modified=%q want %q (the re-Stat observation, not the pre-open Stat's)", lm, fresh)
+		}
+		if lm := resp.Header.Get("Last-Modified"); lm == stale {
+			t.Fatalf("Last-Modified must not come from the pre-open Stat (stale %q)", stale)
+		}
+	})
+
+	t.Run("HEAD drift forces 200 like GET", func(t *testing.T) {
+		// QA F6: GET and HEAD share the handler, so the armed drift yields
+		// 200 with the current validator for both verbs (FR-6).
+		h := newThumbnail304Harness(t)
+		staleV1, etagB200, suffix, _ := h.primeVersions()
+		armStatSwap(h, staleV1)
+		resp, body := req(t, "HEAD", thumbURL(h), nil, map[string]string{"If-None-Match": `"` + staleV1 + "-thumb-" + suffix + `"`})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d want 200 for HEAD (drift must not 304)", resp.StatusCode)
+		}
+		if len(body) != 0 {
+			t.Fatalf("HEAD body must be empty, got %d bytes", len(body))
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q", got, etagB200)
+		}
+	})
+
+	t.Run("non-matching If-None-Match skips the re-Stat", func(t *testing.T) {
+		// QA F3 / FR-5: the re-Stat lives strictly inside the 304 branch, so
+		// a non-matching request costs the same 2 target-key reads as the 200
+		// path always did (Stat + opener) — no third read.
+		h := newThumbnail304Harness(t)
+		_, etagB200, suffix, _ := h.primeVersions()
+		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": `"nonexistent-thumb-` + suffix + `"`})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d want 200 for the non-matching request", resp.StatusCode)
+		}
+		if got := resp.Header.Get("ETag"); got != etagB200 {
+			t.Fatalf("ETag=%q want %q", got, etagB200)
+		}
+		assertCalls(t, h, 14, "non-matching 200 path (12 prime + Stat + opener; no re-Stat)")
+	})
+}
+
+// TestThumbnail304RevalidatesAfterStatErrors pins FR-3: a re-Stat that fails
+// (object deleted → 404, corrupt → 410) must propagate the classified error
+// and never emit a 304 — a shared cache must not keep serving a dead or
+// known-bad object's derived thumbnail. The error responses must also carry
+// no cache headers (QA F4).
+func TestThumbnail304RevalidatesAfterStatErrors(t *testing.T) {
+	seed := func(t *testing.T, h *thumbnail304Harness) {
+		t.Helper()
+		if _, err := h.repo.UpsertObject(context.Background(), repository.Object{
+			TenantID:    "default",
+			Bucket:      "default",
+			Key:         "pic.png",
+			StorageKey:  "default/default/pic.png",
+			Size:        1,
+			ETag:        "seed-etag",
+			ContentType: "image/png",
+			Metadata:    map[string]string{},
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	ew, eh := thumbnail.EffectiveDims(100, 100)
+	suffix := fmt.Sprintf("%dx%d", ew, eh)
+
+	t.Run("deleted between stats returns 404 never 304", func(t *testing.T) {
+		// AC-2 Arm C: pre-open Stat = call 1 (real seeded row, matching
+		// validator); re-Stat = call 2 → ErrNotFound → 404. Pre-fix this
+		// request returns 304 and this arm fails.
+		h := newThumbnail304Harness(t)
+		seed(t, h)
+		h.wrapped.mu.Lock()
+		h.wrapped.failErr, h.wrapped.failCall = repository.ErrNotFound, h.wrapped.calls+2
+		h.wrapped.mu.Unlock()
+		resp, body := req(t, "GET", h.u+"/thumbnail?w=100&h=100", nil, map[string]string{"If-None-Match": `"seed-etag-thumb-` + suffix + `"`})
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status=%d want 404 — never a 304 for a state we could not observe; body=%s", resp.StatusCode, body)
+		}
+		if !bytes.Contains(body, []byte(`"code":"NotFound"`)) {
+			t.Fatalf("404 body missing NotFound code: %s", body)
+		}
+		assertNoCacheHeaders(t, resp, "deleted re-Stat 404")
+		h.wrapped.mu.Lock()
+		calls := h.wrapped.calls
+		h.wrapped.mu.Unlock()
+		if calls != 2 {
+			t.Fatalf("target-key GetObject calls = %d, want 2 (pre-open Stat + re-Stat; the opener never ran)", calls)
+		}
+	})
+
+	t.Run("corrupt between stats returns 410 never 304", func(t *testing.T) {
+		// QA F1: same shape with a scrub-corrupt object — classify → 410
+		// ObjectCorrupt, never a 304 for a known-bad object.
+		h := newThumbnail304Harness(t)
+		seed(t, h)
+		h.wrapped.mu.Lock()
+		h.wrapped.failErr, h.wrapped.failCall = service.ErrObjectCorrupt, h.wrapped.calls+2
+		h.wrapped.mu.Unlock()
+		resp, body := req(t, "GET", h.u+"/thumbnail?w=100&h=100", nil, map[string]string{"If-None-Match": `"seed-etag-thumb-` + suffix + `"`})
+		if resp.StatusCode != http.StatusGone {
+			t.Fatalf("status=%d want 410 ObjectCorrupt — never a 304 for a state we could not observe; body=%s", resp.StatusCode, body)
+		}
+		if !bytes.Contains(body, []byte(`"code":"ObjectCorrupt"`)) {
+			t.Fatalf("410 body missing ObjectCorrupt code: %s", body)
+		}
+		assertNoCacheHeaders(t, resp, "corrupt re-Stat 410")
+		h.wrapped.mu.Lock()
+		calls := h.wrapped.calls
+		h.wrapped.mu.Unlock()
+		if calls != 2 {
+			t.Fatalf("target-key GetObject calls = %d, want 2 (pre-open Stat + re-Stat; the opener never ran)", calls)
+		}
+	})
 }
 
 // TestThumbnailETagDerivedFromOpenedObjectSniffBucket is the QA F2 binding

@@ -172,15 +172,40 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		cacheControl = "public, max-age=86400"
 	}
 	if etagListMatches(r.Header.Get("If-None-Match"), statETag) {
-		w.Header().Set("ETag", `"`+statETag+`"`)
-		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-		// The 304 must mirror the 200's directive (RFC 9111 §4.3.4 freshening;
-		// the public/private split itself is per §3.2): a
-		// shared cache revalidating a private thumb would otherwise adopt
-		// the 304's (absent) directive and store the previous public body.
-		w.Header().Set("Cache-Control", cacheControl)
-		w.WriteHeader(http.StatusNotModified)
-		return
+		// Re-observe the object before certifying Not Modified. The pre-open
+		// Stat above and this emission are separate moments: a concurrent PUT
+		// between them would otherwise pair a stale validator with 304, and a
+		// shared cache holding the OLD derived thumbnail would keep serving it
+		// (Cache-Control public|private, max-age=86400) with no subsequent PUT
+		// invalidating the derived resource. The re-Stat is a repository read
+		// only — no stream, no decode slot — so the fast path stays slot-free
+		// and stream-free. The 304's validator and Last-Modified are pinned to
+		// THIS observation (RFC 9110 §13.1.2: conditions evaluate against the
+		// current validator).
+		fresh, err := h.svc.Stat(r.Context(), tenant, service.DefaultBucket, key)
+		if err != nil {
+			// Deleted between the Stats (ErrNotFound → 404) or corrupt (→ 410):
+			// never certify Not Modified for a state we could not observe. Same
+			// writeError classification as the pre-check Stat.
+			h.writeError(w, r, err)
+			return
+		}
+		freshETag := fmt.Sprintf("%s-thumb-%dx%d", fresh.ETag, effW, effH)
+		if etagListMatches(r.Header.Get("If-None-Match"), freshETag) {
+			w.Header().Set("ETag", `"`+freshETag+`"`)
+			w.Header().Set("Last-Modified", fresh.UpdatedAt.UTC().Format(http.TimeFormat))
+			// The 304 must mirror the 200's directive (RFC 9111 §4.3.4 freshening;
+			// the public/private split itself is per §3.2): a
+			// shared cache revalidating a private thumb would otherwise adopt
+			// the 304's (absent) directive and store the previous public body.
+			w.Header().Set("Cache-Control", cacheControl)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		// The object changed between the two Stats (the fresh validator no
+		// longer matches the client's If-None-Match): fall through to the 200
+		// path, which re-derives the validator from the opened object and
+		// serves the current bytes — never a stale-validator 304.
 	}
 
 	// The decode slot is acquired BEFORE the object stream opens —

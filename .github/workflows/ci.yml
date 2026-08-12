@@ -97,9 +97,11 @@ jobs:
         # The mid-decode REST tests (TestThumbnailMidDecode*) drive the
         # handler through a ctx-bound storage stream with goroutine+handshake
         # concurrency — exactly the pattern the race detector exists for
-        # (QA-5). Scoped via -run so the full REST package is not covered
-        # here.
-        run: go test -race -short -count=1 -timeout 120s ./internal/api/rest/ -run 'TestThumbnailMidDecode'
+        # (QA-5). The 304-revalidation tests reuse the mutex-guarded
+        # etagSwapRepo seam (swap/fail arms), so they race under the same
+        # detector too. Scoped via -run so the full REST package is not
+        # covered here.
+        run: go test -race -short -count=1 -timeout 120s ./internal/api/rest/ -run 'TestThumbnailMidDecode|TestThumbnail304RevalidatesAfterStat|TestThumbnail304ShortCircuitsBeforeOpen'
 
       - name: Coverage
         run: |
