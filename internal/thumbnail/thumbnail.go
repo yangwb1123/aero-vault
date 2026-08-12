@@ -334,11 +334,20 @@ func compositeOnWhite(img image.Image) image.Image {
 
 // scale downsamples src to fit within maxW×maxH using bilinear interpolation,
 // preserving aspect ratio. Images already within bounds are returned
-// unchanged. It consults ctx at the top of every cancelCheckRows-th row and
-// returns (nil, ctx.Err()) unwrapped on a done context, so a canceled or
+// unchanged. It dispatches on the source's concrete type: *image.RGBA and
+// *image.NRGBA take the direct-Pix fast kernels (pixfast.go); every other
+// type (*image.YCbCr, *image.Paletted, *image.Gray, *image.RGBA64,
+// *image.NRGBA64, gateImage, custom image.Image) falls through to
+// scaleGeneric — today's At/Set loop, preserved verbatim and byte-identical.
+// Both paths consult ctx at the top of every cancelCheckRows-th row and
+// return (nil, ctx.Err()) unwrapped on a done context, so a canceled or
 // deadline-expired request aborts within cancelCheckRows rows of pixel work;
 // the no-op paths (empty or in-bounds src) return (src, nil) without
-// consulting ctx.
+// consulting ctx and without dispatching (FR-6). The fast kernels read
+// src.Pix via y0*Stride + x0*4 (the sampled coordinates b.Min+(x0,y0)
+// cancel Min in PixOffset; see pixfast.go's header) and write a fresh
+// *image.RGBA of the same bounds/strides scaleGeneric would produce, so the
+// two paths are byte-identical (pinned by TestFastPathByteIdentity).
 func scale(ctx context.Context, src image.Image, maxW, maxH int) (image.Image, error) {
 	b := src.Bounds()
 	sw, sh := b.Dx(), b.Dy()
@@ -357,6 +366,23 @@ func scale(ctx context.Context, src image.Image, maxW, maxH int) (image.Image, e
 	if th < 1 {
 		th = 1
 	}
+
+	switch s := src.(type) {
+	case *image.RGBA:
+		return scaleRGBA(ctx, s, sw, sh, tw, th)
+	case *image.NRGBA:
+		return scaleNRGBA(ctx, s, sw, sh, tw, th)
+	default:
+		return scaleGeneric(ctx, src, sw, sh, tw, th)
+	}
+}
+
+// scaleGeneric is scale's pre-fast-path loop, preserved verbatim: it is the
+// byte anchor of the suite (TestFastPathByteIdentity compares the dispatcher
+// against it) and the safe path for every non-RGBA/NRGBA source. b is
+// re-derived from src.Bounds() exactly as the original body did.
+func scaleGeneric(ctx context.Context, src image.Image, sw, sh, tw, th int) (image.Image, error) {
+	b := src.Bounds()
 
 	dst := image.NewRGBA(image.Rect(0, 0, tw, th))
 	for y := 0; y < th; y++ {

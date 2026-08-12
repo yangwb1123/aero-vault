@@ -39,9 +39,13 @@ var orientIndex = [9]func(r, c, w, h int) (sr, sc int){
 // N×1 and HardMax² frames: source indices derive from the table formulas
 // over w/h bounds, so no read can go out of range.
 //
-// It consults ctx at the top of every cancelCheckRows-th row and returns
-// (nil, ctx.Err()) unwrapped on a done context; the o ≤ 1 / o ≥ 9 fast paths
-// return (img, nil) without consulting ctx.
+// It dispatches on the source's concrete type: *image.RGBA and *image.NRGBA
+// take the direct-Pix fast kernels (pixfast.go); every other type falls
+// through to applyOrientationGeneric — today's At/Set loop, preserved
+// verbatim and byte-identical. Both paths consult ctx at the top of every
+// cancelCheckRows-th row and return (nil, ctx.Err()) unwrapped on a done
+// context; the o ≤ 1 / o ≥ 9 fast paths return (img, nil) without consulting
+// ctx and without dispatching (FR-6).
 func applyOrientation(ctx context.Context, img image.Image, o int) (image.Image, error) {
 	if o <= 1 || o >= 9 {
 		return img, nil
@@ -52,6 +56,21 @@ func applyOrientation(ctx context.Context, img image.Image, o int) (image.Image,
 	if o >= 5 {
 		outW, outH = h, w // orientations 5–8 swap the axes
 	}
+	switch s := img.(type) {
+	case *image.RGBA:
+		return rotateRGBA(ctx, s, o, w, h, outW, outH)
+	case *image.NRGBA:
+		return rotateNRGBA(ctx, s, o, w, h, outW, outH)
+	default:
+		return applyOrientationGeneric(ctx, img, o, b, w, h, outW, outH)
+	}
+}
+
+// applyOrientationGeneric is applyOrientation's pre-fast-path loop, preserved
+// verbatim: it is the byte anchor of the suite (TestFastPathByteIdentity
+// compares the dispatcher against it) and the safe path for every
+// non-RGBA/NRGBA source.
+func applyOrientationGeneric(ctx context.Context, img image.Image, o int, b image.Rectangle, w, h, outW, outH int) (image.Image, error) {
 	idx := orientIndex[o]
 	dst := image.NewRGBA(image.Rect(0, 0, outW, outH))
 	for r := 0; r < outH; r++ {

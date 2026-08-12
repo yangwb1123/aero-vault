@@ -6,14 +6,15 @@ package thumbnail
 // that also discriminates under -race.
 //
 // Measured plain-mode TotalAlloc stage table (go1.26.5, in-package probes;
-// cumulative deltas for one Generate(transparent, HardMax box)):
+// cumulative deltas for one Generate(transparent, HardMax box); post-fix,
+// i.e. with the direct-Pix fast paths active):
 //
 //	stage      | V8 (NRGBA, 4 B/px, 8192²) | V16 (NRGBA64, 8 B/px, 4096²)
 //	decode     |           256.1 MiB       |           128.1 MiB
-//	scale      |           144.0 MiB       |           208.0 MiB  (transient bilinear churn)
+//	scale      |           ≈16 MiB         |           208.0 MiB  (dst buffer only on V8 — the fast path eliminates per-pixel churn; V16 keeps the generic path's transient bilinear churn)
 //	composite  |            16.0 MiB       |            16.0 MiB  (post-scale copy)
 //	jpeg encode|             0.3 MiB       |             0.3 MiB
-//	total      |           416.4 MiB       |           352.4 MiB
+//	total      |          ≈288.4 MiB       |           352.4 MiB
 //
 // The pre-scale composite regression (compositeOnWhite before scale) adds a
 // full-frame copy at source resolution and measures ≈ 656.4 MiB (V8) /
@@ -26,10 +27,12 @@ package thumbnail
 // at 8192²) and the byte-level pin. All figures are cumulative TotalAlloc
 // deltas; the live-peak contract (what the decode semaphore bounds) is
 // different and is documented in thumbnail.go. Under -race the detector's
-// bookkeeping inflates the correct-path deltas (measured V8 416.4 →
-// 672.6 MiB, V16 352.4 → 544.6 MiB, ≈ 1.62×/1.55×), so the allocation pin
-// runs in plain mode only; the feathered byte-level pin keeps the ordering
-// discriminated under -race.
+// bookkeeping inflates only the generic path's churn: measured post-fix V8
+// 288.4 → 288.6 MiB (the fast path eliminated the per-pixel allocations the
+// detector inflated, so the arm is no longer race-sensitive), V16 352.4 →
+// 544.6 MiB (unchanged — depth-16 keeps the generic path). The allocation
+// pin runs in plain mode only; the feathered byte-level pin keeps the
+// ordering discriminated under -race.
 import (
 	"bytes"
 	"context"
@@ -41,8 +44,15 @@ import (
 
 const (
 	// scaleStageAllocBudget covers the transient bilinear per-pixel
-	// interface churn (measured ≤ 208 MiB for NRGBA64 sources) plus 16 MiB
-	// headroom for the scaled destination buffer itself.
+	// interface churn of the GENERIC scale path plus 16 MiB headroom for the
+	// scaled destination buffer. Since the direct-Pix fast paths, the V8
+	// (8-bit *image.NRGBA) arm no longer churns (only the 16 MiB dst buffer
+	// remains, and that is covered by compositeCopyBudget's sibling budget
+	// below — this constant's 224 MiB now bounds the V16 (depth-16
+	// *image.NRGBA64) class, which keeps the generic path: measured ≤ 208 MiB
+	// churn + 16 MiB dst). The ceiling is an upper bound on the correct
+	// order; the V8 pre-scale composite regression (≈ 656 MiB) still exceeds
+	// it, so the ceiling's regression-detection function is preserved.
 	scaleStageAllocBudget = 224 << 20
 	// compositeCopyBudget is the post-scale copy: the composite input is the
 	// scaled buffer, at most HardMax² × 4 B = 16 MiB.
@@ -112,11 +122,24 @@ func TestGenerateLargeTransparentAllocationBounded(t *testing.T) {
 		name        string
 		fixture     func(t *testing.T) []byte
 		decodeBytes uint64
+		floorExtra  uint64 // per-arm lower-bound slack above the decode, MiB-scaled
 		typ         string // expected decoded concrete type
 		wantRect    image.Rectangle
 	}{
-		{name: "V8", fixture: transparentHalfNRGBA, decodeBytes: uint64(MaxSourceDim) * MaxSourceDim * 4, typ: "*image.NRGBA", wantRect: image.Rect(0, 0, MaxSourceDim, MaxSourceDim)},
-		{name: "V16", fixture: transparentHalfNRGBA64, decodeBytes: uint64(Max16BitSourceDim) * Max16BitSourceDim * 8, typ: "*image.NRGBA64", wantRect: image.Rect(0, 0, Max16BitSourceDim, Max16BitSourceDim)},
+		// V8: *image.NRGBA → direct-Pix fast path. Post-fix the scale stage
+		// is only the 16 MiB dst buffer, so the floor is decodeBytes +
+		// compositeCopyBudget (16 MiB) + 8 MiB fixed margin = 280 MiB
+		// (measured post-fix delta ≈ 288.4 MiB passes with ≈ 8.4 MiB
+		// margin ≈ 1600× the ±5.3 KiB measurement jitter). A shrunken
+		// fixture or a silently bypassed decode drops delta by ~256/128 MiB
+		// (far below the floor), so fixture-shrink detection is preserved.
+		{name: "V8", fixture: transparentHalfNRGBA, decodeBytes: uint64(MaxSourceDim) * MaxSourceDim * 4, floorExtra: uint64(compositeCopyBudget) + 8<<20, typ: "*image.NRGBA", wantRect: image.Rect(0, 0, MaxSourceDim, MaxSourceDim)},
+		// V16: *image.NRGBA64 → generic path, behavior unchanged by the fast
+		// path (depth-16 sources are not covered). Floor stays at decodeBytes
+		// + 96 MiB = 224 MiB, exactly today's value (measured post-fix
+		// 352.4 MiB passes); the V16 pin sensitivity mandated by the
+		// fix-stale-memory-ceiling gate is preserved untouched.
+		{name: "V16", fixture: transparentHalfNRGBA64, decodeBytes: uint64(Max16BitSourceDim) * Max16BitSourceDim * 8, floorExtra: 96 << 20, typ: "*image.NRGBA64", wantRect: image.Rect(0, 0, Max16BitSourceDim, Max16BitSourceDim)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,13 +183,15 @@ func TestGenerateLargeTransparentAllocationBounded(t *testing.T) {
 			if delta > limit {
 				t.Fatalf("allocated %d bytes, want ≤ %d (decode %d + budgets) — composite likely ran pre-scale (regression ≈ 656/912 MiB)", delta, limit, tc.decodeBytes)
 			}
-			// Lower-bound floor: the decode alone allocates decodeBytes, and
-			// the scale+composite stages add measurable churn — a shrunken
-			// fixture (or a silently bypassed decode) must fail this floor
-			// even if it sneaks under the ceiling.
-			floor := tc.decodeBytes + 96<<20
+			// Lower-bound floor, per arm: the decode alone allocates
+			// decodeBytes, and the remaining stages add floorExtra — a shrunken
+			// fixture (or a silently bypassed decode) must fail this floor even
+			// if it sneaks under the ceiling. The V8 floor was recalibrated
+			// when the fast path eliminated the scale churn (288.4 MiB post-fix
+			// vs 416.4 MiB pre-fix); the V16 floor is unchanged.
+			floor := tc.decodeBytes + tc.floorExtra
 			if delta < floor {
-				t.Fatalf("allocated %d bytes, want ≥ %d (decode + 96 MiB) — fixture or decode bypassed, pin is stale", delta, floor)
+				t.Fatalf("allocated %d bytes, want ≥ %d (decode + %d MiB) — fixture or decode bypassed, pin is stale", delta, floor, tc.floorExtra>>20)
 			}
 
 			// Output assertions: a JPEG no larger than HardMax².
