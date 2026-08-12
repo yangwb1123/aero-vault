@@ -364,3 +364,98 @@ func calibrateSingleWorstPeak(t *testing.T, fixture []byte) uint64 {
 	}
 	return peak
 }
+
+// lateCancelCtx is the fault-injection context for the pairing-violation
+// seed: Done() never fires (so the acquire's select deterministically picks
+// the send branch — no 50/50 select race) while Err() reports Canceled —
+// exactly the "canceled between the select and the post-send re-check"
+// window, made deterministic.
+type lateCancelCtx struct {
+	context.Context
+	done chan struct{}
+	err  error
+}
+
+func (c *lateCancelCtx) Done() <-chan struct{} { return c.done }
+func (c *lateCancelCtx) Err() error            { return c.err }
+
+// TestAcquireDecodeSlotContextPairingViolationFailsClosed is the seeded
+// pairing-violation fault-injection (QA P1): a mispaired release (an extra
+// receive) steals the token an acquire just placed, so the acquire's
+// slot-return sees an empty buffer — the exact state where a blocking
+// `<-decodeSlots` would park forever. Deterministic via channel FIFO: the
+// thief's receive is queued before the acquire's send, so Go's channel
+// delivery gives it the token; the acquire's own return then finds the
+// buffer empty and must fail toward over-restriction (the default branch)
+// instead of parking. Channel repaired and full capacity re-verified.
+func TestAcquireDecodeSlotContextPairingViolationFailsClosed(t *testing.T) {
+	// Empty the buffer so the thief's receive queues (FIFO) rather than
+	// consuming a legitimate token.
+	slotSaturate()
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		releaseDecodeSlot()
+	}
+	if n := len(decodeSlots); n != 0 {
+		t.Fatalf("seed: decodeSlots len %d, want 0", n)
+	}
+
+	// Canceled-between-select-and-recheck, made deterministic (see
+	// lateCancelCtx): the send branch always wins; the re-check always aborts.
+	ctx := &lateCancelCtx{
+		Context: context.Background(),
+		done:    make(chan struct{}),
+		err:     context.Canceled,
+	}
+
+	thieved := make(chan struct{})
+	go func() {
+		// Mispaired release: queued on the empty buffer BEFORE the acquire's
+		// send, so FIFO delivery gives it the token the send places.
+		<-decodeSlots
+		close(thieved)
+	}()
+	// Settle: let the thief reach the channel and queue. With the acquire
+	// launched after, the steal ordering holds ~always; in the pathological
+	// case the acquire self-returns its own token and every assertion below
+	// still holds (the thief then stays queued for the next send — a
+	// persistent mispaired release, exactly the seeded fault).
+	time.Sleep(time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- acquireDecodeSlotContext(ctx) }()
+
+	// The acquire's slot-return runs against an empty buffer (the thief was
+	// queued first and takes the token at the send): the non-blocking
+	// default branch must return ctx.Err() (the old blocking receive parked
+	// forever here — watchdog-detected deadlock).
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acquire parked after canceled ctx with an empty buffer — pairing-violation deadlock; non-blocking slot-return missing")
+	}
+	// The thief must have received a token — either the acquire's (the
+	// seeded steal; the default branch fired and no phantom token exists)
+	// or, in the pathological scheduling ordering, the acquire self-returned
+	// its own token and the thief is still queued: feed it one so the seed
+	// completes deterministically (the fed token is itself a mispaired
+	// acquire — the violation persists until repaired below).
+	select {
+	case <-thieved:
+	case <-time.After(time.Second):
+		acquireDecodeSlot()
+		select {
+		case <-thieved:
+		case <-time.After(5 * time.Second):
+			t.Fatal("mispaired release never completed — the channel is wedged")
+		}
+	}
+	if n := len(decodeSlots); n != 0 {
+		t.Fatalf("decodeSlots len %d after violation, want 0 (no phantom token; over-restriction)", n)
+	}
+	// Repair + full-capacity re-verification: the channel must still admit
+	// maxConcurrentDecodes acquires (no leaked/corrupted state).
+	recoverSlots(t)
+}
