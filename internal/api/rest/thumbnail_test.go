@@ -1668,6 +1668,84 @@ func TestThumbnailUnsupportedFormat(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("gif thumbnail: status=%d want 200 (body=%s)", resp.StatusCode, body)
 	}
+
+	// Fallback bucket (absent/generic declarations are byte-decided at open
+	// time via thumbnail.Sniff): a generic-declared PNG is admitted by magic
+	// and thumbnailed — today this path returned 400.
+	ou := s.URL + "/v1/files/generic.png"
+	req(t, "PUT", ou, pngBytes(t, 16, 16), map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body = req(t, "GET", ou+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("octet-stream png thumbnail: status=%d want 200 (body=%s)", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("octet-stream png thumbnail: Content-Type=%q want image/jpeg", ct)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(body)); err != nil || format != "jpeg" {
+		t.Fatalf("octet-stream png thumbnail: body must decode as jpeg (format=%q err=%v)", format, err)
+	}
+	// The fallback 200 shares the declared path's derived ETag, so a cache
+	// hit revalidates with 304 — and a 304 never opens the stream or sniffs.
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		resp304, _ := req(t, "GET", ou+"/thumbnail", nil, map[string]string{"If-None-Match": etag})
+		if resp304.StatusCode != http.StatusNotModified {
+			t.Fatalf("octet-stream png revalidation: status=%d want 304", resp304.StatusCode)
+		}
+	}
+
+	// An absent declaration (curl -T semantics — no Content-Type header) is
+	// byte-decided too.
+	ju := s.URL + "/v1/files/plain.jpg"
+	req(t, "PUT", ju, appnPaddedJPEG(t, 0), nil) // no Content-Type header
+	resp, body = req(t, "GET", ju+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("no-declaration jpeg thumbnail: status=%d want 200 (body=%s)", resp.StatusCode, body)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(body)); err != nil || format != "jpeg" {
+		t.Fatalf("no-declaration jpeg thumbnail: body must decode as jpeg (format=%q err=%v)", format, err)
+	}
+
+	// WebP magic under a generic declaration is a server-capability
+	// rejection: 415, never 400 — the bytes are a valid image the pipeline
+	// cannot decode, and the message names the detected format and the
+	// supported set.
+	wu := s.URL + "/v1/files/generic.webp"
+	req(t, "PUT", wu, webpBytes, map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body = req(t, "GET", wu+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("octet-stream webp thumbnail: status=%d want 415 (body=%s)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"UnsupportedMediaType"`)) {
+		t.Fatalf("octet-stream webp: expected code UnsupportedMediaType, body: %s", body)
+	}
+	if !bytes.Contains(body, []byte("webp")) || !bytes.Contains(body, []byte("image/jpeg")) {
+		t.Fatalf("octet-stream webp: message must name the detected format and supported types, body: %s", body)
+	}
+	for _, hdr := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+		if v := resp.Header.Get(hdr); v != "" {
+			t.Fatalf("octet-stream webp 415: %s=%q must be absent (cache hygiene)", hdr, v)
+		}
+	}
+
+	// Unknown bytes under a generic declaration stay the client-argument
+	// class: 400 InvalidArgument.
+	xu := s.URL + "/v1/files/generic.txt"
+	req(t, "PUT", xu, []byte("hello"), map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body = req(t, "GET", xu+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("octet-stream text thumbnail: status=%d want 400 (body=%s)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("octet-stream text: expected code InvalidArgument, body: %s", body)
+	}
+
+	// Control: a declared decodable type still 200 through bucket 1.
+	pu := s.URL + "/v1/files/declared.png"
+	req(t, "PUT", pu, pngBytes(t, 16, 16), map[string]string{"Content-Type": "image/png"})
+	resp, body = req(t, "GET", pu+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("declared png thumbnail: status=%d want 200 (body=%s)", resp.StatusCode, body)
+	}
 }
 
 func TestThumbnailBadDimensions(t *testing.T) {
@@ -1822,7 +1900,11 @@ func TestThumbnailMediaTypeNormalization(t *testing.T) {
 			t.Fatalf("webp-declared PNG bytes: status=%d want 415", resp.StatusCode)
 		}
 	})
-	// Unparseable content type (no slash): client-argument class, 400.
+	// Unparseable content type (no slash): client-argument class, 400. Note
+	// Go's mime.ParseMediaType does not error on slash-less bare tokens —
+	// "not-a-media-type" parses to itself with err == nil — so it stays in
+	// the declared gate (bucket 4); only true parse errors (e.g. "") and
+	// application/octet-stream are byte-decided in the fallback bucket.
 	t.Run("unparseable content type", func(t *testing.T) {
 		u := s.URL + "/v1/files/weird"
 		req(t, "PUT", u, png, map[string]string{"Content-Type": "not-a-media-type"})

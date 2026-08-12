@@ -4,6 +4,15 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ---
 
+## 2026-08-12
+
+### Added
+- **Thumbnail REST: magic-byte sniff fallback for absent/generic Content-Type** (`internal/thumbnail/sniff.go`, `internal/thumbnail/sniff_test.go`, `internal/api/rest/thumbnail.go`, `internal/api/rest/thumbnail_test.go`)
+  - `GET /v1/files/{key}/thumbnail` now decides **from bytes** when the object's declared Content-Type is absent, unparseable, or `application/octet-stream` — the upload norm for `curl -T` (no header) and S3 SDKs (generic default). The new exported `thumbnail.Sniff` recognizes JPEG (`FFD8`), PNG (`89504E47`), GIF (`GIF87a/89a`) and WebP (`RIFF….WEBP`) magic, zero-alloc and panic-free; the handler sniffs the first ≤ 12 bytes **inside the existing opener** (single open, slot-before-open, close-once — head replayed byte-exactly into the decode pipeline). JPEG/PNG/GIF magic → 200 (these objects previously 400'd despite decodable bytes); WebP magic → **415 UnsupportedMediaType** (server-capability class, message names the detected format + supported set); unknown bytes → **400 InvalidArgument**. The fallback 200 shares the declared path's derived ETag, so caching/304 is unchanged and a cache hit never sniffs.
+  - Declared gate preserved verbatim for everything else: `image/jpeg|png|gif` → 200 (unchanged opener), other `image/*` (incl. `image/webp`) → 415 with the historical message, non-image non-generic types (e.g. `text/plain`) → 400. The stored Content-Type is never rewritten; no new config, no `openapi.json` change. One nuance vs. the design: `mime.ParseMediaType("not-a-media-type")` does **not** error in Go (bare token parses to itself), so slash-less garbage declarations stay on the declared 400 path — only true parse errors (e.g. empty) and `application/octet-stream` are byte-decided.
+
+---
+
 ## 2026-08-11
 
 ### Added

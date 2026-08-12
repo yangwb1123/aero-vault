@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -99,25 +100,32 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	// Media-type gate, normalized per RFC 9110 §8.3.1 (media types are
-	// case-insensitive and may carry parameters): mime.ParseMediaType
-	// lowercases the type/subtype and strips parameters, so "Image/JPEG" and
-	// "image/jpeg; charset=utf-8" both normalize to image/jpeg and pass.
-	// The prefix check (400) is the client-argument class — the object is not
-	// an image at all; the exact decodable-set check (415) is the
-	// server-capability class — a valid image the pipeline's registered
-	// decoders (gif/jpeg/png) cannot decode, per RFC 9110 §15.5.16.
+	// Media-type gate, four-bucket partition of the normalized declared
+	// Content-Type (RFC 9110 §8.3.1: case-insensitive, parameters stripped —
+	// so "Image/JPEG" and "image/jpeg; charset=utf-8" both normalize to
+	// image/jpeg and pass):
+	//   1. image/jpeg|image/png|image/gif   → proceed (declared decodable)
+	//   2. other image/* (e.g. image/webp)  → 415 (server capability)
+	//   3. absent/unparseable/octet-stream  → byte-decided at open (Sniff)
+	//   4. other non-image non-generic      → 400 (client argument)
+	// Buckets 1/2/4 keep their historical statuses and messages verbatim;
+	// only bucket 3 changes — the curl -T / S3-SDK upload norm stores an
+	// empty or generic declaration on perfectly decodable JPEG/PNG/GIF
+	// bytes, which the pipeline can classify from magic at open time.
 	mediaType, _, perr := mime.ParseMediaType(obj.ContentType)
-	if perr != nil || !strings.HasPrefix(mediaType, "image/") {
+	sniffBytes := perr != nil || mediaType == "application/octet-stream"
+	if !sniffBytes && !strings.HasPrefix(mediaType, "image/") {
 		h.writeError(w, r, fmt.Errorf("%w: object is not an image (content-type %q)", service.ErrInvalidArgs, obj.ContentType))
 		return
 	}
-	switch mediaType {
-	case "image/jpeg", "image/png", "image/gif":
-	default:
-		h.writeError(w, r, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
-			thumbnail.ErrUnsupportedFormat, obj.ContentType))
-		return
+	if !sniffBytes {
+		switch mediaType {
+		case "image/jpeg", "image/png", "image/gif":
+		default:
+			h.writeError(w, r, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
+				thumbnail.ErrUnsupportedFormat, obj.ContentType))
+			return
+		}
 	}
 	// Validate ?w=/?h= before the ETag derivation, the If-None-Match/304
 	// branch, the object-stream open, and the decode pipeline: garbage
@@ -169,7 +177,40 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// API.
 	img, err := thumbnail.GenerateContextWithOpener(r.Context(), maxW, maxH, func() (io.ReadCloser, error) {
 		rc, _, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
-		return rc, err
+		if err != nil {
+			return nil, err
+		}
+		if !sniffBytes {
+			return rc, nil // bucket 1: declared decodable type, opener unchanged
+		}
+		// Bucket 3: decide from bytes. The magic head is read from the SAME
+		// stream the pipeline will decode (single open, no second svc.Get
+		// round-trip) and replayed byte-exactly in front of the live stream,
+		// so the pipeline observes the full object (the same replay
+		// mechanism generateLocked uses for its DecodeConfig tee).
+		head := make([]byte, sniffHeadLen)
+		n, rerr := io.ReadFull(rc, head)
+		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+			_ = rc.Close() // storage read failure: OpenError → classify; never "not an image"
+			return nil, rerr
+		}
+		head = head[:n] // short objects are valid Sniff input → FormatUnknown → 400
+		switch thumbnail.Sniff(head) {
+		case thumbnail.FormatJPEG, thumbnail.FormatPNG, thumbnail.FormatGIF:
+			// Admission by magic is a gate input only: the decode pipeline
+			// stays the final validity authority (ErrUnsupported → 400).
+			// Close must forward to the storage stream — the API's deferred
+			// close runs on this wrapper, and io.NopCloser would leak rc.
+			return &sniffedStream{Reader: io.MultiReader(bytes.NewReader(head), rc), rc: rc}, nil
+		case thumbnail.FormatWebP:
+			_ = rc.Close()
+			return nil, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
+				thumbnail.ErrUnsupportedFormat, "webp")
+		default:
+			_ = rc.Close()
+			return nil, fmt.Errorf("%w: object bytes are not a supported image format (image/jpeg, image/png, image/gif)",
+				service.ErrInvalidArgs)
+		}
 	})
 	if err != nil {
 		// The OpenError unwrap MUST precede the context-error checks: an
@@ -217,6 +258,23 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(img)
 }
+
+// sniffHeadLen is the longest magic signature Sniff recognizes: RIFF(4) +
+// size(4) + WEBP(4) = 12 bytes. Bucket-3 openers read exactly this many
+// bytes from the object stream to classify it.
+const sniffHeadLen = 12
+
+// sniffedStream replays the sniffed magic head in front of the live object
+// stream (io.MultiReader) and forwards Close to the underlying stream, which
+// the API's deferred close runs on this wrapper — io.NopCloser would leak it
+// (its Close is a no-op). Mirrors the close-forwarding precedent of
+// service.ETagVerifier.
+type sniffedStream struct {
+	io.Reader
+	rc io.Closer
+}
+
+func (s *sniffedStream) Close() error { return s.rc.Close() }
 
 // parseThumbDim validates one ?w=/?h= thumbnail dimension parameter. An
 // absent parameter yields 0 (default-size semantics per Generate's contract).
