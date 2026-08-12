@@ -2911,3 +2911,200 @@ func TestThumbnailClampedETagComposition(t *testing.T) {
 		t.Fatalf("distinct effective dims must differ: %q vs %q", a, b)
 	}
 }
+
+// etagSwapRepo embeds repository.Repository and intercepts GetObject for a
+// single target key: on the swapCall-th such call it returns the real row
+// with ETag forced to stale (the "Stat view" of an object that a concurrent
+// PUT has since replaced); every other call delegates to the real row (the
+// "opened view"). The discriminator is per-key, so the dispatch pre-check
+// Stat ("pic.png/thumbnail") and GetBucketConfig never perturb the count.
+// This is the repository-seam analogue of the burstStore storage wrapper: no
+// goroutines, no sleeps — the race is simulated by the call sequence itself.
+type etagSwapRepo struct {
+	repository.Repository
+	mu       sync.Mutex
+	target   string // "pic.png"
+	stale    string // ETag served on the swap call ("" = disarmed)
+	swapCall int    // 1-based GetObject call number for target to swap on
+	calls    int    // GetObject calls observed for target
+}
+
+func (r *etagSwapRepo) GetObject(ctx context.Context, tenant, bucket, key string) (repository.Object, error) {
+	r.mu.Lock()
+	isTarget := key == r.target
+	if isTarget {
+		r.calls++
+	}
+	swap := isTarget && r.stale != "" && r.calls == r.swapCall
+	r.mu.Unlock()
+	obj, err := r.Repository.GetObject(ctx, tenant, bucket, key)
+	if err != nil || !swap {
+		return obj, err
+	}
+	obj.ETag = r.stale // same row, stale validator: models "PUT landed between Stat and Get"
+	return obj, nil
+}
+
+// TestThumbnailETagDerivedFromOpenedObject pins FR-1: the 200-path ETag must
+// be derived from the Get-opened object's ETag (the version whose bytes were
+// actually decoded), not the pre-open Stat's. A repository seam hook forces
+// the Stat view to carry the stale v1 ETag while the blob/row at open time is
+// v2; pre-fix the 200 validator names v1, post-fix it names v2. The racing
+// body must stay byte-identical to the control (both decode the same v2
+// blob), proving only the validator was wrong.
+func TestThumbnailETagDerivedFromOpenedObject(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	wrapped := &etagSwapRepo{Repository: repo, target: "pic.png"}
+	h := NewHandler(service.NewFileService(store, wrapped, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/pic.png"
+	headETag := func() string {
+		t.Helper()
+		resp, _ := req(t, "HEAD", u, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD: %d", resp.StatusCode)
+		}
+		return strings.Trim(resp.Header.Get("ETag"), `"`)
+	}
+
+	// PUT v1 then v2: both writes hit the same unversioned StorageKey, so a
+	// Stat/Get straddling the second write observes v1 in the Stat row and
+	// v2 at open time — the race this fixture simulates structurally.
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	etagA := headETag()
+	if etagA == "" {
+		t.Fatal("HEAD v1: empty ETag")
+	}
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 320, 160), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	etagB := headETag()
+	if etagB == "" || etagB == etagA {
+		t.Fatalf("v2 ETag %q must differ from v1 %q (same StorageKey rewrite)", etagB, etagA)
+	}
+
+	// Disarmed control: the pipeline runs against the v2 blob and the 200
+	// validator names v2. The suffix is computed through EffectiveDims so the
+	// format string and the clamp rule stay single-sourced.
+	thumbURL := u + "/thumbnail?w=100&h=100"
+	resp, bodyB := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("control thumbnail: %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("control content-type=%q want image/jpeg", ct)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(bodyB)); err != nil || format != "jpeg" {
+		t.Fatalf("control body decode: %v fmt=%s", err, format)
+	}
+	ew, eh := thumbnail.EffectiveDims(100, 100)
+	suffix := fmt.Sprintf("%dx%d", ew, eh)
+	etagB200 := `"` + etagB + "-thumb-" + suffix + `"`
+	if got := resp.Header.Get("ETag"); got != etagB200 {
+		t.Fatalf("control ETag=%q want %q", got, etagB200)
+	}
+
+	// Arm the hook: the next target-key GetObject (the racing request's
+	// pre-open Stat) returns the stale v1 validator; the opener's GetObject
+	// (call +1) still sees the real v2 row.
+	wrapped.mu.Lock()
+	wrapped.stale, wrapped.swapCall = etagA, wrapped.calls+1
+	wrapped.mu.Unlock()
+
+	resp, body := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("racing thumbnail: %d", resp.StatusCode)
+	}
+	if !bytes.Equal(body, bodyB) {
+		t.Fatalf("racing body differs from control — both must decode the same v2 blob")
+	}
+	if got := resp.Header.Get("ETag"); got != etagB200 {
+		t.Fatalf("200 ETag=%q want %q (opened-object validator); got the pre-open Stat validator?", got, etagB200)
+	}
+	if got := resp.Header.Get("ETag"); got == `"`+etagA+"-thumb-"+suffix+`"` {
+		t.Fatalf("200 ETag must not derive from the pre-open Stat (stale v1): %q", got)
+	}
+}
+
+// TestThumbnail304ShortCircuitsBeforeOpen pins FR-2: a matching If-None-Match
+// short-circuits on the Stat-derived validator BEFORE the opener's svc.Get
+// runs — the object stream never opens. The hook's target-key GetObject count
+// is the structural proof (no timers, no sleeps): exactly 1 (the Stat read),
+// never 2. The row is seeded directly through the concrete repo so PUT's
+// overwrite-protection GetObject does not perturb the counter.
+func TestThumbnail304ShortCircuitsBeforeOpen(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	wrapped := &etagSwapRepo{Repository: repo, target: "pic.png"}
+	h := NewHandler(service.NewFileService(store, wrapped, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	// Seed the object row directly (bypassing the wrapper's counter): the 304
+	// path never opens the blob, so no storage write is required.
+	if _, err := repo.UpsertObject(context.Background(), repository.Object{
+		TenantID:    "default",
+		Bucket:      "default",
+		Key:         "pic.png",
+		StorageKey:  "default/default/pic.png",
+		Size:        1,
+		ETag:        "seed-etag-v2",
+		ContentType: "image/png",
+		Metadata:    map[string]string{},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Arm the hook: the next target-key Stat sees the stale validator — the
+	// exact validator a client holding a pre-race response would send back.
+	wrapped.mu.Lock()
+	wrapped.stale, wrapped.swapCall = "stale-etag-a", wrapped.calls+1
+	wrapped.mu.Unlock()
+
+	ew, eh := thumbnail.EffectiveDims(100, 100)
+	suffix := fmt.Sprintf("%dx%d", ew, eh)
+	u := srv.URL + "/v1/files/pic.png/thumbnail?w=100&h=100"
+	resp, _ := req(t, "GET", u, nil, map[string]string{"If-None-Match": `"stale-etag-a-thumb-` + suffix + `"`})
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("If-None-Match: status=%d want 304", resp.StatusCode)
+	}
+	wrapped.mu.Lock()
+	calls := wrapped.calls
+	wrapped.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("target-key GetObject calls = %d, want 1 — the 304 must short-circuit before the opener runs", calls)
+	}
+}

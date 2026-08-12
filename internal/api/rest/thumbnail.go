@@ -14,6 +14,7 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
+	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
@@ -153,7 +154,13 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// fast path. Raw values still flow to GenerateContextWithOpener; the
 	// re-clamp is idempotent, so output bytes are unchanged.
 	effW, effH := thumbnail.EffectiveDims(maxW, maxH)
-	etag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, effW, effH)
+	// Pre-open Stat validator: serves ONLY the If-None-Match / 304 fast path
+	// below, which short-circuits before the object stream opens. The 200
+	// validator is derived separately from the Get-opened object (see the
+	// etag computation before the 200 header emission) so a concurrent PUT
+	// between this Stat and the open cannot pair a stale validator with the
+	// new bytes.
+	statETag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, effW, effH)
 	// Shared-cache directive: public only when this very request was admitted
 	// anonymously — allowAnonymous admits anonymous readers solely for
 	// genuinely public-readable objects, so the bytes are fetchable by any
@@ -164,8 +171,8 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	if auth.IsAnonymous(r.Context()) {
 		cacheControl = "public, max-age=86400"
 	}
-	if etagListMatches(r.Header.Get("If-None-Match"), etag) {
-		w.Header().Set("ETag", `"`+etag+`"`)
+	if etagListMatches(r.Header.Get("If-None-Match"), statETag) {
+		w.Header().Set("ETag", `"`+statETag+`"`)
 		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 		// The 304 must mirror the 200's directive (RFC 9111 §3.2/§3.4): a
 		// shared cache revalidating a private thumb would otherwise adopt
@@ -184,11 +191,18 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// verbatim; decode and context errors keep the branch below. The stream
 	// lifecycle (close on every path, close-before-release) lives inside the
 	// API.
+	// The 200-path validator must describe the bytes actually decoded, so
+	// the opened object is captured here and read after the pipeline
+	// succeeds. Same capture-then-serve ordering the Get handler uses
+	// (handler.go -> handleRangeOrFull): the pre-open Stat validator serves
+	// only the 304 fast path, never the 200.
+	var opened *repository.Object
 	img, err := thumbnail.GenerateContextWithOpener(r.Context(), maxW, maxH, func() (io.ReadCloser, error) {
-		rc, _, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
+		rc, o, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
 		if err != nil {
 			return nil, err
 		}
+		opened = &o // before the sniff branch: the wrapper does not change the opened object
 		if !sniffBytes {
 			return rc, nil // bucket 1: declared decodable type, opener unchanged
 		}
@@ -257,6 +271,16 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		}
 		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
 		return
+	}
+	// 200 validator from the opened object: with no intervening write the
+	// opened ETag equals the Stat's and the value is byte-identical to
+	// today's; under a concurrent PUT it names the version whose bytes were
+	// actually decoded. The fallback (defensive; the opener always runs
+	// before a successful GenerateContextWithOpener returns) keeps the
+	// Stat-derived validator rather than panicking or emitting an empty ETag.
+	etag := statETag
+	if opened != nil {
+		etag = fmt.Sprintf("%s-thumb-%dx%d", opened.ETag, effW, effH)
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("ETag", `"`+etag+`"`)
