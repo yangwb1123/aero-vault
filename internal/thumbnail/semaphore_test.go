@@ -18,6 +18,7 @@ package thumbnail
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image/color"
 	"runtime"
@@ -134,6 +135,90 @@ func TestGenerateSemaphoreBoundsConcurrentAllocation(t *testing.T) {
 	if peak > 2<<30 {
 		t.Fatalf("peak live heap %d bytes exceeds absolute 2 GiB ceiling", peak)
 	}
+}
+
+// TestAcquireDecodeSlotContextCanceledReleaseRace is the regression pin for
+// the claimed post-send-cancellation deadlock (direction: "Fix deadlock in
+// acquireDecodeSlotContext's post-send cancellation path"). The claim: a
+// concurrent releaseDecodeSlot landing between the winning send and the
+// post-check receive empties the channel and parks the receive forever,
+// collapsing the maxConcurrentDecodes=4 ceiling. The invariant argument
+// (requirements spec §1.1) shows the park is unreachable from a clean 1:1
+// acquire/release pairing; this test pins that the post-check release is
+// non-blocking by construction and that the channel state stays consistent
+// under the exact claimed interleaving, so a future pairing violation cannot
+// silently reintroduce the park.
+//
+// Determinism: the test holds maxConcurrentDecodes-1 slots (one free) and
+// cancels the context BEFORE spawning the acquire goroutine, so both select
+// branches are ready when the goroutine runs — the send branch wins with
+// P ≈ 1/2 per iteration (P(never over 500) = 2⁻⁵⁰⁰), driving the
+// send→post-check path hundreds of times. The main goroutine's per-iteration
+// releaseDecodeSlot() is the "concurrent release landing in the window"; the
+// released slot is re-acquired each iteration so the held-slot baseline is
+// invariant. Every iteration must return context.Canceled within a per-
+// iteration watchdog (2 s) — a parked post-check would blow past it.
+// No sleeps are used as timing primitives; the watchdogs are failure
+// detectors only.
+func TestAcquireDecodeSlotContextCanceledReleaseRace(t *testing.T) {
+	// Phase 1: storm loop with maxConcurrentDecodes-1 slots held (both-ready window).
+	for i := 0; i < maxConcurrentDecodes-1; i++ {
+		acquireDecodeSlot()
+	}
+	const iters = 500
+	for i := 0; i < iters; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // canceled BEFORE spawn: both branches ready at the select
+
+		done := make(chan error, 1)
+		go func() {
+			done <- acquireDecodeSlotContext(ctx)
+		}()
+
+		releaseDecodeSlot() // "concurrent release landing in the window" (never blocks: buffer ≥ 3)
+
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("iteration %d: err = %v, want context.Canceled", i, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: acquire parked — post-check release blocked past watchdog", i)
+		}
+		acquireDecodeSlot() // restore the released slot (ready: buffer ≤ 3)
+	}
+
+	// Phase 2: channel-state consistency — exactly maxConcurrentDecodes-1 held,
+	// nothing consumed, nothing leaked (full capacity re-verified by recoverSlots).
+	for i := 0; i < maxConcurrentDecodes-1; i++ {
+		releaseDecodeSlot()
+	}
+	recoverSlots(t)
+
+	// Phase 3: ceiling probe (TestGenerateSemaphoreBoundsConcurrentAllocation-
+	// style, deterministic and cheap — runs under -race, unlike the ~1.2 GiB
+	// test): at most maxConcurrentDecodes concurrent holders.
+	for i := 0; i < maxConcurrentDecodes; i++ {
+		acquireDecodeSlot() // hold all 4
+	}
+	blocked := make(chan struct{})
+	go func() {
+		acquireDecodeSlot() // 5th: must block
+		close(blocked)
+	}()
+	select {
+	case <-blocked:
+		t.Fatal("5th acquire completed with all slots held — ceiling breached")
+	case <-time.After(200 * time.Millisecond):
+		// blocked: correct
+	}
+	releaseDecodeSlot() // unblock the 5th
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked acquire did not complete after release — slot leak?")
+	}
+	releaseAndRecoverSlots(t) // drains the 4 held (3 test + 1 goroutine), re-verifies full capacity
 }
 
 // signalReader blocks on Read until closed; used to prove a Generate call is

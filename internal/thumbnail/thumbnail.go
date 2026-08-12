@@ -149,7 +149,14 @@ func acquireDecodeSlot() { decodeSlots <- struct{}{} }
 // caller waits. After a winning send it re-checks ctx: a canceled context can
 // race a ready buffer (both select branches ready), and the caller must not
 // decode for a dead request — the slot is returned and the error propagated
-// instead.
+// instead. The slot-return is non-blocking by construction (select with a
+// default case), so the acquire path can only wait inside the select, which
+// is ctx-bounded — it can never park on the slot-return. In the current 1:1
+// acquire/release pairing the return is always ready (the winning send
+// guarantees the buffer still holds at least that token), so the default
+// branch is unreachable today; it exists so a future pairing violation fails
+// toward over-restriction (an idle token, ≤ maxConcurrentDecodes effective
+// concurrency) instead of a permanent park.
 func acquireDecodeSlotContext(ctx context.Context) error {
 	select {
 	case decodeSlots <- struct{}{}:
@@ -157,7 +164,10 @@ func acquireDecodeSlotContext(ctx context.Context) error {
 		return ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
-		<-decodeSlots // return the slot taken by the winning send
+		select {
+		case <-decodeSlots: // return the slot taken by the winning send
+		default: // unreachable in the clean 1:1 pairing; fail toward over-restriction
+		}
 		return err
 	}
 	return nil
