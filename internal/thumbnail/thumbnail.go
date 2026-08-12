@@ -1,8 +1,12 @@
 // Package thumbnail generates downscaled JPEG previews of images using only the
 // Go standard library (no external image dependencies). Supported source
 // formats: JPEG, PNG, GIF. JPEG sources carrying a valid EXIF orientation
-// (APP1 tag 0x0112) are rotated/flipped before encoding so thumbnails render
-// upright.
+// (APP1 tag 0x0112) and PNG sources carrying a valid eXIf-chunk EXIF
+// orientation (the same tag) are rotated/flipped before encoding so
+// thumbnails render upright. As with JPEG, the orientation recorded in the
+// profile is applied as-is even though the PNG spec flags possibly-stale Exif
+// data as "of historical value only" — the industry-consistent behavior
+// (browsers, Pillow's ImageOps.exif_transpose).
 package thumbnail
 
 import (
@@ -32,7 +36,10 @@ var ErrImageTooLarge = errors.New("thumbnail: image dimensions exceed MaxSourceD
 
 // ErrMetadataTooLarge is returned when the bytes consumed by image.DecodeConfig
 // exceed MaxMetadataBytes (e.g. a JPEG whose pre-SOF region is packed with
-// attacker-chosen APPn/COM segments). It is distinct from ErrUnsupported
+// attacker-chosen APPn/COM segments, or a PNG whose pre-IDAT ancillary chunks
+// — the eXIf orientation chunk included — push the pre-decode metadata walk
+// past the cap; JPEG-parallel: PNGs with > 8 MiB of pre-IDAT metadata can no
+// longer be thumbnailed). It is distinct from ErrUnsupported
 // (corrupt/non-image) and ErrImageTooLarge (declared dimensions) so callers can
 // tell a metadata-budget rejection from either. Do not confuse it with
 // service.ErrMetadataTooLarge, which is the unrelated object-metadata size

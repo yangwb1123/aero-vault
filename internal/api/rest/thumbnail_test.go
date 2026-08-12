@@ -431,6 +431,105 @@ func TestThumbnailAppliesEXIFOrientation(t *testing.T) {
 	}
 }
 
+// exifOrientationPNG builds a 400×200 red-top/blue-bottom RGBA PNG spliced
+// with an eXIf chunk declaring orient (1–8; 0 = no eXIf), the PNG-parallel of
+// exifOrientationJPEG. The eXIf data is the conformant bare Exif profile
+// (PNG Third Edition §11.3.4.5 — the "Exif\x00\x00" ID code is not included):
+// II byte order, magic 0x2A, IFD0 at offset 8, one SHORT entry for tag
+// 0x0112, next-IFD 0. The chunk CRC is mandatory — image/png validates every
+// chunk, unknown ancillary ones included.
+func exifOrientationPNG(t *testing.T, orient int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 400, 200))
+	for y := 0; y < 200; y++ {
+		c := color.RGBA{255, 0, 0, 255}
+		if y >= 100 {
+			c = color.RGBA{0, 0, 255, 255}
+		}
+		for x := 0; x < 400; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	var base bytes.Buffer
+	if err := png.Encode(&base, img); err != nil {
+		t.Fatalf("encode base png: %v", err)
+	}
+	if orient < 1 || orient > 8 {
+		return base.Bytes()
+	}
+	b := base.Bytes()
+	if len(b) < 33 {
+		t.Fatalf("png fixture too short: %d", len(b))
+	}
+	payload := make([]byte, 26)
+	payload[0], payload[1] = 'I', 'I'
+	binary.LittleEndian.PutUint16(payload[2:4], 0x2A)
+	binary.LittleEndian.PutUint32(payload[4:8], 8)
+	binary.LittleEndian.PutUint16(payload[8:10], 1)
+	binary.LittleEndian.PutUint16(payload[10:12], 0x0112)
+	binary.LittleEndian.PutUint16(payload[12:14], 3)
+	binary.LittleEndian.PutUint32(payload[14:18], 1)
+	binary.LittleEndian.PutUint16(payload[18:20], uint16(orient))
+	var out bytes.Buffer
+	out.Write(b[:33]) // IHDR end; the eXIf chunk splices in before IDAT.
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(payload)))
+	out.Write(l[:])
+	out.WriteString("eXIf")
+	out.Write(payload)
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write([]byte("eXIf"))
+	_, _ = crc.Write(payload)
+	binary.BigEndian.PutUint32(l[:], crc.Sum32())
+	out.Write(l[:])
+	out.Write(b[33:])
+	return out.Bytes()
+}
+
+// TestThumbnailAppliesPNGeXIfOrientation pins the PNG-parallel of
+// TestThumbnailAppliesEXIFOrientation: an orientation-6 camera PNG must
+// produce an upright thumbnail at the REST layer — 128×256 in a 128×256 box
+// (the pre-fix output was a sideways 128×64 landscape), blue on the left,
+// red on the right (90° CW). No production REST change was needed (qa F3 —
+// the wiring between the handler, EffectiveDims and the generate pipeline is
+// shared with JPEG); this test pins the user-visible contract end-to-end.
+func TestThumbnailAppliesPNGeXIfOrientation(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/cam.png"
+	req(t, "PUT", u, exifOrientationPNG(t, 6), map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", u+"/thumbnail?w=128&h=256", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("thumbnail status=%d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type=%q want image/jpeg", ct)
+	}
+	img, format, err := image.Decode(bytes.NewReader(body))
+	if err != nil || format != "jpeg" {
+		t.Fatalf("decode thumb: %v fmt=%s", err, format)
+	}
+	if img.Bounds().Dx() != 128 || img.Bounds().Dy() != 256 {
+		t.Fatalf("thumb dims %dx%d want 128x256 (upright portrait)", img.Bounds().Dx(), img.Bounds().Dy())
+	}
+	// Orientation 6 = rotate 90° CW: the scaled source is 256×128 (red rows
+	// 0–63, blue 64–127) and out(r,c) = in(127-c, r), so the left half is
+	// blue and the right half red, boundary at c=64 — the JPEG twin's exact
+	// interior sampling.
+	b := img.Bounds()
+	for _, c := range []int{0, 8, 16, 24, 31} {
+		r, g, bl, _ := img.At(b.Min.X+c, b.Min.Y+128).RGBA()
+		if bl>>8 <= 180 || r>>8 >= 100 {
+			t.Fatalf("col %d: r=%d g=%d b=%d want blue (left half)", c, r>>8, g>>8, bl>>8)
+		}
+	}
+	for _, c := range []int{96, 104, 112, 120, 127} {
+		r, g, bl, _ := img.At(b.Min.X+c, b.Min.Y+128).RGBA()
+		if r>>8 <= 180 || bl>>8 >= 100 {
+			t.Fatalf("col %d: r=%d g=%d b=%d want red (right half)", c, r>>8, g>>8, bl>>8)
+		}
+	}
+}
+
 // newRESTTestWithRepo mirrors newRESTTest (conditional_test.go) but also
 // returns the repository so tests can corrupt object metadata or toggle
 // bucket versioning directly.

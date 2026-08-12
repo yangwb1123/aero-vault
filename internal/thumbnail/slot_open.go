@@ -147,7 +147,37 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	if cerr := ctx.Err(); cerr != nil {
 		return nil, cerr
 	}
-	src, _, err := image.Decode(io.MultiReader(bytes.NewReader(head.buf.Bytes()), r))
+	// PNG eXIf orientation: unlike JPEG (whose APP1 DecodeConfig consumed
+	// into head), a PNG's eXIf chunk sits mid-stream, so the walk must run
+	// HERE — before Decode consumes the stream — reading pre-IDAT chunks
+	// from head[33:] and then r through the replay tee. Every byte the walk
+	// reads from the stream is replayed to Decode (byte-identical frame);
+	// the walk is bounded by MaxMetadataBytes (head + replay ≤ budget, the
+	// same expression both sides) and stops at IDAT (compressed data is
+	// never scanned). Errors classify with the exact Decode-site block.
+	pngOrient := 1
+	decodeR := io.MultiReader(bytes.NewReader(head.buf.Bytes()), r)
+	if format == "png" {
+		replay := &limitedBuffer{remaining: MaxMetadataBytes - len(head.buf.Bytes())}
+		pngOrient, err = pngOrientation(ctx, head.buf.Bytes(), io.TeeReader(r, replay))
+		if err != nil {
+			if errors.Is(err, errMetadataBudgetExceeded) {
+				return nil, ErrMetadataTooLarge
+			}
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return nil, err // same instance
+			}
+			// Any other read error (EOF/truncation/generic): stop the walk
+			// with orientation 1 and let Decode re-encounter the same bytes
+			// and error, so classification (→ ErrUnsupported) is unchanged.
+			pngOrient = 1
+		}
+		decodeR = io.MultiReader(bytes.NewReader(head.buf.Bytes()), bytes.NewReader(replay.buf.Bytes()), r)
+	}
+	src, _, err := image.Decode(decodeR)
 	if err != nil {
 		// Same identity preservation as the DecodeConfig branch above: a
 		// deadline/cancellation that fires while the payload is read is
@@ -164,15 +194,19 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	if cerr := ctx.Err(); cerr != nil {
 		return nil, cerr
 	}
-	// EXIF orientation (JPEG only): the tag lives in the APP1 segment that
-	// DecodeConfig consumed into head (its config scan reads every pre-SOS
-	// segment in full), so extraction is free and bounded by MaxMetadataBytes.
-	// Orientations 5–8 swap the box so the rotated frame still fits maxW×maxH.
-	// Rotation runs post-scale, pre-composite; the rotated frame is opaque, so
-	// compositeOnWhite's fast path keeps the ≈ 288 MiB ceiling.
+	// EXIF orientation (JPEG APP1 + PNG eXIf): the JPEG tag lives in the
+	// APP1 segment that DecodeConfig consumed into head (its config scan
+	// reads every pre-SOS segment in full), so extraction is free and bounded
+	// by MaxMetadataBytes; the PNG walk ran pre-Decode (see above), bounded
+	// by the same cap, and stops at IDAT. Orientations 5–8 swap the box so
+	// the rotated frame still fits maxW×maxH. Rotation runs post-scale,
+	// pre-composite; the rotated frame is opaque, so compositeOnWhite's fast
+	// path keeps the ≈ 288 MiB ceiling.
 	orient := 1
 	if format == "jpeg" {
 		orient = exifOrientation(head.buf.Bytes())
+	} else if format == "png" {
+		orient = pngOrient
 	}
 	boxW, boxH := maxW, maxH
 	if orient >= 5 {

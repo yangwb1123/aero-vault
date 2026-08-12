@@ -66,31 +66,48 @@ func exifOrientation(buf []byte) int {
 	return 1
 }
 
+// exifTiffBase is the offset of the TIFF header within an EXIF payload of
+// the JPEG APP1 layout: the 6-byte "Exif\x00\x00" signature precedes it.
+const exifTiffBase = 6
+
 // tiffOrientation parses the TIFF header + IFD0 of an EXIF payload (p starts
 // at "Exif\x00\x00") and returns the value of tag 0x0112 (type SHORT, count
 // ≥ 1): 1–8, or 1 on any anomaly. Both II (little-endian) and MM
 // (big-endian) byte orders are supported; every read is bounds-checked and
 // any structural anomaly yields 1 — never a panic, never an error.
 func tiffOrientation(p []byte) int {
-	const tiffBase = 6       // TIFF header starts after the "Exif\x00\x00" signature
-	if len(p) < tiffBase+8 { // signature + TIFF header (8 B)
+	return tiffOrientationFrom(p, exifTiffBase)
+}
+
+// tiffOrientationFrom is tiffOrientation's body with the TIFF-header offset
+// parameterized: base is the offset of the TIFF header within p (6 for the
+// "Exif\x00\x00"+TIFF layout — JPEG APP1 / prefixed PNG eXIf; 0 for a bare
+// Exif profile — the conformant PNG eXIf layout). Every read position shifts
+// by base: byte order at p[base:base+2], magic at p[base+2:base+4], IFD0
+// offset at p[base+4:base+8]; the ifd/vo lower-bound guards become base+8
+// (the 32-bit wrap guards from e8d9072 are preserved verbatim). The count==1
+// inline SHORT value read stays at entry[8:10] for both byte orders — TIFF
+// 6.0 §2 left-justifies the inline value (the fix-exif-mm gate's verdict),
+// and the base shift is a mechanical offset that cannot alter the geometry.
+func tiffOrientationFrom(p []byte, base int) int {
+	if len(p) < base+8 { // TIFF header (8 B)
 		return 1
 	}
 	var bo binary.ByteOrder
 	switch {
-	case p[6] == 'I' && p[7] == 'I':
+	case p[base] == 'I' && p[base+1] == 'I':
 		bo = binary.LittleEndian
-	case p[6] == 'M' && p[7] == 'M':
+	case p[base] == 'M' && p[base+1] == 'M':
 		bo = binary.BigEndian
 	default:
 		return 1
 	}
-	if bo.Uint16(p[8:10]) != 0x2A {
+	if bo.Uint16(p[base+2:base+4]) != 0x2A {
 		return 1 // TIFF magic
 	}
 	// All TIFF offsets are relative to the start of the TIFF header.
-	ifd := tiffBase + int(bo.Uint32(p[10:14]))
-	if ifd < tiffBase+8 || ifd+2 > len(p) {
+	ifd := base + int(bo.Uint32(p[base+4:base+8]))
+	if ifd < base+8 || ifd+2 > len(p) {
 		return 1 // IFD0 offset must lie within the payload
 	}
 	count := int(bo.Uint16(p[ifd : ifd+2]))
@@ -112,15 +129,15 @@ func tiffOrientation(p []byte) int {
 		}
 		var v uint16
 		if cnt == 1 {
-			v = bo.Uint16(entry[8:10]) // value inline
+			v = bo.Uint16(entry[8:10]) // value inline (left-justified, both byte orders)
 		} else {
-			vo := tiffBase + int(bo.Uint32(entry[8:12])) // value field is an offset
-			// Lower bound is load-bearing on 32-bit targets: tiffBase +
+			vo := base + int(bo.Uint32(entry[8:12])) // value field is an offset
+			// Lower bound is load-bearing on 32-bit targets: base +
 			// 0xFFFFFFFF wraps int to a small negative, which passes a
 			// one-sided vo+2 > len(p) check and panics on the slice below
 			// (verified GOARCH=386 reproduction). The offset must point
 			// into the payload proper (after the TIFF header), not before it.
-			if vo < tiffBase+8 || vo+2 > len(p) {
+			if vo < base+8 || vo+2 > len(p) {
 				return 1
 			}
 			v = bo.Uint16(p[vo : vo+2])

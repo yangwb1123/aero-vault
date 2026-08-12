@@ -455,6 +455,14 @@ func FuzzGenerate(f *testing.F) {
 		f.Add(jpegWithPostSOFExif(payload)) // post-SOF APP1 must be ignored
 	}
 
+	// PNG eXIf seeds (direction: honor PNG eXIf-chunk EXIF orientation): an
+	// oriented bare-layout PNG, the tolerated "Exif\x00\x00"+TIFF prefixed
+	// deviation, and an eXIf placed after IDAT (must be ignored — orientation
+	// 1; the walk terminates at IDAT).
+	f.Add(orientedPNG(f, 16, 16, 6, false))
+	f.Add(orientedPNG(f, 16, 16, 6, true))
+	f.Add(spliceAfterIDAT(f, orientedPNG(f, 16, 16, 0, false), "eXIf", bareExifPayload(6, binary.LittleEndian)))
+
 	// GIF seeds (direction: GIF decode-pipeline test coverage). Fixture
 	// builders live in gif_test.go; makeGIF is the sniff-level helper (typed
 	// testing.TB, so *testing.F works — F embeds common). Classes: known-good
@@ -682,7 +690,7 @@ func TestEffectiveDims(t *testing.T) {
 		{"small identity", 100, 100, 100, 100},
 		{"independent clamp w", 2048, 100, HardMax, 100},
 		{"independent clamp h", 100, 9999, 100, HardMax},
-		{"max int clamped", 1 << 62, 1 << 62, HardMax, HardMax},
+		{"max int clamped", int(^uint(0) >> 1), int(^uint(0) >> 1), HardMax, HardMax},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

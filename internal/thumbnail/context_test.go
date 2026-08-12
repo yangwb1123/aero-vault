@@ -42,9 +42,12 @@ func (t *readTracker) Read([]byte) (int, error) {
 //
 // The data prefix must be exactly what image/png's DecodeConfig consumes (PNG
 // signature + IHDR = 33 bytes, no read-ahead), so the block deterministically
-// occurs in the Decode phase — mid-decode-section — never during the config
+// occurs in the decode section — mid-decode-section — never during the config
 // scan, and the slot is genuinely held (unlike the acquisition tests, which
-// park before the decode starts).
+// park before the decode starts). With the PNG eXIf walk in place the first
+// post-IHDR read for PNG is the pre-Decode orientation walk (still
+// mid-decode-section, slot held, same error contract), so the block lands
+// there.
 type ctxBlockingReader struct {
 	ctx     context.Context
 	data    []byte
@@ -105,7 +108,7 @@ func TestGenerateContextPreservesCancelMidDecode(t *testing.T) {
 		_, err := GenerateContext(ctx, reader, 32, 32)
 		done <- err
 	}()
-	<-blocked // reader is mid-decode, parked on the context
+	<-blocked // reader is parked in the pre-Decode orientation walk
 	cancel()
 	select {
 	case err := <-done:
@@ -176,7 +179,8 @@ func TestGenerateContextPreservesDeadlineMidDecodeConfig(t *testing.T) {
 // The served prefix must be shorter than what the decoder needs: 8 bytes
 // (PNG signature only) fails DecodeConfig at the chunk-header read, 33
 // bytes (signature + IHDR, exactly what the config scan consumes) lets
-// DecodeConfig succeed and fails image.Decode on the post-IHDR chunk read.
+// DecodeConfig succeed and fails the pre-Decode orientation walk's first
+// post-IHDR chunk read (Decode would re-encounter the same bytes/error).
 type errAfterDataReader struct {
 	data []byte
 	off  int
@@ -222,10 +226,12 @@ func TestGenerateContextPreservesWrappedErrorMidDecodeConfig(t *testing.T) {
 }
 
 // TestGenerateContextPreservesWrappedErrorMidDecode pins the same fallback
-// at the Decode site (QA-3): the full 33-byte config prefix is served
+// in the decode section (QA-3): the full 33-byte config prefix is served
 // (DecodeConfig succeeds), then the stream fails with the wrapped sentinel
-// on the first post-header read inside image.Decode. Same instance
-// assertion as the DecodeConfig-site variant.
+// on the first post-header read — which, for PNG, is the pre-Decode
+// orientation walk's first chunk-header read (the walk returns the raw
+// wrapped instance and generateLocked's classification surfaces it
+// unchanged). Same instance assertion as the DecodeConfig-site variant.
 func TestGenerateContextPreservesWrappedErrorMidDecode(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

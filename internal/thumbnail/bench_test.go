@@ -172,3 +172,34 @@ func BenchmarkGenerateParallel(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkGeneratePNGWithEXIF covers the PNG-with-eXIf shape (F8): the
+// pre-Decode orientation walk runs before Decode — for the small fixture a
+// few chunk-header reads from head, no r reads, no replay — the baseline for
+// the walk's per-request cost; BenchmarkGeneratePNGPlain is the no-eXIf
+// control (the two should be within noise).
+// Run: go test -bench='BenchmarkGeneratePNG(WithEXIF|Plain)$' -benchmem ./internal/thumbnail/
+func BenchmarkGeneratePNGWithEXIF(b *testing.B) {
+	fixture := orientedPNG(b, 64, 64, 6, false)
+	b.SetBytes(int64(len(fixture)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Generate(bytes.NewReader(fixture), 64, 64); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGeneratePNGPlain is the no-eXIf control for the walk benchmark.
+func BenchmarkGeneratePNGPlain(b *testing.B) {
+	fixture := orientedPNG(b, 64, 64, 0, false)
+	b.SetBytes(int64(len(fixture)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Generate(bytes.NewReader(fixture), 64, 64); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
