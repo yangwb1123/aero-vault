@@ -85,6 +85,21 @@ stages:
           outstanding finding in code + tests (not just in prose).
           Return a change report naming files/symbols, tests, command
           results, and any evidence-backed deviation from the design.
+          END the report with a fenced ```yaml completion_report block
+          (mandatory — a validator rejects reports without it):
+          ```yaml
+          completion_report:
+            summary: ...
+            changed_files: [...]
+            commands_executed:
+              - command: "make check"
+                result: passed   # passed | failed | not_executed
+            not_executed:
+              - check: ...
+                reason: ...
+            residual_risks: [...]
+            assumptions: [...]
+          ```
           Output the COMPLETE change report as your final response text —
           the entire report, not a summary. Do NOT use the write tool for the
           deliverable (the runner captures your final response to the output
