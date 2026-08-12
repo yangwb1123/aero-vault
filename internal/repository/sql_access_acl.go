@@ -58,6 +58,7 @@ func (s *sqlStore) ListApplicableACL(ctx context.Context, tenant, bucket, key st
 	// widen the ACL to sibling keys (reportX2026/...). folder keys always
 	// end in '/' (normalizeACLResource), so the length-bound comparison
 	// preserves the slash boundary; substr/length are portable SQLite/PG.
+
 	return s.queryACL(ctx,
 		`SELECT `+accessACLColumns+` FROM resource_acls
 		 WHERE tenant_id=$1 AND bucket=$2 AND (

@@ -85,7 +85,12 @@ func classify(err error) (string, string, int) {
 		return "InvalidRange", "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable
 	case errors.Is(err, service.ErrPreconditionFailed):
 		return "PreconditionFailed", "precondition failed", http.StatusPreconditionFailed
+	case errors.Is(err, mw.ErrBodyTooLarge):
+		return "BodyTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrForbidden):
+		// Surface the denial reason (e.g. default_deny) in the message —
+		// the fail-closed delete contract requires operator-visible reasons.
+
 		return "AccessDenied", err.Error(), http.StatusForbidden
 	case errors.Is(err, service.ErrObjectCorrupt):
 		return "ObjectCorrupt", "object is marked as corrupt", http.StatusGone

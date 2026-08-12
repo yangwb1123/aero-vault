@@ -202,6 +202,7 @@ func validateReceipt(response *http.Response, fact repository.AuditGovernanceFac
 		// relay fails the fact with retention instead of bounded-backoff
 		// retrying it forever.
 		return ErrReceiptConflict
+
 	}
 	if !receiptMatches(envelope, fact) {
 		return ErrInvalidReceipt

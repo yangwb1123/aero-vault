@@ -78,6 +78,11 @@ func setupSvc(t *testing.T) (repository.Repository, *service.FileService) {
 	return repo, service.NewFileService(store, repo, nil)
 }
 
+// quietLogger discards all output; shared by hardening_test.go.
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
 func TestWorkerScanCleanTagsObject(t *testing.T) {
 	ctx := context.Background()
 	repo, svc := setupSvc(t)
@@ -100,7 +105,7 @@ func TestWorkerScanCleanTagsObject(t *testing.T) {
 }
 
 func TestWorkerQuarantinesInfected(t *testing.T) {
-	ctx := context.Background()
+	ctx := access.AntivirusContext(context.Background(), "default")
 	repo, svc := setupSvc(t)
 	obj, err := svc.Put(ctx, "default", "default", "bad.txt", strings.NewReader(EICAR), int64(len(EICAR)), service.PutOptions{})
 	if err != nil {
@@ -143,7 +148,7 @@ func TestWorkerNoQuarantineKeepsButTags(t *testing.T) {
 }
 
 func TestWorkerQuarantinesOnlyInfectedVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := access.AntivirusContext(context.Background(), "default")
 	repo, svc := setupSvc(t)
 	if err := svc.SetBucketVersioning(ctx, "default", "default", true); err != nil {
 		t.Fatalf("enable versioning: %v", err)
@@ -581,10 +586,6 @@ func TestScanObjectByIDBoundsOversizedSignature(t *testing.T) {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
-
-func quietLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
 
 const (
 	claimOwner = "test-owner"

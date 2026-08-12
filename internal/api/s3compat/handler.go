@@ -21,6 +21,7 @@ type Handler struct {
 	svc    *service.FileService
 	logger *slog.Logger
 	authz  AuthorizationProvider // nil = unset = fail-closed deny on delete
+
 }
 
 func NewHandler(svc *service.FileService, logger *slog.Logger, authz AuthorizationProvider) *Handler {
@@ -274,6 +275,10 @@ func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 	}
 	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
 		h.abortMultipartUpload(w, r, bucket, key, uploadID)
+		return
+	}
+	if !h.authorizeDelete(r.Context(), mw.TenantFrom(r.Context()), bucket, key) {
+		writeS3Error(w, r, service.ErrForbidden)
 		return
 	}
 	versionID, deleteMarker, err := h.deleteS3Object(

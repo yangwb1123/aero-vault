@@ -55,6 +55,7 @@ WHERE id IN (
  AND o.available_at_ns <= $5 AND o.lease_expires_at_ns <= $6
  AND b.revision=$7
  ORDER BY o.available_at_ns,o.created_at_ns,o.id LIMIT $8 FOR UPDATE OF o SKIP LOCKED)
+
 RETURNING ` + auditGovernanceCols
 	rows, err := s.db.QueryContext(ctx, query, owner, token, now.Add(ttl).UnixNano(),
 		now.UnixNano(), now.UnixNano(), now.UnixNano(), revision, limit)
@@ -77,6 +78,7 @@ func (s *sqlStore) claimAuditGovernanceSQLite(
 JOIN audit_governance_bindings b ON b.tenant_id=o.tenant_id
 WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0 AND o.available_at_ns <= $1
 AND o.lease_expires_at_ns <= $2
+
 AND b.revision=$3
 ORDER BY o.available_at_ns,o.created_at_ns,o.id LIMIT $4`),
 		now.UnixNano(), now.UnixNano(), revision, limit)
@@ -216,6 +218,7 @@ func (s *sqlStore) OldestPendingAuditGovernance(
 FROM audit_governance_outbox o JOIN audit_governance_bindings b
  ON b.tenant_id=o.tenant_id
 WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0`).Scan(&value)
+
 	if err != nil || !value.Valid {
 		return time.Time{}, false, err
 	}

@@ -31,6 +31,7 @@ func TestScrubCorruptionRemovesSearchChunks(t *testing.T) {
 		t.Fatalf("storage: %v", err)
 	}
 	fileService := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllAuthz{})
+
 	body := "trusted content"
 	digest := md5.Sum([]byte(body))
 	object, err := fileService.Put(

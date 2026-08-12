@@ -30,6 +30,7 @@ func newManagedSSETestServer(t *testing.T) *httptest.Server {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(NewRouter(service.NewFileService(store, repo, nil), nil, nil))
+
 	t.Cleanup(func() {
 		srv.Close()
 		_ = repo.Close()

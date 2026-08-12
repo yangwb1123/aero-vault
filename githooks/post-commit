@@ -1,0 +1,39 @@
+#!/bin/bash
+# githooks/post-commit — 提交后自动同步远端
+#
+# 每次 git commit 成功后自动执行：
+#   1. git pull --ff-only（本地落后时快进）；若远端已分叉则回退到
+#      git pull --rebase（把本地新提交重放到远端之上）
+#   2. git push（推送到上游分支）
+#
+# 递归安全：pull --rebase / push 本身不再产生新的本地提交；若 rebase
+# 重建的提交再次触发本 hook，此时 pull 为空操作、push 幂等，自然终止。
+#
+# 关闭自动推送：AERO_HOOK_NO_PUSH=1 git commit …
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+[ -n "${AERO_HOOK_NO_PUSH:-}" ] && exit 0
+
+branch="$(git symbolic-ref --short -q HEAD 2>/dev/null || true)"
+upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+if [ -z "$branch" ] || [ -z "$upstream" ]; then
+    echo "==> [post-commit] 分支 $branch 无上游，跳过 pull/push"
+    exit 0
+fi
+
+echo "==> [post-commit] git pull --ff-only (origin: $upstream) ..."
+if ! git pull --ff-only; then
+    echo "==> [post-commit] 远端已分叉，改用 git pull --rebase ..."
+    if ! git pull --rebase; then
+        echo "==> [post-commit] ❌ pull 失败（可能工作区不干净或有冲突），请手动处理；提交本身已成功" >&2
+        exit 1
+    fi
+fi
+
+echo "==> [post-commit] git push ..."
+if ! git push; then
+    echo "==> [post-commit] ❌ push 失败，请手动 git push" >&2
+    exit 1
+fi
+echo "==> [post-commit] ✅ 已同步 origin/$branch"

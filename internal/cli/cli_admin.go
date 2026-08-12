@@ -35,6 +35,7 @@ resources:
   buckets delete <bucket>
 
 note: buckets lifecycle|encryption|website|delete are tenant-scoped writes (X-Aero-Tenant caller), not admin-gated; only buckets quota is admin-gated.`)
+
 }
 
 func (c *Client) cmdAdmin(args []string) int {

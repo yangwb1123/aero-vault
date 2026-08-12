@@ -32,7 +32,7 @@ func TestAdminUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new local storage: %v", err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	reg, _ := auth.Parse("")
 	adm := NewAdminHandler(svc, repo, reg)
 

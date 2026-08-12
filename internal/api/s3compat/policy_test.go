@@ -222,6 +222,7 @@ func newPolicyTestServer(t *testing.T) (*httptest.Server, *service.FileService) 
 	}
 	svc := service.NewFileService(store, repo, nil)
 	srv := httptest.NewServer(NewRouter(svc, nil, nil))
+
 	t.Cleanup(func() {
 		srv.Close()
 		_ = repo.Close()

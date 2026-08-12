@@ -69,7 +69,6 @@ var s3CodeStatus = map[string]int{
 
 var s3CodeMessage = map[string]string{
 	"MalformedXML":                 "The XML you provided was not well-formed or did not validate against our published schema.",
-	"EntityTooLarge":               "Your proposed upload exceeds the maximum allowed object size.",
 	"NoSuchBucket":                 "The specified bucket does not exist.",
 	"BucketNotEmpty":               "The bucket you tried to delete is not empty.",
 	"NoSuchBucketPolicy":           "The bucket policy does not exist.",
@@ -85,6 +84,7 @@ var s3CodeMessage = map[string]string{
 	"IncompleteBody":               "You did not provide the number of bytes specified by the Content-Length HTTP header.",
 	"AccessDenied":                 "Access denied.",
 	"AccessDenied.Locked":          "Object is under retention lock (WORM).",
+	"EntityTooLarge":               "Your proposed upload exceeds the maximum allowed object size.",
 	"ObjectCorrupt":                "Object is marked as corrupt.",
 	"QuotaExceeded":                "The tenant storage quota has been exceeded.",
 	"ServiceUnavailable":           "The tenant entitlement projection is unavailable.",

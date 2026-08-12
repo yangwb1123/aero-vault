@@ -21,10 +21,11 @@ const (
 )
 
 var (
-	ErrInvalidConfig    = errors.New("audit governance configuration is invalid")
-	ErrInvalidEvent     = errors.New("audit governance event is invalid")
-	ErrInvalidReceipt   = errors.New("audit governance receipt is invalid")
-	ErrReceiptConflict  = errors.New("audit governance receipt reports a conflict")
+	ErrInvalidConfig   = errors.New("audit governance configuration is invalid")
+	ErrInvalidEvent    = errors.New("audit governance event is invalid")
+	ErrInvalidReceipt  = errors.New("audit governance receipt is invalid")
+	ErrReceiptConflict = errors.New("audit governance receipt reports a conflict")
+
 	ErrTokenUnavailable = errors.New("audit governance token is unavailable")
 )
 

@@ -103,6 +103,7 @@ func (c *Client) cmdRemove(args []string) int {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		fmt.Fprintln(os.Stderr, renderError(resp))
+
 		return 1
 	}
 	return 0

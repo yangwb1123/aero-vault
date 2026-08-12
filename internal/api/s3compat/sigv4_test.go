@@ -47,6 +47,7 @@ func newSignedS3Server(t *testing.T) *httptest.Server {
 	r := chi.NewRouter()
 	r.Use(reg.Middleware())
 	r.Mount("/", NewRouter(svc, nil, nil))
+
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 	return srv

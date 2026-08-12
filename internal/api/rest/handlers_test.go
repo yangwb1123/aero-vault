@@ -47,6 +47,7 @@ func setupTestWith(t *testing.T, opts ...func(*Handler)) (*service.FileService, 
 	}
 	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
 	router := NewRouter(svc, repo, nil, nil, nil, nil, nil, slog.Default(), false, nil, nil, 0, false, opts...)
+
 	ts := httptest.NewServer(router)
 	t.Cleanup(func() { ts.Close(); _ = repo.Close() })
 	return svc, repo, ts

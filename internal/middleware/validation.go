@@ -56,12 +56,6 @@ func (l *limitErrReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// MaxBodySize limits the request body to maxBytes. If the Content-Length header
-// exceeds the limit the request is rejected immediately (without reading any
-// body) with 413 Request Entity Too Large. Otherwise the body reader is wrapped
-// with io.LimitReader so streaming reads also honour the cap.
-//
-// A maxBytes value of 0 or less disables limiting (zero-cost pass-through).
 func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 	if maxBytes <= 0 {
 		return func(next http.Handler) http.Handler { return next }
@@ -81,6 +75,7 @@ func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 			// the upload and let a corrupt object be stored (adapters map
 			// the sentinel to 413).
 			r.Body = io.NopCloser(&limitErrReader{r: r.Body, limit: maxBytes})
+
 			next.ServeHTTP(w, r)
 		})
 	}

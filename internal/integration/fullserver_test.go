@@ -38,6 +38,16 @@ import (
 	"github.com/aero-vault/aero-vault/internal/webui"
 )
 
+// allowAllProvider satisfies both access.Authorizer and
+// s3compat.AuthorizationProvider (identical method shape): everything is
+// allowed, so baseline harness tests exercise CRUD mechanics, not the
+// fail-closed delete gates (which have dedicated tests).
+type allowAllProvider struct{}
+
+func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
+	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
+}
+
 // fullServerHarness exposes the loopback server plus the repo/DSN the tests
 // need to assert outbox/audit state (AC-3/AC-5).
 type fullServerHarness struct {
@@ -81,6 +91,7 @@ func startFullServerOpts(t *testing.T, relayOpts *events.EventOutboxRelayOptions
 // the middleware chain rings that the default config leaves inert (MaxBodySize,
 // CORS). cfg is required — a nil config would nil-dereference inside
 // server.ApplyMiddleware, so fail fast in the test.
+
 func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string, cfg *config.Config) *fullServerHarness {
 	t.Helper()
 	if cfg == nil {
@@ -104,7 +115,7 @@ func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayO
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.NewFileService(store, repo, logger).WithAuthorizer(allowAllProvider{})
+	svc := service.NewFileService(store, repo, logger).WithAuthorizer(allowAllProvider{}).WithTenantStatusEnforcement()
 	// Production bus shape (mirrors cmd/server/main.go:215 + workers.go:141-147):
 	// the service sinks lifecycle events into the Bus and the Notifier delivers
 	// them per bucket notification rules. Existing tests are unaffected — with
@@ -144,7 +155,7 @@ func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayO
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
 	r.Mount("/v1", rest.NewRouter(svc, repo, nil, nil, nil, nil, authReg, logger, false, aiRL, nil, 0, false))
-	r.Mount("/s3", s3compat.NewRouter(svc, logger, nil))
+	r.Mount("/s3", s3compat.NewRouter(svc, logger, allowAllProvider{}))
 
 	mcpServer := mcp.NewServer(svc, repo, nil, "default", logger)
 	r.Method(http.MethodPost, "/mcp", mcp.HTTPHandler(mcpServer))
@@ -1426,14 +1437,4 @@ func waitForBodies(t *testing.T, count func() int, want int, timeout time.Durati
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("L2 received %d POSTs, want %d", count(), want)
-}
-
-// allowAllProvider is the CI-baseline test double injected into the full-server
-// harness: it preserves the pre-fail-closed baseline (all actions allowed) for
-// integration tests exercising non-authz behavior. The fail-closed delete gate
-// is covered by dedicated service/rest tests.
-type allowAllProvider struct{}
-
-func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
-	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -94,6 +95,7 @@ func (r *Runtime) deliverFact(fact repository.AuditGovernanceFact) {
 		// retention prune (7d default), mirroring the events outbox 'failed'
 		// state. Transient errors fall through to retryFact. Sentinel list
 		// cross-referenced by classifyRelayError below.
+
 		r.failFact(fact, err)
 		return
 	}
@@ -193,6 +195,7 @@ func (r *Runtime) cleanupDelivered() {
 	if err == nil {
 		// Terminal-failed rows (conflict:true, contract A) share the retention
 		// window: kept for diagnosis until the retention prune, then removed.
+
 		_, err = r.store.CleanupFailedAuditGovernance(
 			ctx, now.Add(-r.retention), r.cleanupBatch)
 	}
@@ -235,7 +238,9 @@ func boundedBackoffDelay(attempts int, initial, maximum time.Duration, fraction 
 func classifyRelayError(err error) string {
 	var status *httpStatusError
 	if errors.As(err, &status) {
-		return status.Error()
+		// Status only — the response body is untrusted input and may echo
+		// raw actor/target/secret values; it must never reach the logs.
+		return fmt.Sprintf("audit governance HTTP %d", status.Status)
 	}
 	if errors.Is(err, ErrInvalidEvent) || errors.Is(err, ErrInvalidReceipt) ||
 		errors.Is(err, ErrReceiptConflict) || errors.Is(err, ErrTokenUnavailable) {

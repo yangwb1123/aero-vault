@@ -214,6 +214,7 @@ func (s *FileService) finishMultipartCompletion(
 	// FR-1a: account usage before the storage upload is consumed and before the
 	// object row is committed, so an accounting failure leaves zero durable
 	// footprint and a retry re-runs the whole completion cleanly (claim released).
+
 	if err := s.accountObjectUsage(ctx, u.TenantID, usage, total); err != nil {
 		return repository.Object{}, s.releaseMultipartCompletion(ctx, scope, idemKey, err)
 	}
@@ -281,6 +282,7 @@ func (s *FileService) persistMultipartCompletion(
 	u repository.Upload,
 	saved repository.Object,
 	usage objectWriteUsage, // D4: signature retained; accounting moved to finishMultipartCompletion
+
 	idemKey string,
 ) error {
 	body, _ := json.Marshal(saved)

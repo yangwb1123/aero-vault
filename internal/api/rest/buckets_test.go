@@ -33,7 +33,7 @@ func newBucketTestServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	h := NewHandler(svc, nil)
 	reg, _ := auth.Parse("")
 	adm := NewAdminHandler(svc, repo, reg)
@@ -68,7 +68,7 @@ func newBucketQuotaAuthTestServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatalf("parse auth: %v", err)
 	}
-	adm := NewAdminHandler(service.NewFileService(store, repo, nil), repo, reg)
+	adm := NewAdminHandler(service.NewFileService(store, repo, nil).WithDeleteFailOpen(true), repo, reg)
 	r := chi.NewRouter()
 	r.Use(mw.Tenant)
 	r.Use(reg.Middleware())

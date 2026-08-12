@@ -29,7 +29,7 @@ func newAuthRESTTest(t *testing.T) (*httptest.Server, string) {
 		t.Fatalf("migrate: %v", err)
 	}
 	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
-	h := NewHandler(service.NewFileService(store, repo, nil), nil)
+	h := NewHandler(service.NewFileService(store, repo, nil).WithDeleteFailOpen(true), nil)
 
 	reg, err := auth.Parse("k1:default:read+write")
 	if err != nil {

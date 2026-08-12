@@ -208,6 +208,7 @@ authentication source (API key, JWT/JWKS, SigV4, or persistent API-key store).
 | `ACCESS_DEFAULT_POLICY` | `deny` | `deny` requires ownership/ACL/admin access. `tenant` allows the existing `read`/`write` scope fallback only when no resource ACL applies; useful for gradual migration. |
 | `ACCESS_SHARE_SECRET` | _(empty)_ | Required when enabled; at least 32 bytes and identical on every replica. HMAC-protects share passwords. |
 | `ACCESS_PUBLIC_BASE_URL` | _(empty)_ | Canonical external base URL placed in returned share/asset URLs, e.g. `https://source.ywbsd.site`. Empty derives it from the request. |
+| `ACCESS_DELETE_FAIL_CLOSED` | `true` | `false` restores the legacy nil-authorizer → allow delete baseline (`WithDeleteFailOpen`); default denies deletes without an authorizer (the antivirus system actor stays exempt). |
 
 For Snaplink, configure a tenant-bound `aero-vault` OAuth client, pin issuer and
 audience, and map that trusted client to the Aero tenant. State/cookie handling,
@@ -356,6 +357,9 @@ File delete (`FileService.Delete`, hard and soft) commits the metadata delete an
 | `EVENT_OUTBOX_ENABLED` | `true` | Kill-switch for the relay loop (claim → deliver → complete → prune). Enqueue of the two delete facts is **never** gated — rows keep accumulating while disabled and drain (FIFO) once re-enabled. Unparseable values fall back to the default (`true`). |
 | `EVENT_OUTBOX_POLL_INTERVAL_MILLIS` | `1000` | Relay claim poll interval (`1..60000`). |
 | `EVENT_OUTBOX_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
+| `EVENT_OUTBOX_ENABLED` | `true` | Gates the relay loop entirely; `false` logs a nil-repo-safe disabled line and skips the L2 sink build. |
+| `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` | `24` | Delivered rows are pruned after this many hours (`1..8760`). |
+| `EVENT_OUTBOX_FAILED_RETENTION_HOURS` | `168` | Terminal-failed rows are pruned after this many hours (`1..8760`). |
 | `EVENT_OUTBOX_CLAIM_TTL_SECONDS` | `30` | Fenced delivery lease; must exceed twice `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` so a slow target plus lease expiry cannot cause concurrent duplicate POSTs without any crash (`1..600`). Worst-case in-flight time per fact is `targets×timeout` — raise the TTL when a rule targets more than 3 endpoints at the default timeout. |
 | `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` | `5` | Per-target HTTP POST timeout (`1..29`). |
 | `EVENT_OUTBOX_MAX_ATTEMPTS` | `10` | Delivery attempts before a fact becomes terminal `failed` (`1..1000`); prune cutoffs are configurable — defaults 24h for delivered, 7 days for failed, see `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` / `EVENT_OUTBOX_FAILED_RETENTION_HOURS`. |

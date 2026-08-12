@@ -32,6 +32,7 @@ func newTestServer(t *testing.T, search *ai.Search) (*Server, *service.FileServi
 		t.Fatal(err)
 	}
 	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{})
+
 	srv := NewServer(svc, repo, search, "default", nil)
 	return srv, svc, repo
 }

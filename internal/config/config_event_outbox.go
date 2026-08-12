@@ -12,14 +12,15 @@ import (
 // the transactional enqueue) and is a silent no-op without notification
 // rules.
 type EventOutboxConfig struct {
-	Enabled                 bool // EVENT_OUTBOX_ENABLED (kill-switch for the relay loop)
-	PollMilliseconds        int  // EVENT_OUTBOX_POLL_INTERVAL_MILLIS
-	BatchSize               int  // EVENT_OUTBOX_BATCH_SIZE
-	ClaimTTLSeconds         int  // EVENT_OUTBOX_CLAIM_TTL_SECONDS
-	HTTPTimeoutSeconds      int  // EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS
-	MaxAttempts             int  // EVENT_OUTBOX_MAX_ATTEMPTS
-	DeliveredRetentionHours int  // EVENT_OUTBOX_DELIVERED_RETENTION_HOURS
-	FailedRetentionHours    int  // EVENT_OUTBOX_FAILED_RETENTION_HOURS
+	Enabled bool // EVENT_OUTBOX_ENABLED (kill-switch for the relay loop)
+
+	PollMilliseconds        int // EVENT_OUTBOX_POLL_INTERVAL_MILLIS
+	BatchSize               int // EVENT_OUTBOX_BATCH_SIZE
+	ClaimTTLSeconds         int // EVENT_OUTBOX_CLAIM_TTL_SECONDS
+	HTTPTimeoutSeconds      int // EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS
+	MaxAttempts             int // EVENT_OUTBOX_MAX_ATTEMPTS
+	DeliveredRetentionHours int // EVENT_OUTBOX_DELIVERED_RETENTION_HOURS
+	FailedRetentionHours    int // EVENT_OUTBOX_FAILED_RETENTION_HOURS
 }
 
 func loadEventOutboxConfig() EventOutboxConfig {
@@ -47,6 +48,7 @@ func loadEventOutboxConfig() EventOutboxConfig {
 // ≥ 1). Asymmetry (harmless today): a hand-built zero Config{} yields a
 // relay-off EventOutboxConfig while an env-loaded one is relay-on; any
 // future path that constructs Config directly must set Enabled explicitly.
+
 func (c EventOutboxConfig) withDefaults() EventOutboxConfig {
 	if c.PollMilliseconds == 0 {
 		c.PollMilliseconds = 1000

@@ -109,6 +109,7 @@ type Repository interface {
 	PruneEventOutbox(ctx context.Context, deliveredBefore, failedBefore time.Time) (int64, error)
 	HasEventOutboxFact(ctx context.Context, originID int64, eventType OutboxEventType) (bool, error)
 	CountEventOutbox(ctx context.Context) (int64, error)
+	CountPendingEventOutbox(ctx context.Context) (int64, error)
 
 	// ── AI Chunks ──
 	DeleteChunksForObject(ctx context.Context, objectID int64) error

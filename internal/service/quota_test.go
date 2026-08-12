@@ -28,6 +28,7 @@ func newQuotaTestSvc(t *testing.T) (*FileService, repository.Repository) {
 		t.Fatalf("storage: %v", err)
 	}
 	return NewFileService(store, repo, nil).WithAuthorizer(allowAllProvider{}), repo
+
 }
 
 // An unsized (no Content-Length) PUT must still be refused when the tenant is

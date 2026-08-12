@@ -42,6 +42,7 @@ type allowAllProvider struct{}
 
 func (allowAllProvider) Authorize(context.Context, access.Principal, access.Action, access.Resource) (access.Decision, error) {
 	return access.Decision{Allowed: true, Reason: "test_allow_all"}, nil
+
 }
 
 func putTestObject(t *testing.T, svc *FileService, key, body string) repository.Object {

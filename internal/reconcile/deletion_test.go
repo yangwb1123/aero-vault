@@ -30,6 +30,7 @@ func TestHardDeleteKeyRemovesEveryVersionAndAdjustsUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := service.NewFileService(store, repo, nil).WithAuthorizer(allowAllAuthz{})
+
 	if err := svc.SetBucketVersioning(ctx, "default", "versions", true); err != nil {
 		t.Fatal(err)
 	}

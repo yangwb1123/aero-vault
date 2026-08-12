@@ -59,6 +59,7 @@ const currentSQL = `SELECT ` + probeCols + ` FROM resource_acls
    resource_kind='bucket'
    OR (resource_kind='object' AND resource_key=?)
    OR (resource_kind='folder' AND (resource_key=? OR (inherit_acl=1 AND substr(?, 1, length(resource_key)) = resource_key)))
+
  ) ORDER BY LENGTH(resource_key) DESC, created_at, id`
 
 func scanRows(rows *sql.Rows) (int64, error) {

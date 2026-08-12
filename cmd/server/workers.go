@@ -30,7 +30,7 @@ func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slo
 			if err != nil {
 				return err
 			}
-			return avw.ScanObjectByID(access.SystemContext(ctx, job.TenantID), id)
+			return avw.ScanObjectByID(access.AntivirusContext(ctx, job.TenantID), id)
 		})
 		avSub, _ := bus.Subscribe()
 		go avw.Run(ctx, avSub)
@@ -167,6 +167,7 @@ func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog
 	if !cfg.EventOutbox.Enabled {
 		logger.Info("event outbox relay disabled",
 			"backlog", eventOutboxBacklog(ctx, repo))
+
 		return nil
 	}
 	opts := events.EventOutboxRelayOptions{
@@ -200,6 +201,7 @@ func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog
 		"delivered_retain_h", cfg.EventOutbox.DeliveredRetentionHours,
 		"failed_retain_h", cfg.EventOutbox.FailedRetentionHours,
 		"backlog", eventOutboxBacklog(ctx, repo))
+
 	return nil
 }
 

@@ -13,6 +13,7 @@ import (
 )
 
 func testManager(t *testing.T, defaultPolicy string) (*access.Manager, access.Store, context.Context) {
+
 	t.Helper()
 	ctx := context.Background()
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "access.db"))
@@ -35,6 +36,7 @@ func testManager(t *testing.T, defaultPolicy string) (*access.Manager, access.St
 		t.Fatal(err)
 	}
 	return manager, store, ctx
+
 }
 
 func adminContext(ctx context.Context, tenant string) context.Context {
@@ -441,5 +443,6 @@ func TestAuthorizeFailsClosedOnACLStoreError(t *testing.T) {
 	}
 	if decision.Allowed || decision.Reason != "acl_store_error" {
 		t.Fatalf("decision=%+v, want fail-closed acl_store_error", decision)
+
 	}
 }
