@@ -455,6 +455,18 @@ func FuzzGenerate(f *testing.F) {
 		f.Add(jpegWithPostSOFExif(payload)) // post-SOF APP1 must be ignored
 	}
 
+	// GIF seeds (direction: GIF decode-pipeline test coverage). Fixture
+	// builders live in gif_test.go; makeGIF is the sniff-level helper (typed
+	// testing.TB, so *testing.F works — F embeds common). Classes: known-good
+	// decode, composite path (Opaque()==false → white flatten), first-frame
+	// policy under mutation, and the header-only dims probes.
+	f.Add(makeGIF(f))                     // 1×1 opaque GIF: known-good decode seed
+	f.Add(makeTransparent1x1GIF(f))       // composite-path seed (transparent palette entry)
+	f.Add(makeAnimatedGIF(f))             // 2-frame GIF: first-frame policy under mutation
+	f.Add(headerOnlyGIF(f, 65535, 65535)) // ErrImageTooLarge: dims > MaxSourceDim (13 B)
+	f.Add(headerOnlyGIF(f, 8192, 8192))   // boundary: ErrUnsupported (no image data)
+	f.Add(makeGIF(f)[:len(makeGIF(f))/2]) // mid-stream truncation → ErrUnsupported
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)
 		if err != nil {
