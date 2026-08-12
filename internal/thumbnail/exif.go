@@ -115,7 +115,12 @@ func tiffOrientation(p []byte) int {
 			v = bo.Uint16(entry[8:10]) // value inline
 		} else {
 			vo := tiffBase + int(bo.Uint32(entry[8:12])) // value field is an offset
-			if vo+2 > len(p) {
+			// Lower bound is load-bearing on 32-bit targets: tiffBase +
+			// 0xFFFFFFFF wraps int to a small negative, which passes a
+			// one-sided vo+2 > len(p) check and panics on the slice below
+			// (verified GOARCH=386 reproduction). The offset must point
+			// into the payload proper (after the TIFF header), not before it.
+			if vo < tiffBase+8 || vo+2 > len(p) {
 				return 1
 			}
 			v = bo.Uint16(p[vo : vo+2])

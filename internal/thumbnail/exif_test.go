@@ -600,3 +600,57 @@ func TestGenerateOrientationRatioGe1YCbCr(t *testing.T) {
 		t.Fatalf("top=(%d,%d) bottom=(%d,%d): want top blue-dominant, bottom red-dominant", tr, tb, br, bb)
 	}
 }
+
+// FuzzExifOrientation drives the hand-rolled EXIF walker with arbitrary
+// mutations: any input must yield 1..8, never panic — including the
+// 32-bit int-wrap class (0xFFFFFFFF offsets, verified GOARCH=386 panic
+// before the lower-bound guard). The seeds cover the count-2
+// offset-follow wrap, a huge IFD0 offset, and a valid orientation-6 frame.
+// Run: go test -fuzz=FuzzExifOrientation -fuzztime=60s ./internal/thumbnail/
+func FuzzExifOrientation(f *testing.F) {
+	validLE := exifPayload(6, binary.LittleEndian)
+	f.Add(validLE)
+	f.Add(exifPayload(8, binary.BigEndian))
+	f.Add(jpegWithAPP1(validLE))
+	f.Add(jpegWithPostSOFExif(validLE))
+	// count-2 wrap seeds: the value field is an offset; 0xFFFFFFFF and
+	// 0x7FFFFFFF must not wrap int on 32-bit targets (the guard rejects).
+	wrap := func(off uint32) []byte {
+		p := make([]byte, 30)
+		copy(p, exifSignature)
+		p[6], p[7] = 'I', 'I'
+		binary.LittleEndian.PutUint16(p[8:10], 0x2A)
+		binary.LittleEndian.PutUint32(p[10:14], 8)
+		binary.LittleEndian.PutUint16(p[14:16], 1)
+		binary.LittleEndian.PutUint16(p[16:18], 0x0112)
+		binary.LittleEndian.PutUint16(p[18:20], 3)
+		binary.LittleEndian.PutUint32(p[20:24], 2)
+		binary.LittleEndian.PutUint32(p[24:28], off)
+		return jpegWithAPP1(p)
+	}
+	f.Add(wrap(0xFFFFFFFF))
+	f.Add(wrap(0x7FFFFFFF))
+	f.Add(wrap(0xFFFFFFF8))
+	f.Add(jpegWithAPP1(mutatedU32(validLE, 10, 0xFFFFFFFF))) // IFD0 wrap class
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		got := exifOrientation(data)
+		if got < 1 || got > 8 {
+			t.Fatalf("exifOrientation = %d, want 1..8", got)
+		}
+	})
+}
+
+// FuzzProgressiveJPEG drives the segment-aware SOF2 walker: any input must
+// yield true/false, never panic, never scan past the SOS header.
+// Run: go test -fuzz=FuzzProgressiveJPEG -fuzztime=60s ./internal/thumbnail/
+func FuzzProgressiveJPEG(f *testing.F) {
+	f.Add([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x42, 0x42, 0xFF, 0xC2})
+	f.Add(headerOnlyProgressiveJPEG(f, 64, 64))
+	f.Add(realBaselineJPEG(f, 64, 64, 82))
+	f.Add([]byte{0xFF, 0xD8, 0xFF, 0xFF, 0xFF})
+	f.Add([]byte{0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF, 0x42})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_ = progressiveJPEG(data) // must not panic; verdict unconstrained
+	})
+}
