@@ -248,7 +248,9 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // the context error, never reclassified as ErrUnsupported. After the stream
 // is fully read, a decode aborts at the next phase boundary (post-config,
 // post-decode, pre-encode) — and, inside the scale and rotation phases,
-// within cancelCheckRows rows of pixel work — and releases its decode slot.
+// within cancelCheckRows rows of pixel work, and inside jpeg.Encode at every
+// emitted byte via the context-checking encode writer (plus a terminal check
+// after Encode returns) — and releases its decode slot.
 //
 // GenerateContext acquires the decode slot itself. Callers that must hold the
 // slot across an object-stream open (e.g. the REST thumbnail handler, whose

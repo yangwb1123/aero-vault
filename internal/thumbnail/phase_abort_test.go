@@ -267,8 +267,11 @@ func TestGenerateContextAbortsAtConfigBoundary(t *testing.T) {
 // cancelCheckRows rows of pixel work (the deterministic mid-scale pin lives
 // in cpu_cancel_test.go's gateImage unit tests); C3 remains the pre-encode
 // safety net. Pre-fix this fails: the pipeline completes and a JPEG comes
-// back. The only residual timing direction is a false failure (cancel
-// landing after the abort point, during encode), never a false pass.
+// back. The former residual false-failure direction — a cancel landing after
+// the abort point, during encode — is now closed by the in-encode writer
+// boundary (encode_writer.go), pinned by TestGenerateContextAbortsMidEncode;
+// the remaining timing residual there is bounded by that test's calibration
+// margin (see its doc), never a false pass here.
 func TestGenerateContextAbortsBeforeEncode(t *testing.T) {
 	data := makePNG(t, 4096, 4096)
 	consumed := make(chan struct{})

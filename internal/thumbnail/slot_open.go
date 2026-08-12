@@ -68,7 +68,9 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 // across the call. Clamping was relocated here from GenerateContext's entry
 // (pure integer arithmetic; byte-identical output). Cancellation is honored
 // at the same phase boundaries as before and additionally inside
-// scale/applyOrientation (every cancelCheckRows rows).
+// scale/applyOrientation (every cancelCheckRows rows) and inside jpeg.Encode
+// at every emitted byte via the context-checking encode writer (plus a
+// terminal ctx.Err() check after Encode returns).
 func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
 	// Single source of truth for the dimension rule: generateLocked and the
 	// REST handler both derive effective bounds from EffectiveDims, so the
@@ -198,8 +200,21 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 		return nil, cerr
 	}
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality}); err != nil {
+	// In-encode cancellation boundary (encode_writer.go): while ctx is alive
+	// the writer is a pure pass-through (byte-identical output — the encoder
+	// uses it directly, dropping the bufio, which is transparent to bytes);
+	// once ctx is done the first write returns the exact ctx.Err(), the
+	// encoder's sticky error stops emission, and Encode returns it unwrapped.
+	// The target goes through the encodeSink seam so tests can pin this
+	// wiring deterministically (encode_cancel_test.go, F1/F2).
+	if err := jpeg.Encode(encodeSink(ctx, &buf), dst, &jpeg.Options{Quality: quality}); err != nil {
 		return nil, err
+	}
+	// Terminal check: a cancel landing after the final flush but before
+	// Encode returns (or after Encode returned nil) must still surface the
+	// context error rather than a 200 (F2 contract). No-op while ctx is alive.
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
 	}
 	return buf.Bytes(), nil
 }
