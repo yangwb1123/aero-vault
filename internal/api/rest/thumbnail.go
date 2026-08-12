@@ -174,7 +174,8 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	if etagListMatches(r.Header.Get("If-None-Match"), statETag) {
 		w.Header().Set("ETag", `"`+statETag+`"`)
 		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-		// The 304 must mirror the 200's directive (RFC 9111 §3.2/§3.4): a
+		// The 304 must mirror the 200's directive (RFC 9111 §4.3.4 freshening;
+		// the public/private split itself is per §3.2): a
 		// shared cache revalidating a private thumb would otherwise adopt
 		// the 304's (absent) directive and store the previous public body.
 		w.Header().Set("Cache-Control", cacheControl)

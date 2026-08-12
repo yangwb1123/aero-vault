@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1561,8 +1562,9 @@ func TestThumbnailCacheControlPrivacy(t *testing.T) {
 	})
 
 	t.Run("304 mirrors the 200 directive", func(t *testing.T) {
-		// RFC 9111 §3.2/§3.4: a revalidating shared cache adopts the 304's
-		// directive — a private 304 must never follow a public 200.
+		// RFC 9111 §4.3.4: a revalidating shared cache freshens the stored
+		// response with the 304's directive — a private 304 must never
+		// follow a public 200.
 		s, tok := newAuthRESTTest(t)
 		authH := map[string]string{"Authorization": tok}
 		u := s.URL + "/v1/files/img"
@@ -3193,5 +3195,336 @@ func TestThumbnailETagDerivedFromOpenedObjectSniffBucket(t *testing.T) {
 	}
 	if got := resp.Header.Get("ETag"); got == `"`+etagA+"-thumb-"+fmt.Sprintf("%dx%d", ew, eh)+`"` {
 		t.Fatalf("200 ETag must not derive from the pre-open Stat (stale v1) on the sniff path: %q", got)
+	}
+}
+
+// TestThumbnailHeadParityExistingImage pins AC-1: HEAD /v1/files/{key}/thumbnail
+// must return the same status and header fields as GET on the same URL (RFC
+// 9110 §9.3.2) with an empty body — the derived thumbnail ETag, the generated
+// JPEG Content-Length and Content-Type, the identical Cache-Control directive,
+// and the 304 conditional arm. Regression: previously HEAD stat-ed the
+// un-trimmed "{key}/thumbnail" full key and 404'd while GET 200'd.
+func TestThumbnailHeadParityExistingImage(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/pic.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT pic.png: %d", resp.StatusCode)
+	}
+	thumbURL := u + "/thumbnail?w=100&h=100"
+
+	// GET baseline: 200 image/jpeg with the derived thumbnail ETag and the
+	// generated-JPEG Content-Length.
+	getResp, getBody := req(t, "GET", thumbURL, nil, nil)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET thumbnail: status=%d want 200", getResp.StatusCode)
+	}
+	getETag := getResp.Header.Get("ETag")
+	if getETag == "" {
+		t.Fatal("GET thumbnail: missing ETag")
+	}
+	if ct := getResp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("GET thumbnail: Content-Type=%q want image/jpeg", ct)
+	}
+	getCL := getResp.Header.Get("Content-Length")
+	if getCL != strconv.Itoa(len(getBody)) {
+		t.Fatalf("GET thumbnail: Content-Length=%q want %d", getCL, len(getBody))
+	}
+	getCC := getResp.Header.Get("Cache-Control")
+
+	// HEAD must mirror status + headers with an empty body.
+	headResp, headBody := req(t, "HEAD", thumbURL, nil, nil)
+	if headResp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD thumbnail: status=%d want 200", headResp.StatusCode)
+	}
+	if ct := headResp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("HEAD thumbnail: Content-Type=%q want image/jpeg", ct)
+	}
+	if et := headResp.Header.Get("ETag"); et != getETag {
+		t.Fatalf("HEAD thumbnail: ETag=%q want GET's %q", et, getETag)
+	}
+	if cl := headResp.Header.Get("Content-Length"); cl != getCL {
+		t.Fatalf("HEAD thumbnail: Content-Length=%q want GET's %q", cl, getCL)
+	}
+	if cc := headResp.Header.Get("Cache-Control"); cc != getCC {
+		t.Fatalf("HEAD thumbnail: Cache-Control=%q want GET's %q", cc, getCC)
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("HEAD thumbnail: body=%d bytes, want empty", len(headBody))
+	}
+
+	// Conditional arm (R3): HEAD carrying the GET-derived validator in
+	// If-None-Match must 304 exactly like GET, mirroring ETag /
+	// Last-Modified / Cache-Control.
+	head304, body304 := req(t, "HEAD", thumbURL, nil, map[string]string{"If-None-Match": getETag})
+	if head304.StatusCode != http.StatusNotModified {
+		t.Fatalf("HEAD thumbnail If-None-Match: status=%d want 304", head304.StatusCode)
+	}
+	if len(body304) != 0 {
+		t.Fatalf("HEAD 304: body=%d bytes, want empty", len(body304))
+	}
+	if et := head304.Header.Get("ETag"); et != getETag {
+		t.Fatalf("HEAD 304: ETag=%q want %q", et, getETag)
+	}
+	if cc := head304.Header.Get("Cache-Control"); cc != getCC {
+		t.Fatalf("HEAD 304: Cache-Control=%q want GET 200's %q", cc, getCC)
+	}
+	if lm := head304.Header.Get("Last-Modified"); lm == "" {
+		t.Fatal("HEAD 304: missing Last-Modified")
+	}
+}
+
+// TestThumbnailHeadParityMissingOrNonImage pins AC-2: for every URL where GET
+// /thumbnail returns an error status, HEAD on the same URL must return the
+// identical status (RFC 9110 §9.3.2) — never the old divergent 404 from
+// stat-ing the un-trimmed "{key}/thumbnail" full key.
+func TestThumbnailHeadParityMissingOrNonImage(t *testing.T) {
+	s := newRESTTest(t)
+	check := func(t *testing.T, url string, want int) {
+		t.Helper()
+		getResp, _ := req(t, "GET", url, nil, nil)
+		headResp, headBody := req(t, "HEAD", url, nil, nil)
+		if getResp.StatusCode != want || headResp.StatusCode != want {
+			t.Fatalf("%s: GET=%d HEAD=%d want both %d", url, getResp.StatusCode, headResp.StatusCode, want)
+		}
+		if len(headBody) != 0 {
+			t.Fatalf("%s HEAD: body=%d bytes, want empty", url, len(headBody))
+		}
+	}
+
+	// Missing object → 404 both.
+	check(t, s.URL+"/v1/files/nope.png/thumbnail", http.StatusNotFound)
+
+	// Declared non-image → 400 InvalidArgument both (GET's classification
+	// preserved).
+	notesURL := s.URL + "/v1/files/notes.txt"
+	if resp, _ := req(t, "PUT", notesURL, []byte("plain text"), map[string]string{"Content-Type": "text/plain"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT notes.txt: %d", resp.StatusCode)
+	}
+	check(t, notesURL+"/thumbnail", http.StatusBadRequest)
+
+	// Declared unsupported image → 415 UnsupportedMediaType both.
+	webpURL := s.URL + "/v1/files/pic.webp"
+	if resp, _ := req(t, "PUT", webpURL, webpBytes, map[string]string{"Content-Type": "image/webp"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT pic.webp: %d", resp.StatusCode)
+	}
+	check(t, webpURL+"/thumbnail", http.StatusUnsupportedMediaType)
+}
+
+// TestThumbnailHeadParityExactKey pins design P1 (R3 exact-key arm, FR-1):
+// when an object literally named "{key}/thumbnail" exists, GET serves the raw
+// object. HEAD must mirror that raw response — ETag, Content-Type and
+// Content-Length identical, body empty — never a derived thumbnail.
+func TestThumbnailHeadParityExactKey(t *testing.T) {
+	s, tok, repo := newAuthRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+
+	getResp, getBody := req(t, "GET", uFull, nil, authH)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET exact key: status=%d want 200", getResp.StatusCode)
+	}
+	headResp, headBody := req(t, "HEAD", uFull, nil, authH)
+	if headResp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD exact key: status=%d want 200", headResp.StatusCode)
+	}
+	if et := headResp.Header.Get("ETag"); et != getResp.Header.Get("ETag") {
+		t.Fatalf("HEAD exact key: ETag=%q want GET's %q", et, getResp.Header.Get("ETag"))
+	}
+	if ct := headResp.Header.Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("HEAD exact key: Content-Type=%q want text/plain", ct)
+	}
+	if cl := headResp.Header.Get("Content-Length"); cl != strconv.Itoa(len(getBody)) {
+		t.Fatalf("HEAD exact key: Content-Length=%q want %d", cl, len(getBody))
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("HEAD exact key: body=%d bytes, want empty", len(headBody))
+	}
+}
+
+// TestThumbnailHeadParityEmptyExactKey pins protocol-expert F2: a 0-byte
+// object literally named "{key}/thumbnail" is served through
+// handleRangeOrFull, which must emit "Content-Length: 0" on HEAD exactly as
+// GET does (RFC 9110 §9.3.2). net/http auto-emits CL only when a body was
+// written (server.go:1327) — GET gets auto-0, HEAD would get no CL header at
+// all without the explicit unconditional set (mirroring Head, handler.go:249).
+func TestThumbnailHeadParityEmptyExactKey(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/empty/thumbnail"
+	if resp, _ := req(t, "PUT", u, nil, map[string]string{"Content-Type": "text/plain"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT empty/thumbnail: %d", resp.StatusCode)
+	}
+	getResp, getBody := req(t, "GET", u, nil, nil)
+	headResp, headBody := req(t, "HEAD", u, nil, nil)
+	if getResp.StatusCode != http.StatusOK || headResp.StatusCode != http.StatusOK {
+		t.Fatalf("empty exact key: GET=%d HEAD=%d want both 200", getResp.StatusCode, headResp.StatusCode)
+	}
+	if getCL := getResp.Header.Get("Content-Length"); getCL != "0" {
+		t.Fatalf("GET empty exact key: Content-Length=%q want \"0\"", getCL)
+	}
+	if headCL := headResp.Header.Get("Content-Length"); headCL != "0" {
+		t.Fatalf("HEAD empty exact key: Content-Length=%q want \"0\"", headCL)
+	}
+	if len(getBody) != 0 || len(headBody) != 0 {
+		t.Fatalf("empty exact key: GET body=%d HEAD body=%d bytes, want both empty", len(getBody), len(headBody))
+	}
+}
+
+// TestThumbnailHeadAnonymousPublicRead pins design P2 (D3 ordering): the HEAD
+// /thumbnail dispatch must precede Head's full-key gates. An anonymous HEAD of
+// a public-read image must 200 (trimmed-key admission on the derivation path)
+// and of a private image must 403 — identical to GET on the same URL. Without
+// the D3 placement, anonymous HEAD would 403 while GET 200s.
+func TestThumbnailHeadAnonymousPublicRead(t *testing.T) {
+	s, tok := newAuthRESTTest(t)
+	authH := map[string]string{"Authorization": tok}
+
+	// Public-read image: anonymous GET and HEAD /thumbnail both 200.
+	u := s.URL + "/v1/files/pic.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT pic.png: %d", resp.StatusCode)
+	}
+	if resp, _ := req(t, "PUT", u+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+		t.Fatalf("set public-read acl: %d", resp.StatusCode)
+	}
+	getResp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+	headResp, headBody := req(t, "HEAD", u+"/thumbnail", nil, nil)
+	if getResp.StatusCode != http.StatusOK || headResp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous public image: GET=%d HEAD=%d want both 200", getResp.StatusCode, headResp.StatusCode)
+	}
+	if ct := headResp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("anonymous HEAD public image: Content-Type=%q want image/jpeg", ct)
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("anonymous HEAD public image: body=%d bytes, want empty", len(headBody))
+	}
+
+	// Private image: anonymous GET and HEAD /thumbnail both 403.
+	priv := s.URL + "/v1/files/priv.png"
+	if resp, _ := req(t, "PUT", priv, pngBytes(t, 100, 100), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT priv.png: %d", resp.StatusCode)
+	}
+	getResp, _ = req(t, "GET", priv+"/thumbnail", nil, nil)
+	headResp, _ = req(t, "HEAD", priv+"/thumbnail", nil, nil)
+	if getResp.StatusCode != http.StatusForbidden || headResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("anonymous private image: GET=%d HEAD=%d want both 403", getResp.StatusCode, headResp.StatusCode)
+	}
+
+	// Public-BUCKET variant (protocol-expert F5): bucket ACL public-read, no
+	// per-object ACL. allowAnonymous then admits at bucket level, so a dispatch
+	// misplaced AFTER Head's full-key gates would NOT 403 here — it would 404
+	// (full-key Stat of the nonexistent "{key}/thumbnail" object, which passes
+	// the bucket-level anonymous gate) while GET 200s. This pins the
+	// 404-vs-200 mechanism, distinct from the per-object-ACL 403 above.
+	s2, alice, _ := newThumbnailAccessHarness(t)
+	pubB := s2.URL + "/v1/files/bucketpub.png"
+	if resp, _ := req(t, "PUT", pubB, pngBytes(t, 120, 80), map[string]string{"Content-Type": "image/png", "Authorization": alice}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT bucketpub.png: %d", resp.StatusCode)
+	}
+	if resp, _ := req(t, "PUT", s2.URL+"/v1/buckets/default/acl", []byte(`{"acl":"public-read"}`), map[string]string{"Authorization": "Bearer operator"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("set public-read bucket acl: %d", resp.StatusCode)
+	}
+	getResp, _ = req(t, "GET", pubB+"/thumbnail", nil, nil)
+	headResp, headBody = req(t, "HEAD", pubB+"/thumbnail", nil, nil)
+	if getResp.StatusCode != http.StatusOK || headResp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous public-bucket image: GET=%d HEAD=%d want both 200", getResp.StatusCode, headResp.StatusCode)
+	}
+	if ct := headResp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("anonymous HEAD public-bucket image: Content-Type=%q want image/jpeg", ct)
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("anonymous HEAD public-bucket image: body=%d bytes, want empty", len(headBody))
+	}
+}
+
+// TestThumbnailHeadVersionPinParity pins design P3 (R3 ?version= arm): the
+// version-pinned read delegates to Get on the FULL key, so GET and HEAD must
+// agree on both the 404 arm (pinned version does not exist for the full key —
+// the oldID below belongs to the trimmed key img.png) and the 200 arm (an
+// existing pinned version of the full key serves its own raw bytes).
+func TestThumbnailHeadVersionPinParity(t *testing.T) {
+	s, tok, repo := newAuthRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/img.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "img.png")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	oldID := versions[0].VersionID
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 200, 100), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+
+	// Pinned version of the FULL key does not exist → 404 both (R3's
+	// "including its 404 when the pinned version does not exist").
+	thumbURL := u + "/thumbnail?version=" + oldID
+	getResp, _ := req(t, "GET", thumbURL, nil, authH)
+	headResp, headBody := req(t, "HEAD", thumbURL, nil, authH)
+	if getResp.StatusCode != http.StatusNotFound || headResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("version-pinned full-key missing: GET=%d HEAD=%d want both 404", getResp.StatusCode, headResp.StatusCode)
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("version-pinned HEAD: body=%d bytes, want empty", len(headBody))
+	}
+
+	// Existing pinned version of the full key (raw object at img.png/thumbnail)
+	// → both 200 with the pinned version's own bytes.
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("full v1 bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT full v1: %d", resp.StatusCode)
+	}
+	fullVersions, err := repo.ListObjectVersions(context.Background(), "default", "default", "img.png/thumbnail")
+	if err != nil || len(fullVersions) == 0 {
+		t.Fatalf("list full-key versions: %v (n=%d)", err, len(fullVersions))
+	}
+	fullOld := fullVersions[0].VersionID
+	if resp, _ := req(t, "PUT", uFull, []byte("full v2 bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT full v2: %d", resp.StatusCode)
+	}
+	pinnedURL := uFull + "?version=" + fullOld
+	getResp, getBody := req(t, "GET", pinnedURL, nil, authH)
+	headResp, headBody = req(t, "HEAD", pinnedURL, nil, authH)
+	if getResp.StatusCode != http.StatusOK || headResp.StatusCode != http.StatusOK {
+		t.Fatalf("version-pinned full-key existing: GET=%d HEAD=%d want both 200", getResp.StatusCode, headResp.StatusCode)
+	}
+	if et := headResp.Header.Get("ETag"); et != getResp.Header.Get("ETag") {
+		t.Fatalf("HEAD version-pinned: ETag=%q want GET's %q", et, getResp.Header.Get("ETag"))
+	}
+	if cl := headResp.Header.Get("Content-Length"); cl != strconv.Itoa(len(getBody)) {
+		t.Fatalf("HEAD version-pinned: Content-Length=%q want %d", cl, len(getBody))
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("HEAD version-pinned: body=%d bytes, want empty", len(headBody))
+	}
+}
+
+// TestThumbnailHeadOversized413 pins design P4 (error-arm breadth): the 413
+// ImageTooLarge arm must be reached identically by GET and HEAD.
+func TestThumbnailHeadOversized413(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/bomb.png"
+	// Tiny 33-byte PUT passes the (disabled-by-default) MaxBodySize cap.
+	if resp, _ := req(t, "PUT", u, bombPNG(t, 100000, 100000), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT bomb.png: %d", resp.StatusCode)
+	}
+	thumbURL := u + "/thumbnail"
+	getResp, _ := req(t, "GET", thumbURL, nil, nil)
+	headResp, headBody := req(t, "HEAD", thumbURL, nil, nil)
+	if getResp.StatusCode != http.StatusRequestEntityTooLarge || headResp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized: GET=%d HEAD=%d want both 413", getResp.StatusCode, headResp.StatusCode)
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("oversized HEAD: body=%d bytes, want empty", len(headBody))
 	}
 }

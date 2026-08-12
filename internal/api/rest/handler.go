@@ -214,6 +214,23 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 
 // HEAD /v1/files/*key
 func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
+	// HEAD on the /thumbnail subresource must mirror GET on the same URL
+	// (RFC 9110 §9.3.2: identical status and headers, body suppressed):
+	// dispatch to the same decision tree getKey uses for its /thumbnail
+	// branch (router.go) instead of stat-ing the un-trimmed
+	// "{key}/thumbnail" full key, which names no object and would 404 while
+	// GET 200s. This MUST precede Head's own full-key gates — the thumbnail
+	// derivation path gates on the TRIMMED key (checkBucketPolicy +
+	// allowAnonymous in thumbnail.go), so gating the full key first would
+	// 403 anonymous public reads and evaluate bucket policy against the
+	// wrong ARN. net/http suppresses the response body for HEAD while
+	// preserving explicitly-set status and headers (Content-Type, ETag,
+	// Content-Length, Cache-Control), so reusing Thumbnail verbatim yields
+	// exact GET parity on every arm.
+	if strings.HasSuffix(r.URL.Path, "/thumbnail") {
+		h.Thumbnail(w, r)
+		return
+	}
 	key := keyFromPath(r)
 	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
 		return

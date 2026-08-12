@@ -142,9 +142,12 @@ func (h *Handler) handleRangeOrFull(w http.ResponseWriter, r *http.Request, rc i
 	if obj.ContentType != "" {
 		w.Header().Set("Content-Type", obj.ContentType)
 	}
-	if obj.Size > 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
-	}
+	// Content-Length is unconditional (mirrors Head, handler.go:249): net/http
+	// auto-emits CL only for a written body (server.go:1327), so a 0-byte
+	// object would get "Content-Length: 0" on GET but no CL on HEAD — an
+	// RFC 9110 §9.3.2 header-set divergence on the exact-key /?version= arms.
+	// The explicit "0" is wire-identical to GET's auto-0.
+	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 	writeMetadataHeaders(w, obj.Metadata)
 	writeContentMD5(w, obj.Metadata)
