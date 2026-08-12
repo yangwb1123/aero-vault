@@ -70,18 +70,10 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 // at the same phase boundaries as before and additionally inside
 // scale/applyOrientation (every cancelCheckRows rows).
 func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
-	if maxW <= 0 {
-		maxW = DefaultMax
-	}
-	if maxH <= 0 {
-		maxH = DefaultMax
-	}
-	if maxW > HardMax {
-		maxW = HardMax
-	}
-	if maxH > HardMax {
-		maxH = HardMax
-	}
+	// Single source of truth for the dimension rule: generateLocked and the
+	// REST handler both derive effective bounds from EffectiveDims, so the
+	// cache validator can never drift from the produced bytes.
+	maxW, maxH = EffectiveDims(maxW, maxH)
 
 	// Aggregate bound (unchanged contract): at most maxConcurrentDecodes calls
 	// hold the allocation-bearing section below (config scan, decode, scale,

@@ -2683,3 +2683,126 @@ func TestThumbnailOctetStreamMagicPins(t *testing.T) {
 		t.Fatalf("content-type=%q want image/jpeg", ct)
 	}
 }
+
+func TestThumbnailETagFromEffectiveDims(t *testing.T) {
+	// Requests whose dims differ only in clamped-away values (?w=2048 vs
+	// ?w=9999, h absent → 256 in both) produce byte-identical JPEGs and must
+	// share one cache validator, so shared caches don't fragment entries per
+	// distinct oversized URL and the If-None-Match/304 fast path hits across
+	// URLs. The validator must encode the EFFECTIVE pair (HardMax-clamped w,
+	// DefaultMax defaulted h), not the raw query values.
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/pic.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT pic.png: %d", resp.StatusCode)
+	}
+
+	resp, body1 := req(t, "GET", u+"/thumbnail?w=2048", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("thumbnail ?w=2048: status=%d", resp.StatusCode)
+	}
+	etag1 := resp.Header.Get("ETag")
+	if etag1 == "" {
+		t.Fatal("thumbnail ?w=2048 missing ETag")
+	}
+
+	// Same effective pair (2048x256): identical validator and bytes.
+	resp, body2 := req(t, "GET", u+"/thumbnail?w=9999", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("thumbnail ?w=9999: status=%d", resp.StatusCode)
+	}
+	etag2 := resp.Header.Get("ETag")
+	if etag2 == "" {
+		t.Fatal("thumbnail ?w=9999 missing ETag")
+	}
+	if etag1 != etag2 {
+		t.Fatalf("clamped-away dims split validators: %q vs %q", etag1, etag2)
+	}
+	if !bytes.Equal(body1, body2) {
+		t.Fatal("?w=2048 and ?w=9999 returned different bodies")
+	}
+
+	// Cross-URL revalidation: the shared validator 304s on both URLs.
+	resp, b := req(t, "GET", u+"/thumbnail?w=9999", nil, map[string]string{"If-None-Match": etag1})
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("?w=9999 If-None-Match %q: status=%d want 304", etag1, resp.StatusCode)
+	}
+	if len(b) != 0 {
+		t.Fatalf("304 must have empty body, got %d bytes", len(b))
+	}
+	resp, b = req(t, "GET", u+"/thumbnail?w=2048", nil, map[string]string{"If-None-Match": etag1})
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("?w=2048 If-None-Match %q: status=%d want 304", etag1, resp.StatusCode)
+	}
+	if len(b) != 0 {
+		t.Fatalf("304 must have empty body, got %d bytes", len(b))
+	}
+
+	// Strengthening: the shared validator is the CORRECT effective value —
+	// HardMax-clamped w (2048) and DefaultMax-defaulted h (256).
+	resp, _ = req(t, "GET", u, nil, nil)
+	objETag := strings.Trim(resp.Header.Get("ETag"), `"`)
+	if objETag == "" {
+		t.Fatal("plain GET missing object ETag")
+	}
+	if want := `"` + objETag + "-thumb-2048x256\""; etag1 != want {
+		t.Fatalf("validator=%q want %q", etag1, want)
+	}
+}
+
+func TestThumbnailDefaultDimsShareETag(t *testing.T) {
+	// Absent dims and explicit ?w=0&h=0 both default to DefaultMax in the
+	// pipeline; they must share one validator encoding 256x256, so the
+	// no-query URL class collapses onto the explicit-zero class instead of
+	// fragmenting shared caches with a bogus "-thumb-0x0" validator.
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/pic.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT pic.png: %d", resp.StatusCode)
+	}
+
+	resp, bodyZ := req(t, "GET", u+"/thumbnail?w=0&h=0", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("thumbnail ?w=0&h=0: status=%d", resp.StatusCode)
+	}
+	etagZ := resp.Header.Get("ETag")
+	if etagZ == "" {
+		t.Fatal("thumbnail ?w=0&h=0 missing ETag")
+	}
+
+	resp, bodyN := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("thumbnail no query: status=%d", resp.StatusCode)
+	}
+	etagN := resp.Header.Get("ETag")
+	if etagN == "" {
+		t.Fatal("thumbnail no query missing ETag")
+	}
+	if etagZ != etagN {
+		t.Fatalf("defaulted dims split validators: %q vs %q", etagZ, etagN)
+	}
+	if !bytes.Equal(bodyZ, bodyN) {
+		t.Fatal("?w=0&h=0 and no-query returned different bodies")
+	}
+
+	// The shared validator 304s on the no-query URL.
+	resp, b := req(t, "GET", u+"/thumbnail", nil, map[string]string{"If-None-Match": etagZ})
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("no-query If-None-Match %q: status=%d want 304", etagZ, resp.StatusCode)
+	}
+	if len(b) != 0 {
+		t.Fatalf("304 must have empty body, got %d bytes", len(b))
+	}
+
+	// Strengthening: the shared validator encodes the correct effective
+	// value (both dims defaulted to DefaultMax), not merely a common wrong
+	// one — the pre-fix validator was "-thumb-0x0".
+	resp, _ = req(t, "GET", u, nil, nil)
+	objETag := strings.Trim(resp.Header.Get("ETag"), `"`)
+	if objETag == "" {
+		t.Fatal("plain GET missing object ETag")
+	}
+	if want := `"` + objETag + "-thumb-256x256\""; etagZ != want {
+		t.Fatalf("validator=%q want %q", etagZ, want)
+	}
+}

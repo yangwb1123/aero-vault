@@ -144,7 +144,16 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	etag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, maxW, maxH)
+	// Validator derived from the EFFECTIVE dimensions the pipeline applies
+	// (generateLocked: <=0 → DefaultMax, >HardMax → HardMax), not the raw
+	// ?w=/?h= values: requests whose dims differ only in clamped-away values
+	// (?w=2048 vs ?w=9999; ?w=0&h=0 vs absent) produce byte-identical JPEGs
+	// and must share one validator — or shared caches fragment entries and
+	// re-run the full pipeline per distinct oversized URL instead of the 304
+	// fast path. Raw values still flow to GenerateContextWithOpener; the
+	// re-clamp is idempotent, so output bytes are unchanged.
+	effW, effH := thumbnail.EffectiveDims(maxW, maxH)
+	etag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, effW, effH)
 	// Shared-cache directive: public only when this very request was admitted
 	// anonymously — allowAnonymous admits anonymous readers solely for
 	// genuinely public-readable objects, so the bytes are fetchable by any

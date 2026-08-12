@@ -116,6 +116,31 @@ const (
 	MaxMetadataBytes = 8 << 20
 )
 
+// EffectiveDims maps a requested thumbnail bound pair to the values the
+// decode pipeline actually applies, per dimension and independently:
+// non-positive bounds default to DefaultMax (256), bounds above HardMax
+// (2048) are capped to HardMax, in-range values pass through unchanged.
+// generateLocked clamps via this function and the REST thumbnail handler
+// derives its cache validator (ETag) from it, so validator dimensions
+// always match the produced bytes. Pure integer arithmetic — no I/O, no
+// allocation, no error return; every input pair maps to exactly one
+// effective pair.
+func EffectiveDims(maxW, maxH int) (int, int) {
+	if maxW <= 0 {
+		maxW = DefaultMax
+	}
+	if maxW > HardMax {
+		maxW = HardMax
+	}
+	if maxH <= 0 {
+		maxH = DefaultMax
+	}
+	if maxH > HardMax {
+		maxH = HardMax
+	}
+	return maxW, maxH
+}
+
 // maxConcurrentDecodes caps how many Generate calls may be inside their
 // allocation-bearing section (DecodeConfig through jpeg.Encode) at once.
 // Aggregate live decode memory is therefore bounded by
