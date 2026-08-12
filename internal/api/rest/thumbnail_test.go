@@ -3528,3 +3528,102 @@ func TestThumbnailHeadOversized413(t *testing.T) {
 		t.Fatalf("oversized HEAD: body=%d bytes, want empty", len(headBody))
 	}
 }
+
+// TestThumbnailHeadParityPins pins the HEAD-on-thumbnail dispatch (QA F1/F2/F3):
+// HEAD must mirror GET field-for-field on every arm — derivation, policy
+// deny, long-key fallback, and the 304 fast path.
+func TestThumbnailHeadParityPins(t *testing.T) {
+	// F1: HEAD on the derivation path under a bucket-policy deny → 403,
+	// identical to the GET pin.
+	t.Run("derivation path bucket-policy deny", func(t *testing.T) {
+		s, tok, _ := newThumbnailAccessHarness(t)
+		adminH := map[string]string{"Authorization": "Bearer operator"}
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/secret"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		denyGet := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::default/secret"}]}`
+		if resp, _ := req(t, "PUT", s.URL+"/v1/buckets/default/policy", bodyPolicy(denyGet), adminH); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set deny policy: %d", resp.StatusCode)
+		}
+		resp, _ := req(t, "HEAD", u+"/thumbnail", nil, authH)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("HEAD denied derivation: status=%d want 403", resp.StatusCode)
+		}
+	})
+
+	// F3a: HEAD on an over-cap full key (201 chars) falls back to the
+	// derivation (200), like GET.
+	t.Run("long-key fallback", func(t *testing.T) {
+		s := newRESTTest(t)
+		key := strings.Repeat("k", service.MaxKeyLen-9) // 191 chars
+		if resp, _ := req(t, "PUT", s.URL+"/v1/files/"+key, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		resp, _ := req(t, "HEAD", s.URL+"/v1/files/"+key+"/thumbnail?w=32&h=32", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD over-cap full key: status=%d want 200 (fallback)", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+			t.Fatalf("content-type=%q want image/jpeg", ct)
+		}
+	})
+
+	// F3b: HEAD with the anonymous-gate 403 (private full key over a public
+	// trimmed key) mirrors GET's 403.
+	t.Run("anonymous gate 403", func(t *testing.T) {
+		s, tok, repo := newAuthRESTTestWithRepo(t)
+		enableVersioningForCoexistence(t, repo)
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/dir"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set acl: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/thumbnail", []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+		}
+		resp, _ := req(t, "HEAD", u+"/thumbnail", nil, nil) // anonymous
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("HEAD private full key: status=%d want 403", resp.StatusCode)
+		}
+	})
+
+	// F2: GET-304 vs HEAD-304 field-for-field equality; neither carries
+	// Content-Length/Content-Type (the 304 branch sets only the validator
+	// headers; net/http adds no body headers for a bodiless status).
+	t.Run("304 field parity", func(t *testing.T) {
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/img"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		resp, _ := req(t, "GET", u+"/thumbnail?w=64&h=64", nil, nil)
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			t.Fatal("missing ETag")
+		}
+		getResp, _ := req(t, "GET", u+"/thumbnail?w=64&h=64", nil, map[string]string{"If-None-Match": etag})
+		headResp, _ := req(t, "HEAD", u+"/thumbnail?w=64&h=64", nil, map[string]string{"If-None-Match": etag})
+		if getResp.StatusCode != http.StatusNotModified || headResp.StatusCode != http.StatusNotModified {
+			t.Fatalf("GET=%d HEAD=%d want both 304", getResp.StatusCode, headResp.StatusCode)
+		}
+		for _, hdr := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+			g, h := getResp.Header.Get(hdr), headResp.Header.Get(hdr)
+			if g != h {
+				t.Fatalf("304 header %s: GET=%q HEAD=%q — field-for-field parity required", hdr, g, h)
+			}
+		}
+		for _, hdr := range []string{"Content-Length", "Content-Type"} {
+			if v := getResp.Header.Get(hdr); v != "" {
+				t.Fatalf("GET 304 must not carry %s (%q)", hdr, v)
+			}
+			if v := headResp.Header.Get(hdr); v != "" {
+				t.Fatalf("HEAD 304 must not carry %s (%q)", hdr, v)
+			}
+		}
+	})
+}
