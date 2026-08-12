@@ -2806,3 +2806,108 @@ func TestThumbnailDefaultDimsShareETag(t *testing.T) {
 		t.Fatalf("validator=%q want %q", etagZ, want)
 	}
 }
+
+// TestThumbnailClampedETag304UnderSaturation pins QA P1 F1: the validator is
+// derived from the EFFECTIVE (clamped) dims, and the 304 branch precedes the
+// decode-slot acquisition and the deadline scope — so a revalidation with the
+// clamped ETag answers 304 immediately even while all 4 slots are held by
+// concurrent decodes (no park, no 504).
+func TestThumbnailClampedETag304UnderSaturation(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "etag.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	h := NewHandler(service.NewFileService(store, repo, nil), nil)
+	h.thumbnailTimeout = 300 * time.Millisecond
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/img"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	// The clamped request's ETag reflects the effective dims (HardMax).
+	resp, _ := req(t, "GET", u+"/thumbnail?w=9999&h=9999", nil, nil)
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("missing ETag")
+	}
+	if !strings.Contains(etag, fmt.Sprintf("-2048x2048")) {
+		t.Fatalf("clamped ETag %q must reflect effective HardMax dims (-2048x2048)", etag)
+	}
+
+	// Saturate all 4 decode slots with concurrent slow decodes.
+	big := pngBytes(t, 8192, 8192)
+	if resp, _ := req(t, "PUT", srv.URL+"/v1/files/big", big, map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT big: %d", resp.StatusCode)
+	}
+	for i := 0; i < 4; i++ {
+		go func() {
+			r2, err := http.Get(srv.URL + "/v1/files/big/thumbnail?w=256&h=256")
+			if err == nil {
+				r2.Body.Close()
+			}
+		}()
+	}
+	time.Sleep(150 * time.Millisecond) // holders now hold the slots
+
+	// The 304 must answer immediately from the pre-acquisition branch.
+	start := time.Now()
+	resp, body := req(t, "GET", u+"/thumbnail?w=9999&h=9999", nil, map[string]string{"If-None-Match": etag})
+	elapsed := time.Since(start)
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("clamped 304 under saturation: status=%d want 304 (body=%q)", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("ETag"); got != etag {
+		t.Fatalf("304 ETag %q, want %q", got, etag)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("304 took %v — the branch must precede slot acquisition (no park)", elapsed)
+	}
+}
+
+// TestThumbnailClampedETagComposition pins QA P1 F2: requests whose dims
+// differ only in clamped-away values share one validator — a mixed-clamp
+// request (?w=3000&h=100) equals its fully-clamped twin (?w=2048&h=100), and
+// a dimension-transposition bug (effective values applied to the wrong axis)
+// fails the equality assertions instead of escaping the suite.
+func TestThumbnailClampedETagComposition(t *testing.T) {
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/img"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	etagFor := func(q string) string {
+		resp, _ := req(t, "GET", u+"/thumbnail"+q, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: %d", q, resp.StatusCode)
+		}
+		return resp.Header.Get("ETag")
+	}
+	pairs := [][2]string{
+		{"?w=3000&h=100", "?w=2048&h=100"},   // mixed clamp: w clamped, h not
+		{"?w=100&h=3000", "?w=100&h=2048"},   // clamp on the other axis
+		{"?w=9999&h=9999", "?w=2048&h=2048"}, // full clamp
+		{"?w=0&h=0", ""},                     // defaults vs absent
+		{"?w=3000", "?w=2048"},               // clamp with the other dim defaulted
+		{"?w=1&h=9999", "?w=1&h=2048"},       // mixed, transposition would swap axes
+	}
+	for _, p := range pairs {
+		a, b := etagFor(p[0]), etagFor(p[1])
+		if a == "" || a != b {
+			t.Fatalf("ETag(%q)=%q vs ETag(%q)=%q — clamped-away dims must share one validator (transposition?)", p[0], a, p[1], b)
+		}
+	}
+	// Distinct effective dims must still produce distinct validators.
+	if a, b := etagFor("?w=100&h=100"), etagFor("?w=200&h=100"); a == "" || a == b {
+		t.Fatalf("distinct effective dims must differ: %q vs %q", a, b)
+	}
+}

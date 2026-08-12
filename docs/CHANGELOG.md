@@ -26,6 +26,16 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ---
 
+## 2026-08-12
+
+### Changed
+- **Thumbnail ETag derived from effective (clamped) dimensions** (`internal/api/rest/thumbnail.go`, `internal/thumbnail/thumbnail.go`)
+  - The derived validator was previously built from the raw `?w=`/`?h=` values while the pipeline clamps (`<=0` → `DefaultMax`, `>HardMax` → `HardMax`): requests differing only in clamped-away values (`?w=2048` vs `?w=9999`; `?w=0&h=0` vs absent) produced byte-identical JPEGs with **distinct validators**, fragmenting shared caches and re-running the full pipeline per distinct oversized URL instead of the 304 fast path. The ETag now uses `thumbnail.EffectiveDims` (idempotent re-clamp; output bytes unchanged).
+  - This also closes the persistent-cache design's "raw-dims CacheKey" premise (clamping is HTTP-invisible — the response-ETag space is the effective-dims space), the cache-run mandate #2 resolution.
+  - Pins: clamped 304 answers from the pre-acquisition branch even with all 4 decode slots saturated (no park, no 504); mixed-clamp/full-clamp twins share one validator (a dimension-transposition bug fails the equality assertions); distinct effective dims keep distinct validators.
+
+---
+
 ## 2026-08-10
 
 ### Added
