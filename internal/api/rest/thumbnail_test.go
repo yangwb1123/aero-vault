@@ -2621,3 +2621,65 @@ func oversizedMetadataJPEG(t *testing.T) []byte {
 	buf.Write(sos)
 	return buf.Bytes()
 }
+
+// TestThumbnailOctetStreamMagicPins pins the byte-decided admission class
+// for undeclared/generic content types:
+//   - a magic-admitted object whose bytes are not decodable (false positive)
+//     → 400 InvalidArgument, never 415/500 (the decode pipeline is the final
+//     validity authority);
+//   - a magic-admitted decompression bomb (PNG magic, declared dims above
+//     MaxSourceDim) → 413 ImageTooLarge, exactly like the declared-type path.
+func TestThumbnailOctetStreamMagicPins(t *testing.T) {
+	s := newRESTTest(t)
+
+	// False positive: JPEG magic bytes followed by garbage.
+	u := s.URL + "/v1/files/fake.jpg"
+	req(t, "PUT", u, append([]byte{0xFF, 0xD8, 0xFF, 0xE0}, bytes.Repeat([]byte{0x42}, 64)...), map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("false-positive magic: status=%d want 400 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("false-positive magic: expected code InvalidArgument, body: %s", body)
+	}
+
+	// Unknown magic bytes → 400 too (the client-argument class).
+	u2 := s.URL + "/v1/files/notimg"
+	req(t, "PUT", u2, []byte("plain text bytes"), map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body = req(t, "GET", u2+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown magic: status=%d want 400 (body=%q)", resp.StatusCode, body)
+	}
+
+	// WebP magic via octet-stream → 415 (server-capability class, same as
+	// the declared gate).
+	u3 := s.URL + "/v1/files/weird.webp"
+	req(t, "PUT", u3, webpBytes, map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body = req(t, "GET", u3+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("webp magic via octet-stream: status=%d want 415 (body=%q)", resp.StatusCode, body)
+	}
+
+	// Decompression bomb admitted by PNG magic → 413 ImageTooLarge.
+	u4 := s.URL + "/v1/files/bomb-octet"
+	req(t, "PUT", u4, headerOnlyPNGBytes(t, 100000, 100000, 8, 6), map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body = req(t, "GET", u4+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("octet-stream bomb: status=%d want 413 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"ImageTooLarge"`)) {
+		t.Fatalf("octet-stream bomb: expected code ImageTooLarge, body: %s", body)
+	}
+
+	// Happy path through the byte-decided gate: a real PNG via octet-stream
+	// thumbnails (200).
+	u5 := s.URL + "/v1/files/real-octet"
+	req(t, "PUT", u5, pngBytes(t, 64, 64), map[string]string{"Content-Type": "application/octet-stream"})
+	resp, body = req(t, "GET", u5+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("octet-stream real PNG: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type=%q want image/jpeg", ct)
+	}
+}

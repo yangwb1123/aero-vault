@@ -3,6 +3,7 @@ package thumbnail
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"image"
 	"image/color"
 	"image/gif"
@@ -89,5 +90,53 @@ func TestSniff(t *testing.T) {
 		if got := Sniff(sniffWebPBytes); got != FormatWebP {
 			t.Fatalf("Sniff(webp) iteration %d = %v, want FormatWebP", i, got)
 		}
+	}
+}
+
+// TestAdmitByMagic pins the extracted admission decision: the decodable
+// formats replay the head exactly as read; WebP is the server-capability
+// rejection (ErrUnsupportedFormat); unknown and too-short bytes are the
+// client-argument rejection (ErrNotAnImage). The replay is byte-identical —
+// the pipeline must observe the full object, magic included.
+func TestAdmitByMagic(t *testing.T) {
+	jpegHead := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x42}
+	pngHead := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A}
+	gifHead := []byte{'G', 'I', 'F', '8', '9', 'a'}
+	webpHead := []byte("RIFF\x24\x00\x00\x00WEBPVP8 ")
+	cases := []struct {
+		name string
+		head []byte
+		want error // nil = admitted
+	}{
+		{"jpeg magic", jpegHead, nil},
+		{"png magic", pngHead, nil},
+		{"gif magic", gifHead, nil},
+		{"webp magic rejected", webpHead, ErrUnsupportedFormat},
+		{"unknown bytes", []byte("hello world"), ErrNotAnImage},
+		{"empty head", nil, ErrNotAnImage},
+		{"truncated jpeg", []byte{0xFF}, ErrNotAnImage},
+		{"truncated png", []byte{0x89, 'P'}, ErrNotAnImage},
+		{"truncated gif", []byte{'G', 'I'}, ErrNotAnImage},
+		{"truncated riff", webpHead[:8], ErrNotAnImage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			replay, err := AdmitByMagic(tc.head)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("AdmitByMagic(% x) = err %v, want admission", tc.head, err)
+				}
+				if !bytes.Equal(replay, tc.head) {
+					t.Fatalf("replay % x, want the head % x byte-identical (pipeline must see the magic)", replay, tc.head)
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("AdmitByMagic(% x) = err %v, want %v", tc.head, err, tc.want)
+			}
+			if replay != nil {
+				t.Fatalf("rejected admission returned a replay (% x)", replay)
+			}
+		})
 	}
 }

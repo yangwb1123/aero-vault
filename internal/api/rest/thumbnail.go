@@ -195,22 +195,20 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 			return nil, rerr
 		}
 		head = head[:n] // short objects are valid Sniff input → FormatUnknown → 400
-		switch thumbnail.Sniff(head) {
-		case thumbnail.FormatJPEG, thumbnail.FormatPNG, thumbnail.FormatGIF:
-			// Admission by magic is a gate input only: the decode pipeline
-			// stays the final validity authority (ErrUnsupported → 400).
-			// Close must forward to the storage stream — the API's deferred
-			// close runs on this wrapper, and io.NopCloser would leak rc.
-			return &sniffedStream{Reader: io.MultiReader(bytes.NewReader(head), rc), rc: rc}, nil
-		case thumbnail.FormatWebP:
-			_ = rc.Close()
-			return nil, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
-				thumbnail.ErrUnsupportedFormat, "webp")
-		default:
-			_ = rc.Close()
-			return nil, fmt.Errorf("%w: object bytes are not a supported image format (image/jpeg, image/png, image/gif)",
-				service.ErrInvalidArgs)
+		replay, aerr := thumbnail.AdmitByMagic(head)
+		if aerr != nil {
+			_ = rc.Close() // stream closed on every rejection path
+			if errors.Is(aerr, thumbnail.ErrUnsupportedFormat) {
+				return nil, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
+					thumbnail.ErrUnsupportedFormat, "webp")
+			}
+			return nil, fmt.Errorf("%w: %v", service.ErrInvalidArgs, aerr)
 		}
+		// Admission by magic is a gate input only: the decode pipeline stays
+		// the final validity authority (ErrUnsupported → 400). Close must
+		// forward to the storage stream — the API's deferred close runs on
+		// this wrapper, and io.NopCloser would leak rc.
+		return &sniffedStream{Reader: io.MultiReader(bytes.NewReader(replay), rc), rc: rc}, nil
 	})
 	if err != nil {
 		// The OpenError unwrap MUST precede the context-error checks: an

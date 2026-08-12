@@ -12,3 +12,10 @@ import "errors"
 // by Generate/GenerateContext, which keep returning ErrUnsupported for
 // byte-level failures (corrupt or non-image input).
 var ErrUnsupportedFormat = errors.New("thumbnail: unsupported image format")
+
+// ErrNotAnImage is returned by AdmitByMagic when the magic bytes match no
+// known image format (or the head is too short to contain one): the object
+// bytes are not a supported image, the client-argument class (REST maps it
+// to 400 InvalidArgument). It is the byte-decided analogue of the declared-
+// type gate's "not an image" path.
+var ErrNotAnImage = errors.New("thumbnail: object bytes are not a supported image format")

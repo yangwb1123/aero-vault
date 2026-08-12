@@ -45,3 +45,27 @@ func Sniff(head []byte) Format {
 	}
 	return FormatUnknown
 }
+
+// AdmitByMagic decides magic-byte admission for an undeclared/generic
+// content type: it returns the head bytes to replay in front of the object
+// stream (exactly as read) for the decodable formats, or a classification
+// error — ErrUnsupportedFormat for a valid image the pipeline cannot decode
+// (WebP, the server-capability class, RFC 9110 §15.5.16) and ErrNotAnImage
+// for unknown or too-short bytes (the client-argument class). Admission is a
+// gate input only: the decode pipeline remains the final validity authority
+// (a false positive merely admits the object to decode, which then fails
+// with ErrUnsupported exactly as today).
+//
+// Extracted from the REST opener closure so the decision — including the
+// short-head and unknown-byte branches — is directly unit-testable; the
+// closure keeps only the stream I/O (read the head, close on rejection).
+func AdmitByMagic(head []byte) ([]byte, error) {
+	switch Sniff(head) {
+	case FormatJPEG, FormatPNG, FormatGIF:
+		return head, nil
+	case FormatWebP:
+		return nil, ErrUnsupportedFormat
+	default:
+		return nil, ErrNotAnImage
+	}
+}
