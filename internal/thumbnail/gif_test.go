@@ -293,3 +293,74 @@ func TestGenerateGIFAtDimensionCap(t *testing.T) {
 		t.Fatalf("thumbnail exceeds bounds: %s", thumb.Bounds())
 	}
 }
+
+// makeTransparentGIF builds a uniform fully-transparent w×h GIF (single
+// palette entry, transparent index everywhere) — the F1 downscale fixture.
+func makeTransparentGIF(t testing.TB, w, h int) []byte {
+	t.Helper()
+	img := image.NewPaletted(image.Rect(0, 0, w, h), color.Palette{
+		color.RGBA{0, 0, 0, 0}, // transparent
+	})
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetColorIndex(x, y, 0)
+		}
+	}
+	var buf bytes.Buffer
+	if err := gif.Encode(&buf, img, nil); err != nil {
+		t.Fatalf("encode gif: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestGenerateTransparentGIFDownscale pins F1 (P1): a fully-transparent
+// paletted GIF driven through the bilinear DOWNSCALE path (ratio < 1) must
+// composite onto white — the downscaled buffer samples only transparent
+// pixels, and the output must be white, never black (premultiplied-at-0
+// rendering) or red.
+func TestGenerateTransparentGIFDownscale(t *testing.T) {
+	fix := makeTransparentGIF(t, 128, 128)
+	decoded, format, err := image.Decode(bytes.NewReader(fix))
+	if err != nil || format != "gif" {
+		t.Fatalf("fixture self-check: %v fmt=%q", err, format)
+	}
+	if o, ok := decoded.(interface{ Opaque() bool }); !ok || o.Opaque() {
+		t.Fatal("fixture must be transparent (Opaque() == false)")
+	}
+	out, err := Generate(bytes.NewReader(fix), 64, 64) // ratio < 1: real downscale
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	thumb, _, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode thumbnail: %v", err)
+	}
+	// Every sampled pixel is fully transparent → composited onto white.
+	for _, p := range []image.Point{{0, 0}, {32, 32}, {63, 63}, {10, 50}} {
+		r, g, b, _ := thumb.At(p.X, p.Y).RGBA()
+		if r>>8 < 235 || g>>8 < 235 || b>>8 < 235 {
+			t.Fatalf("downscaled transparent GIF at %v = (%d,%d,%d), want white (≥235)", p, r>>8, g>>8, b>>8)
+		}
+	}
+}
+
+// TestGenerateGIFOneSideOverDim pins F3 (P2): the dimension gate's per-side
+// `||` semantics — one side over MaxSourceDim (65535, uint16 max) with the
+// other under (16) must still reject with ErrImageTooLarge, before any
+// pixel allocation.
+func TestGenerateGIFOneSideOverDim(t *testing.T) {
+	junk := append(append([]byte{}, headerOnlyGIF(t, 65535, 16)...), make([]byte, 16<<20)...)
+	cnt := &countingReader{r: bytes.NewReader(junk)}
+	img, err := Generate(cnt, 100, 100)
+	if img != nil || !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("65535x16: expected ErrImageTooLarge, got img!=nil=%v err=%v", img != nil, err)
+	}
+	if cnt.n > 4096 {
+		t.Fatalf("read %d bytes, want ≤ 4096 (payload never read)", cnt.n)
+	}
+	// The mirrored axis: 16×65535.
+	img, err = Generate(bytes.NewReader(headerOnlyGIF(t, 16, 65535)), 100, 100)
+	if img != nil || !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("16x65535: expected ErrImageTooLarge, got img!=nil=%v err=%v", img != nil, err)
+	}
+}

@@ -465,7 +465,8 @@ func FuzzGenerate(f *testing.F) {
 	f.Add(makeAnimatedGIF(f))             // 2-frame GIF: first-frame policy under mutation
 	f.Add(headerOnlyGIF(f, 65535, 65535)) // ErrImageTooLarge: dims > MaxSourceDim (13 B)
 	f.Add(headerOnlyGIF(f, 8192, 8192))   // boundary: ErrUnsupported (no image data)
-	f.Add(makeGIF(f)[:len(makeGIF(f))/2]) // mid-stream truncation → ErrUnsupported
+	gifSeed := makeGIF(f)                 // single build, then slice (F4)
+	f.Add(gifSeed[:len(gifSeed)/2])       // mid-stream truncation → ErrUnsupported
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)
