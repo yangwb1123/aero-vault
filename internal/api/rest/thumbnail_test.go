@@ -3108,3 +3108,90 @@ func TestThumbnail304ShortCircuitsBeforeOpen(t *testing.T) {
 		t.Fatalf("target-key GetObject calls = %d, want 1 — the 304 must short-circuit before the opener runs", calls)
 	}
 }
+
+// TestThumbnailETagDerivedFromOpenedObjectSniffBucket is the QA F2 binding
+// variant: the same Stat→Get race, armed on the dominant upload path —
+// application/octet-stream (the magic-sniff bucket), where the opener wraps
+// the stream and the capture position is guarded by a wrapper. The 200
+// validator must still name the OPENED object (v2), never the pre-open Stat's
+// stale v1, and the sniffed body must decode identically.
+func TestThumbnailETagDerivedFromOpenedObjectSniffBucket(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	wrapped := &etagSwapRepo{Repository: repo, target: "pic.bin"}
+	h := NewHandler(service.NewFileService(store, wrapped, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/pic.bin"
+	octet := map[string]string{"Content-Type": "application/octet-stream"}
+	headETag := func() string {
+		t.Helper()
+		resp, _ := req(t, "HEAD", u, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD: %d", resp.StatusCode)
+		}
+		return strings.Trim(resp.Header.Get("ETag"), `"`)
+	}
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), octet); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	etagA := headETag()
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 320, 160), octet); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	etagB := headETag()
+	if etagB == "" || etagB == etagA {
+		t.Fatalf("v2 ETag %q must differ from v1 %q", etagB, etagA)
+	}
+
+	// Control: sniffed admission (magic bytes) + 200 validator names v2.
+	thumbURL := u + "/thumbnail?w=100&h=100"
+	resp, bodyB := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("control thumbnail (sniff bucket): %d", resp.StatusCode)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(bodyB)); err != nil || format != "jpeg" {
+		t.Fatalf("control body decode: %v fmt=%s", err, format)
+	}
+	ew, eh := thumbnail.EffectiveDims(100, 100)
+	etagB200 := `"` + etagB + "-thumb-" + fmt.Sprintf("%dx%d", ew, eh) + `"`
+	if got := resp.Header.Get("ETag"); got != etagB200 {
+		t.Fatalf("control ETag=%q want %q", got, etagB200)
+	}
+
+	// Arm the hook on the sniff-bucket path: the racing request's pre-open
+	// Stat sees stale v1; the opener (sniff wrapper around svc.Get) still
+	// reads the v2 row.
+	wrapped.mu.Lock()
+	wrapped.stale, wrapped.swapCall = etagA, wrapped.calls+1
+	wrapped.mu.Unlock()
+
+	resp, body := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("racing thumbnail (sniff bucket): %d", resp.StatusCode)
+	}
+	if !bytes.Equal(body, bodyB) {
+		t.Fatalf("racing body differs from control — both must decode the same v2 blob")
+	}
+	if got := resp.Header.Get("ETag"); got != etagB200 {
+		t.Fatalf("200 ETag=%q want %q (opened-object validator through the sniff wrapper)", got, etagB200)
+	}
+	if got := resp.Header.Get("ETag"); got == `"`+etagA+"-thumb-"+fmt.Sprintf("%dx%d", ew, eh)+`"` {
+		t.Fatalf("200 ETag must not derive from the pre-open Stat (stale v1) on the sniff path: %q", got)
+	}
+}
