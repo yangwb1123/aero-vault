@@ -273,9 +273,18 @@ func TestGenerateContextCancelAfterDecodeReleasesSlot(t *testing.T) {
 // TestGenerateContextDeadlineMidScaleReleasesSlot pins AC-2b (FR-4): a 50 ms
 // self-firing deadline on the 4096² pipeline must abort with the exact
 // DeadlineExceeded sentinel and release the slot. Phase-agnostic by
-// construction — whichever boundary fires (post-decode, inside scale,
-// pre-encode) yields the same identity and the same slot release, so the
-// test cannot false-fail on the abort site.
+// construction — whichever boundary fires (the decode read site, post-decode,
+// inside scale, pre-encode) yields the same identity and the same slot
+// release, so the test cannot false-fail on the abort site.
+//
+// The drain wait accepts BOTH orderings: the decode may drain the stream and
+// then hit the post-decode check after the deadline (the pre-fix behavior),
+// or the deadline may fire while the payload is still being read and abort
+// the drain at the next codec buffer fill via the context-checking reader
+// (ctx_reader.go — the post-fix behavior, which makes "never drained" the
+// expected outcome on typical hardware, since serving 58.7 KB of compressed
+// IDAT outpaces the 50 ms deadline). Both arms converge on the same
+// assertions.
 func TestGenerateContextDeadlineMidScaleReleasesSlot(t *testing.T) {
 	data := makePNG(t, 4096, 4096)
 	consumed := make(chan struct{})
@@ -290,13 +299,20 @@ func TestGenerateContextDeadlineMidScaleReleasesSlot(t *testing.T) {
 	}()
 	select {
 	case <-consumed:
-	case <-time.After(10 * time.Second):
-		t.Fatal("GenerateContext never drained the stream")
-	}
-	select {
+		// Stream drained before the deadline: the abort fires at a
+		// phase-boundary check. The deadline must still fire while the
+		// decoder finalizes / scale runs (it cannot have passed).
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("deadline never fired")
+		}
 	case <-ctx.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("deadline never fired")
+		// Deadline fired mid-drain (post-fix): the ctxReader aborts the
+		// decode at the next codec buffer fill, so the stream is never
+		// fully drained — the abort comes from the decode read site.
+	case <-time.After(10 * time.Second):
+		t.Fatal("GenerateContext never drained the stream and the deadline never fired")
 	}
 	select {
 	case cerr := <-done:

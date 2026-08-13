@@ -174,10 +174,18 @@ func TestGenerateContextAbortsAfterStreamConsumed(t *testing.T) {
 	})
 
 	t.Run("deadline", func(t *testing.T) {
-		// R2 identity for the 504 leg: a server-side deadline that fires after
-		// the stream is read must surface as context.DeadlineExceeded, never
-		// ErrUnsupported. Deterministic: the deadline provably fires before
-		// the gate opens.
+		// R2 identity for the 504 leg: a server-side deadline that fires
+		// must surface as context.DeadlineExceeded, never ErrUnsupported.
+		// Deterministic: the deadline provably fires before the gate opens.
+		//
+		// The drain wait accepts BOTH orderings: the decode may drain the
+		// stream and park at the gate before the deadline (the pre-fix
+		// path), or the deadline may fire while the payload is still being
+		// read and abort the drain at the next codec buffer fill via the
+		// context-checking reader (ctx_reader.go) — the post-fix path,
+		// which makes "never drained" the expected outcome when serving the
+		// 2048² stream outpaces the 50 ms deadline (as under -race). Both
+		// arms converge on the same identity and slot-release assertions.
 		data := makePNG(t, 2048, 2048)
 		consumed := make(chan struct{})
 		release := make(chan struct{})
@@ -192,15 +200,21 @@ func TestGenerateContextAbortsAfterStreamConsumed(t *testing.T) {
 		}()
 		select {
 		case <-consumed:
-		case <-time.After(5 * time.Second):
-			t.Fatal("GenerateContext never drained the stream (gate not reached)")
-		}
-		select {
+			// Stream drained and the decoder parked at the gate: the
+			// deadline must fire while it is parked.
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("deadline never fired while the decoder was parked")
+			}
 		case <-ctx.Done():
+			// Deadline fired mid-drain (post-fix): the ctxReader aborted
+			// the decode at the next codec buffer fill; the gate reader
+			// was never parked.
 		case <-time.After(5 * time.Second):
-			t.Fatal("deadline never fired while the decoder was parked")
+			t.Fatal("GenerateContext neither drained the stream nor hit the deadline (gate not reached)")
 		}
-		close(release)
+		close(release) // unblocks a parked final read; no-op if never parked
 		select {
 		case err := <-done:
 			if !errors.Is(err, context.DeadlineExceeded) {

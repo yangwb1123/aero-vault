@@ -252,12 +252,15 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // non-nil context. Cancellation is honored at acquisition (returns ctx.Err()
 // without reading the stream or consuming a slot) and mid-decode: a stream
 // failure caused by the context's deadline or cancellation is surfaced as
-// the context error, never reclassified as ErrUnsupported. After the stream
-// is fully read, a decode aborts at the next phase boundary (post-config,
-// post-decode, pre-encode) — and, inside the scale and rotation phases,
-// within cancelCheckRows rows of pixel work, and inside jpeg.Encode at every
-// emitted byte via the context-checking encode writer (plus a terminal check
-// after Encode returns) — and releases its decode slot.
+// the context error, never reclassified as ErrUnsupported. Mid-decode
+// cancellation aborts payload reads at the next codec buffer fill (≤ 4 KiB
+// over-read) via the context-checking reader (ctx_reader.go), and a decode
+// whose stream is fully read still aborts at the next phase boundary
+// (post-config, post-decode, pre-encode) — and, inside the scale and
+// rotation phases, within cancelCheckRows rows of pixel work, and inside
+// jpeg.Encode at every emitted byte via the context-checking encode writer
+// (plus a terminal check after Encode returns) — and releases its decode
+// slot.
 //
 // GenerateContext acquires the decode slot itself. Callers that must hold the
 // slot across an object-stream open (e.g. the REST thumbnail handler, whose

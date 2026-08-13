@@ -68,9 +68,11 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 // across the call. Clamping was relocated here from GenerateContext's entry
 // (pure integer arithmetic; byte-identical output). Cancellation is honored
 // at the same phase boundaries as before and additionally inside
-// scale/applyOrientation (every cancelCheckRows rows) and inside jpeg.Encode
+// scale/applyOrientation (every cancelCheckRows rows), inside jpeg.Encode
 // at every emitted byte via the context-checking encode writer (plus a
-// terminal ctx.Err() check after Encode returns).
+// terminal ctx.Err() check after Encode returns), and inside the decode
+// phase: payload reads through the context-checking reader (ctx_reader.go)
+// abort at the next codec buffer fill.
 func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
 	// Single source of truth for the dimension rule: generateLocked and the
 	// REST handler both derive effective bounds from EffectiveDims, so the
@@ -155,8 +157,16 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// the walk is bounded by MaxMetadataBytes (head + replay ≤ budget, the
 	// same expression both sides) and stops at IDAT (compressed data is
 	// never scanned). Errors classify with the exact Decode-site block.
+	// decodeR replays the exact prefix DecodeConfig (and, for PNG, the
+	// orientation walk) consumed, then continues from the raw stream r
+	// through the context-checking payload reader: mid-decode cancellation
+	// aborts at the next codec buffer fill instead of running the decode to
+	// completion (see ctx_reader.go). The tee paths above are intentionally
+	// NOT wrapped — the config-scan budget and its budget-wins-over-ctx
+	// ordering are pinned by TestGenerateContextMetadataBudgetWinsOverDeadline.
+	payloadR := &ctxReader{ctx: ctx, r: r}
 	pngOrient := 1
-	decodeR := io.MultiReader(bytes.NewReader(head.buf.Bytes()), r)
+	decodeR := io.MultiReader(bytes.NewReader(head.buf.Bytes()), payloadR)
 	if format == "png" {
 		replay := &limitedBuffer{remaining: MaxMetadataBytes - len(head.buf.Bytes())}
 		pngOrient, err = pngOrientation(ctx, head.buf.Bytes(), io.TeeReader(r, replay))
@@ -175,14 +185,16 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 			// and error, so classification (→ ErrUnsupported) is unchanged.
 			pngOrient = 1
 		}
-		decodeR = io.MultiReader(bytes.NewReader(head.buf.Bytes()), bytes.NewReader(replay.buf.Bytes()), r)
+		decodeR = io.MultiReader(bytes.NewReader(head.buf.Bytes()), bytes.NewReader(replay.buf.Bytes()), payloadR)
 	}
 	src, _, err := image.Decode(decodeR)
 	if err != nil {
 		// Same identity preservation as the DecodeConfig branch above: a
-		// deadline/cancellation that fires while the payload is read is
-		// surfaced as the context error, never flattened to ErrUnsupported;
-		// ctx.Err() wins over a coincident genuine decode error.
+		// deadline/cancellation that fires while the payload is read aborts
+		// at the next codec buffer fill (≤ 4 KiB over-read, see ctx_reader.go)
+		// and is surfaced as the context error — promptly, never flattened
+		// to ErrUnsupported; ctx.Err() wins over a coincident genuine decode
+		// error.
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
