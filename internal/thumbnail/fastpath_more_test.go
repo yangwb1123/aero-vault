@@ -177,3 +177,88 @@ func TestApplyOrientationDispatchesFast(t *testing.T) {
 		t.Fatalf("applyOrientation on a 1024² YCbCr allocated %.0f objects/op, want < 40000 (kernel class ≈ 5–10; generic ≈ 2M)", n)
 	}
 }
+
+// TestFastKernelsDispatchedGrayPaletted proves the scale/rotate dispatcher
+// takes the Gray/Paletted kernels (P1-1/F-D2) via the alloc-count
+// discriminator: the generic At/Set path boxes once per pixel (≈ 1–2M
+// allocs at 512²), the kernels allocate a fresh RGBA plus scaffolding
+// (< 40000). Mutation-verified: removing any of the four dispatch cases
+// sends that row back to the generic path and fails the alloc bound.
+func TestFastKernelsDispatchedGrayPaletted(t *testing.T) {
+	if raceEnabled {
+		t.Skip("alloc count is race-inflated; TestFastPathByteIdentity pins byte identity under -race")
+	}
+	ctx := context.Background()
+	gray := image.NewGray(image.Rect(0, 0, 512, 512))
+	for y := 0; y < 512; y++ {
+		for x := 0; x < 512; x++ {
+			gray.SetGray(x, y, color.Gray{Y: uint8((x + y) % 256)})
+		}
+	}
+	pal := image.NewPaletted(image.Rect(0, 0, 512, 512), color.Palette{
+		color.RGBA{255, 0, 0, 255}, color.RGBA{0, 255, 0, 255},
+		color.RGBA{0, 0, 255, 255}, color.RGBA{255, 255, 255, 255},
+	})
+	for y := 0; y < 512; y++ {
+		for x := 0; x < 512; x++ {
+			pal.SetColorIndex(x, y, uint8((x+y)%4))
+		}
+	}
+	cases := []struct {
+		name string
+		run  func() (image.Image, error)
+	}{
+		{"scaleGray", func() (image.Image, error) { return scale(ctx, gray, 256, 256) }},
+		{"scalePaletted", func() (image.Image, error) { return scale(ctx, pal, 256, 256) }},
+		{"rotateGray", func() (image.Image, error) { return applyOrientation(ctx, gray, 6) }},
+		{"rotatePaletted", func() (image.Image, error) { return applyOrientation(ctx, pal, 6) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.run(); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			n := testing.AllocsPerRun(20, func() {
+				out, err := tc.run()
+				if err != nil {
+					t.Fatalf("run: %v", err)
+				}
+				if _, ok := out.(*image.RGBA); !ok {
+					t.Fatalf("output is %T, want *image.RGBA", out)
+				}
+			})
+			if n >= 40000 {
+				t.Fatalf("%s allocated %.0f objects/op, want < 40000 (kernel class ≈ 5–10; generic ≈ 1M+) — dispatch not taken", tc.name, n)
+			}
+		})
+	}
+}
+
+// TestYCbCrRGBA16MatchesStdlib pins P1-2/F-D3: the kernel's conversion
+// helper must reproduce the stdlib's color.YCbCr.RGBA() exactly, including
+// the clamp branches (extreme Y/Cb/Cr values that overflow the 16-bit
+// range), so the fast path never diverges from the generic path's color
+// math — the parity battery's byte anchor.
+func TestYCbCrRGBA16MatchesStdlib(t *testing.T) {
+	values := [][3]uint8{
+		{0, 128, 128}, {255, 128, 128}, {128, 0, 0}, {128, 255, 255},
+		{0, 0, 0}, {255, 255, 255}, {16, 235, 240}, {76, 84, 255},
+		{29, 255, 107}, {219, 16, 138}, {0, 255, 0}, {255, 0, 255},
+		// Clamp-discriminating extremes (overflow both directions).
+		{255, 0, 255}, {0, 255, 0}, {255, 255, 0}, {0, 0, 255},
+	}
+	img := image.NewYCbCr(image.Rect(0, 0, len(values), 1), image.YCbCrSubsampleRatio444)
+	for i, v := range values {
+		img.Y[i] = v[0]
+		img.Cb[i] = v[1]
+		img.Cr[i] = v[2]
+	}
+	for i, v := range values {
+		sr, sg, sb, _ := img.YCbCrAt(i, 0).RGBA()
+		kr, kg, kb := ycbcrRGBA16(v[0], v[1], v[2])
+		if sr != uint32(kr) || sg != uint32(kg) || sb != uint32(kb) {
+			t.Fatalf("ycbcrRGBA16(%d,%d,%d) = (%d,%d,%d), stdlib RGBA = (%d,%d,%d)",
+				v[0], v[1], v[2], kr, kg, kb, sr, sg, sb)
+		}
+	}
+}
