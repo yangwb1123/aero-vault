@@ -34,7 +34,7 @@ func countingOpener3(data []byte, etag string, opens *atomic.Int64) open3 {
 // once — and the cached output is byte-identical to a fresh uncached decode
 // of the same source (determinism pin).
 func TestCacheGenerateSpyOpenerSingleInvocation(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	data := makePNG(t, 64, 64)
 	var opens atomic.Int64
 	ctx := context.Background()
@@ -74,7 +74,7 @@ func TestCacheGenerateSpyOpenerSingleInvocation(t *testing.T) {
 // it never acquires decodeSlots, never re-invokes the opener — and the
 // semaphore is fully recovered afterwards.
 func TestCacheGenerateHitBypassesDecodeSlot(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	data := makePNG(t, 64, 64)
 	var opens atomic.Int64
 	ctx := context.Background()
@@ -121,7 +121,7 @@ func TestCacheGenerateHitBypassesDecodeSlot(t *testing.T) {
 // changed source ETag observes a miss and produces the fresh version's bytes;
 // stale bytes are never served; repeats hit per key.
 func TestCacheGenerateETagChangeMisses(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	v1 := makePNG(t, 64, 64)
 	v2 := makeJPEG(t, 64, 64)
 	var opens1, opens2 atomic.Int64
@@ -172,7 +172,7 @@ func TestCacheGenerateDisabledParity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reference decode: %v", err)
 	}
-	for _, cache := range []*Cache{nil, NewCache(0)} {
+	for _, cache := range []*Cache{nil, NewCache(0, 0)} {
 		var opens atomic.Int64
 		got, from, err := GenerateContextWithOpenerCached(ctx, cache, "t1", "etag-v1", 32, 32, countingOpener3(data, "etag-v1", &opens))
 		if err != nil {
@@ -196,7 +196,7 @@ func TestCacheGenerateDisabledParity(t *testing.T) {
 // (handler classification: Canceled → silent return) and the opener is not
 // invoked.
 func TestCacheGenerateHitHonorsCanceledContext(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	data := makePNG(t, 64, 64)
 	var opens atomic.Int64
 	ctx := context.Background()
@@ -222,7 +222,7 @@ func TestCacheGenerateHitHonorsCanceledContext(t *testing.T) {
 // the cache empty and a subsequent identical call re-invokes the opener
 // (miss again) — errors never populate the cache.
 func TestCacheGenerateErrorNeverCached(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	ctx := context.Background()
 
 	bomb := headerOnlyPNG(t, 8193, 8, 8, 6) // declared width > MaxSourceDim
@@ -258,7 +258,7 @@ func TestCacheGenerateErrorNeverCached(t *testing.T) {
 // (a PUT landed between the caller's Stat and the open), the success bytes
 // are returned but never stored — a subsequent identical call re-opens.
 func TestCacheGenerateETagMismatchDoesNotStore(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	data := makePNG(t, 64, 64)
 	var opens atomic.Int64
 	ctx := context.Background()
@@ -288,7 +288,7 @@ func TestCacheGenerateETagMismatchDoesNotStore(t *testing.T) {
 // two tenants each open exactly once — one tenant's cached bytes are never
 // served to another tenant's requests.
 func TestCacheGenerateCrossTenantIsolation(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	data := makePNG(t, 64, 64)
 	var opensA, opensB atomic.Int64
 	ctx := context.Background()
@@ -326,7 +326,7 @@ func TestCacheGenerateCrossTenantIsolation(t *testing.T) {
 // normalization: requests whose dims differ only in clamped-away values
 // (?w=0 vs ?w=256; 2048 vs 9999) share one key — one open, one hit.
 func TestCacheGenerateClampedDimsShareEntry(t *testing.T) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	data := makePNG(t, 64, 64)
 	var opens atomic.Int64
 	ctx := context.Background()
@@ -359,7 +359,7 @@ func TestCacheGenerateClampedDimsShareEntry(t *testing.T) {
 // first call (miss) is outside the loop. Benchmarks are documentation-quality
 // (repo bench discipline — never asserted in CI).
 func BenchmarkGenerateContextWithOpenerCachedHit(b *testing.B) {
-	c := NewCache(1 << 20)
+	c := NewCache(1<<20, 0)
 	fixture := benchFixture(b, 256, 256)
 	var opens atomic.Int64
 	ctx := context.Background()

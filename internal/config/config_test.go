@@ -215,6 +215,58 @@ func TestValidateThumbnailCacheBytes(t *testing.T) {
 	}
 }
 
+// TestValidateThumbnailCacheTTL (AC-4) pins the THUMBNAIL_CACHE_TTL knob:
+// 0 (disabled default) and positive values validate, negatives are rejected
+// at startup, the wiring loads the env var exactly like THUMBNAIL_CACHE_BYTES,
+// and — the deliberate divergence from AI_SEARCH_CACHE_TTL_SECONDS — a
+// positive TTL with a disabled byte-budget cache is harmless and validates
+// (FM-5). An absurdly large TTL (beyond one year) is rejected to fail fast
+// on time.Duration overflow at the wiring site (perf F3).
+func TestValidateThumbnailCacheTTL(t *testing.T) {
+	c := baseValid()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default (0 = disabled) must validate: %v", err)
+	}
+	c.App.ThumbnailCacheTTL = 3600
+	if err := c.Validate(); err != nil {
+		t.Fatalf("positive TTL must validate: %v", err)
+	}
+	// Deliberate divergence: TTL > 0 with BYTES = 0 (cache disabled) is a
+	// harmless pass-through no-op — it must NOT be rejected (unlike the AI
+	// search cache cross-constraint).
+	c.App.ThumbnailCacheBytes = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("positive TTL with disabled byte-budget cache must validate: %v", err)
+	}
+	c.App.ThumbnailCacheTTL = -1
+	if err := c.Validate(); err == nil {
+		t.Fatal("negative THUMBNAIL_CACHE_TTL must be rejected")
+	}
+	c.App.ThumbnailCacheTTL = 31536001
+	if err := c.Validate(); err == nil {
+		t.Fatal("THUMBNAIL_CACHE_TTL beyond one year must be rejected (time.Duration overflow guard)")
+	}
+
+	// Wiring clause: the env var is loaded into cfg.App.ThumbnailCacheTTL,
+	// mirroring THUMBNAIL_CACHE_BYTES; unset/empty falls back to 0.
+	t.Setenv("THUMBNAIL_CACHE_TTL", "3600")
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load with THUMBNAIL_CACHE_TTL set: %v", err)
+	}
+	if loaded.App.ThumbnailCacheTTL != 3600 {
+		t.Fatalf("wired ThumbnailCacheTTL = %d, want 3600", loaded.App.ThumbnailCacheTTL)
+	}
+	t.Setenv("THUMBNAIL_CACHE_TTL", "")
+	loaded, err = Load()
+	if err != nil {
+		t.Fatalf("Load with THUMBNAIL_CACHE_TTL empty: %v", err)
+	}
+	if loaded.App.ThumbnailCacheTTL != 0 {
+		t.Fatalf("wired ThumbnailCacheTTL = %d, want 0 (default) when unset/empty", loaded.App.ThumbnailCacheTTL)
+	}
+}
+
 func TestValidate_Storage(t *testing.T) {
 	t.Run("local requires root", func(t *testing.T) {
 		c := baseValid()

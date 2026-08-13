@@ -36,6 +36,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `APP_TLS_KEY_FILE` | _(empty)_ | Path to TLS private key file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`) **and the `/thumbnail` route** (bounding the decode-slot wait, see "Thumbnail decode budget"). Set to `0` to disable. |
 | `THUMBNAIL_CACHE_BYTES` | `0` | Server-side thumbnail output cache budget in bytes (see "Thumbnail decode budget"); `0` disables the cache (default, zero allocation, byte-identical behavior). |
+| `THUMBNAIL_CACHE_TTL` | `0` | Thumbnail cache entry retention in seconds; `0` disables expiry (unbounded — the pre-TTL behavior, byte-for-byte). When `> 0` every cached thumbnail expires this long after it was last generated (fixed TTL from the last store; hits do not extend it). Negative values and values `> 31536000` (1 year) are rejected at startup (the latter fails fast on `time.Duration` overflow). A positive TTL with `THUMBNAIL_CACHE_BYTES=0` is a harmless no-op (cache is a pass-through). |
 | `MAX_INFLIGHT_REQUESTS` | `0` | Global weighted in-flight request limit (reads cost 1, writes cost 2); `0` disables. |
 | `PER_TENANT_CONCURRENCY_MAX` | `0` | Optional per-tenant in-flight limit used alongside the global cap; `0` disables per-tenant partitioning. |
 | `EVENTS_SUB_BUFFER` | `64` | Per-subscriber in-process event channel buffer depth. Increase if subscribers fall behind under high event throughput. Set to `0` to use the default. |
@@ -464,15 +465,47 @@ is an in-process LRU keyed by **(tenant, source ETag, effective dims)** — the
 exact inputs of the derived response ETag, so a concurrent PUT changes the
 ETag ⇒ new key ⇒ miss ⇒ fresh regeneration; superseded entries are reclaimed
 by LRU eviction (no invalidation, no cache-busting). Retention model:
-**in-memory per-process, byte-budget-bounded, eviction-only** — no TTL, no
-shared/replicated state, no persistence; replicas warm independently and a
-stale entry can never be served to a request that cannot observe its key.
+**in-memory per-process, byte-budget-bounded** — no shared/replicated state,
+no persistence; replicas warm independently and a stale entry can never be
+served to a request that cannot observe its key.
+
+**Retention bound (`THUMBNAIL_CACHE_TTL`, seconds; default `0` = unbounded):**
+when `> 0`, every cached entry expires that long **after the store that
+produced it** (a fixed TTL from the last `Put`; hits do **not** extend the
+deadline — a hot key whose inter-request gap exceeds the TTL regenerates on
+each request, so size the TTL above the expected inter-request gap of hot
+keys, e.g. `3600` for thumbnails hit at ≥ 1/min). Expiry is lazy: an expired
+entry is removed on the next `Get` of its key and surfaces as an ordinary
+miss (no new metric; watch `thumbnail.cache.misses_total` and the
+`ThumbnailCacheHitRatioLow` alert — a miss-rate rise proportional to the
+working-set fraction with inter-request gap > TTL is the intended signal).
+The default `0` keeps the pre-TTL behavior byte-for-byte (entries live until
+LRU byte-budget pressure evicts them); the server logs a startup warning
+when the cache is enabled (`THUMBNAIL_CACHE_BYTES > 0`) without a TTL.
+
 A cache hit skips the decode slot (no semaphore acquisition), the storage
 GET (no opener), and the decode itself — the amplification the cache targets.
 On the REST path the cache is consulted only after bucket-policy and
 anonymous-read authorization and after the 304 fast path; the tenant
 component of the key isolates tenants. Observability: `thumbnail.cache.hits_total`
 / `misses_total` / `evictions_total` at `/metrics` (`PROMETHEUS_ENABLED=true`).
+
+**Compliance & retention notes (what an auditor can cite):** the cache holds
+derived JPEG bytes only, keyed by (tenant, ETag, effective dims); bytes are
+server-memory-only, regenerable, and cleared on restart. Served-path erasure
+is enforced before any cache lookup: deleted objects 404 via the Stat gate
+and overwritten objects key-miss via the content ETag, so retained bytes are
+never served after delete/overwrite. With a TTL set, physical retention of a
+never-read key is bounded by TTL + time-until-next-same-key-Get (a periodic
+physical purge — `SweepExpired` — is a documented follow-up, not yet
+implemented); without a TTL, the residual bound is the LRU byte budget. SSE-C
+and multipart-ETag objects never enter the cache (no customer-key-derived
+bytes are retained beyond the request). Shared caches (browsers/CDNs) holding
+the `public, max-age=86400` response are governed by `Cache-Control`, not the
+server TTL: their copies are dropped at revalidation (the derived ETag + 304
+re-Stat gate returns 404 for a deleted object), with worst-case retention
+`max-age` (86400 s); `must-revalidate`/shorter `max-age` would be a REST
+surface change and is out of scope.
 
 ---
 

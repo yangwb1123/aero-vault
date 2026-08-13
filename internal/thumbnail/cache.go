@@ -3,6 +3,7 @@ package thumbnail
 import (
 	"container/list"
 	"sync"
+	"time"
 )
 
 // CacheKeyVersion is the cache-key schema version: bump it whenever the
@@ -29,24 +30,49 @@ type CacheKey struct {
 
 // entry is one cached payload, linked into Cache's LRU list. data is
 // cache-owned memory (a copy of what Put received); it is never mutated
-// after insertion.
+// after insertion. expiresAt is the retention deadline set by the last Put
+// (fresh expiry per generation); the zero value is never consulted when the
+// owning cache has ttl <= 0.
 type entry struct {
-	key  CacheKey
-	data []byte
+	key       CacheKey
+	data      []byte
+	expiresAt time.Time
 }
 
 // Cache is a bounded, in-process LRU cache of generated thumbnail bytes,
 // keyed by CacheKey. The byte budget (maxBytes) is enforced by evicting
 // least-recently-used entries from the tail on overflow; a single payload
 // larger than the whole budget (or empty) is never stored. All state is
-// guarded by mu; the type is deterministic (no randomness, no timers) and
-// safe for concurrent use under -race.
+// guarded by mu; the type spawns no goroutines and owns no timers. When
+// ttl > 0, Get/Put perform monotonic wall-clock comparisons inside the
+// existing critical sections; when ttl <= 0, no wall-clock reads occur on
+// any path. The type is otherwise deterministic and safe for concurrent use
+// under -race.
 //
 // A cache created with maxBytes <= 0 is disabled: Get always misses, Put is
 // a no-op, Len/Bytes/Stats report zeros, and no state is allocated beyond
-// the Cache struct itself (zero-allocation pass-through). disabled is
-// immutable after NewCache (written before the pointer escapes), so Get and
-// Put read it without locking.
+// the Cache struct itself (zero-allocation pass-through). disabled and ttl
+// are immutable after NewCache (written before the pointer escapes), so Get
+// and Put read them without locking.
+//
+// Retention model (THUMBNAIL_CACHE_TTL): when ttl > 0, every stored entry
+// expires that long after the Put that produced it — a fixed TTL from the
+// last store, never extended by hits — and is never served after expiry
+// (lazy expiry on Get; an expired read is an ordinary miss). When ttl <= 0
+// (default) entries live until LRU byte-budget pressure evicts them,
+// byte-for-byte the pre-TTL behavior.
+//
+// TODO(campaign add-ttl-lifecycle-invalidation-to-the-thumbnail, FR-4): the
+// optional physical purge is a documented follow-up, not implemented here.
+// Contract for a future implementer: func (c *Cache) SweepExpired(now
+// time.Time) (n int) — O(entries) walk under c.mu, removing entries with
+// now.After(e.expiresAt), decrementing c.bytes by exactly len(e.data) each,
+// returning the count for telemetry. It must be cheap, must not bump the
+// LRU eviction counter, and must never be invoked from the request path;
+// the natural driver is an existing timer loop (e.g. the Reconcile ticker,
+// AGENTS.md §2.4), never a goroutine owned by Cache. Lazy expiry alone
+// bounds served retention strictly; the sweep additionally bounds physical
+// retention of never-read expired keys.
 type Cache struct {
 	mu        sync.Mutex
 	ll        *list.List
@@ -56,14 +82,22 @@ type Cache struct {
 	hits      uint64 // Stats surface (deterministic tests; telemetry forwards from the entry point)
 	misses    uint64
 	evictions uint64
-	disabled  bool // immutable after NewCache
+	disabled  bool          // immutable after NewCache
+	ttl       time.Duration // immutable after NewCache; <= 0 = no expiry
 }
 
-// NewCache returns a thumbnail output cache with the given byte budget, or a
-// disabled pass-through when maxBytes <= 0 (THUMBNAIL_CACHE_BYTES=0 default).
-func NewCache(maxBytes int64) *Cache {
+// NewCache returns a thumbnail output cache with the given byte budget and
+// per-entry retention TTL, or a disabled pass-through when maxBytes <= 0
+// (THUMBNAIL_CACHE_BYTES=0 default). ttl <= 0 disables expiry: entries live
+// until LRU byte-budget pressure evicts them (THUMBNAIL_CACHE_TTL=0 default)
+// — byte-for-byte the pre-TTL behavior, including no wall-clock reads on
+// any path. When ttl > 0, every stored entry expires that long after the Put
+// that produced it (fixed TTL from the last store; hits do not extend it)
+// and is never served after expiry.
+func NewCache(maxBytes int64, ttl time.Duration) *Cache {
 	c := &Cache{
 		maxBytes: maxBytes,
+		ttl:      ttl,
 		disabled: maxBytes <= 0,
 	}
 	if !c.disabled {
@@ -77,7 +111,12 @@ func NewCache(maxBytes int64) *Cache {
 // refreshed (moved to the front of the LRU list) and the stored slice is
 // returned by reference — callers must treat it as read-only so the byte
 // budget stays exact (the sole production caller writes it only to the
-// response). On a miss or on a disabled cache it returns (nil, false).
+// response). Expiry is NOT extended on hits: the retention deadline is set
+// by the last Put (a hit proves the entry is being served, but the deadline
+// is fixed by the generation that produced it — this is what guarantees no
+// entry is served beyond TTL after its producing generation). On a miss, on
+// a TTL-expired entry (removed here, counted as a miss) or on a disabled
+// cache it returns (nil, false).
 func (c *Cache) Get(k CacheKey) ([]byte, bool) {
 	if c.disabled {
 		return nil, false
@@ -85,9 +124,24 @@ func (c *Cache) Get(k CacheKey) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.m[k]; ok {
+		e := el.Value.(*entry)
+		if c.ttl > 0 && time.Now().After(e.expiresAt) {
+			// TTL-expired: remove exactly (map delete + list removal) and
+			// decrement the byte accounting; report a miss. This is not an
+			// LRU eviction — the eviction counter is untouched, and the
+			// expired entry must not earn a fresh LRU lease. The miss is
+			// counted here so Cache-level Stats stay coherent with the entry
+			// point (lookupCached forwards the same (nil, false) to
+			// IncThumbnailCacheMiss — zero new telemetry plumbing).
+			c.ll.Remove(el)
+			delete(c.m, k)
+			c.bytes -= int64(len(e.data))
+			c.misses++
+			return nil, false
+		}
 		c.ll.MoveToFront(el)
 		c.hits++
-		return el.Value.(*entry).data, true
+		return e.data, true
 	}
 	c.misses++
 	return nil, false
@@ -100,8 +154,10 @@ func (c *Cache) Get(k CacheKey) ([]byte, bool) {
 // whole budget is refused: a superseded entry under the same key is removed
 // (its payload must not be served as current) but no eviction is counted
 // (a refusal, not budget pressure). An existing key is replaced in place
-// (recency refreshed, no duplicate entry). On overflow, least-recently-used
-// entries are evicted from the tail until bytes <= maxBytes.
+// (recency refreshed, no duplicate entry; a replacement is a new generation
+// → a fresh expiry when ttl > 0). When ttl <= 0, no wall-clock reads occur
+// on this path. On overflow, least-recently-used entries are evicted from
+// the tail until bytes <= maxBytes.
 func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 	if c.disabled || len(img) == 0 {
 		return 0
@@ -124,13 +180,21 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	data := append([]byte(nil), img...)
+	// A fresh retention deadline per store; the zero value when ttl <= 0 is
+	// never consulted by Get (guarded by c.ttl > 0), so no wall-clock read
+	// happens on the disabled path.
+	var expiresAt time.Time
+	if c.ttl > 0 {
+		expiresAt = time.Now().Add(c.ttl) // monotonic clock participates in comparisons
+	}
 	if el, ok := c.m[k]; ok {
 		e := el.Value.(*entry)
 		c.bytes += int64(len(data)) - int64(len(e.data))
 		e.data = data
+		e.expiresAt = expiresAt
 		c.ll.MoveToFront(el)
 	} else {
-		c.m[k] = c.ll.PushFront(&entry{key: k, data: data})
+		c.m[k] = c.ll.PushFront(&entry{key: k, data: data, expiresAt: expiresAt})
 		c.bytes += int64(len(data))
 	}
 	for c.bytes > c.maxBytes {

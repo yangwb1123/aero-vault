@@ -47,6 +47,7 @@ type AppConfig struct {
 	PerTenantMax        int    // PER_TENANT_CONCURRENCY_MAX; 0 = unlimited
 	MaxBodySize         int    // APP_MAX_BODY_SIZE; max request body bytes (0 = unlimited)
 	ThumbnailCacheBytes int64  // THUMBNAIL_CACHE_BYTES; server-side thumbnail output cache (bytes); 0 = disabled
+	ThumbnailCacheTTL   int    // THUMBNAIL_CACHE_TTL; seconds; 0 = disabled (unbounded)
 }
 
 func Load() (*Config, error) {
@@ -83,6 +84,7 @@ func Load() (*Config, error) {
 			PerTenantMax:        getEnvInt("PER_TENANT_CONCURRENCY_MAX", 0),
 			MaxBodySize:         getEnvInt("APP_MAX_BODY_SIZE", 0),
 			ThumbnailCacheBytes: int64(getEnvInt("THUMBNAIL_CACHE_BYTES", 0)),
+			ThumbnailCacheTTL:   getEnvInt("THUMBNAIL_CACHE_TTL", 0),
 		},
 		Storage: StorageConfig{
 			Backend:            strings.ToLower(getEnv("STORAGE_BACKEND", "local")),

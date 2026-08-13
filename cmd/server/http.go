@@ -178,7 +178,15 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode,
 		func(h *rest.Handler) {
 			h.WithCORSProvider(corsProvider)
-			h.WithThumbnailCache(thumbnail.NewCache(cfg.App.ThumbnailCacheBytes))
+			h.WithThumbnailCache(thumbnail.NewCache(cfg.App.ThumbnailCacheBytes, time.Duration(cfg.App.ThumbnailCacheTTL)*time.Second))
+			if cfg.App.ThumbnailCacheBytes > 0 && cfg.App.ThumbnailCacheTTL == 0 {
+				// Compliance F2 (privacy-by-default posture): the cache is enabled
+				// without a retention bound — derived bytes of deleted/overwritten
+				// objects stay resident until LRU pressure evicts them. Zero
+				// behavior change (0 = unbounded is the documented default); the
+				// operator is alerted to set THUMBNAIL_CACHE_TTL.
+				logger.Warn("thumbnail cache enabled without a retention bound (THUMBNAIL_CACHE_TTL=0): cached derived bytes are retained until LRU pressure evicts them; set THUMBNAIL_CACHE_TTL to bound retention")
+			}
 			if accessManager != nil {
 				h.WithAccessManager(accessManager, cfg.Access.PublicBaseURL)
 			}

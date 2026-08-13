@@ -159,6 +159,15 @@ func (c *Config) validateTimeouts() error {
 	if c.App.ThumbnailCacheBytes < 0 {
 		return errors.New("THUMBNAIL_CACHE_BYTES must be >= 0 (0 = disabled)")
 	}
+	if c.App.ThumbnailCacheTTL < 0 {
+		return errors.New("THUMBNAIL_CACHE_TTL must be >= 0 (0 = disabled)")
+	}
+	// Upper bound: values beyond one year would overflow time.Duration's
+	// nanosecond range at the wiring site (cmd/server/http.go), silently
+	// wrapping negative and disabling expiry — fail fast instead.
+	if c.App.ThumbnailCacheTTL > 31536000 {
+		return errors.New("THUMBNAIL_CACHE_TTL must be <= 31536000 (1 year)")
+	}
 	return nil
 }
 

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -70,13 +71,14 @@ func (r *recordingSink) count(typ repository.EventType) int {
 }
 
 // newThumbnailCacheREST returns an httptest server whose router mirrors the
-// production REST shape for the thumbnail path: putKey/getKey/Head on
-// /v1/files/* plus the bucket-policy routes (authz gate test). withCache
-// attaches a 1 MiB server-side thumbnail cache; the counting store is always
-// installed so both cached and uncached flows are observable. The raw chi
-// router is returned as well so tests can wrap it with middleware (e.g.
-// mw.Tenant for cross-tenant isolation).
-func newThumbnailCacheREST(t *testing.T, withCache bool) (*httptest.Server, *countingStore, *service.FileService, *chi.Mux) {
+// production REST shape for the thumbnail path: putKey/getKey/Head/deleteKey
+// on /v1/files/* plus the bucket-policy routes (authz gate test). withCache
+// attaches a 1 MiB server-side thumbnail cache with the given per-entry TTL
+// (0 = no expiry); the counting store is always installed so both cached and
+// uncached flows are observable. The raw chi router is returned as well so
+// tests can wrap it with middleware (e.g. mw.Tenant for cross-tenant
+// isolation).
+func newThumbnailCacheREST(t *testing.T, withCache bool, ttl time.Duration) (*httptest.Server, *countingStore, *service.FileService, *chi.Mux) {
 	t.Helper()
 	dir := t.TempDir()
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
@@ -91,15 +93,16 @@ func newThumbnailCacheREST(t *testing.T, withCache bool) (*httptest.Server, *cou
 		t.Fatalf("storage: %v", err)
 	}
 	store := &countingStore{Storage: real}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	h := NewHandler(svc, nil)
 	if withCache {
-		h.WithThumbnailCache(thumbnail.NewCache(1 << 20))
+		h.WithThumbnailCache(thumbnail.NewCache(1<<20, ttl))
 	}
 	r := chi.NewRouter()
 	r.Put("/v1/files/*", h.putKey)
 	r.Get("/v1/files/*", h.getKey)
 	r.Head("/v1/files/*", h.Head)
+	r.Delete("/v1/files/*", h.deleteKey)
 	r.Put("/v1/buckets/{bucket}/policy", h.PutBucketPolicy)
 	r.Delete("/v1/buckets/{bucket}/policy", h.DeleteBucketPolicy)
 	srv := httptest.NewServer(r)
@@ -128,7 +131,7 @@ func pngBytesAlt(t *testing.T, w, h int) []byte {
 // Get count stays 1), a PUT with different bytes forces a miss (Get == 2),
 // and the same sequence without the cache increments Get per request.
 func TestThumbnailCacheServesRepeatRequestFromCache(t *testing.T) {
-	srv, store, _, _ := newThumbnailCacheREST(t, true)
+	srv, store, _, _ := newThumbnailCacheREST(t, true, 0)
 	base := srv.URL + "/v1/files/img.png"
 	thumb := base + "/thumbnail?w=32&h=32"
 	hdr := map[string]string{"Content-Type": "image/png"}
@@ -188,7 +191,7 @@ func TestThumbnailCacheServesRepeatRequestFromCache(t *testing.T) {
 	}
 
 	// Regression: without the cache, every request runs the full pipeline.
-	srv2, store2, _, _ := newThumbnailCacheREST(t, false)
+	srv2, store2, _, _ := newThumbnailCacheREST(t, false, 0)
 	base2 := srv2.URL + "/v1/files/img.png"
 	thumb2 := base2 + "/thumbnail?w=32&h=32"
 	req(t, "PUT", base2, pngBytes(t, 64, 64), hdr)
@@ -204,7 +207,7 @@ func TestThumbnailCacheServesRepeatRequestFromCache(t *testing.T) {
 // before the entry point, neither serving nor populating the cache, and a
 // subsequent authorized request still hits the surviving entry.
 func TestThumbnailCacheAuthzGateBeforeLookup(t *testing.T) {
-	srv, store, _, _ := newThumbnailCacheREST(t, true)
+	srv, store, _, _ := newThumbnailCacheREST(t, true, 0)
 	base := srv.URL + "/v1/files/img.png"
 	thumb := base + "/thumbnail?w=32&h=32"
 	policyURL := srv.URL + "/v1/buckets/default/policy"
@@ -263,7 +266,7 @@ func TestThumbnailCacheAuthzGateBeforeLookup(t *testing.T) {
 // Cache-Control + Last-Modified and no storage Get (the 304 re-Stat is
 // repo-only).
 func TestThumbnailCacheHitKeeps304AndHeaders(t *testing.T) {
-	srv, store, _, _ := newThumbnailCacheREST(t, true)
+	srv, store, _, _ := newThumbnailCacheREST(t, true, 0)
 	base := srv.URL + "/v1/files/img.png"
 	thumb := base + "/thumbnail?w=32&h=32"
 	hdr := map[string]string{"Content-Type": "image/png"}
@@ -301,7 +304,7 @@ func TestThumbnailCacheHitKeeps304AndHeaders(t *testing.T) {
 // stream open in the service, hits via the handler-side EmitAccessed — and
 // 304s emit none.
 func TestThumbnailCacheHitEmitsAccessedEvent(t *testing.T) {
-	srv, _, svc, _ := newThumbnailCacheREST(t, true)
+	srv, _, svc, _ := newThumbnailCacheREST(t, true, 0)
 	sink := &recordingSink{}
 	svc.WithEventSink(sink)
 	base := srv.URL + "/v1/files/img.png"
@@ -339,7 +342,7 @@ func TestThumbnailCacheHitEmitsAccessedEvent(t *testing.T) {
 // of the key). Builds its own server wrapped in mw.Tenant (the production
 // chain extracts X-Aero-Tenant before the handler runs).
 func TestThumbnailCacheCrossTenantIsolationHTTP(t *testing.T) {
-	_, store, _, r := newThumbnailCacheREST(t, true)
+	_, store, _, r := newThumbnailCacheREST(t, true, 0)
 	// Wrap the raw router with the tenant middleware (the production chain
 	// extracts X-Aero-Tenant before the handler runs) and serve it fresh.
 	srv := httptest.NewServer(mw.Tenant(r))
@@ -406,9 +409,9 @@ func BenchmarkThumbnailCacheHandlerHit(b *testing.B) {
 		b.Fatal(err)
 	}
 	store := &countingStore{Storage: real}
-	svc := service.NewFileService(store, repo, nil)
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 	h := NewHandler(svc, nil)
-	h.WithThumbnailCache(thumbnail.NewCache(1 << 20))
+	h.WithThumbnailCache(thumbnail.NewCache(1<<20, 0))
 	r := chi.NewRouter()
 	r.Put("/v1/files/*", h.putKey)
 	r.Get("/v1/files/*", h.getKey)
@@ -472,9 +475,9 @@ func TestThumbnailCacheAdmissionGates(t *testing.T) {
 			t.Fatalf("storage: %v", err)
 		}
 		store := &countingStore{Storage: real}
-		svc := service.NewFileService(store, repo, nil)
+		svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
 		h := NewHandler(svc, nil)
-		h.WithThumbnailCache(thumbnail.NewCache(1 << 20))
+		h.WithThumbnailCache(thumbnail.NewCache(1<<20, 0))
 		r := chi.NewRouter()
 		r.Put("/v1/files/*", h.putKey)
 		r.Get("/v1/files/*", h.getKey)
@@ -552,6 +555,71 @@ func TestThumbnailCacheAdmissionGates(t *testing.T) {
 		}
 		if n := store.gets.Load(); n != 3 {
 			t.Fatalf("multipart storage Get count = %d, want 3 (never cached)", n)
+		}
+	})
+}
+
+// TestThumbnailCacheTTLExpiryRegenerates (AC-3) pins the retention contract
+// end-to-end: (1) delete arm — after the object is deleted a repeat request
+// 404s via the handler's Stat gate (retained bytes are never served), and
+// (2) TTL arm — an entry read past its per-entry TTL regenerates (a fresh
+// storage Get, byte-identical body) instead of serving retained bytes.
+func TestThumbnailCacheTTLExpiryRegenerates(t *testing.T) {
+	hdr := map[string]string{"Content-Type": "image/png"}
+
+	t.Run("delete arm: retained bytes never served after object delete", func(t *testing.T) {
+		srv, store, _, _ := newThumbnailCacheREST(t, true, 0) // ttl=0: retention is LRU-budget-only
+		base := srv.URL + "/v1/files/img.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+
+		req(t, "PUT", base, pngBytes(t, 64, 64), hdr)
+		resp, body := req(t, "GET", thumb, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("warm GET status=%d want 200, body=%s", resp.StatusCode, body)
+		}
+		if n := store.gets.Load(); n != 1 {
+			t.Fatalf("warm GET storage Get count = %d, want 1 (cache warm)", n)
+		}
+		// Soft-delete the object: the cache still holds the derived bytes,
+		// but the handler's Stat gate fires before any lookup — the repeat
+		// request must 404 with no storage Get (the 404 comes from the repo
+		// Stat, not storage), never serving the retained body.
+		resp, body = req(t, "DELETE", base, nil, nil)
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("DELETE status=%d, body=%s", resp.StatusCode, body)
+		}
+		resp, body = req(t, "GET", thumb, nil, nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET after delete status=%d want 404 (Stat gate before cache lookup), body=%s", resp.StatusCode, body)
+		}
+		if n := store.gets.Load(); n != 1 {
+			t.Fatalf("GET after delete must not open storage: Get count = %d, want 1", n)
+		}
+	})
+
+	t.Run("TTL arm: expired entry regenerates with byte-identical output", func(t *testing.T) {
+		srv, store, _, _ := newThumbnailCacheREST(t, true, time.Nanosecond)
+		base := srv.URL + "/v1/files/img.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+
+		req(t, "PUT", base, pngBytes(t, 64, 64), hdr)
+		resp, body := req(t, "GET", thumb, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("warm GET status=%d want 200, body=%s", resp.StatusCode, body)
+		}
+		if n := store.gets.Load(); n != 1 {
+			t.Fatalf("warm GET storage Get count = %d, want 1", n)
+		}
+		time.Sleep(2 * time.Millisecond) // nanosecond TTL has elapsed
+		resp2, body2 := req(t, "GET", thumb, nil, nil)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("repeat GET status=%d want 200 (regenerated), body=%s", resp2.StatusCode, body2)
+		}
+		if n := store.gets.Load(); n != 2 {
+			t.Fatalf("repeat GET after TTL expiry must regenerate: storage Get count = %d, want 2 (not served from the expired entry)", n)
+		}
+		if !bytes.Equal(body, body2) {
+			t.Fatal("regenerated body differs from the first — deterministic pipeline must produce identical bytes")
 		}
 	})
 }
