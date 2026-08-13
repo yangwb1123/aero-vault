@@ -50,19 +50,22 @@ func BenchmarkGenerateDownscale(b *testing.B) {
 	}
 }
 
-// BenchmarkGenerateJPEGDownscale covers the generic-path shape that every
-// JPEG thumbnail takes in production: a 1024² JPEG decodes to *image.YCbCr,
-// which misses the dispatcher's *image.RGBA/*image.NRGBA switch
-// (thumbnail.go:380-384) and traverses scaleGeneric (≈ 6 allocs/pixel: 4
-// At() boxes + Set box + rgbamodel re-box, pixfast.go:1-10). The scaled
-// output is fully opaque (YCbCr→RGBA A=65535), so the post-scale
-// compositeOnWhite (slot_open.go:232) is a no-op. Fixture = makePNG content
-// re-encoded as JPEG at quality 82, so PNG-vs-JPEG deltas are codec-only.
-// Baseline (Go 1.26.5, HEAD 48c2976, this box, 2×1s runs): ≈ 9.9 ms/op
-// (9.60/10.20), 393,250 allocs/op, 52,360-byte fixture — 393,250 ≈ 6/pixel ×
-// 65,536 dst pixels + ~34 fixed, matching pixfast.go's theoretical figure to
-// 0.01 %. The 52-alloc/op PNG control (BenchmarkGenerateDownscale) is the
-// fast-path contrast; the difference is the direction-1 (YCbCr kernels) ROI.
+// BenchmarkGenerateJPEGDownscale covers the production shape every JPEG
+// thumbnail takes: a 1024² JPEG decodes to *image.YCbCr, which now takes
+// the direct-Pix scaleYCbCr kernel (pixfast_more.go) — the pre-kernel
+// generic path boxed ≈ 6 allocs/pixel (4 At() boxes + Set box + rgbamodel
+// re-box, pixfast.go:1-10) at ≈ 393,251 allocs/op. The scaled output is
+// fully opaque (YCbCr→RGBA A=65535), so the post-scale compositeOnWhite
+// (slot_open.go:232) is a no-op. Fixture = makePNG content re-encoded as
+// JPEG at quality 82, so PNG-vs-JPEG deltas are codec-only.
+// Baseline (Go 1.26.5, HEAD 57a5e2d + pixfast_more.go, this box, 2×1s
+// runs): ≈ 7.5 ms/op (7.46/7.62), 35 allocs/op, 52,360-byte fixture — 35 =
+// decode 7 + encode 9 + ~19 generateLocked scaffolding, the same class as
+// the PNG fast-path control (BenchmarkGenerateDownscale, 53 allocs/op) and
+// ≈ 11,000× below the pre-kernel 393,251 (the 40000 gate of
+// TestGenerateDownscaleAllocCeiling trips any regression to per-pixel
+// boxing). ms/op is below the PNG control's 8.8 ms because the JPEG
+// fixture's decode is cheaper than PNG's for this gradient content.
 // Run: go test -bench='BenchmarkGenerate(JPEG|GIF)Downscale$' -benchmem ./internal/thumbnail/
 func BenchmarkGenerateJPEGDownscale(b *testing.B) {
 	fixture := makeJPEG(b, 1024, 1024)
@@ -76,17 +79,19 @@ func BenchmarkGenerateJPEGDownscale(b *testing.B) {
 	}
 }
 
-// BenchmarkGenerateGIFDownscale covers the transparent-GIF generic-path
-// shape: a 1024² transparent GIF decodes to *image.Paletted and traverses
-// scaleGeneric — at ≈ 2 allocs/pixel (131,122 allocs/op): Paletted.At returns
-// a pre-materialized palette interface (no boxing), so only the dst.Set box
-// and rgbamodel re-box allocate. Opaque()==false (a transparent palette
+// BenchmarkGenerateGIFDownscale covers the transparent-GIF shape: a 1024²
+// transparent GIF decodes to *image.Paletted and takes the direct-Pix
+// scalePaletted kernel (pixfast_more.go) — the pre-kernel generic path
+// boxed ≈ 2 allocs/pixel (131,122 allocs/op): Paletted.At returns a
+// pre-materialized palette interface (no boxing), so only the dst.Set box
+// and rgbamodel re-box allocated. Opaque()==false (a transparent palette
 // entry) makes the post-scale scaled RGBA (A=0) pay the generic
 // compositeOnWhite draw.Over flatten (slot_open.go:232) — the fuller
-// production shape; the opaque-GIF control (makeWideGIF) measures 131,117
-// (Δ5 = the composite).
-// Baseline (Go 1.26.5, HEAD 48c2976, this box, 2×1s runs): ≈ 5.8 ms/op
-// (5.76/5.84), 131,122 allocs/op, 1,790-byte fixture.
+// production shape.
+// Baseline (Go 1.26.5, HEAD 57a5e2d + pixfast_more.go, this box, 2×1s
+// runs): ≈ 5.6 ms/op (5.57/5.79), 51 allocs/op, 1,790-byte fixture — down
+// from ≈ 5.8 ms and 131,122 allocs/op pre-kernels; the residual above the
+// JPEG arm is the transparent composite flatten.
 // Run: go test -bench='BenchmarkGenerate(JPEG|GIF)Downscale$' -benchmem ./internal/thumbnail/
 func BenchmarkGenerateGIFDownscale(b *testing.B) {
 	fixture := makeTransparentGIF(b, 1024, 1024)
@@ -95,6 +100,27 @@ func BenchmarkGenerateGIFDownscale(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := Generate(bytes.NewReader(fixture), 256, 256); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGenerateHardMaxOrientedJPEG covers the HardMax EXIF-5..8 JPEG
+// shape (review finding F-3 of the YCbCr-kernel direction): a 2048²
+// orientation-6 JPEG at a HardMax box — the o ≥ 5 box swap keeps both axes
+// ratio ≥ 1, so scale is a no-op and the full 2048² frame rotates.
+// Pre-kernels that rotation was generic-path (≈ 500 ms / 8.4 M allocs at
+// 2048² — scaleGeneric At/Set boxing); rotateYCbCr (pixfast_more.go) turns
+// it into a ~10–25 ms direct-Pix pass. Informational (house style): no hard
+// gate — recorded baseline + periodic -benchmem spot check.
+// Run: go test -bench='BenchmarkGenerateHardMaxOrientedJPEG$' -benchmem ./internal/thumbnail/
+func BenchmarkGenerateHardMaxOrientedJPEG(b *testing.B) {
+	fixture := makeOrientedJPEG(b, HardMax, HardMax, 6)
+	b.SetBytes(int64(len(fixture)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := GenerateContext(context.Background(), bytes.NewReader(fixture), HardMax, HardMax); err != nil {
 			b.Fatal(err)
 		}
 	}

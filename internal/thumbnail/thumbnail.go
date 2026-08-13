@@ -346,11 +346,12 @@ func compositeOnWhite(img image.Image) image.Image {
 
 // scale downsamples src to fit within maxW×maxH using bilinear interpolation,
 // preserving aspect ratio. Images already within bounds are returned
-// unchanged. It dispatches on the source's concrete type: *image.RGBA and
-// *image.NRGBA take the direct-Pix fast kernels (pixfast.go); every other
-// type (*image.YCbCr, *image.Paletted, *image.Gray, *image.RGBA64,
-// *image.NRGBA64, gateImage, custom image.Image) falls through to
-// scaleGeneric — today's At/Set loop, preserved verbatim and byte-identical.
+// unchanged. It dispatches on the source's concrete type: *image.RGBA,
+// *image.NRGBA, *image.YCbCr, *image.Gray and *image.Paletted take the
+// direct-Pix fast kernels (pixfast.go / pixfast_more.go); every other type
+// (*image.RGBA64, *image.NRGBA64, gateImage, custom image.Image) falls
+// through to scaleGeneric — today's At/Set loop, preserved verbatim and
+// byte-identical.
 // Both paths consult ctx at the top of every cancelCheckRows-th row and
 // return (nil, ctx.Err()) unwrapped on a done context, so a canceled or
 // deadline-expired request aborts within cancelCheckRows rows of pixel work;
@@ -384,6 +385,12 @@ func scale(ctx context.Context, src image.Image, maxW, maxH int) (image.Image, e
 		return scaleRGBA(ctx, s, sw, sh, tw, th)
 	case *image.NRGBA:
 		return scaleNRGBA(ctx, s, sw, sh, tw, th)
+	case *image.YCbCr:
+		return scaleYCbCr(ctx, s, sw, sh, tw, th)
+	case *image.Gray:
+		return scaleGray(ctx, s, sw, sh, tw, th)
+	case *image.Paletted:
+		return scalePaletted(ctx, s, sw, sh, tw, th)
 	default:
 		return scaleGeneric(ctx, src, sw, sh, tw, th)
 	}

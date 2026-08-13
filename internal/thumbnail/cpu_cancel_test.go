@@ -366,23 +366,14 @@ func TestScaleApplyOrientationNoopIdentity(t *testing.T) {
 	}
 }
 
-// TestGenerateContextCancelMidRotationReleasesSlot is the rotation-phase
-// integration pin (AC-1a, FR-4 rotation arm): a cancel that lands after the
-// stream is consumed, with the pipeline already past the post-decode check
-// and scale (both fast), must abort inside the ~500 ms rotation of a
-// 3072×4096 frame at the cancelCheckRows row check — and release the decode
-// slot. The box swap for orientation 6 (o ≥ 5) with both axes ratio ≥ 1
-// makes scale return the source unchanged, so the rotation is the only
-// long pole and the abort provably comes from applyOrientation's ctx check.
-func TestGenerateContextCancelMidRotationReleasesSlot(t *testing.T) {
-	// 2048×2048 orientation-6 JPEG with a box of 2048×2048 (HardMax): the
-	// o ≥ 5 box swap keeps both axes ratio ≥ 1, so scale returns the source
-	// unchanged and the rotation of the full 2048² frame (≈ 4.2M pixels)
-	// is the dominant pipeline phase — the discriminator for the
-	// rotation-branch abort.
-	img := image.NewRGBA(image.Rect(0, 0, 2048, 2048))
-	for y := 0; y < 2048; y += 64 {
-		for x := 0; x < 2048; x += 64 {
+// makeOrientedJPEG builds a w×h blocky RGBA frame, JPEG-encodes it, and
+// splices an EXIF orientation-o APP1 segment between SOI and the rest — the
+// HardMax EXIF-5..8 shape that drives rotateYCbCr's production trigger.
+func makeOrientedJPEG(tb testing.TB, w, h, o int) []byte {
+	tb.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y += 64 {
+		for x := 0; x < w; x += 64 {
 			c := color.RGBA{R: uint8(x / 8), G: uint8(y / 8), B: 128, A: 255}
 			for dy := 0; dy < 64; dy++ {
 				for dx := 0; dx < 64; dx++ {
@@ -393,20 +384,36 @@ func TestGenerateContextCancelMidRotationReleasesSlot(t *testing.T) {
 	}
 	var jpg bytes.Buffer
 	if err := jpeg.Encode(&jpg, img, &jpeg.Options{Quality: 85}); err != nil {
-		t.Fatalf("encode: %v", err)
+		tb.Fatalf("encode: %v", err)
 	}
-	// Splice the EXIF orientation-6 APP1 between SOI and the rest.
+	// Splice the EXIF orientation-o APP1 between SOI and the rest.
 	body := jpg.Bytes()[2:]
 	var out bytes.Buffer
 	out.Write([]byte{0xFF, 0xD8})
-	payload := exifPayload(6, binary.LittleEndian)
+	payload := exifPayload(o, binary.LittleEndian)
 	var seg [4]byte
 	seg[0], seg[1] = 0xFF, 0xE1
 	binary.BigEndian.PutUint16(seg[2:4], uint16(len(payload)+2))
 	out.Write(seg[:])
 	out.Write(payload)
 	out.Write(body)
-	data := out.Bytes()
+	return out.Bytes()
+}
+
+// TestGenerateContextCancelMidRotationReleasesSlot is the rotation-phase
+// integration pin (AC-1a, FR-4 rotation arm): a cancel that lands after the
+// stream is consumed, with the pipeline already past the post-decode check
+// and scale (both fast), must abort inside the remaining CPU-bound phases
+// and release the decode slot. The box swap for orientation 6 (o ≥ 5) with
+// both axes ratio ≥ 1 makes scale return the source unchanged, so the
+// rotation of the full 2048² frame is the first long pole; post-kernels
+// rotateYCbCr is ~10–25 ms (vs ~500 ms generic), so the abort is
+// phase-agnostic — it lands in the rotation or, on a loaded runner, the
+// in-encode ctxWriter per-byte check; the rotation-branch cadence itself is
+// deterministically pinned by TestApplyOrientationHonorsCancelMidRotate.
+func TestGenerateContextCancelMidRotationReleasesSlot(t *testing.T) {
+	// 2048×2048 orientation-6 JPEG at a 2048×2048 (HardMax) box.
+	data := makeOrientedJPEG(t, 2048, 2048, 6)
 
 	consumed := make(chan struct{})
 	reader := &drainReader{data: data, consumed: consumed}
@@ -427,9 +434,9 @@ func TestGenerateContextCancelMidRotationReleasesSlot(t *testing.T) {
 	// decoder still finalizes (unfilter/IDCT/upsample, ~10–50 ms) before the
 	// post-decode check runs. A calibrated delay lands the cancel strictly
 	// AFTER the post-decode check and the ratio ≥ 1 scale no-op — inside the
-	// rotation window, which dominates the remaining pipeline. If a loaded
-	// CI runner shifts the window, the abort still surfaces Canceled and
-	// releases the slot (the rotation branch itself is deterministically
+	// rotation-or-encode window that dominates the remaining pipeline. If a
+	// loaded CI runner shifts the window, the abort still surfaces Canceled
+	// and releases the slot (the rotation branch itself is deterministically
 	// covered by TestApplyOrientationHonorsCancelMidRotate).
 	time.Sleep(50 * time.Millisecond)
 	cancel()
@@ -440,7 +447,7 @@ func TestGenerateContextCancelMidRotationReleasesSlot(t *testing.T) {
 		t.Fatal("GenerateContext did not abort after mid-rotation cancel")
 	}
 	if !errors.Is(cerr, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled (rotation-phase abort)", cerr)
+		t.Fatalf("err = %v, want context.Canceled (phase-agnostic abort: rotation or in-encode ctxWriter)", cerr)
 	}
 	if errors.Is(cerr, ErrUnsupported) {
 		t.Fatalf("err = %v, must not be reclassified as ErrUnsupported", cerr)

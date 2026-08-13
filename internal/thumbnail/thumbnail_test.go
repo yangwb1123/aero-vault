@@ -30,12 +30,13 @@ func makePNG(t testing.TB, w, h int) []byte {
 }
 
 // makeJPEG encodes the makePNG content (deterministic x/y gradient) as a
-// baseline JPEG at the package quality constant — the generic-path fixture:
-// jpeg.Decode yields *image.YCbCr, which misses scale's RGBA/NRGBA fast-path
-// dispatch (thumbnail.go:380-384) and traverses scaleGeneric for every
-// downscale. Identical content to makePNG keeps PNG-vs-JPEG benchmark deltas
-// codec-only (BenchmarkGenerateJPEGDownscale). Typed testing.TB so
-// *testing.T, *testing.B and *testing.F all work.
+// baseline JPEG at the package quality constant — the YCbCr-kernel
+// fixture: jpeg.Decode yields *image.YCbCr, which scale dispatches to
+// scaleYCbCr (pixfast_more.go) — the pre-kernel path fell through to
+// scaleGeneric at ≈ 393K allocs/op (see BenchmarkGenerateJPEGDownscale).
+// Identical content to makePNG keeps PNG-vs-JPEG benchmark deltas
+// codec-only. Typed testing.TB so *testing.T, *testing.B and *testing.F
+// all work.
 func makeJPEG(t testing.TB, w, h int) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
@@ -497,8 +498,8 @@ func FuzzGenerate(f *testing.F) {
 	f.Add(headerOnlyGIF(f, 8192, 8192))    // boundary: ErrUnsupported (no image data)
 	gifSeed := makeGIF(f)                  // single build, then slice (F4)
 	f.Add(gifSeed[:len(gifSeed)/2])        // mid-stream truncation → ErrUnsupported
-	f.Add(makeJPEG(f, 400, 200))           // generic-path downscale seed: JPEG → *image.YCbCr → scaleGeneric (ratio < 1)
-	f.Add(makeTransparentGIF(f, 400, 200)) // generic-path downscale seed: GIF → *image.Paletted (transparent) + white composite
+	f.Add(makeJPEG(f, 400, 200))           // YCbCr-kernel downscale seed: JPEG → *image.YCbCr → scaleYCbCr (ratio < 1)
+	f.Add(makeTransparentGIF(f, 400, 200)) // Paletted-kernel downscale seed: GIF → *image.Paletted (transparent) + white composite
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)

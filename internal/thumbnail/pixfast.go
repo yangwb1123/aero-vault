@@ -7,7 +7,9 @@ package thumbnail
 // conversion re-boxes (1 alloc) — ≈ 6 allocs/pixel ≈ 393K allocs for a
 // 256×256 downscale. The kernels below read/write src.Pix/dst.Pix directly,
 // replicating the exact stdlib conversions (see the read/write notes), with
-// zero per-pixel allocation.
+// zero per-pixel allocation. Sibling file pixfast_more.go extends the same
+// machinery to *image.YCbCr / *image.Gray / *image.Paletted sources (the
+// JPEG/GIF/grayscale-PNG production shapes).
 //
 // Byte-identity contract (FR-3): fast ≡ generic on all valid inputs. Every
 // downstream consumer (jpeg encoder, compositeOnWhite Opaque(), REST ETag

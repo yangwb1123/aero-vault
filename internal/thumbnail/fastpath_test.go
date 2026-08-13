@@ -7,22 +7,26 @@ package thumbnail
 // compares the dispatch entries (scale / applyOrientation) against the
 // preserved generic references (scaleGeneric / applyOrientationGeneric) on a
 // deterministic matrix — source types (RGBA/NRGBA × opaque/semi-transparent
-// incl. α=0 with RGB≠0 and the anti-correlated α/c ramp), sizes (1×1 through
-// the 1024² benchmark shape), scale targets (downscales, equal-dims no-op,
-// upscale no-op, empty source), sub-images with nonzero Min, and every
-// orientation. Identical Bounds/Stride/Pix bytes on every case is what makes
-// fast ≡ generic imply fast ≡ today's bytes (the generic bodies are the
-// pre-fix loops, verbatim).
+// incl. α=0 with RGB≠0 and the anti-correlated α/c ramp; YCbCr × 420/422/444
+// × ramp/clamp-extreme; Gray × ramp/solid; Paletted × opaque/gradient/
+// semi-transparent-NRGBA/gray-entries; builders in fastpath_more_test.go),
+// sizes (1×1 through the 1024² benchmark shape), scale targets (downscales,
+// equal-dims no-op, upscale no-op, empty source), sub-images with nonzero
+// Min (incl. the odd-Min YCbCr 420 case that discriminates the
+// non-canceling subsampled chroma COffset form), and every orientation.
+// Identical Bounds/Stride/Pix bytes on every case is what makes fast ≡
+// generic imply fast ≡ today's bytes (the generic bodies are the pre-fix
+// loops, verbatim).
 //
-// T2 (TestGenerateDownscaleAllocCeiling) is the machine-checkable AC-1 alloc
-// gate: the ≈ 393K allocs/op pre-fix (6 allocs/pixel boxing) must drop below
-// 40000 (post-fix the pipeline is dominated by the jpeg encoder's fixed cost
-// ≈ 700–1,100 at 256²). It skips under -race, matching the package's
-// allocation-delta convention. The JPEG arm (AC-2) floors the generic path:
-// its ≈ 393,250 allocs/op baseline — the very per-pixel boxing cost the fast
-// kernels eliminated for RGBA — is the regression floor for YCbCr/Paletted
-// sources until a kernel direction replaces it (documented on
-// jpegGenericAllocCeiling).
+// T2 (TestGenerateDownscaleAllocCeiling) is the machine-checkable alloc
+// gate shared by both codec arms: the PNG arm (RGBA fast path, ≈ 53
+// allocs/op) and the JPEG arm (YCbCr/Paletted fast kernels, ≈ 42–48
+// allocs/op post-fix — decode 7 + encode 9 + ~26 scaffolding) must stay
+// below the same 40000 threshold, which trips on any second full per-pixel
+// boxing layer (12 allocs/pixel ≈ 786,470; the pre-kernel generic class
+// measured 393,251). It skips under -race, matching the package's
+// allocation-delta convention. Pre-kernel baselines are recorded in
+// bench_test.go.
 import (
 	"bytes"
 	"context"
@@ -191,38 +195,74 @@ func TestFastPathByteIdentity(t *testing.T) {
 
 	empty := image.NewRGBA(image.Rect(0, 0, 0, 0))
 
+	// The RGBA/NRGBA fixtures run the full size matrix in every mode. The
+	// YCbCr/Gray/Paletted fixtures (moreSizes) add the 1024² shape only in
+	// normal mode: under -race a generic 1024² rotate arm boxes ≈ 2M
+	// objects (the performance review measured the untrimmed suite past the
+	// 120s test-race-thumbnail budget). With the trim the full -race -short
+	// suite measures 102.5s on this box (parity battery 14.4s; Go 1.26.5,
+	// HEAD 57a5e2d + pixfast_more.go) — ≥ 15s under the gate — and the
+	// 1024² arms still run in normal mode. Byte identity is deterministic
+	// and size-independent — identical code paths at every size, no
+	// size-dependent branching in kernel or generic — so the race run keeps
+	// full coverage at ≤ 300×200 for the new types.
+	moreSizes := sizes
+	if raceEnabled {
+		moreSizes = sizes[:len(sizes)-1]
+	}
+	runFixtureArms := func(w, h int, name string, src image.Image) {
+		for _, tg := range targets {
+			t.Run(fmt.Sprintf("%dx%d/%s/downscale-%dx%d", w, h, name, tg[0], tg[1]), func(t *testing.T) {
+				scaleParity(t, ctx, src, tg[0], tg[1])
+			})
+		}
+		// No-op arms: equal dims and upscale must return the same
+		// instance; the empty source is checked once below.
+		t.Run(fmt.Sprintf("%dx%d/%s/equal-dims", w, h, name), func(t *testing.T) {
+			scaleParity(t, ctx, src, w, h)
+		})
+		t.Run(fmt.Sprintf("%dx%d/%s/upscale", w, h, name), func(t *testing.T) {
+			scaleParity(t, ctx, src, w+1, h+1)
+		})
+		for o := 2; o <= 8; o++ {
+			t.Run(fmt.Sprintf("%dx%d/%s/rotate-o%d", w, h, name, o), func(t *testing.T) {
+				rotateParity(t, ctx, src, o)
+			})
+		}
+		for _, o := range []int{0, 1, 9} {
+			t.Run(fmt.Sprintf("%dx%d/%s/rotate-noop-o%d", w, h, name, o), func(t *testing.T) {
+				rotateParity(t, ctx, src, o)
+			})
+		}
+	}
 	for _, sz := range sizes {
 		w, h := sz[0], sz[1]
-		fixtures := map[string]image.Image{
+		for name, src := range map[string]image.Image{
 			"rgba-opaque":  buildRGBA(w, h),
 			"rgba-alpha":   buildRGBAAlpha(w, h),
 			"nrgba-opaque": buildNRGBA(w, h),
 			"nrgba-ramp":   buildNRGBARamp(w, h),
+		} {
+			runFixtureArms(w, h, name, src)
 		}
-		for name, src := range fixtures {
-			for _, tg := range targets {
-				t.Run(fmt.Sprintf("%dx%d/%s/downscale-%dx%d", w, h, name, tg[0], tg[1]), func(t *testing.T) {
-					scaleParity(t, ctx, src, tg[0], tg[1])
-				})
-			}
-			// No-op arms: equal dims and upscale must return the same
-			// instance; the empty source is checked once below.
-			t.Run(fmt.Sprintf("%dx%d/%s/equal-dims", w, h, name), func(t *testing.T) {
-				scaleParity(t, ctx, src, w, h)
-			})
-			t.Run(fmt.Sprintf("%dx%d/%s/upscale", w, h, name), func(t *testing.T) {
-				scaleParity(t, ctx, src, w+1, h+1)
-			})
-			for o := 2; o <= 8; o++ {
-				t.Run(fmt.Sprintf("%dx%d/%s/rotate-o%d", w, h, name, o), func(t *testing.T) {
-					rotateParity(t, ctx, src, o)
-				})
-			}
-			for _, o := range []int{0, 1, 9} {
-				t.Run(fmt.Sprintf("%dx%d/%s/rotate-noop-o%d", w, h, name, o), func(t *testing.T) {
-					rotateParity(t, ctx, src, o)
-				})
-			}
+	}
+	for _, sz := range moreSizes {
+		w, h := sz[0], sz[1]
+		for name, src := range map[string]image.Image{
+			"ycbcr420-ramp":     buildYCbCr(w, h, image.YCbCrSubsampleRatio420, ycbcrModeRamp),
+			"ycbcr420-extreme":  buildYCbCr(w, h, image.YCbCrSubsampleRatio420, ycbcrModeExtreme),
+			"ycbcr422-ramp":     buildYCbCr(w, h, image.YCbCrSubsampleRatio422, ycbcrModeRamp),
+			"ycbcr422-extreme":  buildYCbCr(w, h, image.YCbCrSubsampleRatio422, ycbcrModeExtreme),
+			"ycbcr444-ramp":     buildYCbCr(w, h, image.YCbCrSubsampleRatio444, ycbcrModeRamp),
+			"ycbcr444-extreme":  buildYCbCr(w, h, image.YCbCrSubsampleRatio444, ycbcrModeExtreme),
+			"gray-ramp":         buildGray(w, h),
+			"gray-solid":        buildGraySolid(w, h),
+			"paletted-opaque":   buildPaletted(w, h, palModeOpaque),
+			"paletted-gradient": buildPaletted(w, h, palModeGradient),
+			"paletted-nrgba":    buildPaletted(w, h, palModeNRGBA),
+			"paletted-gray":     buildPaletted(w, h, palModeGray),
+		} {
+			runFixtureArms(w, h, name, src)
 		}
 	}
 
@@ -231,9 +271,11 @@ func TestFastPathByteIdentity(t *testing.T) {
 		scaleParity(t, ctx, empty, 32, 32)
 	})
 
-	// Sub-image arm (FR-4/C-2): nonzero Min with shared Stride, for both
-	// RGBA and NRGBA. Sampling at b.Min+(x0,y0) must cancel Min in
-	// PixOffset and read the same bytes the generic At path reads.
+	// Sub-image arm (FR-4/C-2): nonzero Min with shared Stride, for RGBA,
+	// NRGBA, YCbCr and Paletted. Sampling at b.Min+(x0,y0) must cancel Min
+	// in PixOffset/YOffset and read the same bytes the generic At path reads;
+	// the YCbCr 420 entry also exercises the non-canceling subsampled chroma
+	// COffset form at odd Min (k = w/4).
 	for _, sz := range sizes {
 		w, h := sz[0], sz[1]
 		if w < 4 || h < 4 {
@@ -244,12 +286,34 @@ func TestFastPathByteIdentity(t *testing.T) {
 			k = 1
 		}
 		subW, subH := w-k, h-k
-		subs := map[string]image.Image{
+		for name, sub := range map[string]image.Image{
 			"rgba":   buildRGBA(w, h).SubImage(image.Rect(k, k, w, h)),
 			"nrgba":  buildNRGBA(w, h).SubImage(image.Rect(k, k, w, h)),
 			"nrgba2": buildNRGBARamp(w, h).SubImage(image.Rect(k, k, w, h)),
+		} {
+			t.Run(fmt.Sprintf("subimage-%dx%d/%s", w, h, name), func(t *testing.T) {
+				scaleParity(t, ctx, sub, (subW+1)/2, (subH+1)/2)
+				for o := 2; o <= 8; o++ {
+					rotateParity(t, ctx, sub, o)
+				}
+			})
 		}
-		for name, sub := range subs {
+	}
+	for _, sz := range moreSizes {
+		w, h := sz[0], sz[1]
+		if w < 4 || h < 4 {
+			continue
+		}
+		k := w / 4
+		if k < 1 {
+			k = 1
+		}
+		subW, subH := w-k, h-k
+		for name, sub := range map[string]image.Image{
+			"ycbcr420":          buildYCbCr(w, h, image.YCbCrSubsampleRatio420, ycbcrModeRamp).SubImage(image.Rect(k, k, w, h)),
+			"paletted-gradient": buildPaletted(w, h, palModeGradient).SubImage(image.Rect(k, k, w, h)),
+			"paletted-nrgba":    buildPaletted(w, h, palModeNRGBA).SubImage(image.Rect(k, k, w, h)),
+		} {
 			t.Run(fmt.Sprintf("subimage-%dx%d/%s", w, h, name), func(t *testing.T) {
 				scaleParity(t, ctx, sub, (subW+1)/2, (subH+1)/2)
 				for o := 2; o <= 8; o++ {
@@ -260,32 +324,15 @@ func TestFastPathByteIdentity(t *testing.T) {
 	}
 }
 
-// TestGenerateDownscaleAllocCeiling is T2, the machine-checkable AC-1 alloc
-// gate: per-pixel interface boxing (≈ 393,256 allocs/op pre-fix) must be
-// eliminated. The fixture is built OUTSIDE the measured closure (makePNG
-// itself allocates ~1M objects — the benchmark's own pattern). The 40000
-// threshold carries ~40× margin over the realistic post-fix figure (~700–1,100:
-// jpeg encode fixed cost ≈ 660 at 256² dominates) and ~1000× over the
-// 90%-reduction bar (39,326).
-//
-// jpegGenericAllocCeiling is the JPEG-arm threshold of this test (AC-2): the
-// generic-path alloc baseline for a 1024² JPEG → 256² downscale is ≈ 393,250
-// allocs/op (measured, Go 1.26.5, HEAD 48c2976, this box — matches the
-// ≈ 6 allocs/pixel × 65,536 dst pixels ≈ 393,216 theoretical figure in
-// pixfast.go to 0.01 %). The ceiling ≈ 2.03 × baseline (~100 % headroom)
-// absorbs Go-version alloc-count drift (interface boxing is language-level,
-// but escape-analysis shifts of a few percent must not trip CI), sits an
-// order above the 52-alloc fast-path class so direction-1 (YCbCr/Paletted
-// kernels) progress is measurable across the entire gap, and trips on any
-// generic-path regression ≥ 2.04× the baseline (a second full per-pixel
-// boxing layer, 12 allocs/pixel ≈ 786,470, lands just under the line and is
-// caught instead by the committed allocs/op baselines of
-// BenchmarkGenerateJPEGDownscale). The 40000 threshold cannot apply here:
-// 40000 was the post-fast-path elimination bar for the RGBA arm, and the
-// generic path's per-pixel boxing is the cost this gate exists to floor — a
-// JPEG fixture passing at 40000 would prove it was not actually taking
-// scaleGeneric (measured: 393,250, ≈ 10× over 40000).
-const jpegGenericAllocCeiling = 800000
+// TestGenerateDownscaleAllocCeiling is T2, the machine-checkable alloc gate:
+// per-pixel interface boxing must be eliminated on every codec shape. The
+// fixtures are built OUTSIDE the measured closures (makePNG/makeJPEG
+// themselves allocate — the benchmark's own pattern). Both arms share the
+// 40000 threshold: the PNG arm measures ≈ 53 allocs/op on the RGBA fast
+// path, and the JPEG arm ≈ 42–48 allocs/op post-kernels (decode 7 + encode
+// 9 + ~26 scaffolding, measured this box) — ≈ 800× margin, and any
+// regression to a second per-pixel boxing layer (12 allocs/pixel ≈ 786,470)
+// trips it.
 
 func TestGenerateDownscaleAllocCeiling(t *testing.T) {
 	if raceEnabled {
@@ -305,19 +352,18 @@ func TestGenerateDownscaleAllocCeiling(t *testing.T) {
 		t.Fatalf("Generate downscale allocated %.0f objects/op, want < 40000 (pre-fix: 393,256)", n)
 	}
 
-	// JPEG arm (AC-2, generic path): the fixture decodes to *image.YCbCr,
-	// misses the fast-path dispatch, and pays scaleGeneric — the production
-	// shape for every JPEG thumbnail. Decode-type self-check pins the fixture
-	// class (a fixture that did not take scaleGeneric would pass any ceiling
-	// vacuously); the measured baseline is documented on
-	// jpegGenericAllocCeiling. Same raceEnabled skip as the PNG arm.
+	// JPEG arm (AC-2): the fixture decodes to *image.YCbCr, which takes the
+	// scaleYCbCr/rotateYCbCr kernels — the production shape for every JPEG
+	// thumbnail. Decode-type self-check pins the fixture class (a fixture
+	// that did not take the YCbCr path would pass any ceiling vacuously);
+	// the 40000 threshold is shared with the PNG arm. Same raceEnabled skip.
 	fixtureJPEG := makeJPEG(t, 1024, 1024)
 	dec, _, err := image.Decode(bytes.NewReader(fixtureJPEG))
 	if err != nil {
 		t.Fatalf("jpeg fixture decode: %v", err)
 	}
 	if _, ok := dec.(*image.YCbCr); !ok {
-		t.Fatalf("jpeg fixture decoded to %T, want *image.YCbCr (generic-path class)", dec)
+		t.Fatalf("jpeg fixture decoded to %T, want *image.YCbCr", dec)
 	}
 	nJPEG := testing.AllocsPerRun(20, func() {
 		out, err := Generate(bytes.NewReader(fixtureJPEG), 256, 256)
@@ -328,7 +374,7 @@ func TestGenerateDownscaleAllocCeiling(t *testing.T) {
 			t.Fatal("generate jpeg returned empty output")
 		}
 	})
-	if nJPEG >= jpegGenericAllocCeiling {
-		t.Fatalf("Generate JPEG downscale allocated %.0f objects/op, want < %d (measured baseline: 393,250)", nJPEG, jpegGenericAllocCeiling)
+	if nJPEG >= 40000 {
+		t.Fatalf("Generate JPEG downscale allocated %.0f objects/op, want < 40000 (pre-kernel baseline: 393,251)", nJPEG)
 	}
 }
