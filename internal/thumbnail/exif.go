@@ -107,7 +107,7 @@ func tiffOrientationFrom(p []byte, base int) int {
 	}
 	// All TIFF offsets are relative to the start of the TIFF header.
 	ifd := base + int(bo.Uint32(p[base+4:base+8]))
-	if ifd < base+8 || ifd+2 > len(p) {
+	if ifd < base+8 || ifd > len(p)-2 {
 		return 1 // IFD0 offset must lie within the payload
 	}
 	count := int(bo.Uint16(p[ifd : ifd+2]))
@@ -137,7 +137,7 @@ func tiffOrientationFrom(p []byte, base int) int {
 			// one-sided vo+2 > len(p) check and panics on the slice below
 			// (verified GOARCH=386 reproduction). The offset must point
 			// into the payload proper (after the TIFF header), not before it.
-			if vo < base+8 || vo+2 > len(p) {
+			if vo < base+8 || vo > len(p)-2 {
 				return 1
 			}
 			v = bo.Uint16(p[vo : vo+2])

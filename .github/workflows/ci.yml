@@ -120,3 +120,32 @@ jobs:
           sleep 2
           BASE_URL=http://localhost:9199 python3 tests/run_all.py
           kill %1 2>/dev/null || true
+
+  fuzz-thumbnail:
+    name: fuzz (thumbnail — bounded fuzztime, 4 targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fuzz FuzzGenerate
+        run: go test -fuzz=FuzzGenerate -run '^$' -fuzztime=30s ./internal/thumbnail/
+
+      - name: Fuzz FuzzPNGOrientation
+        run: go test -fuzz=FuzzPNGOrientation -run '^$' -fuzztime=30s ./internal/thumbnail/
+
+      - name: Fuzz FuzzExifOrientation
+        run: go test -fuzz=FuzzExifOrientation -run '^$' -fuzztime=30s ./internal/thumbnail/
+
+      - name: Fuzz FuzzProgressiveJPEG
+        run: go test -fuzz=FuzzProgressiveJPEG -run '^$' -fuzztime=30s ./internal/thumbnail/
+
+      - name: Seed corpus on 32-bit int (TIFF wrap class, GOARCH=386)
+        run: GOARCH=386 go test -run 'Fuzz' -count=1 ./internal/thumbnail/
