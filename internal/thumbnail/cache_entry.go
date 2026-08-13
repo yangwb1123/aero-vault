@@ -35,7 +35,7 @@ func GenerateContextWithOpenerCached(
 		return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: nil opener")
 	}
 	effW, effH := EffectiveDims(maxW, maxH)
-	key := CacheKey{Tenant: tenant, SourceETag: sourceETag, EffW: effW, EffH: effH}
+	key := CacheKey{Tenant: tenant, SourceETag: sourceETag, EffW: effW, EffH: effH, Version: CacheKeyVersion}
 
 	// Fast-fail dead requests before any work, mirroring generateLocked's
 	// terminal checks and acquireDecodeSlotContext's re-check.

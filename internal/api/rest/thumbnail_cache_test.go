@@ -448,3 +448,121 @@ func BenchmarkThumbnailCacheHandlerHit(b *testing.B) {
 		}
 	}
 }
+
+// TestThumbnailCacheAdmissionGates pins the two cache-bypass gates: SSE-C
+// objects and multipart (non-content-derived) ETags must never be served
+// from or stored into the server-side cache — every request runs the full
+// pipeline (storage Get increments each time), because caching could either
+// persist customer-key-decrypted-derived bytes beyond the request (SSE-C)
+// or pair stale bytes with a legitimately changed object (multipart ETags
+// are not content-derived).
+func TestThumbnailCacheAdmissionGates(t *testing.T) {
+	newHarness := func(t *testing.T) (*httptest.Server, *countingStore, repository.Repository) {
+		t.Helper()
+		dir := t.TempDir()
+		repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if err := repo.Migrate(context.Background()); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		real, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+		if err != nil {
+			t.Fatalf("storage: %v", err)
+		}
+		store := &countingStore{Storage: real}
+		svc := service.NewFileService(store, repo, nil)
+		h := NewHandler(svc, nil)
+		h.WithThumbnailCache(thumbnail.NewCache(1 << 20))
+		r := chi.NewRouter()
+		r.Put("/v1/files/*", h.putKey)
+		r.Get("/v1/files/*", h.getKey)
+		srv := httptest.NewServer(r)
+		t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+		return srv, store, repo
+	}
+
+	t.Run("SSE-C never cached", func(t *testing.T) {
+		srv, store, repo := newHarness(t)
+		base := srv.URL + "/v1/files/sec.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+		hdr := map[string]string{"Content-Type": "image/png"}
+		if resp, _ := req(t, "PUT", base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		// Mark the object as SSE-C (reserved metadata, as prepareSSECWrite
+		// would): algorithm + key MD5 present.
+		ctx := context.Background()
+		for k, v := range map[string]string{
+			"_aero_sse_c_algorithm": "AES256",
+			"_aero_sse_c_key_md5":   "d41d8cd98f00b204e9800998ecf8427e",
+		} {
+			if err := repo.SetObjectMetaKey(ctx, "default", "default", "sec.png", k, v); err != nil {
+				t.Fatalf("set ssec meta %s: %v", k, err)
+			}
+		}
+		// The guard predicate: SSECustomerInfo must report the object as
+		// SSE-C, which is exactly the handler's cache-bypass condition.
+		if _, _, ok := service.SSECustomerInfo(objMeta(t, repo, "sec.png")); !ok {
+			t.Fatal("SSECustomerInfo must report ok for the seeded SSE-C metadata")
+		}
+		// Observable contract on the current surface: an SSE-C object has no
+		// REST read path without the customer key, so every thumbnail request
+		// fails identically (400) — never a cached 200 — and the storage is
+		// never opened (the service rejects pre-open). The handler-level
+		// cache guard (cache=nil when SSECustomerInfo ok) is defense-in-depth
+		// for a future key-passing surface; the consistent failure pins that
+		// no derived bytes are ever served or stored for SSE-C objects.
+		for i := 0; i < 3; i++ {
+			resp, _ := req(t, "GET", thumb, nil, nil)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("GET %d: %d want 400 (SSE-C object unreadable without the customer key)", i, resp.StatusCode)
+			}
+		}
+		if n := store.gets.Load(); n != 0 {
+			t.Fatalf("SSE-C storage Get count = %d, want 0 (rejected before any open)", n)
+		}
+	})
+
+	t.Run("multipart ETag never cached", func(t *testing.T) {
+		srv, store, repo := newHarness(t)
+		base := srv.URL + "/v1/files/mp.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+		hdr := map[string]string{"Content-Type": "image/png"}
+		if resp, _ := req(t, "PUT", base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		// Forge a multipart-shaped ETag ("<md5>-<n>", not content-derived)
+		// by rewriting the object row's ETag column (the multipart completion
+		// path stores exactly this shape).
+		obj, err := repo.GetObject(context.Background(), "default", "default", "mp.png")
+		if err != nil {
+			t.Fatalf("get object: %v", err)
+		}
+		obj.ETag = "abc123def4567890abcdef1234567890-3"
+		if _, err := repo.UpsertObject(context.Background(), obj); err != nil {
+			t.Fatalf("rewrite etag: %v", err)
+		}
+		for i := 0; i < 3; i++ {
+			resp, _ := req(t, "GET", thumb, nil, nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET %d: %d", i, resp.StatusCode)
+			}
+		}
+		if n := store.gets.Load(); n != 3 {
+			t.Fatalf("multipart storage Get count = %d, want 3 (never cached)", n)
+		}
+	})
+}
+
+// objMeta fetches the live object row's metadata (for the SSE-C predicate
+// assertion).
+func objMeta(t *testing.T, repo repository.Repository, key string) map[string]string {
+	t.Helper()
+	obj, err := repo.GetObject(context.Background(), "default", "default", key)
+	if err != nil {
+		t.Fatalf("get object: %v", err)
+	}
+	return obj.Metadata
+}

@@ -221,6 +221,24 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// and keep today's writeError classification verbatim; decode and
 	// context errors keep the branch below. The stream lifecycle (close on
 	// every path, close-before-release) lives inside the API.
+	// The server-side cache (THUMBNAIL_CACHE_BYTES; keyed by tenant + source
+	// ETag + effective dims + key version) is consulted after full
+	// authorization and the 304 fast path; a hit returns the stored JPEG
+	// with NO slot, NO opener, NO decode (it also emits the access event
+	// below so every 200 emits exactly one EventAccessed). Two admission
+	// gates bypass the cache by design (pre-launch conditions):
+	//   - SSE-C objects (SSECustomerInfo ok): the operator's expectation is
+	//     that the server never holds bytes derived from customer-keyed
+	//     decryption beyond the request — caching the derived JPEG would
+	//     persist them indefinitely in server memory.
+	//   - multipart uploads (ETag "<md5>-<n>" contains a dash): the ETag is
+	//     not content-derived, so the key could pair stale bytes with a
+	//     legitimately changed object; only whole-object content MD5 ETags
+	//     admit caching.
+	cache := h.thumbnailCache
+	if _, _, ssec := service.SSECustomerInfo(obj.Metadata); ssec || strings.Contains(obj.ETag, "-") {
+		cache = nil
+	}
 	// The 200-path validator must describe the bytes actually decoded, so
 	// the opened object is captured here and read after the pipeline
 	// succeeds. Same capture-then-serve ordering the Get handler uses
@@ -231,7 +249,7 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// caches new-version bytes under an old-version key).
 	var opened *repository.Object
 	img, fromCache, err := thumbnail.GenerateContextWithOpenerCached(
-		r.Context(), h.thumbnailCache, tenant, obj.ETag, maxW, maxH,
+		r.Context(), cache, tenant, obj.ETag, maxW, maxH,
 		func() (io.ReadCloser, string, error) {
 			rc, o, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
 			if err != nil {

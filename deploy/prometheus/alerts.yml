@@ -207,3 +207,25 @@ groups:
         annotations:
           summary: "Audit governance relay enabled with zero bound tenants"
           description: "An enabled audit governance relay reports no bound tenants for 10m. audit_governance_draining==1: in-progress drain transition (disable flow step 2 — complete with ENABLED=false and clear AUDIT_GOVERNANCE_DRAIN + the empty manifest). audit_governance_draining==0: stale AUDIT_GOVERNANCE_DRAIN with an empty manifest replay — clear the flag and remove the manifest, or restore bindings at a higher revision."
+
+  - name: aero-vault-thumbnail-cache
+    rules:
+      # Server-side thumbnail cache hit-ratio floor: with THUMBNAIL_CACHE_BYTES
+      # enabled, a sustained low hit ratio means the key space is thrashing
+      # (evictions racing requests — LRU working set > budget) or the admission
+      # gates are accidentally excluding the dominant path. The denominator
+      # guard (sum of rates > 0) keeps the rule silent on idle caches and on
+      # disabled caches (no counters emitted).
+      - alert: ThumbnailCacheHitRatioLow
+        expr: |
+          (sum by (instance) (rate(thumbnail.cache.hits_total[5m])) /
+           (sum by (instance) (rate(thumbnail.cache.hits_total[5m])) +
+            sum by (instance) (rate(thumbnail.cache.misses_total[5m])))) < 0.5
+            and on(instance) (sum by (instance) (rate(thumbnail.cache.hits_total[5m]))
+            + sum by (instance) (rate(thumbnail.cache.misses_total[5m]))) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thumbnail cache hit ratio below 50% for 15m"
+          description: "The server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail.cache.evictions_total; raise the budget or review the admission gates (SSE-C / multipart objects bypass the cache by design)."

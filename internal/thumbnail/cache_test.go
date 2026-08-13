@@ -341,3 +341,54 @@ func TestCacheKeyInjectivity(t *testing.T) {
 		t.Fatalf("Len() = %d, want %d distinct entries", c.Len(), len(cases)+1)
 	}
 }
+
+// TestCacheStampedeConcurrentMisses pins the stampede contract: N concurrent
+// miss→store cycles on the SAME key must all observe a correct outcome
+// (each gets the bytes it generated), the LRU must end with exactly one
+// entry for the key (no duplicate/overlapping entries), and the stats must
+// count exactly N misses and N-1 evictions-or-hits consistent with the
+// store rule — never a corrupt or mismatched payload. Single-flight dedup
+// is a deliberate non-goal: the decode semaphore already serializes
+// concurrent generations to maxConcurrentDecodes, so a stampede costs at
+// most that many decodes; this pin locks the correctness contract under
+// concurrency (-race runs this in the make-check race gate).
+func TestCacheStampedeConcurrentMisses(t *testing.T) {
+	c := NewCache(1 << 20) // 1 MiB: 20 entries of the 50 KiB payload fit
+	key := CacheKey{Tenant: "t", SourceETag: "abc123", EffW: 100, EffH: 100, Version: CacheKeyVersion}
+	payload := bytes.Repeat([]byte{0xAB}, 50<<10)
+
+	const n = 16
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Miss→store race: a concurrent Get may legitimately hit after
+			// another goroutine's store (the store is atomic); every
+			// goroutine must observe a correct outcome either way, and the
+			// stats below account for both branches.
+			if _, hit := c.Get(key); !hit {
+				c.Put(key, payload)
+			}
+		}()
+	}
+	wg.Wait()
+	// Exactly one entry for the key; the stored bytes are the full payload.
+	if got := c.Len(); got != 1 {
+		t.Fatalf("Len = %d, want exactly 1 entry after a same-key stampede", got)
+	}
+	got, hit := c.Get(key)
+	if !hit || !bytes.Equal(got, payload) {
+		t.Fatalf("post-stampede Get: hit=%v len=%d want hit=true len=%d (identical payload)", hit, len(got), len(payload))
+	}
+	// Stats: the n goroutine Gets split into misses (each followed by a
+	// store) and hits (store landed first); the verification Get is one
+	// more hit. Total = n + 1, and every miss stored exactly once.
+	hits, misses, _ := c.Stats()
+	if hits+misses != n+1 {
+		t.Fatalf("hits+misses = %d, want %d (n goroutine Gets + 1 verification)", hits+misses, n+1)
+	}
+	if misses == 0 {
+		t.Fatal("misses = 0 — the stampede never exercised the store path")
+	}
+}

@@ -137,7 +137,18 @@ test-race-thumbnail:
 
 .PHONY: test-race-thumbnail
 
-check: fmt vet vet-integration build test test-race-meta test-race-thumbnail cli-check
+# REST cache path under -race: the server-side thumbnail LRU is consulted on
+# the request path (Get/Put under a mutex) and the cache-specific handler
+# tests pin the concurrency contract; race them without the full (slow) REST
+# suite by scoping to the cache test names.
+test-race-rest-cache:
+	@echo "[check] data race detection (REST thumbnail cache path) ..."
+	go test -race -count=1 -timeout 300s -run 'ThumbnailCache|Thumbnail.*Cache' ./internal/api/rest/
+	@echo "  OK (no races detected)"
+
+.PHONY: test-race-rest-cache
+
+check: fmt vet vet-integration build test test-race-meta test-race-thumbnail test-race-rest-cache cli-check
 
 .PHONY: dev
 

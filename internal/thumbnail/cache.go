@@ -5,17 +5,26 @@ import (
 	"sync"
 )
 
+// CacheKeyVersion is the cache-key schema version: bump it whenever the
+// generated thumbnail bytes can change for the same source ETag + effective
+// dims (pipeline output changes — quality, composite, rotation, format
+// defaults). Stale entries under an old version are never looked up; the
+// bounded LRU evicts them naturally.
+const CacheKeyVersion = 1
+
 // CacheKey identifies one cacheable thumbnail output: the tenant (cross-tenant
 // isolation), the source object's content ETag (opaque — local storage uses
 // hex MD5 of content), and the EFFECTIVE bounds EffectiveDims applies inside
-// generateLocked. Bucket and object key are deliberately excluded: the output
-// is a pure function of source bytes + effective dims, so two objects with
-// identical bytes share one correct entry; the tenant component prevents one
-// tenant's bytes ever being served to another tenant's requests.
+// generateLocked, plus the key schema version. Bucket and object key are
+// deliberately excluded: the output is a pure function of source bytes +
+// effective dims, so two objects with identical bytes share one correct
+// entry; the tenant component prevents one tenant's bytes ever being served
+// to another tenant's requests.
 type CacheKey struct {
 	Tenant     string
 	SourceETag string
 	EffW, EffH int
+	Version    uint8
 }
 
 // entry is one cached payload, linked into Cache's LRU list. data is
