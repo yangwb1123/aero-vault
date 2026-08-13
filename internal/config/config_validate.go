@@ -156,6 +156,9 @@ func (c *Config) validateTimeouts() error {
 	if c.App.RequestTimeoutSec < 0 {
 		return errors.New("REQUEST_TIMEOUT_SECONDS must be >= 0 (0 = disabled)")
 	}
+	if c.App.ThumbnailCacheBytes < 0 {
+		return errors.New("THUMBNAIL_CACHE_BYTES must be >= 0 (0 = disabled)")
+	}
 	return nil
 }
 

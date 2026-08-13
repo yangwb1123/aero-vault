@@ -49,7 +49,7 @@ architecture:
     "internal/replication": ["internal/repository", "internal/storage"]
     "internal/antivirus": ["internal/repository", "internal/storage"]
     "internal/telemetry": []
-    "internal/thumbnail": []
+    "internal/thumbnail": ["internal/telemetry"]
     "internal/webui": []
     "internal/cli": ["internal/service", "internal/ai", "internal/repository", "internal/snapshot"]
     "internal/cluster": ["internal/repository"]

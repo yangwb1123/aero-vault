@@ -22,6 +22,14 @@ func (e *OpenError) Error() string { return "thumbnail: open object stream: " + 
 
 func (e *OpenError) Unwrap() error { return e.Err }
 
+// open3 is the opener contract shared by the generation entry points: it
+// returns the object stream plus the opened object's source ETag. The cached
+// entry point uses the ETag to verify content identity before storing (a
+// concurrent PUT between the caller's Stat and the open must never store
+// new-version bytes under an old-version key); GenerateContextWithOpener
+// discards it (its adapter returns "").
+type open3 func() (io.ReadCloser, string, error)
+
 // GenerateContextWithOpener acquires a decode slot, then invokes open to
 // obtain the object stream, then runs the exact GenerateContext decode
 // pipeline on it (generateLocked). Ordering is load-bearing: the slot is held
@@ -39,11 +47,28 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 	if open == nil {
 		return nil, errors.New("thumbnail: GenerateContextWithOpener: nil opener")
 	}
+	img, _, err := generateContextWithOpener3(ctx, maxW, maxH, func() (io.ReadCloser, string, error) {
+		rc, err := open()
+		return rc, "", err
+	})
+	return img, err
+}
+
+// generateContextWithOpener3 is the shared slot→open→decode→close→release
+// body behind GenerateContextWithOpener and the cached entry point
+// (GenerateContextWithOpenerCached). The slot is held BEFORE open runs; on
+// success or error the slot is released and, if a stream was opened, the
+// stream is closed — close runs before release, so open streams ≤
+// maxConcurrentDecodes stays airtight. A (nil, nil) open result is a
+// programming error and returns an error rather than panicking. The opened
+// object's ETag is returned alongside the bytes so the cached entry point can
+// verify content identity before storing.
+func generateContextWithOpener3(ctx context.Context, maxW, maxH int, open open3) ([]byte, string, error) {
 	if err := acquireDecodeSlotContext(ctx); err != nil {
-		return nil, err // no slot consumed, no stream opened
+		return nil, "", err // no slot consumed, no stream opened
 	}
 	defer releaseDecodeSlot() // registered first → runs LAST
-	rc, err := open()
+	rc, etag, err := open()
 	if err != nil {
 		// Defensive close: an opener may return a non-nil stream together
 		// with an error; the stream must not leak. The close error is
@@ -51,13 +76,14 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 		if rc != nil {
 			_ = rc.Close()
 		}
-		return nil, &OpenError{Err: err}
+		return nil, "", &OpenError{Err: err}
 	}
 	if rc == nil {
-		return nil, errors.New("thumbnail: GenerateContextWithOpener: opener returned nil stream with nil error")
+		return nil, "", errors.New("thumbnail: opener returned nil stream with nil error")
 	}
 	defer rc.Close() // registered second → runs FIRST: stream closed while the slot is still held
-	return generateLocked(ctx, rc, maxW, maxH)
+	img, err := generateLocked(ctx, rc, maxW, maxH)
+	return img, etag, err
 }
 
 // generateLocked is GenerateContext's decode body (dimension clamping through

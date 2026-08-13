@@ -239,6 +239,31 @@ func TestAuditGovernanceDrainGaugesSurfaceInScrape(t *testing.T) {
 	}
 }
 
+// TestThumbnailCacheCountersSurface records the server-side thumbnail cache
+// counters and verifies they appear in the Prometheus scrape body with the
+// expected values (reusing the shared handler set up once in TestMain).
+func TestThumbnailCacheCountersSurface(t *testing.T) {
+	if sharedPromHandler == nil {
+		t.Skip("sharedPromHandler not initialized")
+	}
+	ctx := context.Background()
+	IncThumbnailCacheHit(ctx)
+	IncThumbnailCacheHit(ctx)
+	IncThumbnailCacheMiss(ctx)
+	IncThumbnailCacheEviction(ctx, 3)
+
+	body := scrapeShared(t)
+	if v, ok := scrapeValue(body, "thumbnail_cache_hits_total"); !ok || v != 2 {
+		t.Fatalf("thumbnail_cache_hits_total = %v (ok=%v), want 2", v, ok)
+	}
+	if v, ok := scrapeValue(body, "thumbnail_cache_misses_total"); !ok || v != 1 {
+		t.Fatalf("thumbnail_cache_misses_total = %v (ok=%v), want 1", v, ok)
+	}
+	if v, ok := scrapeValue(body, "thumbnail_cache_evictions_total"); !ok || v != 3 {
+		t.Fatalf("thumbnail_cache_evictions_total = %v (ok=%v), want 3", v, ok)
+	}
+}
+
 // scrapeShared runs one /metrics scrape through the shared handler.
 func scrapeShared(t *testing.T) string {
 	t.Helper()

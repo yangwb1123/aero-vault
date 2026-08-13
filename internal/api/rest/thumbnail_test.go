@@ -36,7 +36,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
-func pngBytes(t *testing.T, w, h int) []byte {
+func pngBytes(t testing.TB, w, h int) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {

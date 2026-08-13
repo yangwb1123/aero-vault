@@ -209,56 +209,65 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The decode slot is acquired BEFORE the object stream opens —
-	// GenerateContextWithOpener acquires, then invokes the opener (svc.Get),
-	// then decodes — so at most maxConcurrentDecodes object streams are open
-	// at once, and a request parked on the semaphore holds no stream at all
-	// (waiter holds nothing: no fd, no in-flight storage GET). Open failures
-	// surface as *OpenError and keep today's writeError classification
-	// verbatim; decode and context errors keep the branch below. The stream
-	// lifecycle (close on every path, close-before-release) lives inside the
-	// API.
+	// GenerateContextWithOpenerCached acquires, then invokes the opener
+	// (svc.Get), then decodes — so at most maxConcurrentDecodes object
+	// streams are open at once, and a request parked on the semaphore holds
+	// no stream at all (waiter holds nothing: no fd, no in-flight storage
+	// GET). The server-side cache (THUMBNAIL_CACHE_BYTES; keyed by tenant +
+	// source ETag + effective dims) is consulted after full authorization
+	// and the 304 fast path; a hit returns the stored JPEG with NO slot, NO
+	// opener, NO decode (it also emits the access event below so every 200
+	// emits exactly one EventAccessed). Open failures surface as *OpenError
+	// and keep today's writeError classification verbatim; decode and
+	// context errors keep the branch below. The stream lifecycle (close on
+	// every path, close-before-release) lives inside the API.
 	// The 200-path validator must describe the bytes actually decoded, so
 	// the opened object is captured here and read after the pipeline
 	// succeeds. Same capture-then-serve ordering the Get handler uses
 	// (handler.go -> handleRangeOrFull): the pre-open Stat validator serves
-	// only the 304 fast path, never the 200.
+	// only the 304 fast path, never the 200. The opener also reports the
+	// opened object's ETag so the cache's store rule can verify content
+	// identity before caching (a PUT between the Stat and the open never
+	// caches new-version bytes under an old-version key).
 	var opened *repository.Object
-	img, err := thumbnail.GenerateContextWithOpener(r.Context(), maxW, maxH, func() (io.ReadCloser, error) {
-		rc, o, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
-		if err != nil {
-			return nil, err
-		}
-		opened = &o // before the sniff branch: the wrapper does not change the opened object
-		if !sniffBytes {
-			return rc, nil // bucket 1: declared decodable type, opener unchanged
-		}
-		// Bucket 3: decide from bytes. The magic head is read from the SAME
-		// stream the pipeline will decode (single open, no second svc.Get
-		// round-trip) and replayed byte-exactly in front of the live stream,
-		// so the pipeline observes the full object (the same replay
-		// mechanism generateLocked uses for its DecodeConfig tee).
-		head := make([]byte, sniffHeadLen)
-		n, rerr := io.ReadFull(rc, head)
-		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
-			_ = rc.Close() // storage read failure: OpenError → classify; never "not an image"
-			return nil, rerr
-		}
-		head = head[:n] // short objects are valid Sniff input → FormatUnknown → 400
-		replay, aerr := thumbnail.AdmitByMagic(head)
-		if aerr != nil {
-			_ = rc.Close() // stream closed on every rejection path
-			if errors.Is(aerr, thumbnail.ErrUnsupportedFormat) {
-				return nil, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
-					thumbnail.ErrUnsupportedFormat, "webp")
+	img, fromCache, err := thumbnail.GenerateContextWithOpenerCached(
+		r.Context(), h.thumbnailCache, tenant, obj.ETag, maxW, maxH,
+		func() (io.ReadCloser, string, error) {
+			rc, o, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
+			if err != nil {
+				return nil, "", err
 			}
-			return nil, fmt.Errorf("%w: %v", service.ErrInvalidArgs, aerr)
-		}
-		// Admission by magic is a gate input only: the decode pipeline stays
-		// the final validity authority (ErrUnsupported → 400). Close must
-		// forward to the storage stream — the API's deferred close runs on
-		// this wrapper, and io.NopCloser would leak rc.
-		return &sniffedStream{Reader: io.MultiReader(bytes.NewReader(replay), rc), rc: rc}, nil
-	})
+			opened = &o // before the sniff branch: the wrapper does not change the opened object
+			if !sniffBytes {
+				return rc, o.ETag, nil // bucket 1: declared decodable type, opener unchanged
+			}
+			// Bucket 3: decide from bytes. The magic head is read from the SAME
+			// stream the pipeline will decode (single open, no second svc.Get
+			// round-trip) and replayed byte-exactly in front of the live stream,
+			// so the pipeline observes the full object (the same replay
+			// mechanism generateLocked uses for its DecodeConfig tee).
+			head := make([]byte, sniffHeadLen)
+			n, rerr := io.ReadFull(rc, head)
+			if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+				_ = rc.Close() // storage read failure: OpenError → classify; never "not an image"
+				return nil, "", rerr
+			}
+			head = head[:n] // short objects are valid Sniff input → FormatUnknown → 400
+			replay, aerr := thumbnail.AdmitByMagic(head)
+			if aerr != nil {
+				_ = rc.Close() // stream closed on every rejection path
+				if errors.Is(aerr, thumbnail.ErrUnsupportedFormat) {
+					return nil, "", fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
+						thumbnail.ErrUnsupportedFormat, "webp")
+				}
+				return nil, "", fmt.Errorf("%w: %v", service.ErrInvalidArgs, aerr)
+			}
+			// Admission by magic is a gate input only: the decode pipeline stays
+			// the final validity authority (ErrUnsupported → 400). Close must
+			// forward to the storage stream — the API's deferred close runs on
+			// this wrapper, and io.NopCloser would leak rc.
+			return &sniffedStream{Reader: io.MultiReader(bytes.NewReader(replay), rc), rc: rc}, o.ETag, nil
+		})
 	if err != nil {
 		// The OpenError unwrap MUST precede the context-error checks: an
 		// opener that failed with a canceled ctx is a Get-path failure and
@@ -297,6 +306,13 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		}
 		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
 		return
+	}
+	if fromCache {
+		// Deterministic access evidence: every successful 200 thumbnail
+		// response emits exactly one EventAccessed. Misses emit it on stream
+		// open inside the service; hits bypass the stream, so the handler
+		// emits it here (best-effort like every other event emission).
+		h.svc.EmitAccessed(r.Context(), obj)
 	}
 	// 200 validator from the opened object: with no intervening write the
 	// opened ETag equals the Stat's and the value is byte-identical to

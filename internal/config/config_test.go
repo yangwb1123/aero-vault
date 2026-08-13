@@ -197,6 +197,24 @@ func TestValidate_OK(t *testing.T) {
 	}
 }
 
+// TestValidateThumbnailCacheBytes pins the THUMBNAIL_CACHE_BYTES kill-switch:
+// 0 (disabled default) and positive budgets are accepted; negatives are
+// rejected at startup validation.
+func TestValidateThumbnailCacheBytes(t *testing.T) {
+	c := baseValid()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default (0 = disabled) must validate: %v", err)
+	}
+	c.App.ThumbnailCacheBytes = 32 << 20
+	if err := c.Validate(); err != nil {
+		t.Fatalf("positive budget must validate: %v", err)
+	}
+	c.App.ThumbnailCacheBytes = -1
+	if err := c.Validate(); err == nil {
+		t.Fatal("negative THUMBNAIL_CACHE_BYTES must be rejected")
+	}
+}
+
 func TestValidate_Storage(t *testing.T) {
 	t.Run("local requires root", func(t *testing.T) {
 		c := baseValid()
@@ -408,6 +426,9 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.RateLimit.RPS != 0 || cfg.RateLimit.Burst != 0 {
 		t.Errorf("default RateLimit = %+v, want zero", cfg.RateLimit)
+	}
+	if cfg.App.ThumbnailCacheBytes != 0 {
+		t.Errorf("default ThumbnailCacheBytes = %d, want 0 (disabled)", cfg.App.ThumbnailCacheBytes)
 	}
 }
 

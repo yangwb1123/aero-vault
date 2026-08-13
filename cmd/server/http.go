@@ -24,6 +24,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
+	"github.com/aero-vault/aero-vault/internal/thumbnail"
 	"github.com/aero-vault/aero-vault/internal/webui"
 	"log/slog"
 )
@@ -177,6 +178,7 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode,
 		func(h *rest.Handler) {
 			h.WithCORSProvider(corsProvider)
+			h.WithThumbnailCache(thumbnail.NewCache(cfg.App.ThumbnailCacheBytes))
 			if accessManager != nil {
 				h.WithAccessManager(accessManager, cfg.Access.PublicBaseURL)
 			}

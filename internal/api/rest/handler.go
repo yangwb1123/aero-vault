@@ -18,6 +18,7 @@ import (
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
 // Handler binds REST routes to the FileService.
@@ -28,7 +29,8 @@ type Handler struct {
 	putPresigner     *auth.PutPresigner
 	access           *access.Manager
 	publicBaseURL    string
-	thumbnailTimeout time.Duration // REQUEST_TIMEOUT_SECONDS; 0 = disabled
+	thumbnailTimeout time.Duration    // REQUEST_TIMEOUT_SECONDS; 0 = disabled
+	thumbnailCache   *thumbnail.Cache // THUMBNAIL_CACHE_BYTES; nil/0-budget = disabled
 }
 
 func (h *Handler) WithAccessManager(manager *access.Manager, publicBaseURL string) *Handler {
@@ -54,6 +56,14 @@ func NewHandler(svc *service.FileService, logger *slog.Logger) *Handler {
 // CORS rule updates. Returns the handler for fluent wiring.
 func (h *Handler) WithCORSProvider(p mw.BucketCORSProvider) *Handler {
 	h.corsProvider = p
+	return h
+}
+
+// WithThumbnailCache attaches the server-side thumbnail output cache. nil
+// (default) or a zero-budget cache disables caching with byte-identical
+// behavior (THUMBNAIL_CACHE_BYTES=0). Returns the handler for fluent wiring.
+func (h *Handler) WithThumbnailCache(c *thumbnail.Cache) *Handler {
+	h.thumbnailCache = c
 	return h
 }
 

@@ -35,6 +35,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `APP_TLS_CERT_FILE` | _(empty)_ | Path to TLS certificate file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `APP_TLS_KEY_FILE` | _(empty)_ | Path to TLS private key file (PEM). Required when `APP_TLS_ENABLED=true`. |
 | `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`) **and the `/thumbnail` route** (bounding the decode-slot wait, see "Thumbnail decode budget"). Set to `0` to disable. |
+| `THUMBNAIL_CACHE_BYTES` | `0` | Server-side thumbnail output cache budget in bytes (see "Thumbnail decode budget"); `0` disables the cache (default, zero allocation, byte-identical behavior). |
 | `MAX_INFLIGHT_REQUESTS` | `0` | Global weighted in-flight request limit (reads cost 1, writes cost 2); `0` disables. |
 | `PER_TENANT_CONCURRENCY_MAX` | `0` | Optional per-tenant in-flight limit used alongside the global cap; `0` disables per-tenant partitioning. |
 | `EVENTS_SUB_BUFFER` | `64` | Per-subscriber in-process event channel buffer depth. Increase if subscribers fall behind under high event throughput. Set to `0` to use the default. |
@@ -452,6 +453,26 @@ object-stream open failures classify as the underlying object error
 > 0 in production. The semaphore bounds in-flight *decodes* (4), not the number
 of *waiters*; the request-context lifetime bounds each wait, but admission
 control is the outer bound on concurrent waiters (defaults are 0 = unlimited).
+
+**Server-side output cache (`THUMBNAIL_CACHE_BYTES`):** repeated requests for
+hot objects — the same image rendered at the same dimensions by N users —
+re-run the full decode→scale→composite→encode pipeline (and a storage GET)
+per request even though the pipeline is deterministic: same source bytes +
+same effective dimensions ⇒ byte-identical JPEG. The optional server-side
+cache (default `0` = disabled; set a byte budget, e.g. 32–128 MiB, to enable)
+is an in-process LRU keyed by **(tenant, source ETag, effective dims)** — the
+exact inputs of the derived response ETag, so a concurrent PUT changes the
+ETag ⇒ new key ⇒ miss ⇒ fresh regeneration; superseded entries are reclaimed
+by LRU eviction (no invalidation, no cache-busting). Retention model:
+**in-memory per-process, byte-budget-bounded, eviction-only** — no TTL, no
+shared/replicated state, no persistence; replicas warm independently and a
+stale entry can never be served to a request that cannot observe its key.
+A cache hit skips the decode slot (no semaphore acquisition), the storage
+GET (no opener), and the decode itself — the amplification the cache targets.
+On the REST path the cache is consulted only after bucket-policy and
+anonymous-read authorization and after the 304 fast path; the tenant
+component of the key isolates tenants. Observability: `thumbnail.cache.hits_total`
+/ `misses_total` / `evictions_total` at `/metrics` (`PROMETHEUS_ENABLED=true`).
 
 ---
 

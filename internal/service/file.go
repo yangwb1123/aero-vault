@@ -325,6 +325,15 @@ func uploadStorageKey(u repository.Upload) string {
 
 func (s *FileService) Storage() storage.Storage { return s.store }
 
+// EmitAccessed publishes an EventAccessed for obj without opening any stream
+// or holding a decode slot. The REST thumbnail handler calls it on the
+// server-cache hit path so every successful 200 thumbnail response emits
+// exactly one access event (misses already emit via the stream-open path in
+// openObjectWithOptions). Best-effort like every other event emission.
+func (s *FileService) EmitAccessed(ctx context.Context, obj repository.Object) {
+	s.emit(ctx, obj, repository.EventAccessed)
+}
+
 // emit constructs a minimal Event payload and hands it to the sink. We swallow
 // errors from the sink: lifecycle events are best-effort and must never break a
 // user request.
