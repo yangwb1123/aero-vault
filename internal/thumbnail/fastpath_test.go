@@ -18,7 +18,11 @@ package thumbnail
 // gate: the ≈ 393K allocs/op pre-fix (6 allocs/pixel boxing) must drop below
 // 40000 (post-fix the pipeline is dominated by the jpeg encoder's fixed cost
 // ≈ 700–1,100 at 256²). It skips under -race, matching the package's
-// allocation-delta convention.
+// allocation-delta convention. The JPEG arm (AC-2) floors the generic path:
+// its ≈ 393,250 allocs/op baseline — the very per-pixel boxing cost the fast
+// kernels eliminated for RGBA — is the regression floor for YCbCr/Paletted
+// sources until a kernel direction replaces it (documented on
+// jpegGenericAllocCeiling).
 import (
 	"bytes"
 	"context"
@@ -263,6 +267,26 @@ func TestFastPathByteIdentity(t *testing.T) {
 // threshold carries ~40× margin over the realistic post-fix figure (~700–1,100:
 // jpeg encode fixed cost ≈ 660 at 256² dominates) and ~1000× over the
 // 90%-reduction bar (39,326).
+//
+// jpegGenericAllocCeiling is the JPEG-arm threshold of this test (AC-2): the
+// generic-path alloc baseline for a 1024² JPEG → 256² downscale is ≈ 393,250
+// allocs/op (measured, Go 1.26.5, HEAD 48c2976, this box — matches the
+// ≈ 6 allocs/pixel × 65,536 dst pixels ≈ 393,216 theoretical figure in
+// pixfast.go to 0.01 %). The ceiling ≈ 2.03 × baseline (~100 % headroom)
+// absorbs Go-version alloc-count drift (interface boxing is language-level,
+// but escape-analysis shifts of a few percent must not trip CI), sits an
+// order above the 52-alloc fast-path class so direction-1 (YCbCr/Paletted
+// kernels) progress is measurable across the entire gap, and trips on any
+// generic-path regression ≥ 2.04× the baseline (a second full per-pixel
+// boxing layer, 12 allocs/pixel ≈ 786,470, lands just under the line and is
+// caught instead by the committed allocs/op baselines of
+// BenchmarkGenerateJPEGDownscale). The 40000 threshold cannot apply here:
+// 40000 was the post-fast-path elimination bar for the RGBA arm, and the
+// generic path's per-pixel boxing is the cost this gate exists to floor — a
+// JPEG fixture passing at 40000 would prove it was not actually taking
+// scaleGeneric (measured: 393,250, ≈ 10× over 40000).
+const jpegGenericAllocCeiling = 800000
+
 func TestGenerateDownscaleAllocCeiling(t *testing.T) {
 	if raceEnabled {
 		t.Skip("alloc count is race-inflated; the byte-identity and ordering pins keep discriminating under -race")
@@ -279,5 +303,32 @@ func TestGenerateDownscaleAllocCeiling(t *testing.T) {
 	})
 	if n >= 40000 {
 		t.Fatalf("Generate downscale allocated %.0f objects/op, want < 40000 (pre-fix: 393,256)", n)
+	}
+
+	// JPEG arm (AC-2, generic path): the fixture decodes to *image.YCbCr,
+	// misses the fast-path dispatch, and pays scaleGeneric — the production
+	// shape for every JPEG thumbnail. Decode-type self-check pins the fixture
+	// class (a fixture that did not take scaleGeneric would pass any ceiling
+	// vacuously); the measured baseline is documented on
+	// jpegGenericAllocCeiling. Same raceEnabled skip as the PNG arm.
+	fixtureJPEG := makeJPEG(t, 1024, 1024)
+	dec, _, err := image.Decode(bytes.NewReader(fixtureJPEG))
+	if err != nil {
+		t.Fatalf("jpeg fixture decode: %v", err)
+	}
+	if _, ok := dec.(*image.YCbCr); !ok {
+		t.Fatalf("jpeg fixture decoded to %T, want *image.YCbCr (generic-path class)", dec)
+	}
+	nJPEG := testing.AllocsPerRun(20, func() {
+		out, err := Generate(bytes.NewReader(fixtureJPEG), 256, 256)
+		if err != nil {
+			t.Fatalf("generate jpeg: %v", err)
+		}
+		if len(out) == 0 {
+			t.Fatal("generate jpeg returned empty output")
+		}
+	})
+	if nJPEG >= jpegGenericAllocCeiling {
+		t.Fatalf("Generate JPEG downscale allocated %.0f objects/op, want < %d (measured baseline: 393,250)", nJPEG, jpegGenericAllocCeiling)
 	}
 }

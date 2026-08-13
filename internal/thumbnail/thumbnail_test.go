@@ -29,6 +29,28 @@ func makePNG(t testing.TB, w, h int) []byte {
 	return buf.Bytes()
 }
 
+// makeJPEG encodes the makePNG content (deterministic x/y gradient) as a
+// baseline JPEG at the package quality constant — the generic-path fixture:
+// jpeg.Decode yields *image.YCbCr, which misses scale's RGBA/NRGBA fast-path
+// dispatch (thumbnail.go:380-384) and traverses scaleGeneric for every
+// downscale. Identical content to makePNG keeps PNG-vs-JPEG benchmark deltas
+// codec-only (BenchmarkGenerateJPEGDownscale). Typed testing.TB so
+// *testing.T, *testing.B and *testing.F all work.
+func makeJPEG(t testing.TB, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{uint8(x % 256), uint8(y % 256), 128, 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		t.Fatalf("encode jpeg: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // headerOnlyPNG builds a PNG containing only the signature + IHDR chunk
 // (valid CRC) — no IDAT/IEND — so no pixel buffer is ever allocated. The
 // declared dimensions, IHDR bit depth and color type are attacker-controlled.
@@ -468,13 +490,15 @@ func FuzzGenerate(f *testing.F) {
 	// testing.TB, so *testing.F works — F embeds common). Classes: known-good
 	// decode, composite path (Opaque()==false → white flatten), first-frame
 	// policy under mutation, and the header-only dims probes.
-	f.Add(makeGIF(f))                     // 1×1 opaque GIF: known-good decode seed
-	f.Add(makeTransparent1x1GIF(f))       // composite-path seed (transparent palette entry)
-	f.Add(makeAnimatedGIF(f))             // 2-frame GIF: first-frame policy under mutation
-	f.Add(headerOnlyGIF(f, 65535, 65535)) // ErrImageTooLarge: dims > MaxSourceDim (13 B)
-	f.Add(headerOnlyGIF(f, 8192, 8192))   // boundary: ErrUnsupported (no image data)
-	gifSeed := makeGIF(f)                 // single build, then slice (F4)
-	f.Add(gifSeed[:len(gifSeed)/2])       // mid-stream truncation → ErrUnsupported
+	f.Add(makeGIF(f))                      // 1×1 opaque GIF: known-good decode seed
+	f.Add(makeTransparent1x1GIF(f))        // composite-path seed (transparent palette entry)
+	f.Add(makeAnimatedGIF(f))              // 2-frame GIF: first-frame policy under mutation
+	f.Add(headerOnlyGIF(f, 65535, 65535))  // ErrImageTooLarge: dims > MaxSourceDim (13 B)
+	f.Add(headerOnlyGIF(f, 8192, 8192))    // boundary: ErrUnsupported (no image data)
+	gifSeed := makeGIF(f)                  // single build, then slice (F4)
+	f.Add(gifSeed[:len(gifSeed)/2])        // mid-stream truncation → ErrUnsupported
+	f.Add(makeJPEG(f, 400, 200))           // generic-path downscale seed: JPEG → *image.YCbCr → scaleGeneric (ratio < 1)
+	f.Add(makeTransparentGIF(f, 400, 200)) // generic-path downscale seed: GIF → *image.Paletted (transparent) + white composite
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)

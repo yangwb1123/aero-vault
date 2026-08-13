@@ -50,6 +50,56 @@ func BenchmarkGenerateDownscale(b *testing.B) {
 	}
 }
 
+// BenchmarkGenerateJPEGDownscale covers the generic-path shape that every
+// JPEG thumbnail takes in production: a 1024² JPEG decodes to *image.YCbCr,
+// which misses the dispatcher's *image.RGBA/*image.NRGBA switch
+// (thumbnail.go:380-384) and traverses scaleGeneric (≈ 6 allocs/pixel: 4
+// At() boxes + Set box + rgbamodel re-box, pixfast.go:1-10). The scaled
+// output is fully opaque (YCbCr→RGBA A=65535), so the post-scale
+// compositeOnWhite (slot_open.go:232) is a no-op. Fixture = makePNG content
+// re-encoded as JPEG at quality 82, so PNG-vs-JPEG deltas are codec-only.
+// Baseline (Go 1.26.5, HEAD 48c2976, this box, 2×1s runs): ≈ 9.9 ms/op
+// (9.60/10.20), 393,250 allocs/op, 52,360-byte fixture — 393,250 ≈ 6/pixel ×
+// 65,536 dst pixels + ~34 fixed, matching pixfast.go's theoretical figure to
+// 0.01 %. The 52-alloc/op PNG control (BenchmarkGenerateDownscale) is the
+// fast-path contrast; the difference is the direction-1 (YCbCr kernels) ROI.
+// Run: go test -bench='BenchmarkGenerate(JPEG|GIF)Downscale$' -benchmem ./internal/thumbnail/
+func BenchmarkGenerateJPEGDownscale(b *testing.B) {
+	fixture := makeJPEG(b, 1024, 1024)
+	b.SetBytes(int64(len(fixture)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Generate(bytes.NewReader(fixture), 256, 256); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGenerateGIFDownscale covers the transparent-GIF generic-path
+// shape: a 1024² transparent GIF decodes to *image.Paletted and traverses
+// scaleGeneric — at ≈ 2 allocs/pixel (131,122 allocs/op): Paletted.At returns
+// a pre-materialized palette interface (no boxing), so only the dst.Set box
+// and rgbamodel re-box allocate. Opaque()==false (a transparent palette
+// entry) makes the post-scale scaled RGBA (A=0) pay the generic
+// compositeOnWhite draw.Over flatten (slot_open.go:232) — the fuller
+// production shape; the opaque-GIF control (makeWideGIF) measures 131,117
+// (Δ5 = the composite).
+// Baseline (Go 1.26.5, HEAD 48c2976, this box, 2×1s runs): ≈ 5.8 ms/op
+// (5.76/5.84), 131,122 allocs/op, 1,790-byte fixture.
+// Run: go test -bench='BenchmarkGenerate(JPEG|GIF)Downscale$' -benchmem ./internal/thumbnail/
+func BenchmarkGenerateGIFDownscale(b *testing.B) {
+	fixture := makeTransparentGIF(b, 1024, 1024)
+	b.SetBytes(int64(len(fixture)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Generate(bytes.NewReader(fixture), 256, 256); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkGenerateHardMaxEncode covers the worst-case encode-dominated
 // shape at the HardMax ceiling (QA F4): a 2048² opaque PNG at a HardMax box —
 // scale is a ratio-≥1 no-op, compositeOnWhite is an opaque no-op, no EXIF
