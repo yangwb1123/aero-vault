@@ -3704,6 +3704,51 @@ func TestThumbnailETagDerivedFromOpenedObject(t *testing.T) {
 	}
 }
 
+// TestThumbnailLastModifiedDerivedFromOpenedObject pins R1: the 200-path
+// Last-Modified must derive from the Get-opened object's UpdatedAt (the
+// version whose bytes were actually decoded), not the pre-open Stat's. The
+// etagSwapRepo staleUpdated seam forces the Stat view one hour into the
+// past while the row at open time is current; pre-fix the 200 serves the
+// stale mtime, post-fix the fresh one. Byte-identical body proves only the
+// header provenance is under test (both decode the same v2 blob).
+func TestThumbnailLastModifiedDerivedFromOpenedObject(t *testing.T) {
+	h := newThumbnail304Harness(t)
+	ctx := context.Background()
+	_, etagB200, _, bodyB := h.primeVersions() // PUTs v1 300×150 then v2 320×160; control v2 thumb
+
+	obj, err := h.repo.GetObject(ctx, "default", "default", "pic.png")
+	if err != nil {
+		t.Fatalf("read real row: %v", err)
+	}
+	fresh := obj.UpdatedAt.UTC().Format(http.TimeFormat)
+	stale := obj.UpdatedAt.Add(-time.Hour)
+
+	// Arm the seam: the racing request's pre-open Stat (the next target-key
+	// GetObject) returns the real row with UpdatedAt forced one hour into
+	// the past; the opener (call +1) reads the real row — the deterministic
+	// analogue of "a PUT landed between the pre-open Stat and the open"
+	// (same mechanism as the 304-arm re-Stat provenance test).
+	armStatUpdated(h, stale)
+
+	resp, body := req(t, "GET", h.u+"/thumbnail?w=100&h=100", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("racing thumbnail: %d", resp.StatusCode)
+	}
+	if !bytes.Equal(body, bodyB) {
+		t.Fatal("racing body differs from control — both must decode the same v2 blob")
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != fresh {
+		t.Fatalf("200 Last-Modified=%q want %q (the opened object's mtime, not the pre-open Stat's)", lm, fresh)
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm == stale.UTC().Format(http.TimeFormat) {
+		t.Fatalf("200 Last-Modified must not come from the pre-open Stat (stale %q)", lm)
+	}
+	// The validator/mtime pair names one representation (RFC 9110 §8.8.3).
+	if got := resp.Header.Get("ETag"); got != etagB200 {
+		t.Fatalf("200 ETag=%q want %q (validator and mtime must describe the same served version)", got, etagB200)
+	}
+}
+
 // TestThumbnail304ShortCircuitsBeforeOpen pins FR-4: a matching If-None-Match
 // short-circuits on the Stat-derived validator BEFORE the opener's svc.Get
 // runs — the object stream never opens and no decode slot is touched. The
@@ -4252,6 +4297,101 @@ func TestThumbnailETagDerivedFromOpenedObjectSniffBucket(t *testing.T) {
 	}
 	if got := resp.Header.Get("ETag"); got == `"`+etagA+"-thumb-"+fmt.Sprintf("%dx%d", ew, eh)+`"` {
 		t.Fatalf("200 ETag must not derive from the pre-open Stat (stale v1) on the sniff path: %q", got)
+	}
+}
+
+// TestThumbnailLastModifiedDerivedFromOpenedObjectSniffBucket is the QA F2
+// symmetry obligation for R1: the same 200-path Last-Modified provenance pin
+// on the sniff-bucket path (application/octet-stream + magic admission — the
+// upload norm for curl -T / S3 SDKs). The shared `opened` capture sits before
+// the sniff branch, so a refactor moving it inside the branch would regress
+// the mtime provenance on the dominant upload path with zero test signal;
+// this test fails red on exactly that regression.
+func TestThumbnailLastModifiedDerivedFromOpenedObjectSniffBucket(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	wrapped := &etagSwapRepo{Repository: repo, target: "pic.bin"}
+	h := NewHandler(service.NewFileService(store, wrapped, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	u := srv.URL + "/v1/files/pic.bin"
+	octet := map[string]string{"Content-Type": "application/octet-stream"}
+	headETag := func() string {
+		t.Helper()
+		resp, _ := req(t, "HEAD", u, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD: %d", resp.StatusCode)
+		}
+		return strings.Trim(resp.Header.Get("ETag"), `"`)
+	}
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), octet); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	etagA := headETag()
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 320, 160), octet); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	etagB := headETag()
+	if etagB == "" || etagB == etagA {
+		t.Fatalf("v2 ETag %q must differ from v1 %q", etagB, etagA)
+	}
+
+	// Control: sniffed admission (magic bytes) + 200 mtime names the v2 row.
+	thumbURL := u + "/thumbnail?w=100&h=100"
+	resp, bodyB := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("control thumbnail (sniff bucket): %d", resp.StatusCode)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(bodyB)); err != nil || format != "jpeg" {
+		t.Fatalf("control body decode: %v fmt=%s", err, format)
+	}
+	ew, eh := thumbnail.EffectiveDims(100, 100)
+	etagB200 := `"` + etagB + "-thumb-" + fmt.Sprintf("%dx%d", ew, eh) + `"`
+
+	obj, err := repo.GetObject(context.Background(), "default", "default", "pic.bin")
+	if err != nil {
+		t.Fatalf("read real row: %v", err)
+	}
+	fresh := obj.UpdatedAt.UTC().Format(http.TimeFormat)
+	stale := obj.UpdatedAt.Add(-time.Hour)
+
+	// Arm the hook on the sniff-bucket path: the racing request's pre-open
+	// Stat sees the stale mtime; the opener (sniff wrapper around svc.Get)
+	// still reads the real v2 row.
+	wrapped.mu.Lock()
+	wrapped.staleUpdated, wrapped.swapCall = stale, wrapped.calls+1
+	wrapped.mu.Unlock()
+
+	resp, body := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("racing thumbnail (sniff bucket): %d", resp.StatusCode)
+	}
+	if !bytes.Equal(body, bodyB) {
+		t.Fatalf("racing body differs from control — both must decode the same v2 blob")
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != fresh {
+		t.Fatalf("200 Last-Modified=%q want %q (opened-object mtime through the sniff wrapper)", lm, fresh)
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm == stale.UTC().Format(http.TimeFormat) {
+		t.Fatalf("200 Last-Modified must not come from the pre-open Stat (stale %q) on the sniff path", lm)
+	}
+	if got := resp.Header.Get("ETag"); got != etagB200 {
+		t.Fatalf("200 ETag=%q want %q (validator and mtime must describe the same served version)", got, etagB200)
 	}
 }
 

@@ -299,6 +299,61 @@ func TestThumbnailCacheHitKeeps304AndHeaders(t *testing.T) {
 	}
 }
 
+// TestThumbnailCacheHitLastModifiedIsStatDerived pins the R1 guard on the
+// cache-hit path: a hit (no slot, no opener, no decode — opened == nil)
+// must keep the Stat-derived Last-Modified — the cache key derives from
+// that Stat's ETag, so the Stat's mtime is the coherent freshness basis.
+// Passes pre- and post-fix; it exists to make the "hit path unchanged"
+// clause of R1 testable and drift-proof.
+func TestThumbnailCacheHitLastModifiedIsStatDerived(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	real, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	store := &countingStore{Storage: real}
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
+	h := NewHandler(svc, nil)
+	h.WithThumbnailCache(thumbnail.NewCache(1<<20, 0))
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	base := srv.URL + "/v1/files/img.png"
+	thumb := base + "/thumbnail?w=32&h=32"
+	hdr := map[string]string{"Content-Type": "image/png"}
+	if resp, _ := req(t, "PUT", base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	if resp, _ := req(t, "GET", thumb, nil, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("miss GET: %d", resp.StatusCode)
+	}
+	resp2, body := req(t, "GET", thumb, nil, nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("hit GET: %d, body=%s", resp2.StatusCode, body)
+	}
+	if n := store.gets.Load(); n != 1 {
+		t.Fatalf("repeat GET must hit the server-side cache: storage Get count = %d, want 1", n)
+	}
+	row, err := repo.GetObject(context.Background(), "default", "default", "img.png")
+	if err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	want := row.UpdatedAt.UTC().Format(http.TimeFormat)
+	if got := resp2.Header.Get("Last-Modified"); got != want {
+		t.Fatalf("hit 200 Last-Modified=%q want %q (Stat-derived on the hit path — opened is nil)", got, want)
+	}
+}
+
 // TestThumbnailCacheHitEmitsAccessedEvent pins gate C4 (EventAccessed
 // parity): every successful 200 emits exactly one EventAccessed — misses via
 // stream open in the service, hits via the handler-side EmitAccessed — and

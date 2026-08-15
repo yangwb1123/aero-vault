@@ -282,8 +282,6 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 			}
 		}
 		if inmHit || imsHit {
-			w.Header().Set("ETag", `"`+freshETag+`"`)
-			w.Header().Set("Last-Modified", fresh.UpdatedAt.UTC().Format(http.TimeFormat))
 			if (version != "" || versioning) && fresh.VersionID != "" {
 				// The 304 names the re-observed version: the pin (immutable) or the current one.
 				w.Header().Set("X-Version-Id", fresh.VersionID)
@@ -479,7 +477,11 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("ETag", `"`+etag+`"`)
-	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
+	lastModified := obj.UpdatedAt.UTC().Format(http.TimeFormat)
+	if opened != nil { // miss path: the mtime of the version whose bytes were actually decoded
+		lastModified = opened.UpdatedAt.UTC().Format(http.TimeFormat)
+	}
+	w.Header().Set("Last-Modified", lastModified)
 	w.Header().Set("Content-Length", strconv.Itoa(len(img)))
 	w.Header().Set("Cache-Control", cacheControl)
 	versionID := obj.VersionID
