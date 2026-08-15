@@ -18,12 +18,23 @@ import (
 // a zero-budget cache behaves exactly like GenerateContextWithOpener: opener
 // invoked once per call, identical slot lifecycle, byte-identical output.
 //
-// Ordering is load-bearing: the cache key is derived BEFORE any slot
+// The module itself enforces the content-MD5 shape precondition on
+// sourceETag: only whole-object content-MD5 ETags (exactly 32 lowercase hex,
+// ContentMD5ETag) may seed a cache key. A non-content-derived source ETag
+// (empty, quoted, uppercase hex, multipart "<md5>-<n>", provider quirks,
+// 32-hex-shaped non-MD5 SSE-KMS values) is never a content-identity claim
+// and bypasses the cache entirely — no lookup, no store, no counting —
+// running the exact shared miss body byte-identically to
+// GenerateContextWithOpener with a nil cache.
+//
+// Ordering is load-bearing: a dead request fast-fails before the shape gate
+// (classification: Canceled → silent, DeadlineExceeded → 504); the gate runs
+// before key derivation; the cache key is derived BEFORE any slot
 // acquisition (from EffectiveDims, the single source of truth shared with
 // generateLocked, so the key can never drift from the produced bytes); a
-// dead request fast-fails before the lookup; a hit returns the stored JPEG
-// with no slot acquisition, no opener invocation, no decode; a miss runs the
-// exact shared slot→open→generateLocked body; errors are never cached.
+// hit returns the stored JPEG with no slot acquisition, no opener
+// invocation, no decode; a miss runs the exact shared slot→open→
+// generateLocked body; errors are never cached.
 func GenerateContextWithOpenerCached(
 	ctx context.Context,
 	cache *Cache,
@@ -34,14 +45,43 @@ func GenerateContextWithOpenerCached(
 	if open == nil {
 		return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: nil opener")
 	}
-	effW, effH := EffectiveDims(maxW, maxH)
-	key := CacheKey{Tenant: tenant, SourceETag: sourceETag, EffW: effW, EffH: effH, Version: CacheKeyVersion}
 
 	// Fast-fail dead requests before any work, mirroring generateLocked's
-	// terminal checks and acquireDecodeSlotContext's re-check.
+	// terminal checks and acquireDecodeSlotContext's re-check. This stays
+	// BEFORE the shape gate: a dead request returns ctx.Err() regardless of
+	// ETag shape, preserving the handler's classification contract
+	// (Canceled → silent, DeadlineExceeded → 504). The gate adds no
+	// observable behavior for dead requests.
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+
+	// Shape gate: only whole-object content-MD5 ETags (exactly 32 lowercase
+	// hex, ContentMD5ETag) may seed a cache key — the module enforces its
+	// own documented precondition instead of importing it from an adapter. A
+	// non-content-derived source ETag is never a content-identity claim: run
+	// the exact shared miss body (slot → open → *OpenError wrap → close →
+	// generateLocked) plus the existing empty-result defensive check, and
+	// return — no lookup, no store, zero telemetry, byte-identical to
+	// GenerateContextWithOpener with a nil cache.
+	if !ContentMD5ETag(sourceETag) {
+		img, _, err := generateContextWithOpener3(ctx, maxW, maxH, open)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(img) == 0 {
+			return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: empty result")
+		}
+		return img, false, nil
+	}
+
+	// Cache key derivation. Ordering is load-bearing: the key is derived
+	// BEFORE any slot acquisition (from EffectiveDims, the single source of
+	// truth shared with generateLocked, so the key can never drift from the
+	// produced bytes); a hit returns the stored JPEG with no slot
+	// acquisition, no opener invocation, no decode.
+	effW, effH := EffectiveDims(maxW, maxH)
+	key := CacheKey{Tenant: tenant, SourceETag: sourceETag, EffW: effW, EffH: effH, Version: CacheKeyVersion}
 	// Hit path: no slot acquisition, no opener invocation, no decode. The
 	// disabled cache (NewCache(<=0)) and a nil cache both skip the lookup and
 	// count nothing (nil/disabled = byte-identical to today).

@@ -14,11 +14,13 @@ import (
 const CacheKeyVersion = 1
 
 // CacheKey identifies one cacheable thumbnail output: the tenant (cross-tenant
-// isolation), the source object's content ETag (opaque; the handler's
-// admission gate guarantees it is a whole-object content MD5 — exactly 32
-// lowercase hex — for every stored entry, and SSE-C/SSE-KMS objects never
-// seed a key), and the EFFECTIVE bounds EffectiveDims applies inside
-// generateLocked, plus the key schema version. Bucket and object key are
+// isolation), the source object's content ETag, and the EFFECTIVE bounds
+// EffectiveDims applies inside generateLocked, plus the key schema version.
+// GenerateContextWithOpenerCached enforces the 32-lowercase-hex content-MD5
+// precondition on SourceETag for every stored entry (a non-content-derived
+// ETag bypasses the cache entirely); the REST handler's admission gate
+// additionally excludes SSE-C/SSE-KMS metadata classes the module cannot
+// see. Bucket and object key are
 // deliberately excluded: the output is a pure function of source bytes +
 // effective dims, so two objects with identical bytes share one correct
 // entry; the tenant component prevents one tenant's bytes ever being served
