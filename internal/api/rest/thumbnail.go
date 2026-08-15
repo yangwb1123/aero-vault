@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
@@ -40,9 +41,11 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		// FULL key — never a current-object Stat. A soft-deleted full key
 		// returns ErrNotFound from a current Stat while its pre-delete
 		// versions remain readable, and a version-pinned read of such an
-		// object must serve its own raw bytes. The lookup is a repo read
-		// only — no stream, no decode slot — run on the original request
-		// context, before the thumbnail deadline scope (F1 parity).
+		// object must serve its own raw bytes. The lookup is a repo read plus
+		// an authorization decision (StatVersionWithOptions runs
+		// authorizeObject — the E7 discriminator is an authz decision, not a
+		// pure repo read) — no stream, no decode slot — run on the original
+		// request context, before the thumbnail deadline scope (F1 parity).
 		version = r.URL.Query().Get("version") // "" resolves the current object (Get parity)
 		_, err := h.svc.StatVersionWithOptions(r.Context(), mw.TenantFrom(r.Context()),
 			service.DefaultBucket, fullKey, version, service.ReadOptions{})
@@ -233,20 +236,26 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	if auth.IsAnonymous(r.Context()) {
 		cacheControl = fmt.Sprintf("public, max-age=%d, must-revalidate", thumbFreshnessMaxAge)
 	}
-	if etagListMatches(r.Header.Get("If-None-Match"), statETag) {
+	// Conditional re-observation gate: an INM match OR an IMS-only request
+	// (no INM header) enters the re-Stat block — the IMS arm needs the fresh
+	// observation to evaluate the date comparison (RFC 9110 §13).
+	if etagListMatches(r.Header.Get("If-None-Match"), statETag) ||
+		(r.Header.Get("If-None-Match") == "" && r.Header.Get("If-Modified-Since") != "") {
 		// Re-observe the object before certifying Not Modified. The pre-open
 		// Stat above and this emission are separate moments: a concurrent PUT
 		// between them would otherwise pair a stale validator with 304, and a
 		// shared cache holding the OLD derived thumbnail would keep serving it
 		// (Cache-Control public|private, max-age=300, must-revalidate) until
 		// the bounded window lapses — no subsequent PUT invalidates the
-		// derived resource. The re-Stat is a repository read
-		// only — no stream, no decode slot — so the fast path stays slot-free
-		// and stream-free. The 304's validator and Last-Modified are pinned to
-		// THIS observation (RFC 9110 §13.1.2: conditions evaluate against the
-		// current validator). For pinned requests the re-Stat is deterministic
-		// (version rows are immutable) but the shared path is kept, not
-		// special-cased.
+		// derived resource. The re-Stat is a repository read plus an
+		// authorization decision (StatVersionWithOptions runs
+		// authorizeObject — the E7 discriminator is an authz decision, not a
+		// pure repo read) — no stream, no decode slot — so the fast path stays
+		// slot-free and stream-free. The 304's validator and Last-Modified are
+		// pinned to THIS observation (RFC 9110 §13.1.2: conditions evaluate
+		// against the current validator). For pinned requests the re-Stat is
+		// deterministic (version rows are immutable) but the shared path is
+		// kept, not special-cased.
 		fresh, err := h.statPinned(r.Context(), tenant, key, version)
 		if err != nil {
 			// Deleted between the Stats (ErrNotFound → 404) or corrupt (→ 410):
@@ -256,7 +265,28 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 			return
 		}
 		freshETag := fmt.Sprintf("%s-thumb-%dx%d", fresh.ETag, effW, effH)
-		if etagListMatches(r.Header.Get("If-None-Match"), freshETag) {
+		// Conditional evaluation per RFC 9110 §13: If-None-Match takes
+		// precedence when present; otherwise If-Modified-Since is evaluated
+		// against the re-observed Last-Modified (the derived resource has no
+		// entity of its own, so the source object's mtime is the freshness
+		// basis — same semantics as the raw-download notModified helper).
+		inmHit := etagListMatches(r.Header.Get("If-None-Match"), freshETag)
+		imsHit := false
+		if r.Header.Get("If-None-Match") == "" {
+			if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+				if t, perr := http.ParseTime(ims); perr == nil {
+					imsHit = !fresh.UpdatedAt.Truncate(time.Second).After(t)
+				}
+			}
+		}
+		if inmHit || imsHit {
+			w.Header().Set("ETag", `"`+freshETag+`"`)
+			w.Header().Set("Last-Modified", fresh.UpdatedAt.UTC().Format(http.TimeFormat))
+			if version != "" && fresh.VersionID != "" {
+				// Version-pinned revalidation: the cache entry is keyed to one
+				// immutable version, so the 304 must name it (Get parity).
+				w.Header().Set("X-Version-Id", fresh.VersionID)
+			}
 			w.Header().Set("ETag", `"`+freshETag+`"`)
 			w.Header().Set("Last-Modified", fresh.UpdatedAt.UTC().Format(http.TimeFormat))
 			// The 304 must mirror the 200's directive (RFC 9111 §4.3.5: the
@@ -448,22 +478,17 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		etag = fmt.Sprintf("%s-thumb-%dx%d", opened.ETag, effW, effH)
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 	w.Header().Set("Content-Length", strconv.Itoa(len(img)))
 	w.Header().Set("Cache-Control", cacheControl)
+	if version != "" && opened != nil && opened.VersionID != "" {
+		// Version-pinned derivation: the 200 names the pinned version whose
+		// bytes were decoded (Get parity; the cache key already pins it, the
+		// header makes it observable to clients and caches).
+		w.Header().Set("X-Version-Id", opened.VersionID)
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(img)
-}
-
-// statPinned stats the derivation source without opening its blob: the pinned
-// version when version is non-empty (StatVersionWithOptions — repo-read-only;
-// delete marker → ErrNotFound, corrupt → ErrObjectCorrupt, unauthorized →
-// ErrForbidden, SSE-C without key → ErrInvalidArgs), else the current object
-// (Stat). Both classify via writeError exactly like the unpinned pre-open
-// Stat, so the pinned arm is at parity, not a regression.
-func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (repository.Object, error) {
-	if version == "" {
-		return h.svc.Stat(ctx, tenant, service.DefaultBucket, key)
-	}
-	return h.svc.StatVersionWithOptions(ctx, tenant, service.DefaultBucket, key, version, service.ReadOptions{})
 }

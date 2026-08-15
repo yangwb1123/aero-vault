@@ -1,11 +1,13 @@
 package rest
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
 	"strconv"
 
+	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
@@ -52,4 +54,19 @@ func parseThumbDim(q url.Values, name string) (int, error) {
 			service.ErrInvalidArgs, name, v)
 	}
 	return n, nil
+}
+
+// statPinned stats the derivation source without opening its blob: the pinned
+// version when version is non-empty (StatVersionWithOptions — an
+// authorization decision plus a repo read: authorizeObject runs inside, so
+// the E7 discriminator can return ErrForbidden/ErrInvalidArgs, not just row
+// absence; delete marker → ErrNotFound, corrupt → ErrObjectCorrupt,
+// unauthorized → ErrForbidden, SSE-C without key → ErrInvalidArgs), else the
+// current object (Stat). Both classify via writeError exactly like the
+// unpinned pre-open Stat, so the pinned arm is at parity, not a regression.
+func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (repository.Object, error) {
+	if version == "" {
+		return h.svc.Stat(ctx, tenant, service.DefaultBucket, key)
+	}
+	return h.svc.StatVersionWithOptions(ctx, tenant, service.DefaultBucket, key, version, service.ReadOptions{})
 }

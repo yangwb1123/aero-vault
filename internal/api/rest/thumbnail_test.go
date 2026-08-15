@@ -4700,3 +4700,180 @@ func TestThumbnailHeadParityPins(t *testing.T) {
 		}
 	})
 }
+
+// TestThumbnailVersionPinEmptyAndLengthGate pins C1 + C2: an EMPTY ?version=
+// resolves the current object on both arms (raw download parity), and the
+// over-cap length-gate fall-through holds for pinned URLs too (a legal
+// 191-char image key whose "/thumbnail" suffix exceeds the cap, pinned or
+// not, derives a thumbnail from the trimmed key — the length gate's safety
+// argument in its intended direction).
+func TestThumbnailVersionPinEmptyAndLengthGate(t *testing.T) {
+	// C1a: empty pin on the exact-key arm → raw download of the CURRENT
+	// object (Get parity: ?version= with no value resolves current).
+	t.Run("empty pin exact-key arm", func(t *testing.T) {
+		s, tok, repo := newThumbnailAccessHarness(t)
+		enableVersioningForCoexistence(t, repo)
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/dir"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir: %d", resp.StatusCode)
+		}
+		uFull := u + "/thumbnail"
+		if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+		}
+		resp, body := req(t, "GET", uFull+"?version=", nil, authH)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("empty-pin exact-key: status=%d want 200 (body=%q)", resp.StatusCode, body)
+		}
+		if !bytes.Equal(body, []byte("object bytes")) {
+			t.Fatalf("body=%q want the current object's bytes", body)
+		}
+	})
+	// C1b: empty pin on the derivation arm → the CURRENT version's thumbnail.
+	t.Run("empty pin derivation arm", func(t *testing.T) {
+		s, tok, repo := newAuthRESTTestWithRepo(t)
+		enableVersioningForCoexistence(t, repo)
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/img"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		unpinnedETag := func() string {
+			resp, _ := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, authH)
+			return resp.Header.Get("ETag")
+		}()
+		resp, body := req(t, "GET", u+"/thumbnail?w=32&h=32&version=", nil, authH)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("empty-pin derivation: status=%d want 200 (body=%q)", resp.StatusCode, body)
+		}
+		if et := resp.Header.Get("ETag"); et != unpinnedETag {
+			t.Fatalf("empty-pin ETag %q, want the unpinned %q (empty pin = current resolution)", et, unpinnedETag)
+		}
+	})
+	// C2: over-cap key + pin → 200 derived from the trimmed legal key.
+	t.Run("over-cap length gate pinned", func(t *testing.T) {
+		s, repo := newRESTTestWithRepo(t)
+		enableVersioningForCoexistence(t, repo)
+		key191 := strings.Repeat("k", service.MaxKeyLen-9) // 191 chars: legal
+		u := s.URL + "/v1/files/" + key191
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		versions, err := repo.ListObjectVersions(context.Background(), "default", "default", key191)
+		if err != nil || len(versions) == 0 {
+			t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+		}
+		// The full key key191+"/thumbnail" is 201 chars — over the cap; the
+		// pinned URL must still fall through to the derivation.
+		resp, _ := req(t, "GET", s.URL+"/v1/files/"+key191+"/thumbnail?version="+versions[0].VersionID, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("pinned over-cap full key: status=%d want 200 (derived)", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+			t.Fatalf("content-type=%q want image/jpeg", ct)
+		}
+	})
+}
+
+// TestThumbnailVersionPinTrimmedKeySSECParity pins C3: a pinned derivation
+// whose TRIMMED key names an SSE-C object must 400 via the statPinned path
+// (StatVersionWithOptions → validateSSECRead without the customer key) —
+// the pinned arm must not derive bytes of an object it cannot read, exactly
+// like the unpinned arm.
+func TestThumbnailVersionPinTrimmedKeySSECParity(t *testing.T) {
+	s, tok, repo := newAuthRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/photo"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "photo")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	v1ID := versions[0].VersionID
+	// Mark the object as SSE-C (reserved metadata, as prepareSSECWrite would).
+	for k, v := range map[string]string{
+		"_aero_sse_c_algorithm": "AES256",
+		"_aero_sse_c_key_md5":   "d41d8cd98f00b204e9800998ecf8427e",
+	} {
+		if err := repo.SetObjectMetaKey(context.Background(), "default", "default", "photo", k, v); err != nil {
+			t.Fatalf("set ssec meta %s: %v", k, err)
+		}
+	}
+	// Pinned derivation of the SSE-C object: statPinned rejects (400
+	// InvalidArgument — read without the customer key), never derives.
+	resp, body := req(t, "GET", u+"/thumbnail?version="+v1ID, nil, authH)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("pinned SSE-C trimmed key: status=%d want 400 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("expected code InvalidArgument, body: %s", body)
+	}
+	// Unpinned parity: the same object without a pin also 400s.
+	resp, _ = req(t, "GET", u+"/thumbnail", nil, authH)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unpinned SSE-C trimmed key: status=%d want 400", resp.StatusCode)
+	}
+}
+
+// TestThumbnailVersionPinnedHeadersAndIMS pins C4 + C5 + C8: the pinned
+// derivation's 200 and 304 carry X-Version-Id (the pinned version's ID, Get
+// parity), the 200 carries X-Content-Type-Options: nosniff, and the 304
+// branch evaluates If-Modified-Since (RFC 9110 §13: INM precedence when
+// present; IMS against the re-observed Last-Modified otherwise).
+func TestThumbnailVersionPinnedHeadersAndIMS(t *testing.T) {
+	s, repo := newRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	u := s.URL + "/v1/files/photo.jpg"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "photo.jpg")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	v1ID := versions[0].VersionID
+	thumbURL := u + "/thumbnail?version=" + v1ID
+
+	// 200: X-Version-Id names the pinned version; nosniff present.
+	resp, _ := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET pinned: %d want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Version-Id"); got != v1ID {
+		t.Fatalf("200 X-Version-Id = %q, want the pinned %q", got, v1ID)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("200 X-Content-Type-Options = %q, want nosniff", got)
+	}
+
+	// IMS 304: If-Modified-Since at/after the object's mtime → 304.
+	lastMod := resp.Header.Get("Last-Modified")
+	if lastMod == "" {
+		t.Fatal("200 missing Last-Modified")
+	}
+	imsResp, _ := req(t, "GET", thumbURL, nil, map[string]string{"If-Modified-Since": lastMod})
+	if imsResp.StatusCode != http.StatusNotModified {
+		t.Fatalf("IMS 304: status=%d want 304 (If-Modified-Since: %s)", imsResp.StatusCode, lastMod)
+	}
+	if got := imsResp.Header.Get("X-Version-Id"); got != v1ID {
+		t.Fatalf("304 X-Version-Id = %q, want the pinned %q", got, v1ID)
+	}
+	// An older IMS date → 200 (modified since then).
+	old := time.Unix(1, 0).UTC().Format(http.TimeFormat)
+	oldResp, _ := req(t, "GET", thumbURL, nil, map[string]string{"If-Modified-Since": old})
+	if oldResp.StatusCode != http.StatusOK {
+		t.Fatalf("old IMS: status=%d want 200", oldResp.StatusCode)
+	}
+	// INM precedence: both present, INM mismatched → 200 even if IMS matches.
+	both, _ := req(t, "GET", thumbURL, nil, map[string]string{
+		"If-None-Match":     `"does-not-match"`,
+		"If-Modified-Since": lastMod,
+	})
+	if both.StatusCode != http.StatusOK {
+		t.Fatalf("INM precedence: status=%d want 200 (INM mismatch wins)", both.StatusCode)
+	}
+}
