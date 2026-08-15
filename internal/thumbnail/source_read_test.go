@@ -246,3 +246,41 @@ func TestGenerateContextWithOpenerMidStreamIOErrorClosesStream(t *testing.T) {
 	}
 	recoverSlots(t) // a leaked slot fails loudly here
 }
+
+// TestGenerateProbeSourceErrorClassified is the AC3b discriminator: a genuine
+// source-stream failure surfaced exactly at the MaxSourceBytes cap-probe
+// point must classify as *SourceReadError (the marked instance, identity
+// preserved — REST maps it to 500/410 via handler_helpers.go, never 400) and
+// NEVER as ErrSourceTooLarge (413, a client-budget error). Pre-fix the probe
+// error was folded into the capped boolean (c.capped = n > 0 || perr != io.EOF)
+// and the decode site returned ErrSourceTooLarge — this test fails loudly on
+// that build. The probe fires at off == errAt == MaxSourceBytes (the limit's
+// synthesized EOF is the very next read after the source served exactly
+// MaxSourceBytes), consumes 0 bytes, and the marker wraps the injected error
+// into *SourceReadError; the decode-site probeErr check (before the capped
+// check) returns it.
+func TestGenerateProbeSourceErrorClassified(t *testing.T) {
+	base := appnPaddedJPEG(t, 0)
+	sos := bytes.Index(base, []byte{0xFF, 0xDA})
+	if sos < 0 {
+		t.Fatal("no SOS marker in fixture")
+	}
+	segLen := int(binary.BigEndian.Uint16(base[sos+2 : sos+4]))
+	prefix := base[:sos+2+segLen] // entropy data cut; replaced by zeros to the cap
+	genuineErr := fmt.Errorf("s3 read failed: %w", errors.New("i/o error"))
+	src := &errAfterSource{prefix: prefix, errAt: MaxSourceBytes, probeErr: genuineErr}
+	_, err := Generate(src, 100, 100) // Background ctx: the probe is the classification under test
+	var sre *SourceReadError
+	if !errors.As(err, &sre) {
+		t.Fatalf("err = %v (%T), want *SourceReadError (probe-surfaced storage error)", err, err)
+	}
+	if sre.Err != genuineErr {
+		t.Fatalf("wrapped instance = %v, want the injected instance %v (never re-wrapped)", sre.Err, genuineErr)
+	}
+	if !errors.Is(err, genuineErr) {
+		t.Fatalf("errors.Is(err, injected) = false, want true (identity must traverse Unwrap)")
+	}
+	if errors.Is(err, ErrSourceTooLarge) {
+		t.Fatalf("err = %v, must not be reclassified as ErrSourceTooLarge (413)", err)
+	}
+}

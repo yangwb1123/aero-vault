@@ -68,25 +68,37 @@ const probeCapBytes = 64 << 10
 // sourceCapRecorder wraps the io.LimitReader output: a byte-exact passthrough
 // that records whether the limit's synthesized EOF cut a source stream that
 // still carried data (capped). On the first (0, io.EOF) it performs ONE
-// bounded probe read (≤ probeCapBytes) from the underlying source (the
-// sourceReadMarker-wrapped stream): n > 0, or a non-EOF error, means the
-// source was cut off mid-stream (capped = true); a (0, io.EOF) means the
-// source itself ended at or before the cap (capped = false — genuine
-// truncation stays ErrUnsupported). The probe reads through the marker (its
-// error classification is preserved; only the boolean is consulted) and
-// bypasses the DecodeConfig tee, so the metadata budget is unaffected. The
-// probe runs at most once (probed): a codec that keeps reading after EOF must
-// not re-probe.
+// bounded probe read (≤ probeCapBytes) from the underlying source: the
+// ctxReader-wrapped, sourceReadMarker-wrapped stream (construction site in
+// generateLocked). n > 0, or a non-EOF error, means the source was cut off
+// mid-stream (capped = true); a (0, io.EOF) means the source itself ended at
+// or before the cap (capped = false — genuine truncation stays
+// ErrUnsupported). The probe bypasses the DecodeConfig tee, so the metadata
+// budget is unaffected. The probe runs at most once (probed): a codec that
+// keeps reading after EOF must not re-probe.
+//
+// Context: the probe source is wrapped in ctxReader (outermost) around the
+// marker (innermost) — mirroring the decode-payload path — so a dead context
+// aborts the probe with (0, ctx.Err()) WITHOUT consulting the source (no
+// uncancellable bounded read against slow remote storage, no decode slot held
+// past the deadline; the exact ctx.Err() instance is recorded in probeErr).
+// A non-EOF, non-context probe error is recorded in probeErr (marked
+// *SourceReadError by the marker) and consulted at the two decode sites
+// BEFORE capped: a genuine source-stream failure is a server-side error (500/
+// 410 via the REST *SourceReadError arm), never misclassified as 413
+// ErrSourceTooLarge. The marker stays the single classification seam: the
+// limit's synthesized EOF is never marked (the marker sits inside the limit),
+// and context errors never reach the marker (ctxReader checks ctx first).
 //
 // The recorder must wrap the LimitReader output (never sit inside it): the
 // marker stays inside the limit, so the limit's synthesized EOF is never
-// marked as a *SourceReadError, and the probe reads through the marker so its
-// result is only the capped boolean.
+// marked as a *SourceReadError.
 type sourceCapRecorder struct {
-	r      io.Reader // the io.LimitReader output
-	src    io.Reader // the marker-wrapped source, for the probe
-	capped bool
-	probed bool
+	r        io.Reader // the io.LimitReader output
+	src      io.Reader // the ctxReader→marker-wrapped source, for the probe
+	capped   bool
+	probed   bool
+	probeErr error // non-EOF probe error (marked *SourceReadError via src); consult before capped
 }
 
 func (c *sourceCapRecorder) Read(p []byte) (int, error) {
@@ -96,6 +108,9 @@ func (c *sourceCapRecorder) Read(p []byte) (int, error) {
 		var buf [probeCapBytes]byte
 		n, perr := c.src.Read(buf[:])
 		c.capped = n > 0 || perr != io.EOF
+		if perr != nil && perr != io.EOF {
+			c.probeErr = perr
+		}
 	}
 	return n, err
 }
@@ -211,7 +226,7 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// result is only the capped boolean — both decode sites classify
 	// capped → ErrSourceTooLarge (a server budget rejection), distinct from
 	// ErrUnsupported (truncated/corrupt input).
-	rec := &sourceCapRecorder{r: r, src: capSrc}
+	rec := &sourceCapRecorder{r: r, src: &ctxReader{ctx: ctx, r: capSrc}}
 	r = rec
 
 	// Header-only dimension pre-check: no pixel buffer is ever allocated for
@@ -256,6 +271,15 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 		var sre *SourceReadError
 		if errors.As(err, &sre) {
 			return nil, sre
+		}
+		if rec.probeErr != nil {
+			// The cap probe surfaced a genuine source-stream failure (the
+			// marker classified it as *SourceReadError): the budget was hit,
+			// but the read failed — the storage error, not 413, is the
+			// contract. Structurally unreachable here (the 8 MiB metadata tee
+			// budget trips before the 128 MiB cap); kept for budget-drift
+			// robustness, same philosophy as the capped check below.
+			return nil, rec.probeErr
 		}
 		if rec.capped {
 			// The MaxSourceBytes read cap cut a still-alive source mid-decode:
@@ -354,6 +378,13 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 		var sre *SourceReadError
 		if errors.As(err, &sre) {
 			return nil, sre
+		}
+		if rec.probeErr != nil {
+			// The cap probe surfaced a genuine source-stream failure (the
+			// marker classified it as *SourceReadError): the budget was hit,
+			// but the read failed — the storage error, not 413, is the
+			// contract.
+			return nil, rec.probeErr
 		}
 		if rec.capped {
 			// The MaxSourceBytes read cap cut a still-alive source

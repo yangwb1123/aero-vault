@@ -26,9 +26,12 @@ import (
 // receives the exact context.Canceled / context.DeadlineExceeded instance,
 // never ErrUnsupported.
 //
-// Scope: this reader wraps ONLY the decode payload path (the trailing element
-// of generateLocked's decodeR MultiReaders). The DecodeConfig tee and the PNG
-// orientation-walk tee are intentionally unwrapped: a cancel during the
+// Scope: this reader wraps the decode payload path (the trailing element of
+// generateLocked's decodeR MultiReaders) AND the MaxSourceBytes cap-probe
+// path (the sourceCapRecorder's probe source — the marker-wrapped source is
+// wrapped in a ctxReader at recorder construction, slot_open.go, so a dead
+// ctx at probe entry issues no underlying read). The DecodeConfig tee and the
+// PNG orientation-walk tee are intentionally unwrapped: a cancel during the
 // metadata scan is bounded by MaxMetadataBytes (8 MiB) and the budget abort
 // (ErrMetadataTooLarge) has pinned priority over a coincident context error
 // (TestGenerateContextMetadataBudgetWinsOverDeadline) — wrapping the tee

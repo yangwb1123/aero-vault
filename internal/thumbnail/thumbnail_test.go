@@ -2,6 +2,7 @@ package thumbnail
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -883,13 +884,43 @@ func TestSourceCapRecorderUnit(t *testing.T) {
 	})
 	t.Run("probe error counts capped", func(t *testing.T) {
 		probeErr := errors.New("probe failed")
-		src := &errAfterSource{prefix: jpeg, total: MaxSourceBytes + 1, errAt: MaxSourceBytes, probeErr: probeErr}
+		src := &errAfterSource{prefix: jpeg, errAt: MaxSourceBytes, probeErr: probeErr}
 		rec := &sourceCapRecorder{r: &limitedReader{src: src, limit: MaxSourceBytes}, src: src}
 		var buf [32 << 10]byte
 		for {
 			if _, err := rec.Read(buf[:]); err == io.EOF {
 				break
 			}
+		}
+		if !rec.capped {
+			t.Fatal("capped = false, want true (a non-EOF probe error proves the budget was hit)")
+		}
+		if !errors.Is(rec.probeErr, probeErr) {
+			t.Fatalf("probeErr = %v, want the injected %v (recorded, not folded into capped)", rec.probeErr, probeErr)
+		}
+		if src.off != MaxSourceBytes {
+			t.Fatalf("probe consumed %d bytes, want 0 past the cap (off == errAt == MaxSourceBytes)", src.off-MaxSourceBytes)
+		}
+	})
+	t.Run("probe ctx aborts: no source read", func(t *testing.T) {
+		src := &maxSourceBytesJPEGPayload{prefix: appnPaddedJPEG(t, 0)}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // pre-canceled: the probe must not consult the source
+		rec := &sourceCapRecorder{
+			r:   &limitedReader{src: src, limit: MaxSourceBytes},
+			src: &ctxReader{ctx: ctx, r: src}, // the exact R1/D1 wire shape: ctxReader outermost, marker innermost
+		}
+		var buf [32 << 10]byte
+		for {
+			if _, err := rec.Read(buf[:]); err == io.EOF {
+				break
+			}
+		}
+		if src.off != MaxSourceBytes {
+			t.Fatalf("probe consumed %d bytes past the cap, want 0 (src.off == MaxSourceBytes)", src.off-MaxSourceBytes)
+		}
+		if !errors.Is(rec.probeErr, context.Canceled) {
+			t.Fatalf("probeErr = %v, want context.Canceled (recorded, never wrapped)", rec.probeErr)
 		}
 		if !rec.capped {
 			t.Fatal("capped = false, want true (a non-EOF probe error proves the budget was hit)")
@@ -917,21 +948,23 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// errAfterSource serves prefix+zeros until total bytes, then returns
-// probeErr once on the first read beyond total (the probe-error fixture).
+// errAfterSource serves prefix+zeros until errAt bytes have been served, then
+// returns probeErr sticky on every subsequent read (the probe-error fixture).
+// errAt is the error position (was: total — the dormant duplicate; with the
+// error at exactly errAt, the probe's first read at off == errAt returns
+// (0, probeErr) consuming 0 bytes).
 type errAfterSource struct {
 	prefix   []byte
 	off      int
-	total    int
 	errAt    int
 	probeErr error
 }
 
 func (s *errAfterSource) Read(p []byte) (int, error) {
-	if s.off >= s.total {
+	if s.off >= s.errAt {
 		return 0, s.probeErr
 	}
-	remaining := s.total - s.off
+	remaining := s.errAt - s.off
 	if len(p) > remaining {
 		p = p[:remaining]
 	}

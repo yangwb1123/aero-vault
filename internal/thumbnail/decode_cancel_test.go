@@ -24,6 +24,7 @@ package thumbnail
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
@@ -230,6 +231,113 @@ func TestGenerateContextStopsDecodeReadsOnDeadline(t *testing.T) {
 	// Pre-fix the decode drains to len(data) and fails this loudly.
 	if c2 >= int64(len(data)) {
 		t.Fatalf("reader served %d bytes (= len(data)): the stream was drained, not aborted mid-decode", c2)
+	}
+	recoverSlots(t)
+}
+
+// gateEndlessReader serves an endless maxSourceBytesJPEGPayload stream and
+// parks the decode one fill short of the MaxSourceBytes cap: the read that
+// carries the counter past gateAt serves its FULL request, closes consumed
+// (once) and blocks until release. The atomic counter makes the not-drained
+// guarantee observable. (gateCountReader's endless-source counterpart — the
+// probe is the source read that would follow the limit EOF at MaxSourceBytes.)
+type gateEndlessReader struct {
+	src      *maxSourceBytesJPEGPayload
+	gateAt   int64
+	consumed chan struct{}
+	release  chan struct{}
+	signal   sync.Once
+	count    atomic.Int64
+}
+
+func (r *gateEndlessReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	r.count.Add(int64(n))
+	if r.count.Load() >= r.gateAt {
+		r.signal.Do(func() { close(r.consumed) })
+		<-r.release
+	}
+	return n, err
+}
+
+// TestGenerateContextProbeCanceledNoProbeRead is the AC1b pin (near-cap
+// cancel): a cancel that lands while the decode is parked one fill short of
+// the MaxSourceBytes cap must abort promptly with the exact context.Canceled
+// (never ErrSourceTooLarge/ErrUnsupported) and must not read past the cap —
+// the source stream is never drained to MaxSourceBytes, so the uncancellable
+// ≤ 64 KiB cap-probe read can never be started on a dead ctx.
+//
+// Scope note (deviation from the design's AC1b wording): the design asserted
+// the post-release counter equals MaxSourceBytes exactly, arguing the probe
+// is the very next source read. That state is unreachable through the full
+// pipeline: the payload ctxReader (baseline, untouched) intercepts the
+// cancel at the NEXT payload fill (≤ one codec fill past the gate), so the
+// decode never reaches the limit EOF and the probe never fires — in BOTH the
+// pre-fix and post-fix builds (the design's own §11 risk-1 states this:
+// "the payload ctxReader deterministically intercepts before the probe in
+// the full pipeline"). The counter assertion is therefore the honest
+// invariant: final count == count at the gate (no source read past the gate)
+// and < MaxSourceBytes (the cap, hence the probe point, is never reached).
+// The dead-ctx-at-probe wire shape itself is locked deterministically at the
+// recorder level (AC1a, "probe ctx aborts: no source read"); this pipeline
+// test pins the call-level outcome (prompt context.Canceled, no over-read
+// past the cap) and the near-cap abort ordering.
+func TestGenerateContextProbeCanceledNoProbeRead(t *testing.T) {
+	base := appnPaddedJPEG(t, 0)
+	sos := bytes.Index(base, []byte{0xFF, 0xDA})
+	if sos < 0 {
+		t.Fatal("no SOS marker in fixture")
+	}
+	n := int(binary.BigEndian.Uint16(base[sos+2 : sos+4]))
+	prefix := base[:sos+2+n] // entropy data cut; replaced by endless zeros
+	const gateAt = int64(MaxSourceBytes - 16<<10)
+	consumed := make(chan struct{})
+	release := make(chan struct{})
+	reader := &gateEndlessReader{
+		src:      &maxSourceBytesJPEGPayload{prefix: prefix},
+		gateAt:   gateAt,
+		consumed: consumed,
+		release:  release,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := GenerateContext(ctx, reader, 100, 100)
+		done <- err
+	}()
+	select {
+	case <-consumed: // decode parked inside a fill, gate strictly before the cap
+	case <-time.After(30 * time.Second):
+		t.Fatal("decode never served the gate bytes (not parked near the cap)")
+	}
+	c0 := reader.count.Load()
+	if c0 < gateAt {
+		t.Fatalf("consumed fired with c0 = %d bytes served, want ≥ gateAt (%d)", c0, gateAt)
+	}
+	if c0 >= int64(MaxSourceBytes) {
+		t.Fatalf("consumed fired with c0 = %d bytes served, want < MaxSourceBytes (gate must precede the cap)", c0)
+	}
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrSourceTooLarge) {
+			t.Fatalf("err = %v, must not be reclassified as ErrUnsupported/ErrSourceTooLarge", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("GenerateContext did not abort after the near-cap cancel")
+	}
+	// No source read past the gate: the canceled payload ctxReader aborted the
+	// next fill, so the counter is frozen at c0 — and c0 < MaxSourceBytes, so
+	// the cap (hence the probe point) was never reached: the ≤ 64 KiB probe
+	// read could never have been started on a dead ctx.
+	if c1 := reader.count.Load(); c1 != c0 {
+		t.Fatalf("reader served %d bytes after the gate, want %d (no read past the gate)", c1, c0)
 	}
 	recoverSlots(t)
 }
