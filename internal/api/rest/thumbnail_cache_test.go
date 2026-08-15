@@ -694,6 +694,73 @@ func TestThumbnailCacheTTLExpiryRegenerates(t *testing.T) {
 	})
 }
 
+// TestThumbnailVersionPinnedCache pins AC3: version-pinned thumbnails are
+// served from the server-side cache keyed by the PINNED version's ETag — two
+// identical pinned requests open the pinned blob exactly once (the second is a
+// hit: no slot, no opener, no decode). Version rows and blobs are immutable,
+// so a concurrent PUT cannot plant stale bytes under the pinned key; the
+// openedETag == sourceETag store rule remains the residual guard.
+func TestThumbnailVersionPinnedCache(t *testing.T) {
+	srv, store, svc, _ := newThumbnailCacheREST(t, true, 0)
+	if err := svc.SetBucketVersioning(context.Background(), "default", "default", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	u := srv.URL + "/v1/files/photo.jpg"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	versions, err := svc.ListVersions(context.Background(), "default", "default", "photo.jpg")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	v1ID := versions[0].VersionID // newest-first; captured immediately after the first PUT
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	thumbURL := u + "/thumbnail?version=" + v1ID
+	before := store.gets.Load()
+	resp1, body1 := req(t, "GET", thumbURL, nil, nil)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first pinned GET: %d want 200", resp1.StatusCode)
+	}
+	resp2, body2 := req(t, "GET", thumbURL, nil, nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second pinned GET: %d want 200", resp2.StatusCode)
+	}
+	if delta := store.gets.Load() - before; delta != 1 {
+		t.Fatalf("storage gets delta=%d want exactly 1 (first opens the pinned blob; second is a cache hit)", delta)
+	}
+	if !bytes.Equal(body1, body2) {
+		t.Fatal("repeat pinned requests must serve identical bodies")
+	}
+}
+
+// TestThumbnailVersionPinnedBadPin404 pins AC4: a pin naming no readable
+// version of either key is a 404 on every repeat, never cached, and never
+// opens a blob (the discriminator and the trimmed-key Stat are repo reads
+// only; errors never reach the cache store).
+func TestThumbnailVersionPinnedBadPin404(t *testing.T) {
+	srv, store, svc, _ := newThumbnailCacheREST(t, true, 0)
+	if err := svc.SetBucketVersioning(context.Background(), "default", "default", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	u := srv.URL + "/v1/files/photo.jpg"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	thumbURL := u + "/thumbnail?version=no-such-version"
+	before := store.gets.Load()
+	for i := 0; i < 2; i++ {
+		resp, body := req(t, "GET", thumbURL, nil, nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("bad pin (repeat %d): status=%d want 404 (body=%q)", i, resp.StatusCode, body)
+		}
+	}
+	if after := store.gets.Load(); after != before {
+		t.Fatalf("storage gets changed by bad-pin requests: before=%d after=%d — no blob may be opened", before, after)
+	}
+}
+
 // objMeta fetches the live object row's metadata (for the SSE-C predicate
 // assertion).
 func objMeta(t *testing.T, repo repository.Repository, key string) map[string]string {

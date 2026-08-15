@@ -790,6 +790,205 @@ func TestThumbnailVersionPinnedReadNotShadowed(t *testing.T) {
 	}
 }
 
+// TestThumbnailVersionPinnedDerivation pins AC1/AC2: ?version= on the derived
+// /thumbnail subresource returns a JPEG derived from the PINNED version of the
+// trimmed key — validator from the pinned version's ETag (never the current
+// object's) — and the pin is immutable: later PUTs change the unpinned URL's
+// output but never the pinned response (G1/G2). HEAD mirrors GET with the body
+// suppressed.
+func TestThumbnailVersionPinnedDerivation(t *testing.T) {
+	s, repo := newRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	u := s.URL + "/v1/files/photo.jpg"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "photo.jpg")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	v1ID, v1ETag := versions[0].VersionID, versions[0].ETag // newest-first; captured immediately after the first PUT
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	effW, effH := thumbnail.EffectiveDims(0, 0)
+	wantETag := fmt.Sprintf(`"%s-thumb-%dx%d"`, v1ETag, effW, effH)
+	thumbURL := u + "/thumbnail?version=" + v1ID
+	resp, body := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET pinned derivation: status=%d want 200 (body=%q)", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type=%q want image/jpeg", ct)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(body)); err != nil || format != "jpeg" {
+		t.Fatalf("body must decode as jpeg (format=%q err=%v)", format, err)
+	}
+	if et := resp.Header.Get("ETag"); et != wantETag {
+		t.Fatalf("pinned ETag=%q want %q (derived from v1, not the current version)", et, wantETag)
+	}
+	// HEAD parity: identical status and ETag, body suppressed.
+	headResp, headBody := req(t, "HEAD", thumbURL, nil, nil)
+	if headResp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD pinned derivation: status=%d want 200", headResp.StatusCode)
+	}
+	if et := headResp.Header.Get("ETag"); et != wantETag {
+		t.Fatalf("HEAD pinned ETag=%q want %q", et, wantETag)
+	}
+	if len(headBody) != 0 {
+		t.Fatalf("HEAD pinned derivation: body=%d bytes, want empty", len(headBody))
+	}
+	// The unpinned URL derives from the CURRENT version (v2) — a different
+	// validator, so the pin demonstrably selected v1.
+	unpinned, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+	if et := unpinned.Header.Get("ETag"); et == wantETag {
+		t.Fatalf("unpinned ETag=%q must differ from the pinned v1-derived %q", et, wantETag)
+	}
+	// AC2: a third PUT with distinct bytes changes the unpinned output; the
+	// pinned response stays byte-identical with the identical validator (G2).
+	if resp, _ := req(t, "PUT", u, pngBytesAlt(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v3: %d", resp.StatusCode)
+	}
+	resp2, body2 := req(t, "GET", thumbURL, nil, nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("GET pinned after v3: status=%d want 200", resp2.StatusCode)
+	}
+	if !bytes.Equal(body2, body) {
+		t.Fatal("pinned response changed after a later PUT — version pins must be immutable")
+	}
+	if et := resp2.Header.Get("ETag"); et != wantETag {
+		t.Fatalf("pinned ETag after v3=%q want %q", et, wantETag)
+	}
+	unpinned2, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+	if et := unpinned2.Header.Get("ETag"); et == wantETag || et == unpinned.Header.Get("ETag") {
+		t.Fatalf("unpinned ETag after v3=%q must track the current version (pinned=%q, pre-v3 unpinned=%q)",
+			et, wantETag, unpinned.Header.Get("ETag"))
+	}
+}
+
+// TestThumbnailVersionPinned304 pins AC8: the pinned derivation arm's 304 fast
+// path certifies Not Modified against the pinned version (re-Stat via
+// StatVersionWithOptions), and GET-304 vs HEAD-304 are field-for-field equal
+// with no Content-Length/Content-Type on either (the F2 shape, extended to
+// pins).
+func TestThumbnailVersionPinned304(t *testing.T) {
+	s, repo := newRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	u := s.URL + "/v1/files/photo.jpg"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "photo.jpg")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	thumbURL := u + "/thumbnail?version=" + versions[0].VersionID
+	resp, _ := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET pinned: %d want 200", resp.StatusCode)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("missing ETag")
+	}
+	cond := map[string]string{"If-None-Match": etag}
+	getResp, _ := req(t, "GET", thumbURL, nil, cond)
+	headResp, _ := req(t, "HEAD", thumbURL, nil, cond)
+	if getResp.StatusCode != http.StatusNotModified || headResp.StatusCode != http.StatusNotModified {
+		t.Fatalf("pinned 304: GET=%d HEAD=%d want both 304", getResp.StatusCode, headResp.StatusCode)
+	}
+	for _, hdr := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+		g, h := getResp.Header.Get(hdr), headResp.Header.Get(hdr)
+		if g != h {
+			t.Fatalf("pinned 304 header %s: GET=%q HEAD=%q — field-for-field parity required", hdr, g, h)
+		}
+	}
+	for _, hdr := range []string{"Content-Length", "Content-Type"} {
+		if v := getResp.Header.Get(hdr); v != "" {
+			t.Fatalf("pinned GET 304 must not carry %s (%q)", hdr, v)
+		}
+		if v := headResp.Header.Get(hdr); v != "" {
+			t.Fatalf("pinned HEAD 304 must not carry %s (%q)", hdr, v)
+		}
+	}
+}
+
+// TestThumbnailVersionPinnedPolicyDeny pins AC9 (fail-closed parity): a bucket
+// policy denying s3:GetObject on the TRIMMED key blocks the version-pinned
+// derivation too — a pinned URL cannot bypass the gate (mirrors
+// TestThumbnailDerivationPathBucketPolicyDeny, pinned arm).
+func TestThumbnailVersionPinnedPolicyDeny(t *testing.T) {
+	s, tok, repo := newThumbnailAccessHarness(t)
+	enableVersioningForCoexistence(t, repo)
+	adminH := map[string]string{"Authorization": "Bearer operator"}
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/secret"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "secret")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	denyGet := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::default/secret"}]}`
+	if resp, _ := req(t, "PUT", s.URL+"/v1/buckets/default/policy", bodyPolicy(denyGet), adminH); resp.StatusCode != http.StatusOK {
+		t.Fatalf("set deny policy: %d", resp.StatusCode)
+	}
+	resp, body := req(t, "GET", u+"/thumbnail?version="+versions[0].VersionID, nil, authH)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("pinned derivation under policy deny: status=%d want 403 (body=%q)", resp.StatusCode, body)
+	}
+}
+
+// TestThumbnailVersionPinnedSSECNoShadow pins C-1: a version-pinned read whose
+// full-key pinned version exists but is SSE-C-encrypted (unreadable without the
+// key) must surface the real state (400) — never fall through to the trimmed
+// key's derived content (the shadowing hole a blanket ErrInvalidArgs
+// fall-through would open). The unpinned raw download of the same object is
+// unchanged (400), and a garbage pin still 404s.
+func TestThumbnailVersionPinnedSSECNoShadow(t *testing.T) {
+	s, repo := newRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	if resp, _ := req(t, "PUT", uFull, []byte("object bytes"), map[string]string{"Content-Type": "text/plain"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir/thumbnail: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "dir/thumbnail")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	// Mark the object SSE-C via metadata injection (the pattern of
+	// TestThumbnailCorruptFullKeyPropagates): the merge applies to the live
+	// rows of the key, so the pinned version carries the encryption markers.
+	if err := repo.SetObjectMetaKey(context.Background(), "default", "default", "dir/thumbnail", "_aero_sse_c_algorithm", "AES256"); err != nil {
+		t.Fatalf("inject sse-c algorithm: %v", err)
+	}
+	if err := repo.SetObjectMetaKey(context.Background(), "default", "default", "dir/thumbnail", "_aero_sse_c_key_md5", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="); err != nil {
+		t.Fatalf("inject sse-c key md5: %v", err)
+	}
+	// Version-pinned read: the pinned full-key version is real but unreadable
+	// (SSE-C without the key) → 400, NEVER dir's thumbnail (200).
+	resp, body := req(t, "GET", uFull+"?version="+versions[0].VersionID, nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("pinned SSE-C full key: status=%d want 400 (body=%q)", resp.StatusCode, body)
+	}
+	// Unpinned raw download of the same object: unchanged (400 — SSE-C requires
+	// the key on every read path).
+	resp, _ = req(t, "GET", uFull, nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unpinned SSE-C full key: status=%d want 400 (raw-download semantics unchanged)", resp.StatusCode)
+	}
+	// A garbage pin names nothing at either key → 404, never dir's thumbnail.
+	resp, body = req(t, "GET", uFull+"?version=no-such-version", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("garbage pin: status=%d want 404 (body=%q)", resp.StatusCode, body)
+	}
+}
+
 // TestThumbnailLongKeySuffixFallsBack pins the ErrInvalidArgs mandate: an
 // image key so long that key+"/thumbnail" exceeds the key-length cap must
 // fall through to the subresource interpretation (thumbnail of the trimmed
@@ -1102,6 +1301,23 @@ func TestThumbnailDeadlineScoping(t *testing.T) {
 	}
 	if !bytes.Equal(body, []byte("object bytes")) {
 		t.Fatalf("version-pinned body=%q want the object bytes", body)
+	}
+
+	// AC10: a version-pinned DERIVATION on the trimmed key is deadline-bound
+	// like the unpinned arm. Pin v1 of dir2 (no object at "dir2/thumbnail"):
+	// the discriminator's repo read is ctx-tolerating (proven above), so the
+	// request falls through and the derivation pipeline observes the expired
+	// deadline → visible 504 (the historical behavior was 404).
+	versions2, err := repo.ListObjectVersions(context.Background(), "default", "default", "dir2")
+	if err != nil || len(versions2) == 0 {
+		t.Fatalf("list dir2 versions: %v (n=%d)", err, len(versions2))
+	}
+	resp, body = req(t, "GET", srv.URL+"/v1/files/dir2/thumbnail?version="+versions2[0].VersionID, nil, nil)
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("pinned derivation under expired deadline: status=%d want 504 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"Timeout"`)) {
+		t.Fatalf("expected code Timeout, body: %s", body)
 	}
 
 	// classify() must map the deadline sentinel to 504 at the error seam.
@@ -4285,11 +4501,11 @@ func TestThumbnailHeadAnonymousPublicRead(t *testing.T) {
 	}
 }
 
-// TestThumbnailHeadVersionPinParity pins design P3 (R3 ?version= arm): the
-// version-pinned read delegates to Get on the FULL key, so GET and HEAD must
-// agree on both the 404 arm (pinned version does not exist for the full key —
-// the oldID below belongs to the trimmed key img.png) and the 200 arm (an
-// existing pinned version of the full key serves its own raw bytes).
+// TestThumbnailHeadVersionPinParity pins the version-pinned arms: the pin of
+// the FULL key (raw download wins whenever the pinned version names an object
+// at the exact key) and the version-pinned DERIVATION (a pin naming nothing at
+// the full key derives the thumbnail from the pinned version of the trimmed
+// key). GET and HEAD must agree field-for-field on both arms.
 func TestThumbnailHeadVersionPinParity(t *testing.T) {
 	s, tok, repo := newAuthRESTTestWithRepo(t)
 	enableVersioningForCoexistence(t, repo)
@@ -4302,21 +4518,37 @@ func TestThumbnailHeadVersionPinParity(t *testing.T) {
 	if err != nil || len(versions) == 0 {
 		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
 	}
-	oldID := versions[0].VersionID
+	oldID, oldETag := versions[0].VersionID, versions[0].ETag
 	if resp, _ := req(t, "PUT", u, pngBytes(t, 200, 100), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("PUT v2: %d", resp.StatusCode)
 	}
 
-	// Pinned version of the FULL key does not exist → 404 both (R3's
-	// "including its 404 when the pinned version does not exist").
+	// A pinned version naming nothing at the full key (oldID belongs to the
+	// trimmed key img.png) derives the thumbnail from the pinned version of
+	// the trimmed key: 200 JPEG, validator from v1's ETag, HEAD mirrors GET
+	// field-for-field with the body suppressed.
 	thumbURL := u + "/thumbnail?version=" + oldID
-	getResp, _ := req(t, "GET", thumbURL, nil, authH)
+	getResp, getBody := req(t, "GET", thumbURL, nil, authH)
 	headResp, headBody := req(t, "HEAD", thumbURL, nil, authH)
-	if getResp.StatusCode != http.StatusNotFound || headResp.StatusCode != http.StatusNotFound {
-		t.Fatalf("version-pinned full-key missing: GET=%d HEAD=%d want both 404", getResp.StatusCode, headResp.StatusCode)
+	if getResp.StatusCode != http.StatusOK || headResp.StatusCode != http.StatusOK {
+		t.Fatalf("version-pinned derivation: GET=%d HEAD=%d want both 200", getResp.StatusCode, headResp.StatusCode)
+	}
+	if ct := getResp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("version-pinned derivation: Content-Type=%q want image/jpeg", ct)
+	}
+	if _, _, err := image.Decode(bytes.NewReader(getBody)); err != nil {
+		t.Fatalf("version-pinned derivation: body not a decodable image: %v", err)
+	}
+	effW, effH := thumbnail.EffectiveDims(0, 0)
+	wantETag := fmt.Sprintf(`"%s-thumb-%dx%d"`, oldETag, effW, effH)
+	if et := getResp.Header.Get("ETag"); et != wantETag {
+		t.Fatalf("version-pinned derivation: GET ETag=%q want %q (from v1, not the current version)", et, wantETag)
+	}
+	if et := headResp.Header.Get("ETag"); et != wantETag {
+		t.Fatalf("version-pinned derivation: HEAD ETag=%q want %q", et, wantETag)
 	}
 	if len(headBody) != 0 {
-		t.Fatalf("version-pinned HEAD: body=%d bytes, want empty", len(headBody))
+		t.Fatalf("version-pinned derivation HEAD: body=%d bytes, want empty", len(headBody))
 	}
 
 	// Existing pinned version of the full key (raw object at img.png/thumbnail)
@@ -4334,7 +4566,7 @@ func TestThumbnailHeadVersionPinParity(t *testing.T) {
 		t.Fatalf("PUT full v2: %d", resp.StatusCode)
 	}
 	pinnedURL := uFull + "?version=" + fullOld
-	getResp, getBody := req(t, "GET", pinnedURL, nil, authH)
+	getResp, getBody = req(t, "GET", pinnedURL, nil, authH)
 	headResp, headBody = req(t, "HEAD", pinnedURL, nil, authH)
 	if getResp.StatusCode != http.StatusOK || headResp.StatusCode != http.StatusOK {
 		t.Fatalf("version-pinned full-key existing: GET=%d HEAD=%d want both 200", getResp.StatusCode, headResp.StatusCode)

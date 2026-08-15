@@ -55,6 +55,9 @@ func init() {
 		{Method: "POST", Path: "/v1/files/{key}/restore", Summary: "Restore soft-deleted object", Tag: "files", Status: 200},
 		{Method: "POST", Path: "/v1/files/{key}/lock", Summary: "Set object retention lock", Tag: "files", Status: 200},
 		{Method: "GET", Path: "/v1/files/{key}/thumbnail", Summary: "Get thumbnail (JPEG)", Tag: "files", Status: 200,
+			Query: []apiQueryParameter{
+				{Name: "version", Description: "Historical version ID; when set, the thumbnail is derived from that version of the trimmed key. If the pinned version names an object at the exact key, raw-download semantics apply.", Type: "string"},
+			},
 			Responses: map[int]string{
 				http.StatusUnsupportedMediaType:  "Object content-type is not one of the supported image formats (image/jpeg, image/png, image/gif)",
 				http.StatusGone:                  "Object is marked as corrupt (scrub) — the corrupt-state error is surfaced verbatim, never flattened to a 400 invalid-image error",

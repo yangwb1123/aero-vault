@@ -8,7 +8,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -20,17 +19,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
-// thumbFreshnessMaxAge bounds the client-side freshness of the derived
-// thumbnail resource (package constant, not config). The thumbnail URL
-// carries no version pin, so a PUT that replaces the source object is
-// invisible to caches keyed on the URL; bounded freshness (max-age) plus
-// must-revalidate (RFC 9111 §5.2.2.2) forces revalidation once the window
-// lapses, which engages the If-None-Match/re-Stat machinery below — a
-// replaced object is observed within this window instead of up to the
-// historical 24 h.
-const thumbFreshnessMaxAge = 300
-
-// GET /v1/files/<key>/thumbnail?w=&h=
+// GET /v1/files/<key>/thumbnail?w=&h=&version=
 // Generates a JPEG thumbnail of an image object on demand. The response carries
 // a derived ETag (source ETag + dimensions) so repeat requests are cacheable
 // (304 via If-None-Match).
@@ -38,56 +27,98 @@ const thumbFreshnessMaxAge = 300
 // Dispatch precedence: object keys ending in "/thumbnail" are legal. When an
 // object exists at the exact requested key, raw-download semantics win (FR-1)
 // and the subresource interpretation applies only when no object exists at
-// the full key (FR-2).
+// the full key (FR-2). A ?version= pin requests a specific historical
+// version: when the pinned version names a readable object at the full key,
+// raw-download semantics win there too (a version-pinned read must never be
+// shadowed by derived content of a different key); otherwise the thumbnail is
+// derived from the pinned version of the trimmed key.
 func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	fullKey := keyFromPath(r)
-	// A ?version= pin requests a specific historical version of the object
-	// at the full key. The pre-check/fallback machinery below must never
-	// shadow a version-pinned read with derived content of a different key,
-	// so delegate to Get (which resolves ?version= via GetSpecificVersion)
-	// unconditionally.
+	version := ""
 	if r.URL.Query().Has("version") {
-		h.Get(w, r)
-		return
-	}
-	_, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, fullKey)
-	switch {
-	case err == nil:
-		// The exact key names a real object: raw download wins with full Get
-		// semantics (bucket policy, anonymous gate on the full key,
-		// conditional requests, Range, ?version=).
-		h.Get(w, r)
-		return
-	case errors.Is(err, service.ErrNotFound):
-		// No object at the full key: fall through to the subresource
-		// interpretation below.
-	case errors.Is(err, service.ErrForbidden):
-		// The full key names an existing object the caller cannot read with
-		// the pre-capability principal. Delegate to Get, which re-authorizes
-		// after allowAnonymous injects the canned-public-read capability, so
-		// anonymous reads of public objects keep working in access-enabled
-		// deployments; literal propagation would regress them to 403.
-		h.Get(w, r)
-		return
-	case errors.Is(err, service.ErrInvalidArgs):
-		// A legal object key suffixed with "/thumbnail" can exceed the
-		// key-length cap (e.g. a 191-char image key + 10-char suffix). That
-		// is a dispatch artifact, not an object-state error: fall through to
-		// the subresource interpretation, which works on the trimmed
-		// (legal) key.
-	default:
-		// The key names a real object; propagate corrupt/other errors instead
-		// of falling back to derived content of a different key (FR-3).
-		h.writeError(w, r, err)
-		return
+		// Pinned arm: the discriminator is a pinned-version lookup at the
+		// FULL key — never a current-object Stat. A soft-deleted full key
+		// returns ErrNotFound from a current Stat while its pre-delete
+		// versions remain readable, and a version-pinned read of such an
+		// object must serve its own raw bytes. The lookup is a repo read
+		// only — no stream, no decode slot — run on the original request
+		// context, before the thumbnail deadline scope (F1 parity).
+		version = r.URL.Query().Get("version") // "" resolves the current object (Get parity)
+		_, err := h.svc.StatVersionWithOptions(r.Context(), mw.TenantFrom(r.Context()),
+			service.DefaultBucket, fullKey, version, service.ReadOptions{})
+		switch {
+		case err == nil:
+			// The pin names a readable object at the full key: delegate to
+			// Get, which re-resolves ?version= via GetSpecificVersion with
+			// full raw-download semantics (policy → anonymous → conditional
+			// → Range → X-Version-Id).
+			h.Get(w, r)
+			return
+		case errors.Is(err, service.ErrForbidden):
+			// Re-delegate: Get re-authorizes after allowAnonymous injects
+			// the canned-public-read capability, so anonymous reads of
+			// public exact-key pinned versions keep working.
+			h.Get(w, r)
+			return
+		case errors.Is(err, service.ErrNotFound):
+			// The pin names nothing at the full key: fall through to the
+			// version-pinned derivation on the trimmed key.
+		case errors.Is(err, service.ErrInvalidArgs) && len(fullKey) > service.MaxKeyLen:
+			// Key-length dispatch artifact: a legal image key whose
+			// "/thumbnail" suffix exceeds the key-length cap is a dispatch
+			// artifact, not an object-state error — fall through (mirrors
+			// the unpinned ErrInvalidArgs arm). Any other ErrInvalidArgs
+			// (e.g. an SSE-C object read without its key) lands in default:
+			// the pin names a real but unreadable object, and deriving a
+			// different key's content would shadow it.
+		default:
+			// The pinned full-key version exists in a real but unreadable
+			// state (corrupt → 410, SSE-C without key → 400): never fall
+			// back to derived content of a different key (FR-3).
+			h.writeError(w, r, err)
+			return
+		}
+	} else {
+		_, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, fullKey)
+		switch {
+		case err == nil:
+			// The exact key names a real object: raw download wins with full
+			// Get semantics (bucket policy, anonymous gate on the full key,
+			// conditional requests, Range, ?version=).
+			h.Get(w, r)
+			return
+		case errors.Is(err, service.ErrNotFound):
+			// No object at the full key: fall through to the subresource
+			// interpretation below.
+		case errors.Is(err, service.ErrForbidden):
+			// The full key names an existing object the caller cannot read with
+			// the pre-capability principal. Delegate to Get, which re-authorizes
+			// after allowAnonymous injects the canned-public-read capability, so
+			// anonymous reads of public objects keep working in access-enabled
+			// deployments; literal propagation would regress them to 403.
+			h.Get(w, r)
+			return
+		case errors.Is(err, service.ErrInvalidArgs):
+			// A legal object key suffixed with "/thumbnail" can exceed the
+			// key-length cap (e.g. a 191-char image key + 10-char suffix). That
+			// is a dispatch artifact, not an object-state error: fall through to
+			// the subresource interpretation, which works on the trimmed
+			// (legal) key.
+		default:
+			// The key names a real object; propagate corrupt/other errors instead
+			// of falling back to derived content of a different key (FR-3).
+			h.writeError(w, r, err)
+			return
+		}
 	}
 	key := strings.TrimSuffix(fullKey, "/thumbnail")
 	// Bucket-policy gate on the derivation path, mirroring Get's ordering
 	// (policy → anonymous): a policy denying s3:GetObject on the trimmed key
 	// must not be bypassable by requesting its derived thumbnail (which
 	// returns near-lossless image bytes of the same object). Fail-closed like
-	// every other object read surface. Run before the deadline scope: the
-	// gates are cheap and fail-closed either way.
+	// every other object read surface — a version-pinned URL cannot bypass it
+	// either. Run before the deadline scope: the gates are cheap and
+	// fail-closed either way.
 	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
 		return
 	}
@@ -106,8 +137,19 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		r = r.WithContext(ctx)
 	}
+	h.thumbnailDerive(w, r, key, version)
+}
+
+// thumbnailDerive is the shared derivation body for both dispatch arms,
+// parameterized by the source key and the optional version pin ("" = the
+// current object, byte-identical to the historical unpinned behavior). The
+// pinned substitutions are localized in three places — the pre-open Stat and
+// the 304 re-Stat go through statPinned, and the opener selects GetVersion
+// instead of Get; everything else (media gate, dims, validator shape, cache
+// admission, classification) is one code path serving both arms.
+func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, version string) {
 	tenant := mw.TenantFrom(r.Context())
-	obj, err := h.svc.Stat(r.Context(), tenant, service.DefaultBucket, key)
+	obj, err := h.statPinned(r.Context(), tenant, key, version)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -115,7 +157,9 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// Media-type gate, four-bucket partition of the normalized declared
 	// Content-Type (RFC 9110 §8.3.1: case-insensitive, parameters stripped —
 	// so "Image/JPEG" and "image/jpeg; charset=utf-8" both normalize to
-	// image/jpeg and pass):
+	// image/jpeg and pass). For a pinned request the gate describes the
+	// PINNED version's bytes — a pinned text/plain version must 400 even if
+	// the current version is image/png:
 	//   1. image/jpeg|image/png|image/gif   → proceed (declared decodable)
 	//   2. other image/* (e.g. image/webp)  → 415 (server capability)
 	//   3. absent/unparseable/octet-stream  → byte-decided at open (Sniff)
@@ -170,7 +214,9 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// validator is derived separately from the Get-opened object (see the
 	// etag computation before the 200 header emission) so a concurrent PUT
 	// between this Stat and the open cannot pair a stale validator with the
-	// new bytes.
+	// new bytes. For a pinned request the validator derives from the PINNED
+	// version's ETag — version rows are immutable, so it can never change
+	// (G2).
 	statETag := fmt.Sprintf("%s-thumb-%dx%d", obj.ETag, effW, effH)
 	// Shared-cache directive: public only when this very request was admitted
 	// anonymously — allowAnonymous admits anonymous readers solely for
@@ -198,8 +244,10 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		// only — no stream, no decode slot — so the fast path stays slot-free
 		// and stream-free. The 304's validator and Last-Modified are pinned to
 		// THIS observation (RFC 9110 §13.1.2: conditions evaluate against the
-		// current validator).
-		fresh, err := h.svc.Stat(r.Context(), tenant, service.DefaultBucket, key)
+		// current validator). For pinned requests the re-Stat is deterministic
+		// (version rows are immutable) but the shared path is kept, not
+		// special-cased.
+		fresh, err := h.statPinned(r.Context(), tenant, key, version)
 		if err != nil {
 			// Deleted between the Stats (ErrNotFound → 404) or corrupt (→ 410):
 			// never certify Not Modified for a state we could not observe. Same
@@ -262,6 +310,9 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	//     not content-derived, so the key could pair stale bytes with a
 	//     legitimately changed object; only whole-object content MD5 ETags
 	//     admit caching.
+	// For a pinned request both gates evaluate the PINNED version's metadata
+	// and ETag, and the lookup key carries the pinned version's ETag — the
+	// existing CacheKey schema, no bump.
 	cache := h.thumbnailCache
 	if _, _, ssec := service.SSECustomerInfo(obj.Metadata); ssec || strings.Contains(obj.ETag, "-") {
 		cache = nil
@@ -273,12 +324,26 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// only the 304 fast path, never the 200. The opener also reports the
 	// opened object's ETag so the cache's store rule can verify content
 	// identity before caching (a PUT between the Stat and the open never
-	// caches new-version bytes under an old-version key).
+	// caches new-version bytes under an old-version key; for pins the ETag
+	// is immutable, so the rule is trivially satisfied and remains the
+	// residual guard).
 	var opened *repository.Object
 	img, fromCache, err := thumbnail.GenerateContextWithOpenerCached(
 		r.Context(), cache, tenant, obj.ETag, maxW, maxH,
 		func() (io.ReadCloser, string, error) {
-			rc, o, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
+			// Version-aware opener: GetVersion for pins (the pinned stream —
+			// sniff-replay and close-forwarding apply unchanged), Get for the
+			// unpinned arm.
+			var (
+				rc  io.ReadCloser
+				o   repository.Object
+				err error
+			)
+			if version == "" {
+				rc, o, err = h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
+			} else {
+				rc, o, err = h.svc.GetVersion(r.Context(), tenant, service.DefaultBucket, key, version)
+			}
 			if err != nil {
 				return nil, "", err
 			}
@@ -368,7 +433,8 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		// Deterministic access evidence: every successful 200 thumbnail
 		// response emits exactly one EventAccessed. Misses emit it on stream
 		// open inside the service; hits bypass the stream, so the handler
-		// emits it here (best-effort like every other event emission).
+		// emits it here (best-effort like every other event emission). For a
+		// pinned request the event names the pinned object.
 		h.svc.EmitAccessed(r.Context(), obj)
 	}
 	// 200 validator from the opened object: with no intervening write the
@@ -389,37 +455,15 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(img)
 }
 
-// sniffHeadLen is the longest magic signature Sniff recognizes: RIFF(4) +
-// size(4) + WEBP(4) = 12 bytes. Bucket-3 openers read exactly this many
-// bytes from the object stream to classify it.
-const sniffHeadLen = 12
-
-// sniffedStream replays the sniffed magic head in front of the live object
-// stream (io.MultiReader) and forwards Close to the underlying stream, which
-// the API's deferred close runs on this wrapper — io.NopCloser would leak it
-// (its Close is a no-op). Mirrors the close-forwarding precedent of
-// service.ETagVerifier.
-type sniffedStream struct {
-	io.Reader
-	rc io.Closer
-}
-
-func (s *sniffedStream) Close() error { return s.rc.Close() }
-
-// parseThumbDim validates one ?w=/?h= thumbnail dimension parameter. An
-// absent parameter yields 0 (default-size semantics per Generate's contract).
-// Present values must parse as a non-negative integer; parse errors and
-// negatives are client argument errors that the caller maps to 400 before any
-// cache validator is emitted or the decode pipeline is entered.
-func parseThumbDim(q url.Values, name string) (int, error) {
-	if !q.Has(name) {
-		return 0, nil
+// statPinned stats the derivation source without opening its blob: the pinned
+// version when version is non-empty (StatVersionWithOptions — repo-read-only;
+// delete marker → ErrNotFound, corrupt → ErrObjectCorrupt, unauthorized →
+// ErrForbidden, SSE-C without key → ErrInvalidArgs), else the current object
+// (Stat). Both classify via writeError exactly like the unpinned pre-open
+// Stat, so the pinned arm is at parity, not a regression.
+func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (repository.Object, error) {
+	if version == "" {
+		return h.svc.Stat(ctx, tenant, service.DefaultBucket, key)
 	}
-	v := q.Get(name)
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		return 0, fmt.Errorf("%w: invalid ?%s value %q (must be a non-negative integer)",
-			service.ErrInvalidArgs, name, v)
-	}
-	return n, nil
+	return h.svc.StatVersionWithOptions(ctx, tenant, service.DefaultBucket, key, version, service.ReadOptions{})
 }
