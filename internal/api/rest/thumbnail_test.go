@@ -2482,6 +2482,100 @@ func TestThumbnailOpenAPIDocuments415(t *testing.T) {
 	}
 }
 
+// TestThumbnailOpenAPIQueryParams pins AC-1: the generated /openapi.json must
+// declare ?w=/?h= as optional integer query parameters for
+// GET /v1/files/{key}/thumbnail, alongside the preserved ?version entry.
+//
+// Finding-1 pin (protocol-expert, required before merge): the description must
+// state that present-but-empty values are rejected with 400 — the clause
+// substring below is byte-frozen. "Empty" may never drift back into the default
+// class: empty ≡ absent would over-promise (parseThumbDim rejects "" with 400
+// InvalidArgument, pinned by TestThumbnailBadDimensions {"?w="} / {"?h="};
+// the exact-key raw-download dispatch arms (thumbnail.go:54-56, 88 — h.Get)
+// never reach parseThumbDim and ignore ?w=/?h= (pinned by
+// TestThumbnailDispatchArmIgnoresGarbageDims), so this clause is scoped to the
+// /thumbnail-suffix derivation operation only).
+//
+// Deliberate fragility (design §5.2/§5.3/§5.6, documented, not hardened away):
+//   - The mandated rejection clause is asserted verbatim; any deliberate
+//     rewording fails the test and requires a conscious AC update in lockstep.
+//   - The numeric constants (256/2048) are deliberately NOT asserted — a
+//     DefaultMax/HardMax change must not false-fail this test (PR discipline
+//     guards the prose); the runtime clamp contract is pinned by
+//     TestThumbnailBadDimensions (0→200, 4096→200) and TestThumbnailETagFromEffectiveDims
+//     (-thumb-256x256 / -thumb-2048x256 / -2048x2048).
+//   - The bare map type assertions (parameters/schema shape) pin the current
+//     specgen emission shape, matching TestOpenAPIBucketVersionsParameters and
+//     TestThumbnailOpenAPIDocuments415; a specgen shape change (e.g. schema →
+//     $ref, parameters → map) fails loudly as a type-conversion panic — the
+//     intended signal for a deliberate convention change, per design §5.3/§5.6.
+func TestThumbnailOpenAPIQueryParams(t *testing.T) {
+	h := OpenAPISpecHandler()
+	srv := httptest.NewServer(http.HandlerFunc(h.ServeHTTP))
+	defer srv.Close()
+
+	resp, body := req(t, "GET", srv.URL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("openapi: status=%d want 200", resp.StatusCode)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(body, &spec); err != nil {
+		t.Fatalf("openapi: decode: %v", err)
+	}
+	paths := spec["paths"].(map[string]any)
+	thumbGet, ok := paths["/v1/files/{key}/thumbnail"].(map[string]any)["get"].(map[string]any)
+	if !ok {
+		t.Fatal("thumbnail route must declare a get operation")
+	}
+	params := thumbGet["parameters"].([]any)
+
+	// Collect the query parameters declared for this operation.
+	query := make(map[string]map[string]any)
+	for _, p := range params {
+		param := p.(map[string]any)
+		if param["in"] == "query" {
+			query[param["name"].(string)] = param
+		}
+	}
+	for _, name := range []string{"w", "h"} {
+		param, ok := query[name]
+		if !ok {
+			t.Fatalf("thumbnail query parameter %q missing; have %v", name, query)
+		}
+		if param["in"] != "query" {
+			t.Fatalf("%s: in=%v want query", name, param["in"])
+		}
+		schema := param["schema"].(map[string]any)
+		if schema["type"] != "integer" {
+			t.Fatalf("%s: schema.type=%v want integer", name, schema["type"])
+		}
+		// Presence check, not truthiness: specgen emits no required key at all
+		// (absent required = optional in OpenAPI 3.1). A future emission of
+		// `required: false` must fail this just as `required: true` would
+		// (design §5.3 — the convention pin is "absent key", not "false value").
+		if v, present := param["required"]; present {
+			t.Fatalf("%s: must not declare required (specgen omits the key); got %v", name, v)
+		}
+		desc, _ := param["description"].(string)
+		// Finding-1 pin: empty ?w=/?h= is a 400 rejection, never a default. The
+		// clause below is the mandated wording (protocol-expert Finding 1+2);
+		// dropping or re-scoping "empty" fails here so the prose cannot drift
+		// back to over-promising.
+		const rejectionClause = "empty, non-integer, negative, or non-representable values are rejected with 400"
+		if !strings.Contains(desc, rejectionClause) {
+			t.Fatalf("%s: description must pin empty-value rejection (%q): %q", name, rejectionClause, desc)
+		}
+	}
+	// The existing version entry must survive unchanged in the same set.
+	vp, ok := query["version"]
+	if !ok {
+		t.Fatalf("thumbnail query parameter %q missing", "version")
+	}
+	if vt := vp["schema"].(map[string]any)["type"]; vt != "string" {
+		t.Fatalf("version: schema.type=%v want string", vt)
+	}
+}
+
 // TestThumbnailMediaTypeNormalization pins the RFC 9110 §8.3.1 normalized
 // gate (must-fix 1): media types are case-insensitive and may carry
 // parameters, so "Image/JPEG" and "image/jpeg; charset=utf-8" normalize to

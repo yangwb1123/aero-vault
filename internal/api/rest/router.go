@@ -57,6 +57,8 @@ func init() {
 		{Method: "GET", Path: "/v1/files/{key}/thumbnail", Summary: "Get thumbnail (JPEG)", Tag: "files", Status: 200,
 			Query: []apiQueryParameter{
 				{Name: "version", Description: "Historical version ID; when set, the thumbnail is derived from that version of the trimmed key. If the pinned version names an object at the exact key, raw-download semantics apply.", Type: "string"},
+				{Name: "w", Description: "Thumbnail width in pixels. Omitted or 0 selects the default (256); empty, non-integer, negative, or non-representable values are rejected with 400. Values above 2048 are clamped to 2048. Aspect ratio is preserved and the image is never upscaled.", Type: "integer"},
+				{Name: "h", Description: "Thumbnail height in pixels. Omitted or 0 selects the default (256); empty, non-integer, negative, or non-representable values are rejected with 400. Values above 2048 are clamped to 2048. Aspect ratio is preserved and the image is never upscaled.", Type: "integer"},
 			},
 			Responses: map[int]string{
 				http.StatusUnsupportedMediaType:  "Object content-type is not one of the supported image formats (image/jpeg, image/png, image/gif)",
