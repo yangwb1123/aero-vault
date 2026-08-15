@@ -31,3 +31,13 @@ func IncThumbnailCacheEviction(ctx context.Context, n int64) {
 	initDomain()
 	mThumbnailCacheEvictions.Add(ctx, n)
 }
+
+// IncThumbnail304 counts one certified 304 revalidation of the derived
+// thumbnail resource (the If-None-Match fast path: three repo point reads,
+// no stream, no decode slot). Bounded client freshness (max-age=300,
+// must-revalidate) converts silent cache hits into these revalidations, so
+// the counter makes the revalidation traffic class observable.
+func IncThumbnail304(ctx context.Context) {
+	initDomain()
+	mThumbnail304.Add(ctx, 1)
+}

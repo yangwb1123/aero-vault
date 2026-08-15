@@ -229,3 +229,21 @@ groups:
         annotations:
           summary: "Thumbnail cache hit ratio below 50% for 15m"
           description: "The server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail.cache.evictions_total; raise the budget or review the admission gates (SSE-C / multipart objects bypass the cache by design)."
+
+      # Client-side revalidation fan-out ceiling: bounded freshness
+      # (max-age=300, must-revalidate on the derived thumbnail) converts
+      # silent cache hits into origin conditionals — up to 288/day per
+      # client-URL. Each certified 304 costs three repo point reads (no
+      # stream, no decode slot); the measured per-core conditional ceiling is
+      # ~1.5-2k/s, so a sustained aggregate rate beyond 2000/s signals a
+      # misconfigured client fleet, a CDN that stopped caching, or a
+      # freshness re-tune. The counter is emitted only with
+      # PROMETHEUS_ENABLED=true.
+      - alert: ThumbnailRevalidationRateHigh
+        expr: sum(rate(thumbnail_304_total[5m])) > 2000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thumbnail revalidation rate above 2000/s for 15m"
+          description: "Sustained If-None-Match revalidations of derived thumbnails exceeded 2000/s over 5m (15m sustained). Bounded client freshness (max-age=300, must-revalidate) makes this the dominant read path per active client per thumbnail URL. Mitigation: arm RATE_LIMIT_RPS for per-tenant ceilings, front high-fan-out deployments with a CDN edge (one conditional per URL per 300 s instead of per client), enable THUMBNAIL_CACHE_BYTES, and inspect the access log for a misconfigured client fleet. The 300 s bound is the single package constant thumbFreshnessMaxAge."

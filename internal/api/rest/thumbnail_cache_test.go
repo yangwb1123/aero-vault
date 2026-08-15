@@ -452,6 +452,76 @@ func BenchmarkThumbnailCacheHandlerHit(b *testing.B) {
 	}
 }
 
+// BenchmarkThumbnail304Revalidation documents the conditional fast path that
+// bounded client freshness (max-age=300, must-revalidate) makes dominant:
+// If-None-Match with the current derived validator → 304. Each revalidation
+// costs three repo point reads (dispatch Stat on the subresource key,
+// pre-open Stat, re-Stat) — no stream, no decode slot — so this is the
+// cheapest read path on the thumbnail route and the one a fan-out fleet
+// exercises every 300 s per client-URL. Documentation-quality (repo bench
+// discipline — never asserted).
+func BenchmarkThumbnail304Revalidation(b *testing.B) {
+	dir := b.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.Migrate(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	real, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		b.Fatal(err)
+	}
+	store := &countingStore{Storage: real}
+	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true)
+	h := NewHandler(svc, nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	base := srv.URL + "/v1/files/img.png"
+	thumb := base + "/thumbnail?w=32&h=32"
+	benchReq := func(method, url string, body []byte, hdr map[string]string) *http.Response {
+		var rd io.Reader
+		if body != nil {
+			rd = bytes.NewReader(body)
+		}
+		rq, _ := http.NewRequest(method, url, rd)
+		for k, v := range hdr {
+			rq.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(rq)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp
+	}
+	if resp := benchReq("PUT", base, pngBytes(b, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		b.Fatalf("PUT status=%d", resp.StatusCode)
+	}
+	resp := benchReq("GET", thumb, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		b.Fatalf("warm GET status=%d", resp.StatusCode)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		b.Fatal("warm GET: missing ETag")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if resp := benchReq("GET", thumb, nil, map[string]string{"If-None-Match": etag}); resp.StatusCode != http.StatusNotModified {
+			b.Fatalf("revalidate status=%d want 304", resp.StatusCode)
+		}
+	}
+}
+
 // TestThumbnailCacheAdmissionGates pins the two cache-bypass gates: SSE-C
 // objects and multipart (non-content-derived) ETags must never be served
 // from or stored into the server-side cache — every request runs the full

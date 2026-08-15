@@ -1718,8 +1718,12 @@ func headerOnlyBaselineJPEGBytes(t *testing.T, w, h int) []byte {
 // caller may hold private access, and a shared cache must never store bytes
 // that an external anonymous caller could not fetch from origin.
 func TestThumbnailCacheControlPrivacy(t *testing.T) {
-	const public = "public, max-age=86400"
-	const private = "private, max-age=86400"
+	// Derived from the production bound (thumbFreshnessMaxAge) so a
+	// freshness retune moves the pins with it (QA F1); the exact emitted
+	// bytes are additionally pinned by the literal assertions in
+	// TestThumbnailRevalidationAfterReplace.
+	public := fmt.Sprintf("public, max-age=%d, must-revalidate", thumbFreshnessMaxAge)
+	private := fmt.Sprintf("private, max-age=%d, must-revalidate", thumbFreshnessMaxAge)
 
 	t.Run("unauthenticated harness is private", func(t *testing.T) {
 		// No auth middleware: IsAnonymous is false, so the directive must
@@ -1734,6 +1738,7 @@ func TestThumbnailCacheControlPrivacy(t *testing.T) {
 		if cc := resp.Header.Get("Cache-Control"); cc != private {
 			t.Fatalf("no-auth derivation Cache-Control=%q want %q", cc, private)
 		}
+		assertThumbnailFreshnessBound(t, resp.Header.Get("Cache-Control"))
 	})
 
 	t.Run("authenticated derivation is private", func(t *testing.T) {
@@ -1804,7 +1809,7 @@ func TestThumbnailCacheControlPrivacy(t *testing.T) {
 	})
 
 	t.Run("304 mirrors the 200 directive", func(t *testing.T) {
-		// RFC 9111 §4.3.4: a revalidating shared cache freshens the stored
+		// RFC 9111 §4.3.5: a revalidating shared cache freshens the stored
 		// response with the 304's directive — a private 304 must never
 		// follow a public 200.
 		s, tok := newAuthRESTTest(t)
@@ -1829,6 +1834,7 @@ func TestThumbnailCacheControlPrivacy(t *testing.T) {
 		if cc := resp.Header.Get("Cache-Control"); cc != public {
 			t.Fatalf("anon 304 Cache-Control=%q want %q", cc, public)
 		}
+		assertThumbnailFreshnessBound(t, resp.Header.Get("Cache-Control"))
 		// Authenticated: 200 private → 304 must also be private.
 		resp, _ = req(t, "GET", u+"/thumbnail", nil, authH)
 		etag = resp.Header.Get("ETag")
@@ -1841,6 +1847,183 @@ func TestThumbnailCacheControlPrivacy(t *testing.T) {
 		}
 		if cc := resp.Header.Get("Cache-Control"); cc != private {
 			t.Fatalf("auth 304 Cache-Control=%q want %q", cc, private)
+		}
+	})
+}
+
+// assertThumbnailFreshnessBound pins the REQ-1 numeric contract (acceptance
+// (a)) beyond exact-string equality: max-age must not exceed
+// thumbFreshnessMaxAge and must-revalidate must be present. The exact-string
+// pins protect the emitted bytes; this parse-based check protects the
+// requirement itself from a lockstep retune of the literals (QA F2).
+func assertThumbnailFreshnessBound(t *testing.T, cc string) {
+	t.Helper()
+	age := -1
+	for _, part := range strings.Split(cc, ",") {
+		part = strings.TrimSpace(part)
+		if v, ok := strings.CutPrefix(part, "max-age="); ok {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				t.Fatalf("Cache-Control=%q: unparseable max-age %q", cc, v)
+			}
+			age = n
+		}
+	}
+	if age < 0 {
+		t.Fatalf("Cache-Control=%q: missing max-age", cc)
+	}
+	if age > thumbFreshnessMaxAge {
+		t.Fatalf("Cache-Control=%q: max-age=%d exceeds bound %d", cc, age, thumbFreshnessMaxAge)
+	}
+	if !strings.Contains(cc, "must-revalidate") {
+		t.Fatalf("Cache-Control=%q: missing must-revalidate", cc)
+	}
+}
+
+// TestThumbnailRevalidationAfterReplace pins REQ-2 (acceptance (b)): after a
+// PUT replaces the object, a revalidating client that sends If-None-Match
+// with the OLD derived validator receives the NEW bytes (200), never a stale
+// 304. With bounded client freshness (max-age=300, must-revalidate) this is
+// exactly what a cache performs once the window lapses; the server must
+// answer it with current bytes. Deterministic: PNG fixtures are
+// byte-deterministic, ETags are content MD5s, and the pipeline never
+// upscales sub-request-sized sources (a 64x64 source at ?w=100&h=100 stays
+// 64x64).
+func TestThumbnailRevalidationAfterReplace(t *testing.T) {
+	// Private class: the browser-cache path (no-auth harness ⇒ private
+	// directive).
+	t.Run("private", func(t *testing.T) {
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/repl.png"
+		thumb := u + "/thumbnail?w=100&h=100"
+
+		// 1. PUT image A (300x150) and fetch its derived thumbnail:
+		// capture validator V1 and body1.
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT A: %d", resp.StatusCode)
+		}
+		resp, body1 := req(t, "GET", thumb, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET thumb A: %d", resp.StatusCode)
+		}
+		v1 := resp.Header.Get("ETag")
+		if v1 == "" {
+			t.Fatal("thumb A: missing ETag")
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "private, max-age=300, must-revalidate" {
+			t.Fatalf("thumb A Cache-Control=%q want bounded private directive", cc)
+		}
+
+		// 2. PUT image B (64x64 — different bytes ⇒ different MD5 ETag ⇒
+		// different derived validator).
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT B: %d", resp.StatusCode)
+		}
+
+		// 3. Revalidating client with the OLD validator V1: must get 200
+		// with the new bytes and a new validator V2 — never a stale 304.
+		resp, body2 := req(t, "GET", thumb, nil, map[string]string{"If-None-Match": v1})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("revalidate after replace: status=%d want 200 (never a stale 304)", resp.StatusCode)
+		}
+		v2 := resp.Header.Get("ETag")
+		if v2 == "" || v2 == v1 {
+			t.Fatalf("revalidate ETag=%q must differ from old %q", v2, v1)
+		}
+		if bytes.Equal(body2, body1) {
+			t.Fatal("revalidate body must differ from the pre-replace thumbnail")
+		}
+		img, format, err := image.Decode(bytes.NewReader(body2))
+		if err != nil || format != "jpeg" {
+			t.Fatalf("revalidate body decode: %v fmt=%s", err, format)
+		}
+		if img.Bounds().Dx() != 64 || img.Bounds().Dy() != 64 {
+			t.Fatalf("revalidate thumb dims %dx%d want 64x64 (the new source, not the old 300x150)",
+				img.Bounds().Dx(), img.Bounds().Dy())
+		}
+		// QA F4: the fall-through 200 is a distinct emission point — pin
+		// its directive too (the user-visible fix).
+		if cc := resp.Header.Get("Cache-Control"); cc != "private, max-age=300, must-revalidate" {
+			t.Fatalf("revalidate 200 Cache-Control=%q want bounded private directive", cc)
+		}
+
+		// 4. HEAD-after-replace parity (QA F5): HEAD with the old validator
+		// falls through to 200 with the new validator and an empty body.
+		headResp, headBody := req(t, "HEAD", thumb, nil, map[string]string{"If-None-Match": v1})
+		if headResp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD revalidate after replace: status=%d want 200", headResp.StatusCode)
+		}
+		if hv := headResp.Header.Get("ETag"); hv != v2 {
+			t.Fatalf("HEAD revalidate ETag=%q want %q", hv, v2)
+		}
+		if len(headBody) != 0 {
+			t.Fatalf("HEAD revalidate body=%d bytes, want empty", len(headBody))
+		}
+
+		// 5. Control: the unchanged-object conditional still works after
+		// replacement — If-None-Match with the NEW validator V2 → 304.
+		resp, _ = req(t, "GET", thumb, nil, map[string]string{"If-None-Match": v2})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("control revalidate with V2: status=%d want 304", resp.StatusCode)
+		}
+	})
+
+	// Public class (QA F3): the CDN-relevant leg — a shared cache holding
+	// the anonymous public response must also observe a replacement at
+	// revalidation.
+	t.Run("public", func(t *testing.T) {
+		s, tok := newAuthRESTTest(t)
+		authH := map[string]string{"Authorization": tok}
+		u := s.URL + "/v1/files/repl.png"
+		thumb := u + "/thumbnail?w=100&h=100"
+
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT A: %d", resp.StatusCode)
+		}
+		if resp, _ := req(t, "PUT", u+"/acl", []byte(`{"acl":"public-read"}`), authH); resp.StatusCode != http.StatusOK {
+			t.Fatalf("set acl: %d", resp.StatusCode)
+		}
+		// Anonymous GET (admitted via the public-read ACL) → public
+		// directive; capture V1.
+		resp, body1 := req(t, "GET", thumb, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("anon GET thumb A: %d", resp.StatusCode)
+		}
+		v1 := resp.Header.Get("ETag")
+		if v1 == "" {
+			t.Fatal("anon thumb A: missing ETag")
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "public, max-age=300, must-revalidate" {
+			t.Fatalf("anon thumb A Cache-Control=%q want bounded public directive", cc)
+		}
+
+		// Replace the object (the ACL survives: PUT without an ACL option
+		// does not touch it).
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT B: %d", resp.StatusCode)
+		}
+
+		// Anonymous revalidation with the OLD validator → 200 with the new
+		// bytes and the public directive — never a stale 304.
+		resp, body2 := req(t, "GET", thumb, nil, map[string]string{"If-None-Match": v1})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("anon revalidate after replace: status=%d want 200 (never a stale 304)", resp.StatusCode)
+		}
+		v2 := resp.Header.Get("ETag")
+		if v2 == "" || v2 == v1 {
+			t.Fatalf("anon revalidate ETag=%q must differ from old %q", v2, v1)
+		}
+		if bytes.Equal(body2, body1) {
+			t.Fatal("anon revalidate body must differ from the pre-replace thumbnail")
+		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "public, max-age=300, must-revalidate" {
+			t.Fatalf("anon revalidate 200 Cache-Control=%q want bounded public directive", cc)
+		}
+
+		// Control: the new validator still 304s anonymously.
+		resp, _ = req(t, "GET", thumb, nil, map[string]string{"If-None-Match": v2})
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("anon control revalidate with V2: status=%d want 304", resp.StatusCode)
 		}
 	})
 }
@@ -3603,7 +3786,7 @@ func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
 			t.Fatalf("status=%d want 304 for If-None-Match: *", resp.StatusCode)
 		}
 		if got := resp.Header.Get("ETag"); got != etagB200 {
-			t.Fatalf("ETag=%q want %q (the fresh validator — a shared cache freshens from it, RFC 9111 §4.3.4)", got, etagB200)
+			t.Fatalf("ETag=%q want %q (the fresh validator — a shared cache freshens from it, RFC 9111 §4.3.5)", got, etagB200)
 		}
 	})
 

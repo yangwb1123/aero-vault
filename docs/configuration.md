@@ -507,11 +507,27 @@ physical purge — `SweepExpired` — is a documented follow-up, not yet
 implemented); without a TTL, the residual bound is the LRU byte budget. SSE-C
 and multipart-ETag objects never enter the cache (no customer-key-derived
 bytes are retained beyond the request). Shared caches (browsers/CDNs) holding
-the `public, max-age=86400` response are governed by `Cache-Control`, not the
-server TTL: their copies are dropped at revalidation (the derived ETag + 304
-re-Stat gate returns 404 for a deleted object), with worst-case retention
-`max-age` (86400 s); `must-revalidate`/shorter `max-age` would be a REST
-surface change and is out of scope.
+the `public, max-age=300, must-revalidate` response are governed by
+`Cache-Control`, not the server TTL: a fresh entry is served for at most 300 s,
+then `must-revalidate` (RFC 9111 §5.2.2.2) forces revalidation, which returns
+200 with current bytes after an object replacement and 404 for a deleted
+object (the derived ETag + 304 re-Stat gate); worst-case retention is `max-age`
+(300 s). This is the protocol-inherent revocation latency: after a deletion or
+an ACL flip away from public-read, a shared cache may keep serving the stored
+thumbnail for at most 300 s until the first revalidation (404/403) retires it
+— and the bound applies to *cached copies* only: origin serving of
+soft-deleted objects follows retention/GC policy. `must-revalidate` also means
+a client with a stale entry errors rather than serves stale once the window
+lapses and origin is unreachable — thumbnail outages surface in browsers
+within 300 s (improved detectability, not a regression). Revalidation traffic
+is observable via `thumbnail.304_total` at `/metrics` (each certified 304
+costs three repo point reads — dispatch Stat, pre-open Stat, re-Stat — with
+no stream and no decode slot); per-tenant ceilings apply via
+`RATE_LIMIT_RPS`, and a CDN edge absorbs the fan-out (one conditional per URL
+per 300 s instead of per client). Entries fetched before a deploy keep their
+stored `max-age=86400` until their next expiry (≤24 h after the last
+pre-deploy fetch); for immediate propagation of a specific public object,
+replace the object (new ETag) after deploy.
 
 ---
 

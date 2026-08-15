@@ -264,6 +264,23 @@ func TestThumbnailCacheCountersSurface(t *testing.T) {
 	}
 }
 
+// TestThumbnail304CounterSurface records the thumbnail 304 revalidation
+// counter and verifies it appears in the Prometheus scrape body with the
+// expected value (reusing the shared handler set up once in TestMain).
+func TestThumbnail304CounterSurface(t *testing.T) {
+	if sharedPromHandler == nil {
+		t.Skip("sharedPromHandler not initialized")
+	}
+	ctx := context.Background()
+	IncThumbnail304(ctx)
+	IncThumbnail304(ctx)
+
+	body := scrapeShared(t)
+	if v, ok := scrapeValue(body, "thumbnail_304_total"); !ok || v != 2 {
+		t.Fatalf("thumbnail_304_total = %v (ok=%v), want 2", v, ok)
+	}
+}
+
 // scrapeShared runs one /metrics scrape through the shared handler.
 func scrapeShared(t *testing.T) string {
 	t.Helper()

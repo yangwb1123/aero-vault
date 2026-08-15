@@ -6,6 +6,12 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ## 2026-08-15
 
+### Changed
+- **Thumbnail: derived-resource client freshness bounded to `max-age=300, must-revalidate` (was `max-age=86400`) on both 200 and 304** (`internal/api/rest/thumbnail.go`; package constant `thumbFreshnessMaxAge`, not config)
+  - A PUT that replaces the object is now observed by revalidating caches within 5 minutes instead of up to 24 h: expiry engages the existing If-None-Match/re-Stat machinery, which serves the current bytes (200) with the opened-object-derived validator — a stale 304 remains structurally impossible. New `TestThumbnailRevalidationAfterReplace` pins the replace-then-revalidate sequence in both privacy classes (private browser path and anonymous public/CDN path), including HEAD parity and the unchanged-object 304 control.
+  - Revalidation traffic is now observable via the new `thumbnail.304_total` counter (`internal/telemetry`); each certified 304 costs three repo point reads (dispatch Stat, pre-open Stat, re-Stat) — no stream, no decode slot.
+  - Privacy split (`public` iff anonymous admission), validator shape, error-path header silence, server-side cache keying, and `/v1/assets`'s documented `public, max-age=86400` are unchanged. No new status, header field, config, migration, or `openapi.json` change.
+
 ### Fixed
 - **Thumbnail: mid-decode storage/verification I/O errors no longer masquerade as client 400s** (`internal/thumbnail/slot_open.go`, `internal/thumbnail/ctx_reader.go`, `internal/api/rest/thumbnail.go`, `internal/thumbnail/source_read_test.go`, `internal/api/rest/thumbnail_test.go`)
   - `generateLocked` previously flattened **every** non-context decode-pipeline error into `ErrUnsupported` → REST 400 `InvalidArgument` ("not an image"). The stdlib codecs surface caller-supplied source-read errors unwrapped with identity (jpeg `fill` n==0 path, png `ReadFull`), so a storage failure surfacing mid-stream — local FS I/O error, S3/OSS/COS network error, or an on-read `ETagVerifier` checksum mismatch (`STORAGE_VERIFY_ON_READ`) — was indistinguishable from a corrupt image: no 5xx for monitoring/alerts, clients never retried, integrity failures were reported as "not an image".

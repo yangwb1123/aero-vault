@@ -62,6 +62,7 @@ var (
 	mThumbnailCacheHits      metric.Int64Counter
 	mThumbnailCacheMisses    metric.Int64Counter
 	mThumbnailCacheEvictions metric.Int64Counter
+	mThumbnail304            metric.Int64Counter
 )
 
 func initDomain() {
@@ -112,6 +113,7 @@ func initDomain() {
 		mThumbnailCacheHits, _ = m.Int64Counter("thumbnail.cache.hits_total")
 		mThumbnailCacheMisses, _ = m.Int64Counter("thumbnail.cache.misses_total")
 		mThumbnailCacheEvictions, _ = m.Int64Counter("thumbnail.cache.evictions_total")
+		mThumbnail304, _ = m.Int64Counter("thumbnail.304_total")
 	})
 }
 

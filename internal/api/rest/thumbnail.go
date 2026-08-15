@@ -16,8 +16,19 @@ import (
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
+
+// thumbFreshnessMaxAge bounds the client-side freshness of the derived
+// thumbnail resource (package constant, not config). The thumbnail URL
+// carries no version pin, so a PUT that replaces the source object is
+// invisible to caches keyed on the URL; bounded freshness (max-age) plus
+// must-revalidate (RFC 9111 §5.2.2.2) forces revalidation once the window
+// lapses, which engages the If-None-Match/re-Stat machinery below — a
+// replaced object is observed within this window instead of up to the
+// historical 24 h.
+const thumbFreshnessMaxAge = 300
 
 // GET /v1/files/<key>/thumbnail?w=&h=
 // Generates a JPEG thumbnail of an image object on demand. The response carries
@@ -167,17 +178,23 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	// external anonymous caller under the current policy. An authenticated
 	// request proves nothing about public readability (the caller may hold
 	// private access), so its response is private (client-local cache only).
-	cacheControl := "private, max-age=86400"
+	// No Vary: Authorization is emitted (RFC 9110 §12.5.5 SHOULD) — accepted:
+	// the bytes are identical across classes (public is reached only for
+	// genuinely public-readable objects), contamination is one-way (private
+	// responses are never stored by shared caches), and the bounded window
+	// below caps any mislabeled entry's lifetime.
+	cacheControl := fmt.Sprintf("private, max-age=%d, must-revalidate", thumbFreshnessMaxAge)
 	if auth.IsAnonymous(r.Context()) {
-		cacheControl = "public, max-age=86400"
+		cacheControl = fmt.Sprintf("public, max-age=%d, must-revalidate", thumbFreshnessMaxAge)
 	}
 	if etagListMatches(r.Header.Get("If-None-Match"), statETag) {
 		// Re-observe the object before certifying Not Modified. The pre-open
 		// Stat above and this emission are separate moments: a concurrent PUT
 		// between them would otherwise pair a stale validator with 304, and a
 		// shared cache holding the OLD derived thumbnail would keep serving it
-		// (Cache-Control public|private, max-age=86400) with no subsequent PUT
-		// invalidating the derived resource. The re-Stat is a repository read
+		// (Cache-Control public|private, max-age=300, must-revalidate) until
+		// the bounded window lapses — no subsequent PUT invalidates the
+		// derived resource. The re-Stat is a repository read
 		// only — no stream, no decode slot — so the fast path stays slot-free
 		// and stream-free. The 304's validator and Last-Modified are pinned to
 		// THIS observation (RFC 9110 §13.1.2: conditions evaluate against the
@@ -194,11 +211,21 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		if etagListMatches(r.Header.Get("If-None-Match"), freshETag) {
 			w.Header().Set("ETag", `"`+freshETag+`"`)
 			w.Header().Set("Last-Modified", fresh.UpdatedAt.UTC().Format(http.TimeFormat))
-			// The 304 must mirror the 200's directive (RFC 9111 §4.3.4 freshening;
-			// the public/private split itself is per §3.2): a
-			// shared cache revalidating a private thumb would otherwise adopt
-			// the 304's (absent) directive and store the previous public body.
+			// The 304 must mirror the 200's directive (RFC 9111 §4.3.5: the
+			// 304's header fields update the stored response, so a divergent
+			// directive would rewrite the stored freshness; the
+			// public/private split itself is per §3.2). A shared cache
+			// revalidating a private thumb keeps the bounded directive
+			// (thumbFreshnessMaxAge + must-revalidate), and one holding the
+			// anonymous public entry cannot have its stored directive
+			// rewritten to private by an authenticated 304.
 			w.Header().Set("Cache-Control", cacheControl)
+			// Revalidation observability: bounded client freshness converts
+			// silent cache hits into these conditionals (per client per URL
+			// per window); each certified 304 costs three repo point reads
+			// (dispatch Stat, pre-open Stat, re-Stat) — no stream, no decode
+			// slot.
+			telemetry.IncThumbnail304(r.Context())
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}

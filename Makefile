@@ -143,7 +143,7 @@ test-race-thumbnail:
 # suite by scoping to the cache test names.
 test-race-rest-cache:
 	@echo "[check] data race detection (REST thumbnail cache path) ..."
-	go test -race -count=1 -timeout 300s -run 'ThumbnailCache|Thumbnail.*Cache' ./internal/api/rest/
+	go test -race -count=1 -timeout 300s -run 'ThumbnailCache|Thumbnail.*(Cache|Revalid)' ./internal/api/rest/
 	@echo "  OK (no races detected)"
 
 .PHONY: test-race-rest-cache
