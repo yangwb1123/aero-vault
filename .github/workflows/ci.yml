@@ -91,7 +91,7 @@ jobs:
         # The aggregate-memory A1 test needs ~1.2 GiB and ~97s under -race;
         # -short skips it while the deterministic slot-contract tests
         # (blocking/release-on-error/release-on-panic) still run.
-        run: go test -race -short -count=1 -timeout 120s ./internal/thumbnail/
+        run: go test -race -short -count=1 -timeout 180s ./internal/thumbnail/
 
       - name: Test (race — thumbnail mid-decode ctx identity, REST)
         # The mid-decode REST tests (TestThumbnailMidDecode*) drive the

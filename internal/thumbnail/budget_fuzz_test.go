@@ -210,3 +210,29 @@ func runCancelLeg(t *testing.T, stream io.Reader) error {
 	}
 	return nil // unreachable
 }
+
+// TestGenerateCanceledCtxOversizedDims is the C1 deterministic pin: the ctx
+// fast-fail at slot acquisition PRECEDES the dimension pre-check, so a
+// canceled request carrying oversized declared dims must classify as
+// context.Canceled — never ErrImageTooLarge. A reorder of the two gates
+// (dims check before the ctx check) would silently flip the wire class for
+// dead requests and fail this test.
+func TestGenerateCanceledCtxOversizedDims(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// 100000² declared dims: would be ErrImageTooLarge on a live request.
+	bomb := headerOnlyPNG(t, 100000, 100000, 8, 6)
+	if _, err := GenerateContext(ctx, bytes.NewReader(bomb), 100, 100); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled ctx + oversized dims: err = %v, want context.Canceled (ctx fast-fail precedes the dims gate)", err)
+	}
+	// Live control: the same fixture on a live ctx is the dims class.
+	if _, err := Generate(bytes.NewReader(bomb), 100, 100); !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("live ctx + oversized dims: err = %v, want ErrImageTooLarge", err)
+	}
+	// The fuzz-shaped seed (budget target, canceled variant) must also
+	// classify Canceled, not the dims sentinel: the same ordering pin at the
+	// fuzz-target boundary.
+	if _, err := GenerateContext(ctx, bytes.NewReader(headerOnlyPNG(t, 8192, 8192, 16, 6)), 100, 100); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled ctx + depth-16 at 8192: err = %v, want context.Canceled", err)
+	}
+}
