@@ -236,6 +236,8 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	if auth.IsAnonymous(r.Context()) {
 		cacheControl = fmt.Sprintf("public, max-age=%d, must-revalidate", thumbFreshnessMaxAge)
 	}
+	// Unpinned X-Version-Id emission needs the bucket versioning gate (S3 parity).
+	versioning := version != "" || h.bucketVersioning(r.Context(), tenant)
 	// Conditional re-observation gate: an INM match OR an IMS-only request
 	// (no INM header) enters the re-Stat block — the IMS arm needs the fresh
 	// observation to evaluate the date comparison (RFC 9110 §13).
@@ -282,9 +284,8 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		if inmHit || imsHit {
 			w.Header().Set("ETag", `"`+freshETag+`"`)
 			w.Header().Set("Last-Modified", fresh.UpdatedAt.UTC().Format(http.TimeFormat))
-			if version != "" && fresh.VersionID != "" {
-				// Version-pinned revalidation: the cache entry is keyed to one
-				// immutable version, so the 304 must name it (Get parity).
+			if (version != "" || versioning) && fresh.VersionID != "" {
+				// The 304 names the re-observed version: the pin (immutable) or the current one.
 				w.Header().Set("X-Version-Id", fresh.VersionID)
 			}
 			w.Header().Set("ETag", `"`+freshETag+`"`)
@@ -483,11 +484,15 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 	w.Header().Set("Content-Length", strconv.Itoa(len(img)))
 	w.Header().Set("Cache-Control", cacheControl)
-	if version != "" && opened != nil && opened.VersionID != "" {
-		// Version-pinned derivation: the 200 names the pinned version whose
-		// bytes were decoded (Get parity; the cache key already pins it, the
-		// header makes it observable to clients and caches).
-		w.Header().Set("X-Version-Id", opened.VersionID)
+	versionID := obj.VersionID
+	if opened != nil && opened.VersionID != "" {
+		versionID = opened.VersionID // miss path: the bytes actually decoded (concurrent-PUT-safe)
+	}
+	if versionID != "" && (version != "" || versioning) {
+		// 200 names the served version: opened (miss) or the pre-open Stat
+		// (hit — the cache key derives from that Stat's ETag, so obj.VersionID
+		// describes the served bytes).
+		w.Header().Set("X-Version-Id", versionID)
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(img)

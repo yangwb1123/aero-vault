@@ -70,3 +70,14 @@ func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (
 	}
 	return h.svc.StatVersionWithOptions(ctx, tenant, service.DefaultBucket, key, version, service.ReadOptions{})
 }
+
+// bucketVersioning reports whether the default bucket has versioning enabled.
+// It gates unpinned X-Version-Id emission on the thumbnail path (S3
+// writeCurrentVersionHeader parity): the repository's internal version_id is
+// non-empty on every object row — also on unversioned PUTs — so only the
+// bucket flag, never the row's VersionID, may decide unpinned emission.
+// Errors fail closed (no header), mirroring the S3 adapter.
+func (h *Handler) bucketVersioning(ctx context.Context, tenant string) bool {
+	cfg, err := h.svc.GetBucketConfig(ctx, tenant, service.DefaultBucket)
+	return err == nil && cfg.Versioning
+}

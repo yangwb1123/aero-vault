@@ -733,6 +733,16 @@ func TestThumbnailVersionPinnedCache(t *testing.T) {
 	if !bytes.Equal(body1, body2) {
 		t.Fatal("repeat pinned requests must serve identical bodies")
 	}
+	// The 200 names the pinned version on BOTH paths: the miss response
+	// derives it from the opened object, the hit response (no opener, no
+	// slot, no decode) from the pre-open Stat whose ETag seeded the cache
+	// key — version rows are immutable, so the two values are identical.
+	if got := resp1.Header.Get("X-Version-Id"); got != v1ID {
+		t.Fatalf("miss 200 X-Version-Id=%q want %q", got, v1ID)
+	}
+	if got := resp2.Header.Get("X-Version-Id"); got != v1ID {
+		t.Fatalf("hit 200 X-Version-Id=%q want %q", got, v1ID)
+	}
 }
 
 // TestThumbnailVersionPinnedBadPin404 pins AC4: a pin naming no readable
@@ -758,6 +768,104 @@ func TestThumbnailVersionPinnedBadPin404(t *testing.T) {
 	}
 	if after := store.gets.Load(); after != before {
 		t.Fatalf("storage gets changed by bad-pin requests: before=%d after=%d — no blob may be opened", before, after)
+	}
+}
+
+// TestThumbnailVersionedUnpinnedCacheHeader pins FR-2/FR-3/FR-4: on a
+// versioned bucket an unpinned thumbnail request serves bytes of one
+// immutable current version, so the miss 200, the cache-hit 200, and the 304
+// must ALL name it via X-Version-Id (S3 writeCurrentVersionHeader parity —
+// the S3 surface already emits x-amz-version-id on exactly this case). The
+// value comes from opened.VersionID on the miss, obj.VersionID (the pre-open
+// Stat whose ETag seeded the cache key) on the hit, and the fresh re-Stat on
+// the 304 — three observations of the same row.
+func TestThumbnailVersionedUnpinnedCacheHeader(t *testing.T) {
+	srv, store, svc, _ := newThumbnailCacheREST(t, true, 0)
+	if err := svc.SetBucketVersioning(context.Background(), "default", "default", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	u := srv.URL + "/v1/files/photo.jpg"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	// Newest-first; captured AFTER the second PUT, whose distinct bytes give
+	// v2 a distinct ETag — so the first GET below is a deterministic miss.
+	versions, err := svc.ListVersions(context.Background(), "default", "default", "photo.jpg")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	v2ID := versions[0].VersionID
+
+	thumbURL := u + "/thumbnail?w=32&h=32"
+	before := store.gets.Load()
+	resp1, body1 := req(t, "GET", thumbURL, nil, nil)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("miss GET: %d want 200", resp1.StatusCode)
+	}
+	resp2, body2 := req(t, "GET", thumbURL, nil, nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("hit GET: %d want 200", resp2.StatusCode)
+	}
+	if delta := store.gets.Load() - before; delta != 1 {
+		t.Fatalf("storage gets delta=%d want exactly 1 (first is a miss; second is a cache hit)", delta)
+	}
+	if !bytes.Equal(body1, body2) {
+		t.Fatal("repeat unpinned requests on a versioned bucket must serve identical bodies")
+	}
+	etag := resp1.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("miss 200 must carry an ETag for the 304 revalidation")
+	}
+	resp3, _ := req(t, "GET", thumbURL, nil, map[string]string{"If-None-Match": etag})
+	if resp3.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional GET: %d want 304", resp3.StatusCode)
+	}
+	for i, resp := range []*http.Response{resp1, resp2, resp3} {
+		if got := resp.Header.Get("X-Version-Id"); got != v2ID {
+			t.Fatalf("response %d X-Version-Id=%q want %q (miss 200, hit 200, and 304 must name the same version)", i+1, got, v2ID)
+		}
+	}
+}
+
+// TestThumbnailUnversionedNoVersionHeader pins FR-5 (the V-1 amendment): an
+// unversioned bucket stays wire-identical to today — the repository's
+// internal version_id is non-empty on EVERY object row (also on unversioned
+// PUTs), so only the bucket-versioning flag gate, never row non-emptiness,
+// may decide emission. All three response kinds must carry no header.
+func TestThumbnailUnversionedNoVersionHeader(t *testing.T) {
+	srv, store, _, _ := newThumbnailCacheREST(t, true, 0) // no SetBucketVersioning
+	u := srv.URL + "/v1/files/img.png"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	thumbURL := u + "/thumbnail?w=32&h=32"
+	before := store.gets.Load()
+	resp1, _ := req(t, "GET", thumbURL, nil, nil)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first GET: %d want 200", resp1.StatusCode)
+	}
+	resp2, _ := req(t, "GET", thumbURL, nil, nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second GET: %d want 200", resp2.StatusCode)
+	}
+	if delta := store.gets.Load() - before; delta != 1 {
+		t.Fatalf("storage gets delta=%d want exactly 1 (second is a cache hit)", delta)
+	}
+	etag := resp1.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("first GET must carry an ETag for the 304 revalidation")
+	}
+	resp3, _ := req(t, "GET", thumbURL, nil, map[string]string{"If-None-Match": etag})
+	if resp3.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional GET: %d want 304", resp3.StatusCode)
+	}
+	for i, resp := range []*http.Response{resp1, resp2, resp3} {
+		if got := resp.Header.Get("X-Version-Id"); got != "" {
+			t.Fatalf("unversioned bucket response %d must not carry X-Version-Id (got %q)", i+1, got)
+		}
 	}
 }
 
