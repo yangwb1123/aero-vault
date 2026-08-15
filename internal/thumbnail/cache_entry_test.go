@@ -475,3 +475,68 @@ func BenchmarkGenerateContextWithOpenerCachedHit(b *testing.B) {
 		}
 	}
 }
+
+// TestCacheETagShapeGateDeadCtxAndStats pins QA F-1/F-2/F-3:
+//   - F-1: a dead context fast-fails BEFORE the shape gate — a canceled
+//     request with a non-MD5 ETag returns ctx.Err() (classification:
+//     Canceled → silent, DeadlineExceeded → 504), never an opener call.
+//   - F-2: bypass counts nothing — Stats() stays zero across bypass calls.
+//   - F-3: every non-admissible shape class bypasses (the design's own
+//     failure-mode table): empty, quoted, uppercase hex, multipart
+//     "<md5>-<n>", 31/33-char, dash-in-32, non-hex-in-32, mixed case.
+func TestCacheETagShapeGateDeadCtxAndStats(t *testing.T) {
+	data := makePNG(t, 64, 64)
+
+	// F-1: dead ctx precedes the shape gate.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c := NewCache(1<<20, 0)
+	var opens atomic.Int64
+	_, _, err := GenerateContextWithOpenerCached(ctx, c, "t1", "e1", 32, 32, countingOpener3(data, "e1", &opens))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dead ctx + non-MD5: err = %v, want context.Canceled (fast-fail precedes the shape gate)", err)
+	}
+	if n := opens.Load(); n != 0 {
+		t.Fatalf("opener invoked %d times on a dead request, want 0", n)
+	}
+
+	// F-2 + F-3: the multi-shape-class matrix bypasses with zero counting.
+	badShapes := []string{
+		"",                                   // empty
+		`"0123456789abcdef0123456789abcdef"`, // quoted
+		"0123456789ABCDEF0123456789ABCDEF",   // uppercase hex
+		"abc123def4567890abcdef1234567890-3", // multipart
+		"0123456789abcdef0123456789abcde",    // 31 chars
+		"0123456789abcdef0123456789abcdef0",  // 33 chars
+		"0123456789abcdef-1234567890abcdef",  // dash inside 32
+		"0123456789abcdef0123456789abcdeg",   // non-hex inside 32
+		"0123456789ABCDEF0123456789abcdef",   // mixed case
+	}
+	for _, et := range badShapes {
+		t.Run("shape "+et[:min(len(et), 12)], func(t *testing.T) {
+			c := NewCache(1<<20, 0)
+			var opens atomic.Int64
+			out, from, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", et, 32, 32, countingOpener3(data, et, &opens))
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if from {
+				t.Fatal("non-MD5 shape must never report a hit")
+			}
+			if opens.Load() != 1 {
+				t.Fatalf("opener invoked %d times, want 1", opens.Load())
+			}
+			if c.Len() != 0 || c.Bytes() != 0 {
+				t.Fatalf("non-MD5 shape must never be stored: Len=%d Bytes=%d", c.Len(), c.Bytes())
+			}
+			// F-2: zero counting — Stats is the observable proxy.
+			hits, misses, evictions := c.Stats()
+			if hits != 0 || misses != 0 || evictions != 0 {
+				t.Fatalf("bypass counted: hits=%d misses=%d evictions=%d, want all zero", hits, misses, evictions)
+			}
+			if len(out) == 0 {
+				t.Fatal("bypass must still produce the thumbnail bytes")
+			}
+		})
+	}
+}

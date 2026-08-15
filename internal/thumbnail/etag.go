@@ -10,6 +10,15 @@ package thumbnail
 // provider quirks, SSE-KMS non-MD5 values) is not content-derived and must
 // bypass the cache. A manual scan rather than a regexp: identical semantics
 // with zero per-call compile/allocation cost on the request path.
+//
+// Residual risk (documented, accepted): the shape test is NOT
+// collision-resistance. MD5 pre-image/collision attacks are out of scope
+// for a cache identity claim — a deliberate collision would require
+// attacker-chosen bytes AND attacker control of the storage ETag, and the
+// worst outcome is a wrong cached thumbnail served until eviction, never a
+// confidentiality breach (the payload is a public-or-private derived image
+// the caller could already fetch). The cache is bounded (THUMBNAIL_CACHE_BYTES)
+// and TTL-bounded, so a poisoned entry self-heals.
 func ContentMD5ETag(etag string) bool {
 	if len(etag) != 32 {
 		return false
