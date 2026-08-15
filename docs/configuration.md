@@ -448,7 +448,13 @@ the (already-open) stream is closed. Stream failures caused by the request
 context surface as the context error (504 `Timeout` for a server-side deadline,
 silent return on client disconnect), never as an invalid-image error;
 object-stream open failures classify as the underlying object error
-(404/403/409/…), never as an image error.
+(404/403/409/…), never as an image error. Mid-decode **source-stream** failures
+(storage I/O, on-read verification with `STORAGE_VERIFY_ON_READ`) classify as
+the underlying storage error — 500 `InternalError`, or 410 `ObjectCorrupt` when
+on-read verification reports a checksum mismatch — never as 400; only
+truncation/corrupt bytes surfacing as EOF keep the 400 `InvalidArgument`
+"not an image" classification (server-side truncation is indistinguishable
+from client truncation at this boundary).
 
 **Deployment prerequisite:** set `MAX_INFLIGHT_REQUESTS` and/or `RATE_LIMIT_RPS`
 > 0 in production. The semaphore bounds in-flight *decodes* (4), not the number

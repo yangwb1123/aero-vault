@@ -22,6 +22,43 @@ func (e *OpenError) Error() string { return "thumbnail: open object stream: " + 
 
 func (e *OpenError) Unwrap() error { return e.Err }
 
+// SourceReadError wraps an error returned by the caller-supplied source
+// stream mid-decode. It lets callers distinguish storage/verification read
+// failures that surface through the codec read chains (local FS I/O, S3/OSS/
+// COS network errors, an on-read ETagVerifier checksum mismatch) from
+// codec-synthesized decode errors (image.ErrFormat, jpeg/png FormatError,
+// io.ErrUnexpectedEOF from truncation) and from context errors, which stay
+// unwrapped. The sets are disjoint, so errors.As on *SourceReadError before
+// sentinel checks is exact (same contract as OpenError).
+type SourceReadError struct{ Err error }
+
+func (e *SourceReadError) Error() string {
+	return "thumbnail: reading image source stream: " + e.Err.Error()
+}
+
+func (e *SourceReadError) Unwrap() error { return e.Err }
+
+// sourceReadMarker marks non-EOF, non-context errors returned by the source
+// stream so the decode sites can classify them as *SourceReadError instead
+// of flattening them into ErrUnsupported. io.EOF passes through unmarked
+// (truncated/corrupt objects keep classifying as ErrUnsupported → 400), as
+// do errors matching context.DeadlineExceeded/Canceled via errors.Is
+// (wrapped-SDK context errors keep their exact-instance contract at the
+// decode sites). A partial read carrying an error keeps its n; a (0,nil)
+// read passes through (no busy-loop synthesis).
+type sourceReadMarker struct{ r io.Reader }
+
+func (m *sourceReadMarker) Read(p []byte) (int, error) {
+	n, err := m.r.Read(p)
+	if err == nil || errors.Is(err, io.EOF) {
+		return n, err
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return n, err
+	}
+	return n, &SourceReadError{Err: err}
+}
+
 // open3 is the opener contract shared by the generation entry points: it
 // returns the object stream plus the opened object's source ETag. The cached
 // entry point uses the ETag to verify content identity before storing (a
@@ -98,7 +135,11 @@ func generateContextWithOpener3(ctx context.Context, maxW, maxH int, open open3)
 // at every emitted byte via the context-checking encode writer (plus a
 // terminal ctx.Err() check after Encode returns), and inside the decode
 // phase: payload reads through the context-checking reader (ctx_reader.go)
-// abort at the next codec buffer fill.
+// abort at the next codec buffer fill. Source-stream read failures (storage
+// I/O, on-read verification) surface through the sourceReadMarker as
+// *SourceReadError — a server-side error class — instead of ErrUnsupported;
+// only codec-synthesized errors and EOF/truncation keep classifying as
+// ErrUnsupported.
 func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
 	// Single source of truth for the dimension rule: generateLocked and the
 	// REST handler both derive effective bounds from EffectiveDims, so the
@@ -111,6 +152,15 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// airtight. The wait now honors ctx — a parked caller unblocks on cancel
 	// and never reaches the decode section; waiters allocate nothing and hold
 	// no stream.
+	// Mark source-stream read failures (storage I/O, on-read verification)
+	// at the module boundary: the codecs surface them unwrapped (jpeg fill /
+	// png ReadFull), and the sites below classify marked errors as
+	// *SourceReadError instead of ErrUnsupported. The marker sits INSIDE the
+	// LimitReader so the limit's synthesized EOF is never marked, and
+	// outside the ctxReader so the payload path's raw ctx.Err() aborts
+	// unmarked. errMetadataBudgetExceeded is synthesized by limitedBuffer
+	// (the tee write side), never by the source — unaffected.
+	r = &sourceReadMarker{r: r}
 	r = io.LimitReader(r, MaxSourceBytes)
 
 	// Header-only dimension pre-check: no pixel buffer is ever allocated for
@@ -146,6 +196,15 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return nil, err
+		}
+		// A marked source-stream failure (storage I/O, on-read verification)
+		// is a server-side error, never a client "not an image": surface the
+		// marked instance itself (identity preserved, never re-wrapped). Only
+		// unmarked errors reach this branch (the marker exempts EOF and
+		// context sentinels), so the classification is exact.
+		var sre *SourceReadError
+		if errors.As(err, &sre) {
+			return nil, sre
 		}
 		return nil, ErrUnsupported
 	}
@@ -208,7 +267,9 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 			}
 			// Any other read error (EOF/truncation/generic): stop the walk
 			// with orientation 1 and let Decode re-encounter the same bytes
-			// and error, so classification (→ ErrUnsupported) is unchanged.
+			// and error — marked source-stream errors re-surface as
+			// *SourceReadError (server error class); codec/truncation errors
+			// classify as before (→ ErrUnsupported).
 			pngOrient = 1
 		}
 		decodeR = io.MultiReader(bytes.NewReader(head.buf.Bytes()), bytes.NewReader(replay.buf.Bytes()), payloadR)
@@ -226,6 +287,14 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return nil, err
+		}
+		// Same marked-error classification as the DecodeConfig branch: a
+		// source-stream failure (storage I/O, on-read verification) that
+		// surfaces mid-payload is a server-side error — return the marked
+		// instance itself, never ErrUnsupported (identity preserved).
+		var sre *SourceReadError
+		if errors.As(err, &sre) {
+			return nil, sre
 		}
 		return nil, ErrUnsupported
 	}

@@ -37,6 +37,11 @@ import (
 // (REQUEST_TIMEOUT_SECONDS in the REST handler, which maps DeadlineExceeded →
 // 504 and Canceled → silent return); a bare context.Background never expires.
 //
+// Non-context source-stream errors (storage I/O, on-read verification) are
+// marked at the module boundary by sourceReadMarker (slot_open.go), which
+// wraps the raw source inside the LimitReader but outside this reader; this
+// reader itself is unchanged — it only ever returns ctx.Err().
+//
 // Accepted residual (F6-test): the REST E10 tests (internal/api/rest/thumbnail_test.go,
 // TestThumbnailMidDecode*) pin error classification (504 / silent return) only;
 // the promptness property itself (≤ 4 KiB over-read, stream not drained, slot

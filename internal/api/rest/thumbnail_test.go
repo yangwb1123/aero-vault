@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"image"
@@ -1229,6 +1230,58 @@ func (r *drainGateReadCloser) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// failAfterStore delegates every Storage method except Get: Get returns the
+// real object stream wrapped in a failAfterReadCloser that serves failAfter
+// real bytes, then returns err (sticky) on every further read — modeling a
+// storage backend that drops mid-stream (S3/OSS network error) or an on-read
+// ETagVerifier mismatch surfacing mid-decode (STORAGE_VERIFY_ON_READ). The
+// error is sticky — the storage-SDK norm — so the PNG orientation walk's
+// deferral re-encounters the same failure at the Decode site.
+type failAfterStore struct {
+	storage.Storage
+	failAfter int
+	err       error
+}
+
+func (s *failAfterStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.ObjectInfo, error) {
+	rc, info, err := s.Storage.Get(ctx, key)
+	if err != nil {
+		return nil, info, err
+	}
+	return &failAfterReadCloser{ReadCloser: rc, failAfter: s.failAfter, err: s.err}, info, nil
+}
+
+// failAfterReadCloser keeps the underlying stream's Close (releasing the
+// pinned object) while routing Read through a fail-after-N-bytes reader.
+// The read that crosses the boundary returns the injected error alongside
+// its partial n (io.ReadFull surfaces it immediately; jpeg fill swallows
+// (n>0, err) and the sticky error resurfaces on the next fill).
+type failAfterReadCloser struct {
+	io.ReadCloser
+	failAfter int
+	err       error
+	off       int
+}
+
+func (r *failAfterReadCloser) Read(p []byte) (int, error) {
+	remaining := r.failAfter - r.off
+	if remaining <= 0 {
+		return 0, r.err
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	n, err := r.ReadCloser.Read(p)
+	r.off += n
+	if err != nil {
+		return n, err
+	}
+	if r.off >= r.failAfter {
+		return n, r.err // boundary crossed: surface the injected failure now
+	}
+	return n, nil
+}
+
 // TestThumbnailMidDecodeDeadlineIs504 pins the mid-decode deadline path
 // (AC-2): a request-scoped timeout that fires while the storage stream is
 // read inside the decode section — after slot acquisition — must surface as
@@ -1264,6 +1317,96 @@ func TestThumbnailMidDecodeDeadlineIs504(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte(`"code":"Timeout"`)) {
 		t.Fatalf("expected code Timeout, body: %s", body)
+	}
+}
+
+// TestThumbnailMidDecodeStorageError pins the REST classification of
+// mid-decode source-stream failures (AC-2): a storage/verification read
+// failure that surfaces inside the decode pipeline — after the slot is held
+// and the object stream is open — must map to a server-side status (500
+// InternalError for I/O failures, 410 ObjectCorrupt for an on-read
+// ETagVerifier mismatch), never 400 InvalidArgument ("not an image"). The
+// truncation control row proves the same fixture still classifies corrupt
+// bytes as 400 — the marker's io.EOF exemption preserved end to end.
+func TestThumbnailMidDecodeStorageError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "storage IO failure",
+			err:        fmt.Errorf("s3 read failed: %w", errors.New("i/o error")),
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "InternalError",
+		},
+		{
+			name:       "on-read verification mismatch",
+			err:        fmt.Errorf("%w: expected abc, computed xyz", service.ErrObjectCorrupt),
+			wantStatus: http.StatusGone,
+			wantCode:   "ObjectCorrupt",
+		},
+		{
+			name:       "truncation control",
+			err:        io.EOF,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "InvalidArgument",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "mid.db"))
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if err := repo.Migrate(context.Background()); err != nil {
+				t.Fatalf("migrate: %v", err)
+			}
+			store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+			png := pngBytes(t, 64, 64)
+			h := NewHandler(service.NewFileService(
+				&failAfterStore{Storage: store, failAfter: len(png) / 2, err: tc.err}, repo, nil), nil)
+			// No route deadline: the injected error — not a context error —
+			// must be what surfaces.
+			h.thumbnailTimeout = 0
+			r := chi.NewRouter()
+			r.Put("/v1/files/*", h.putKey)
+			r.Get("/v1/files/*", h.getKey)
+			srv := httptest.NewServer(r)
+			t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+			u := srv.URL + "/v1/files/img.png"
+			if resp, _ := req(t, "PUT", u, png, map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+				t.Fatalf("PUT img.png: %d", resp.StatusCode)
+			}
+			resp, body := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, nil)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("mid-decode storage error: status=%d want %d (body=%q)", resp.StatusCode, tc.wantStatus, body)
+			}
+			if !bytes.Contains(body, []byte(`"code":"`+tc.wantCode+`"`)) {
+				t.Fatalf("expected code %s, body: %s", tc.wantCode, body)
+			}
+			if tc.wantCode != "InvalidArgument" {
+				// The whole point of the change: server-side failures never
+				// masquerade as client argument errors.
+				if bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+					t.Fatalf("server-side failure must not classify as InvalidArgument, body: %s", body)
+				}
+				// Error paths must carry no cache validators (emitted only on
+				// the 200 branch; a handler edit that set them before
+				// writeError would pollute shared caches).
+				if et := resp.Header.Get("ETag"); et != "" {
+					t.Fatalf("%s path emitted ETag %q", tc.wantCode, et)
+				}
+				if cc := resp.Header.Get("Cache-Control"); cc != "" {
+					t.Fatalf("%s path emitted Cache-Control %q", tc.wantCode, cc)
+				}
+				if tc.wantCode == "InternalError" && !bytes.Contains(body, []byte("s3 read failed")) {
+					t.Fatalf("expected the injected error message in the body, got: %s", body)
+				}
+			}
+		})
 	}
 }
 

@@ -4,6 +4,16 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ---
 
+## 2026-08-15
+
+### Fixed
+- **Thumbnail: mid-decode storage/verification I/O errors no longer masquerade as client 400s** (`internal/thumbnail/slot_open.go`, `internal/thumbnail/ctx_reader.go`, `internal/api/rest/thumbnail.go`, `internal/thumbnail/source_read_test.go`, `internal/api/rest/thumbnail_test.go`)
+  - `generateLocked` previously flattened **every** non-context decode-pipeline error into `ErrUnsupported` → REST 400 `InvalidArgument` ("not an image"). The stdlib codecs surface caller-supplied source-read errors unwrapped with identity (jpeg `fill` n==0 path, png `ReadFull`), so a storage failure surfacing mid-stream — local FS I/O error, S3/OSS/COS network error, or an on-read `ETagVerifier` checksum mismatch (`STORAGE_VERIFY_ON_READ`) — was indistinguishable from a corrupt image: no 5xx for monitoring/alerts, clients never retried, integrity failures were reported as "not an image".
+  - New exported `thumbnail.SourceReadError` + an internal `sourceReadMarker` wired as the first statement of `generateLocked` (inside the `LimitReader`, outside the `ctxReader`): every non-EOF, non-context error the source stream returns is wrapped and classified as a **server-side error** at both decode sites (DecodeConfig and Decode; the PNG orientation walk's deferral re-surfaces marked errors at the Decode site unchanged). The REST handler unwraps the class before the `ErrInvalidArgs` catch-all: the underlying error classifies via the existing `classify` — 500 `InternalError` for I/O failures, **410 `ObjectCorrupt`** for verification mismatches (matches Get/Stat's scrub-marked classification) — never 400.
+  - Preserved byte-for-byte: corrupt/truncated/non-image bytes → `ErrUnsupported` → 400 (the marker exempts `io.EOF`, and codec-synthesized errors never pass through it); context errors (504/silent) with exact-instance identity for wrapped sentinels; budget sentinels (413) and budget-wins-over-deadline ordering; open-phase `OpenError` classification; cache/ETag/304 semantics (error paths still emit no validators). No new config, no `openapi.json` change (the spec's `default` error entry already covers 500/410).
+
+---
+
 ## 2026-08-12
 
 ### Added

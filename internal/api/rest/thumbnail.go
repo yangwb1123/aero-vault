@@ -322,6 +322,18 @@ func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, r, thumbnail.ErrMetadataTooLarge)
 			return
 		}
+		// Mid-decode source-stream failures (storage I/O, on-read
+		// verification) are marked by the thumbnail module: classify the
+		// underlying error raw — default → 500 InternalError; an
+		// ETagVerifier mismatch wraps service.ErrObjectCorrupt → 410 — never
+		// 400 InvalidArgument. MUST precede the catch-all: its %v stringify
+		// would destroy the chain (same trap as the ErrMetadataTooLarge
+		// branch above).
+		var sre *thumbnail.SourceReadError
+		if errors.As(err, &sre) {
+			h.writeError(w, r, sre.Err)
+			return
+		}
 		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
 		return
 	}
