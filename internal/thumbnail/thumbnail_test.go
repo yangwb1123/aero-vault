@@ -395,9 +395,10 @@ func (s *maxSourceBytesJPEGPayload) Read(p []byte) (int, error) {
 
 // TestGenerateSourceBytesBound pins the MaxSourceBytes (128 MiB) read cap —
 // the only budget branch the 64 KiB fuzz cap cannot reach. A payload that
-// never terminates must abort at the cap with ErrUnsupported and bounded
-// reads (no hang, no unbounded consumption). Deleting the LimitReader in
-// Generate would fail this test and no other.
+// never terminates must abort at the cap with ErrSourceTooLarge — a
+// server-side processing-budget rejection, distinct from the corrupt-input
+// class — and bounded reads (no hang, no unbounded consumption). Deleting the
+// LimitReader in Generate would fail this test and no other.
 func TestGenerateSourceBytesBound(t *testing.T) {
 	base := appnPaddedJPEG(t, 0) // plain 8×8 JPEG, zero APP1 segments
 	i := bytes.Index(base, []byte{0xFF, 0xDA})
@@ -408,8 +409,8 @@ func TestGenerateSourceBytesBound(t *testing.T) {
 	prefix := base[:i+2+n] // entropy data cut; replaced by endless zeros
 	cnt := &countingReader{r: &maxSourceBytesJPEGPayload{prefix: prefix}}
 	img, err := Generate(cnt, 100, 100)
-	if img != nil || !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("expected ErrUnsupported with nil payload, got img!=nil=%v err=%v", img != nil, err)
+	if img != nil || !errors.Is(err, ErrSourceTooLarge) {
+		t.Fatalf("expected ErrSourceTooLarge with nil payload, got img!=nil=%v err=%v", img != nil, err)
 	}
 	if cnt.n > MaxSourceBytes+64<<10 {
 		t.Fatalf("read %d bytes, want <= %d", cnt.n, MaxSourceBytes+64<<10)
@@ -425,16 +426,54 @@ func TestGenerateRejectsNonImage(t *testing.T) {
 	}
 }
 
+// TestGenerateSourceTooLargeDiscriminates pins the class distinction between
+// a cap-hit (the MaxSourceBytes budget cut a still-alive source → server-side
+// budget rejection, ErrSourceTooLarge) and corrupt/garbage input (a
+// client-argument error, ErrUnsupported). The non-terminating fixture is the
+// same shape as TestGenerateSourceBytesBound's; the garbage control must
+// never be reclassified as a budget error.
+func TestGenerateSourceTooLargeDiscriminates(t *testing.T) {
+	// Cap-hit: a valid JPEG prefix through SOS followed by endless zeros
+	// never terminates, so the read cap aborts the decode with the budget
+	// sentinel and bounded reads (≤ MaxSourceBytes + one 64 KiB probe).
+	base := appnPaddedJPEG(t, 0)
+	i := bytes.Index(base, []byte{0xFF, 0xDA})
+	if i < 0 {
+		t.Fatal("no SOS marker in fixture")
+	}
+	n := int(binary.BigEndian.Uint16(base[i+2 : i+4]))
+	prefix := base[:i+2+n] // entropy data cut; replaced by endless zeros
+	cnt := &countingReader{r: &maxSourceBytesJPEGPayload{prefix: prefix}}
+	img, err := Generate(cnt, 100, 100)
+	if img != nil || !errors.Is(err, ErrSourceTooLarge) {
+		t.Fatalf("cap-hit: expected ErrSourceTooLarge with nil payload, got img!=nil=%v err=%v", img != nil, err)
+	}
+	if cnt.n > MaxSourceBytes+64<<10 {
+		t.Fatalf("cap-hit: read %d bytes, want <= %d", cnt.n, MaxSourceBytes+64<<10)
+	}
+	if cnt.n < MaxSourceBytes-1<<20 {
+		t.Fatalf("cap-hit: read %d bytes: cap not reached (want ~%d)", cnt.n, MaxSourceBytes)
+	}
+
+	// Corrupt control: garbage bytes stay ErrUnsupported (client-argument
+	// class) — never the budget sentinel.
+	if _, err := Generate(bytes.NewReader([]byte("not an image")), 100, 100); err != ErrUnsupported {
+		t.Fatalf("corrupt control: expected ErrUnsupported, got %v", err)
+	}
+}
+
 // FuzzGenerate drives Generate with arbitrary mutations of the existing
 // fixture shapes, asserting the package's documented contract: no panic;
-// errors are always nil or one of the three sentinels; a nil error yields a
+// errors are always nil or one of the four sentinels; a nil error yields a
 // decodable JPEG no larger than the requested bounds. The 64 KiB input cap
 // bounds per-iteration work (a hang surfaces as a fuzz worker timeout); the
 // module's MaxSourceBytes/MaxMetadataBytes budgets and the MaxSourceDim
 // pre-check bound the decoder side regardless of mutation. ErrMetadataTooLarge
-// is unreachable under the 64 KiB cap (budget is 8 MiB) and is pinned by
-// TestGenerateRejectsOversizedMetadata* / TestGenerateEndlessMetadata; it
-// stays in the accepted set so coverage becomes automatic if budgets change.
+// and ErrSourceTooLarge are both unreachable under the 64 KiB cap (the 8 MiB
+// metadata budget and the 128 MiB source cap are far above it) and are pinned
+// by TestGenerateRejectsOversizedMetadata* / TestGenerateEndlessMetadata /
+// TestGenerateSourceBytesBound; they stay in the accepted set so coverage
+// becomes automatic if budgets change.
 // The error-set assertion depends on jpeg.Encode's error being unreachable:
 // both of its error sources (the dims guard at >= 1<<16 and the sink write
 // path) are structurally impossible here — post-scale bounds are <= 64x64
@@ -505,7 +544,7 @@ func FuzzGenerate(f *testing.F) {
 		out, err := Generate(io.LimitReader(bytes.NewReader(data), 64<<10), 64, 64)
 		if err != nil {
 			if !errors.Is(err, ErrUnsupported) && !errors.Is(err, ErrImageTooLarge) &&
-				!errors.Is(err, ErrMetadataTooLarge) {
+				!errors.Is(err, ErrMetadataTooLarge) && !errors.Is(err, ErrSourceTooLarge) {
 				t.Fatalf("Generate returned non-sentinel error: %v", err)
 			}
 			return

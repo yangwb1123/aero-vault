@@ -46,6 +46,14 @@ var ErrImageTooLarge = errors.New("thumbnail: image dimensions exceed MaxSourceD
 // limit (internal/service/file.go).
 var ErrMetadataTooLarge = errors.New("thumbnail: image metadata exceeds MaxMetadataBytes")
 
+// ErrSourceTooLarge is returned when the compressed source stream is cut off
+// by the MaxSourceBytes (128 MiB) read cap while the source still carried
+// payload — a server-side processing-budget rejection. It is distinct from
+// ErrUnsupported (corrupt/non-image input → client 400), ErrImageTooLarge
+// (declared dimensions), and ErrMetadataTooLarge (metadata budget) so callers
+// can tell a source-payload-budget rejection from each of the others.
+var ErrSourceTooLarge = errors.New("thumbnail: source payload exceeds MaxSourceBytes")
+
 // errMetadataBudgetExceeded is the internal overflow cause written by
 // limitedBuffer. Generate maps it to ErrMetadataTooLarge; keeping the cause
 // unexported matches the package's sentinel pattern.
@@ -102,11 +110,12 @@ const (
 	MaxProgressiveSourceDim = 4096
 
 	// MaxSourceBytes caps the compressed input consumed per Generate call.
-	// A stream that ends before a complete image decodes within this cap
-	// yields ErrUnsupported (reject; never hang, never partially decode).
-	// The cap bounds reads, not object size: a stream whose image terminator
-	// appears before the cap decodes successfully even if the underlying
-	// object is larger.
+	// A stream whose payload exceeds the cap (the source still carries data
+	// at the cap) yields ErrSourceTooLarge — a server budget rejection; a
+	// stream that ends at or before the cap without a complete image yields
+	// ErrUnsupported (truncated/corrupt). The cap bounds reads, not object
+	// size: a stream whose image terminator appears before the cap decodes
+	// successfully even if the underlying object is larger.
 	MaxSourceBytes = 128 << 20
 
 	// MaxMetadataBytes caps what image.DecodeConfig may consume into the tee

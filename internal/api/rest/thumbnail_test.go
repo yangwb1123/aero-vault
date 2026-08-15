@@ -3222,6 +3222,75 @@ func TestThumbnailMetadataTooLargeClassifySeam(t *testing.T) {
 	}
 }
 
+// TestThumbnailSourceTooLargeClassifySeam pins the classify() seam for the
+// source-budget sentinel: the raw sentinel maps to 413 SourceTooLarge (RFC
+// 9110 §15.5.17 Payload Too Large — the request's source image payload
+// exceeds the server's 128 MiB compressed-input processing budget), while a
+// wrapped ErrInvalidArgs stays 400 InvalidArgument — the two classes must not
+// blur (cap-hit = server budget error vs. corrupt input = client argument
+// error).
+func TestThumbnailSourceTooLargeClassifySeam(t *testing.T) {
+	code, msg, status := classify(thumbnail.ErrSourceTooLarge)
+	if code != "SourceTooLarge" || status != http.StatusRequestEntityTooLarge || msg == "" {
+		t.Fatalf("classify(ErrSourceTooLarge) = (%q, %q, %d) want (SourceTooLarge, _, 413)", code, msg, status)
+	}
+	// The wrapped form (generic handler wrap) must NOT reach the 413 arm.
+	wrapped := fmt.Errorf("%w: %v", service.ErrInvalidArgs, thumbnail.ErrSourceTooLarge)
+	code, _, status = classify(wrapped)
+	if code != "InvalidArgument" || status != http.StatusBadRequest {
+		t.Fatalf("classify(wrapped ErrInvalidArgs) = (%q, %d) want (InvalidArgument, 400)", code, status)
+	}
+}
+
+// TestThumbnailSourceTooLarge pins the REST 413 SourceTooLarge arm at the
+// handler level: a valid JPEG whose payload exceeds the 128 MiB compressed
+// input cap (a prefix through SOS followed by zeros — the stream never
+// terminates) is rejected by the read cap mid-decode. This is a server-side
+// processing-budget rejection, distinct from corrupt input (400
+// InvalidArgument, TestThumbnailNonImage) and from the other two 413 classes
+// (ImageTooLarge: declared dims; MetadataTooLarge: metadata budget). The
+// If-None-Match control must not 304 (an error arm emits no validators), and
+// no cache headers may leak onto the 413 response.
+func TestThumbnailSourceTooLarge(t *testing.T) {
+	// Build the prefix-through-SOS JPEG prefix (same shape as the module
+	// fixture) and pad it with zeros past the cap: the stream never
+	// terminates, so decode aborts exactly at the read cap. Total body =
+	// len(prefix) + MaxSourceBytes + 1 (the prefix is PREPENDED, not
+	// overlaying zeros — a body of MaxSourceBytes+1-len(prefix) total would
+	// EOF short of the cap and classify as corrupt instead).
+	base := appnPaddedJPEG(t, 0)
+	i := bytes.Index(base, []byte{0xFF, 0xDA})
+	if i < 0 {
+		t.Fatal("no SOS marker in fixture")
+	}
+	n := int(binary.BigEndian.Uint16(base[i+2 : i+4]))
+	prefix := base[:i+2+n]
+	body := make([]byte, len(prefix)+thumbnail.MaxSourceBytes+1)
+	copy(body, prefix)
+
+	s := newRESTTest(t)
+	u := s.URL + "/v1/files/huge.jpg"
+	req(t, "PUT", u, body, map[string]string{"Content-Type": "image/jpeg"})
+	resp, respBody := req(t, "GET", u+"/thumbnail", nil, map[string]string{"If-None-Match": `"whatever"`})
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("source-budget thumbnail: status=%d want 413 (body=%s)", resp.StatusCode, respBody)
+	}
+	if !bytes.Contains(respBody, []byte(`"code":"SourceTooLarge"`)) {
+		t.Fatalf("expected code SourceTooLarge, body: %s", respBody)
+	}
+	if bytes.Contains(respBody, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("source-budget class must not be InvalidArgument, body: %s", respBody)
+	}
+	// Cache hygiene: the 413 error arm emits no validators (the INM control
+	// must not 304 — the status already proves it; the header check pins the
+	// response surface).
+	for _, h := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+		if v := resp.Header.Get(h); v != "" {
+			t.Fatalf("413 SourceTooLarge: %s=%q must be absent (cache hygiene)", h, v)
+		}
+	}
+}
+
 // oversizedMetadataJPEG builds a JPEG whose pre-SOF APPn metadata exceeds the
 // 8 MiB thumbnail metadata budget — mirroring the package-level fixture at
 // the protocol boundary (see internal/thumbnail/appnPaddedJPEG).

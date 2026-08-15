@@ -59,6 +59,47 @@ func (m *sourceReadMarker) Read(p []byte) (int, error) {
 	return n, &SourceReadError{Err: err}
 }
 
+// probeCapBytes bounds the single probe read sourceCapRecorder performs to
+// decide whether the MaxSourceBytes budget was exhausted mid-stream. It is
+// the only permitted over-read past the cap (pinned by the read-count
+// assertions: ≤ MaxSourceBytes + 64 KiB).
+const probeCapBytes = 64 << 10
+
+// sourceCapRecorder wraps the io.LimitReader output: a byte-exact passthrough
+// that records whether the limit's synthesized EOF cut a source stream that
+// still carried data (capped). On the first (0, io.EOF) it performs ONE
+// bounded probe read (≤ probeCapBytes) from the underlying source (the
+// sourceReadMarker-wrapped stream): n > 0, or a non-EOF error, means the
+// source was cut off mid-stream (capped = true); a (0, io.EOF) means the
+// source itself ended at or before the cap (capped = false — genuine
+// truncation stays ErrUnsupported). The probe reads through the marker (its
+// error classification is preserved; only the boolean is consulted) and
+// bypasses the DecodeConfig tee, so the metadata budget is unaffected. The
+// probe runs at most once (probed): a codec that keeps reading after EOF must
+// not re-probe.
+//
+// The recorder must wrap the LimitReader output (never sit inside it): the
+// marker stays inside the limit, so the limit's synthesized EOF is never
+// marked as a *SourceReadError, and the probe reads through the marker so its
+// result is only the capped boolean.
+type sourceCapRecorder struct {
+	r      io.Reader // the io.LimitReader output
+	src    io.Reader // the marker-wrapped source, for the probe
+	capped bool
+	probed bool
+}
+
+func (c *sourceCapRecorder) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if err == io.EOF && n == 0 && !c.probed {
+		c.probed = true
+		var buf [probeCapBytes]byte
+		n, perr := c.src.Read(buf[:])
+		c.capped = n > 0 || perr != io.EOF
+	}
+	return n, err
+}
+
 // open3 is the opener contract shared by the generation entry points: it
 // returns the object stream plus the opened object's source ETag. The cached
 // entry point uses the ETag to verify content identity before storing (a
@@ -161,7 +202,17 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// unmarked. errMetadataBudgetExceeded is synthesized by limitedBuffer
 	// (the tee write side), never by the source — unaffected.
 	r = &sourceReadMarker{r: r}
+	capSrc := r // marker-wrapped source: the cap probe reads through it
 	r = io.LimitReader(r, MaxSourceBytes)
+	// The cap recorder wraps the LimitReader OUTPUT (the marker stays inside
+	// the limit): it records whether the limit's synthesized EOF cut a source
+	// stream that still carried data. The probe reads through the marker, so
+	// the limit's EOF is never misread as a source failure, and the probe
+	// result is only the capped boolean — both decode sites classify
+	// capped → ErrSourceTooLarge (a server budget rejection), distinct from
+	// ErrUnsupported (truncated/corrupt input).
+	rec := &sourceCapRecorder{r: r, src: capSrc}
+	r = rec
 
 	// Header-only dimension pre-check: no pixel buffer is ever allocated for
 	// oversized sources. image.DecodeConfig consumes from the stream, and each
@@ -205,6 +256,14 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 		var sre *SourceReadError
 		if errors.As(err, &sre) {
 			return nil, sre
+		}
+		if rec.capped {
+			// The MaxSourceBytes read cap cut a still-alive source mid-decode:
+			// a server-side processing-budget rejection, not corrupt input.
+			// Structurally unreachable here (the 8 MiB metadata tee budget
+			// trips first); kept for budget-drift robustness, the same
+			// philosophy as FuzzGenerate's accepted set.
+			return nil, ErrSourceTooLarge
 		}
 		return nil, ErrUnsupported
 	}
@@ -295,6 +354,13 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 		var sre *SourceReadError
 		if errors.As(err, &sre) {
 			return nil, sre
+		}
+		if rec.capped {
+			// The MaxSourceBytes read cap cut a still-alive source
+			// mid-payload: a server-side processing-budget rejection, not
+			// corrupt/truncated input. Distinct from ErrUnsupported so the
+			// REST layer maps it to 413 SourceTooLarge, not 400 InvalidArgument.
+			return nil, ErrSourceTooLarge
 		}
 		return nil, ErrUnsupported
 	}

@@ -25,6 +25,63 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 	}})
 }
 
+// writeThumbnailGenerateError classifies and writes the error returned by the
+// thumbnail generation pipeline (GenerateContextWithOpenerCached). It is the
+// load-bearing error branch, extracted verbatim from thumbnail.go (which sits
+// at the 500-line gate; any further error-branch additions must land here).
+// Ordering is pinned by tests and MUST NOT be reordered: the OpenError unwrap
+// first (a Get-path failure classifies via writeError → classify, never as a
+// silent return), then the server-side deadline (504), then client disconnect
+// (silent), then the thumbnail decode sentinels — each unwrapped RAW so
+// classify() sees the exact instance (the generic wrap below stringifies via
+// %v, destroying the errors.Is chain) — then the marked source-stream failure,
+// then the catch-all.
+func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Request, err error) {
+	var oe *thumbnail.OpenError
+	if errors.As(err, &oe) {
+		h.writeError(w, r, oe.Err)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		h.writeError(w, r, service.ErrTimeout)
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if errors.Is(err, thumbnail.ErrImageTooLarge) {
+		h.writeError(w, r, thumbnail.ErrImageTooLarge)
+		return
+	}
+	if errors.Is(err, thumbnail.ErrMetadataTooLarge) {
+		// The metadata-budget sentinel must reach classify() raw: the
+		// generic wrap below stringifies it via %v, so errors.Is would
+		// never match downstream. Same unwrap pattern as ErrImageTooLarge.
+		h.writeError(w, r, thumbnail.ErrMetadataTooLarge)
+		return
+	}
+	if errors.Is(err, thumbnail.ErrSourceTooLarge) {
+		// The source-budget sentinel must reach classify() raw: the generic
+		// wrap below stringifies it via %v, so errors.Is would never match
+		// downstream. Same unwrap pattern as ErrImageTooLarge/MetadataTooLarge.
+		h.writeError(w, r, thumbnail.ErrSourceTooLarge)
+		return
+	}
+	// Mid-decode source-stream failures (storage I/O, on-read
+	// verification) are marked by the thumbnail module: classify the
+	// underlying error raw — default → 500 InternalError; an
+	// ETagVerifier mismatch wraps service.ErrObjectCorrupt → 410 — never
+	// 400 InvalidArgument. MUST precede the catch-all: its %v stringify
+	// would destroy the chain (same trap as the ErrMetadataTooLarge
+	// branch above).
+	var sre *thumbnail.SourceReadError
+	if errors.As(err, &sre) {
+		h.writeError(w, r, sre.Err)
+		return
+	}
+	h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
+}
+
 func classify(err error) (string, string, int) {
 	if code, msg, status, ok := classifyLock(err); ok {
 		return code, msg, status
@@ -69,6 +126,16 @@ func classify(err error) (string, string, int) {
 		// image metadata exceeds the server's processing budget (8 MiB),
 		// before any pixel buffer is allocated.
 		return "MetadataTooLarge", err.Error(), http.StatusRequestEntityTooLarge
+	case errors.Is(err, thumbnail.ErrSourceTooLarge):
+		// Required, not defensive: the thumbnail handler unwraps the raw
+		// sentinel before classifying (that unwrap is the load-bearing
+		// defense), and errors.Is on the raw sentinel never matches
+		// ErrInvalidArgs — without this case the raw sentinel would fall
+		// through to default → 500 InternalError. The class is 413 per RFC
+		// 9110 §15.5.17 (Payload Too Large): the request's source image
+		// payload exceeds the server's 128 MiB compressed-input processing
+		// budget (MaxSourceBytes) and was cut mid-decode by the read cap.
+		return "SourceTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrInvalidArgs):
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrBadDigest):

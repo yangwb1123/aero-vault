@@ -406,54 +406,7 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 			return &sniffedStream{Reader: io.MultiReader(bytes.NewReader(replay), rc), rc: rc}, o.ETag, nil
 		})
 	if err != nil {
-		// The OpenError unwrap MUST precede the context-error checks: an
-		// opener that failed with a canceled ctx is a Get-path failure and
-		// classifies exactly as today (writeError → classify), never as a
-		// silent return. Load-bearing ordering, pinned by tests.
-		var oe *thumbnail.OpenError
-		if errors.As(err, &oe) {
-			h.writeError(w, r, oe.Err)
-			return
-		}
-		// Server-side route deadline fired while waiting for a decode slot:
-		// the client may still be connected — surface a visible 504 (F2)
-		// instead of a silent empty 200. MUST precede the ErrImageTooLarge
-		// branch so classification order cannot re-wrap context errors.
-		if errors.Is(err, context.DeadlineExceeded) {
-			h.writeError(w, r, service.ErrTimeout)
-			return
-		}
-		// Client gone (request context canceled by disconnect): no stream is
-		// open here (any opened stream was closed inside the API before the
-		// slot was released); do not write to a dead connection and do not
-		// classify a canceled request as a 400 client error.
-		if errors.Is(err, context.Canceled) {
-			return
-		}
-		if errors.Is(err, thumbnail.ErrImageTooLarge) {
-			h.writeError(w, r, thumbnail.ErrImageTooLarge)
-			return
-		}
-		if errors.Is(err, thumbnail.ErrMetadataTooLarge) {
-			// The metadata-budget sentinel must reach classify() raw: the
-			// generic wrap below stringifies it via %v, so errors.Is would
-			// never match downstream. Same unwrap pattern as ErrImageTooLarge.
-			h.writeError(w, r, thumbnail.ErrMetadataTooLarge)
-			return
-		}
-		// Mid-decode source-stream failures (storage I/O, on-read
-		// verification) are marked by the thumbnail module: classify the
-		// underlying error raw — default → 500 InternalError; an
-		// ETagVerifier mismatch wraps service.ErrObjectCorrupt → 410 — never
-		// 400 InvalidArgument. MUST precede the catch-all: its %v stringify
-		// would destroy the chain (same trap as the ErrMetadataTooLarge
-		// branch above).
-		var sre *thumbnail.SourceReadError
-		if errors.As(err, &sre) {
-			h.writeError(w, r, sre.Err)
-			return
-		}
-		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
+		h.writeThumbnailGenerateError(w, r, err)
 		return
 	}
 	if fromCache {
