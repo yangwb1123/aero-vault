@@ -55,7 +55,11 @@ func init() {
 		{Method: "POST", Path: "/v1/files/{key}/restore", Summary: "Restore soft-deleted object", Tag: "files", Status: 200},
 		{Method: "POST", Path: "/v1/files/{key}/lock", Summary: "Set object retention lock", Tag: "files", Status: 200},
 		{Method: "GET", Path: "/v1/files/{key}/thumbnail", Summary: "Get thumbnail (JPEG)", Tag: "files", Status: 200,
-			Responses: map[int]string{http.StatusUnsupportedMediaType: "Object content-type is not one of the supported image formats (image/jpeg, image/png, image/gif)"}},
+			Responses: map[int]string{
+				http.StatusUnsupportedMediaType:  "Object content-type is not one of the supported image formats (image/jpeg, image/png, image/gif)",
+				http.StatusGone:                  "Object is marked as corrupt (scrub) — the corrupt-state error is surfaced verbatim, never flattened to a 400 invalid-image error",
+				http.StatusRequestEntityTooLarge: "Source dimensions exceed the decode caps (MaxSourceDim / MaxProgressiveSourceDim / Max16BitSourceDim) or the image metadata exceeds the 8 MiB budget",
+			}},
 		{
 			Method: "POST", Path: "/v1/files/{key}/presign",
 			Summary: "Generate presigned URL", Tag: "files", Status: 200,
