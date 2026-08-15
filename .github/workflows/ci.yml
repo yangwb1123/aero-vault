@@ -122,7 +122,7 @@ jobs:
           kill %1 2>/dev/null || true
 
   fuzz-thumbnail:
-    name: fuzz (thumbnail — bounded fuzztime, 4 targets)
+    name: fuzz (thumbnail — bounded fuzztime, 5 targets)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Fuzz-found crashers are written to the testdata corpus by `go test
@@ -151,6 +151,9 @@ jobs:
 
       - name: Fuzz FuzzProgressiveJPEG
         run: go test -fuzz=FuzzProgressiveJPEG -run '^$' -fuzztime=30s ./internal/thumbnail/
+
+      - name: Fuzz FuzzGenerateBudgets
+        run: go test -fuzz=FuzzGenerateBudgets -run '^$' -fuzztime=30s ./internal/thumbnail/
 
       - name: Fuzz the 4 targets on 32-bit int (TIFF wrap class, GOARCH=386, serial)
         # -parallel=1 keeps the 386 run deterministic under the race-free
