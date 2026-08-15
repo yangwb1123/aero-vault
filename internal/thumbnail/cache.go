@@ -64,19 +64,19 @@ type entry struct {
 // last store, never extended by hits — and is never served after expiry
 // (lazy expiry on Get; an expired read is an ordinary miss). When ttl <= 0
 // (default) entries live until LRU byte-budget pressure evicts them,
-// byte-for-byte the pre-TTL behavior.
+// byte-for-byte the pre-TTL behavior. Lazy expiry bounds served retention
+// strictly; SweepExpired additionally bounds physical retention of
+// never-read expired keys.
 //
-// TODO(campaign add-ttl-lifecycle-invalidation-to-the-thumbnail, FR-4): the
-// optional physical purge is a documented follow-up, not implemented here.
-// Contract for a future implementer: func (c *Cache) SweepExpired(now
-// time.Time) (n int) — O(entries) walk under c.mu, removing entries with
-// now.After(e.expiresAt), decrementing c.bytes by exactly len(e.data) each,
-// returning the count for telemetry. It must be cheap, must not bump the
-// LRU eviction counter, and must never be invoked from the request path;
-// the natural driver is an existing timer loop (e.g. the Reconcile ticker,
-// AGENTS.md §2.4), never a goroutine owned by Cache. Lazy expiry alone
-// bounds served retention strictly; the sweep additionally bounds physical
-// retention of never-read expired keys.
+// FR-4 (campaign add-ttl-lifecycle-invalidation-to-the-thumbnail) is
+// implemented below: SweepExpired walks the LRU list under c.mu removing
+// entries with now.After(e.expiresAt), decrementing c.bytes by exactly
+// len(e.data) each, returning the count for telemetry. It is cheap (single
+// O(entries) pass, zero allocations), does not bump the LRU eviction
+// counter, and must never be invoked from the request path; the natural
+// driver is an existing timer loop (e.g. the Reconcile ticker, AGENTS.md
+// §2.4), never a goroutine owned by Cache. The runtime wiring is a
+// documented follow-up — the method is inert until a timer driver calls it.
 type Cache struct {
 	mu        sync.Mutex
 	ll        *list.List
@@ -214,6 +214,56 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 		evicted++
 	}
 	return evicted
+}
+
+// SweepExpired removes every stored entry whose retention deadline has
+// passed, returning the number of entries removed. It is the physical purge
+// half of the TTL contract: Get's lazy branch bounds served retention (an
+// expired entry is reclaimed only when a request touches its exact key),
+// while SweepExpired bounds physical retention of never-read expired keys
+// (to TTL + sweep interval once a caller wires a timer driver).
+//
+// It walks the LRU list exactly once under a single c.mu acquisition
+// (O(entries), zero allocations), removing exactly the entries with
+// now.After(e.expiresAt) — the same strict-after predicate Get's lazy
+// branch uses, so "expired" has one definition across both paths. Each
+// removal decrements c.bytes by exactly len(e.data) (invariant: bytes ==
+// Σ len(stored payloads)) and does not touch the hit/miss/eviction
+// counters: an expired removal by sweep is not a read (the lazy path's miss
+// counting does not apply) and it is not an LRU eviction. Live entries
+// (including the boundary expiresAt == now) are left completely alone — no
+// recency refresh, no reorder; the LRU order of survivors is unchanged and
+// they are still served by Get with byte-identical payloads.
+//
+// A disabled cache (maxBytes <= 0) and a cache with ttl <= 0 return 0
+// immediately without acquiring c.mu and without consulting any expiresAt:
+// the zero value is never consulted when the owning cache has ttl <= 0, and
+// a naive walk would evaluate now.After(time.Time{}) == true and wipe a
+// non-TTL cache. now is the caller's clock (time.Now() in production;
+// injected values in tests); the monotonic component participates in the
+// comparison, matching Put's expiresAt = time.Now().Add(c.ttl). It must
+// never be invoked from the request path — the natural driver is an
+// existing timer loop (e.g. the Reconcile ticker, AGENTS.md §2.4), never a
+// goroutine owned by Cache. The returned count is for the caller's
+// telemetry; Cache.Stats is untouched.
+func (c *Cache) SweepExpired(now time.Time) (n int) {
+	if c.disabled || c.ttl <= 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for el := c.ll.Front(); el != nil; {
+		next := el.Next()
+		e := el.Value.(*entry)
+		if now.After(e.expiresAt) {
+			c.ll.Remove(el)
+			delete(c.m, e.key)
+			c.bytes -= int64(len(e.data))
+			n++
+		}
+		el = next
+	}
+	return n
 }
 
 // Len returns the number of stored entries (0 for a disabled cache).

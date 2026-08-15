@@ -502,9 +502,11 @@ server-memory-only, regenerable, and cleared on restart. Served-path erasure
 is enforced before any cache lookup: deleted objects 404 via the Stat gate
 and overwritten objects key-miss via the content ETag, so retained bytes are
 never served after delete/overwrite. With a TTL set, physical retention of a
-never-read key is bounded by TTL + time-until-next-same-key-Get (a periodic
-physical purge — `SweepExpired` — is a documented follow-up, not yet
-implemented); without a TTL, the residual bound is the LRU byte budget.
+never-read key is bounded by TTL + time-until-next-same-key-Get today (lazy
+expiry only: `SweepExpired` is implemented at the cache level but not yet
+wired to a timer driver); once the timer driver lands (e.g. the Reconcile
+ticker), the bound becomes TTL + sweep interval; without a TTL, the residual
+bound is the LRU byte budget.
 **Admission gate:** SSE-C, SSE-KMS, and non-content-MD5-ETag objects never
 enter the cache: the gate admits only whole-object content MD5 ETags
 (exactly 32 lowercase hex) on objects that are neither SSE-C nor SSE-KMS —
