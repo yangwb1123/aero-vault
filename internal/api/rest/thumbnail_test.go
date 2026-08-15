@@ -5017,3 +5017,99 @@ func TestThumbnailVersionPinnedHeadersAndIMS(t *testing.T) {
 		t.Fatalf("INM precedence: status=%d want 200 (INM mismatch wins)", both.StatusCode)
 	}
 }
+
+// TestThumbnailLastModifiedDerivedFromOpenedObjectVersioned is the binding
+// QA F1 variant: on a VERSIONED bucket, the unpinned 200-path mtime-triplet
+// (Last-Modified, ETag, X-Version-Id) must all derive from the OPENED
+// version — the seam forces the pre-open Stat's UpdatedAt one hour into the
+// past, and the 200 must serve the opened version's mtime, validator, and
+// version ID together (RFC 9110 §8.8.3: the triplet names one
+// representation).
+func TestThumbnailLastModifiedDerivedFromOpenedObjectVersioned(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if err := repo.SetBucketVersioning(context.Background(), "default", "default", true); err != nil {
+		t.Fatalf("enable versioning: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	wrapped := &etagSwapRepo{Repository: repo, target: "pic.png"}
+	h := NewHandler(service.NewFileService(store, wrapped, nil), nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+	u := srv.URL + "/v1/files/pic.png"
+
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 300, 150), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v1: %d", resp.StatusCode)
+	}
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 320, 160), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT v2: %d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "pic.png")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	cur := versions[0]
+	obj, err := repo.GetObject(context.Background(), "default", "default", "pic.png")
+	if err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	fresh := obj.UpdatedAt.UTC().Format(http.TimeFormat)
+	stale := obj.UpdatedAt.Add(-time.Hour)
+
+	// Control: the unpinned 200 on a versioned bucket emits the triplet
+	// (X-Version-Id is gated by the bucket versioning flag).
+	thumbURL := u + "/thumbnail?w=100&h=100"
+	resp, bodyB := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("control: %d", resp.StatusCode)
+	}
+	ctrlETag := resp.Header.Get("ETag")
+	ctrlVid := resp.Header.Get("X-Version-Id")
+	if ctrlVid == "" {
+		t.Fatal("control X-Version-Id must be present on a versioned bucket (unpinned)")
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != fresh {
+		t.Fatalf("control Last-Modified=%q want %q", lm, fresh)
+	}
+
+	// Arm the seam: the racing request's pre-open Stat sees the stale mtime.
+	wrapped.mu.Lock()
+	wrapped.staleUpdated, wrapped.swapCall = stale, wrapped.calls+1
+	wrapped.mu.Unlock()
+
+	resp, body := req(t, "GET", thumbURL, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("racing: %d", resp.StatusCode)
+	}
+	if !bytes.Equal(body, bodyB) {
+		t.Fatal("racing body differs from control — both must decode the same v2 blob")
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != fresh {
+		t.Fatalf("200 Last-Modified=%q want %q (opened version's mtime, not the pre-open Stat's)", lm, fresh)
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm == stale.UTC().Format(http.TimeFormat) {
+		t.Fatalf("200 Last-Modified must not come from the pre-open Stat (stale %q)", lm)
+	}
+	if got := resp.Header.Get("ETag"); got != ctrlETag {
+		t.Fatalf("200 ETag=%q want control %q (opened-derived)", got, ctrlETag)
+	}
+	if got := resp.Header.Get("X-Version-Id"); got != ctrlVid {
+		t.Fatalf("200 X-Version-Id=%q want %q (the opened version)", got, ctrlVid)
+	}
+	if cur.VersionID == "" {
+		t.Fatal("versioned row must carry a VersionID")
+	}
+}
