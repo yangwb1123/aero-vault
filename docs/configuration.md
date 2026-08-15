@@ -504,9 +504,20 @@ and overwritten objects key-miss via the content ETag, so retained bytes are
 never served after delete/overwrite. With a TTL set, physical retention of a
 never-read key is bounded by TTL + time-until-next-same-key-Get (a periodic
 physical purge — `SweepExpired` — is a documented follow-up, not yet
-implemented); without a TTL, the residual bound is the LRU byte budget. SSE-C
-and multipart-ETag objects never enter the cache (no customer-key-derived
-bytes are retained beyond the request). Shared caches (browsers/CDNs) holding
+implemented); without a TTL, the residual bound is the LRU byte budget.
+**Admission gate:** SSE-C, SSE-KMS, and non-content-MD5-ETag objects never
+enter the cache: the gate admits only whole-object content MD5 ETags
+(exactly 32 lowercase hex) on objects that are neither SSE-C nor SSE-KMS —
+so no customer-key-derived bytes are retained and no non-content-derived
+ETag can seed a cache key. S3 SSE-KMS ETags are documented non-MD5 and are
+excluded by *metadata* (`_aero_sse_algorithm=aws:kms`), not by shape, because
+AWS may return 32-hex-shaped values that the shape test alone cannot
+distinguish from a content MD5. Deployment note: SSE-KMS must be configured
+**through this codebase** (request headers or bucket config, which persist the
+metadata the gate reads) — SSE-KMS enabled at the provider console writes no
+row metadata, so such objects are admitted whenever their ETag happens to be
+32-hex-shaped (a documented residual; storage-layer ETag validation is out of
+scope). Shared caches (browsers/CDNs) holding
 the `public, max-age=300, must-revalidate` response are governed by
 `Cache-Control`, not the server TTL: a fresh entry is served for at most 300 s,
 then `must-revalidate` (RFC 9111 §5.2.2.2) forces revalidation, which returns

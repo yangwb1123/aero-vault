@@ -228,7 +228,7 @@ groups:
           severity: warning
         annotations:
           summary: "Thumbnail cache hit ratio below 50% for 15m"
-          description: "The server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail.cache.evictions_total; raise the budget or review the admission gates (SSE-C / multipart objects bypass the cache by design)."
+          description: "The server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail.cache.evictions_total; raise the budget or review the admission gates (SSE-C, SSE-KMS, and non-content-MD5-ETag objects bypass the cache by design; raising the budget will not recover their hits)."
 
       # Client-side revalidation fan-out ceiling: bounded freshness
       # (max-age=300, must-revalidate on the derived thumbnail) converts

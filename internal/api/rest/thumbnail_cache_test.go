@@ -627,6 +627,179 @@ func TestThumbnailCacheAdmissionGates(t *testing.T) {
 			t.Fatalf("multipart storage Get count = %d, want 3 (never cached)", n)
 		}
 	})
+
+	t.Run("dash-less non-content-derived ETag never cached", func(t *testing.T) {
+		srv, store, repo := newHarness(t)
+		base := srv.URL + "/v1/files/kms.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+		hdr := map[string]string{"Content-Type": "image/png"}
+		if resp, _ := req(t, "PUT", base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		// Forge a dash-less, non-MD5 ETag (an SSE-KMS-style 36-char value):
+		// no dash, not 32 hex. Local storage wrote a genuine 32-hex MD5; the
+		// row rewrite makes it claim content identity it does not have,
+		// exactly what the S3 SSE-KMS / OSS / COS verbatim-copy backends
+		// produce for real. The gate must bypass the cache for this shape.
+		forgeETag(t, repo, "kms.png", "0123456789abcdef0123456789abcdef0123")
+		for i := 0; i < 3; i++ {
+			thumbGetOK(t, thumb, i)
+		}
+		if n := store.gets.Load(); n != 3 {
+			t.Fatalf("storage Get count = %d, want 3 (never cached)", n)
+		}
+	})
+
+	t.Run("SSE-KMS (aws:kms) never cached", func(t *testing.T) {
+		srv, store, repo := newHarness(t)
+		base := srv.URL + "/v1/files/kms2.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+		hdr := map[string]string{"Content-Type": "image/png"}
+		if resp, _ := req(t, "PUT", base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		// Seed provider-managed SSE-KMS metadata (as prepareServerSideEncryption
+		// persists at PUT) while KEEPING the genuine 32-hex MD5 ETag: the
+		// metadata gate, not the shape gate, must keep this class out — a
+		// shape-only fix would admit it (this subtest is the R2 discriminator).
+		ctx := context.Background()
+		for k, v := range map[string]string{
+			"_aero_sse_algorithm":  "aws:kms",
+			"_aero_sse_kms_key_id": "alias/testing",
+		} {
+			if err := repo.SetObjectMetaKey(ctx, "default", "default", "kms2.png", k, v); err != nil {
+				t.Fatalf("set sse-kms meta %s: %v", k, err)
+			}
+		}
+		// The guard predicate (mandatory, mirrors the SSE-C subtest):
+		// ServerSideEncryptionInfo must report the object as aws:kms, which
+		// is exactly the handler's cache-bypass condition.
+		if algo, _, ok := service.ServerSideEncryptionInfo(objMeta(t, repo, "kms2.png")); !ok || algo != "aws:kms" {
+			t.Fatalf("ServerSideEncryptionInfo must report ok with aws:kms for the seeded metadata (got algo=%q ok=%v)", algo, ok)
+		}
+		for i := 0; i < 3; i++ {
+			thumbGetOK(t, thumb, i)
+		}
+		if n := store.gets.Load(); n != 3 {
+			t.Fatalf("storage Get count = %d, want 3 (never cached)", n)
+		}
+	})
+
+	t.Run("AES256 (SSE-S3) metadata still admits caching", func(t *testing.T) {
+		srv, store, repo := newHarness(t)
+		base := srv.URL + "/v1/files/sse3.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+		hdr := map[string]string{"Content-Type": "image/png"}
+		if resp, _ := req(t, "PUT", base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		// SSE-S3 / local envelope: the ETag remains the content MD5, so
+		// caching stays correct — the R2 discriminator is aws:kms ONLY. This
+		// subtest is the only one that fails on an implementation slip that
+		// drops the algo == "aws:kms" check.
+		if err := repo.SetObjectMetaKey(context.Background(), "default", "default", "sse3.png", "_aero_sse_algorithm", "AES256"); err != nil {
+			t.Fatalf("set sse meta: %v", err)
+		}
+		thumbGetOK(t, thumb, 0)
+		for i := 1; i < 3; i++ {
+			thumbGetOK(t, thumb, i)
+		}
+		if n := store.gets.Load(); n != 1 {
+			t.Fatalf("AES256 storage Get count = %d, want 1 (first stores; repeats hit)", n)
+		}
+	})
+
+	t.Run("collision: same forged ETag different bytes never cross-served", func(t *testing.T) {
+		srv, store, repo := newHarness(t)
+		hdr := map[string]string{"Content-Type": "image/png"}
+		const sharedETag = "0123456789abcdef0123456789abcdef0123" // dash-less, non-MD5
+		if resp, _ := req(t, "PUT", srv.URL+"/v1/files/coll-a.png", pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT A: %d", resp.StatusCode)
+		}
+		forgeETag(t, repo, "coll-a.png", sharedETag)
+		bodyA := thumbGetOK(t, srv.URL+"/v1/files/coll-a.png/thumbnail?w=32&h=32", 0)
+		if resp, _ := req(t, "PUT", srv.URL+"/v1/files/coll-b.png", pngBytesAlt(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT B: %d", resp.StatusCode)
+		}
+		forgeETag(t, repo, "coll-b.png", sharedETag)
+		// The vulnerability this direction closes, demonstrated: pre-fix, B's
+		// first GET would HIT the entry A stored under the shared ETag and
+		// serve A's bytes as B's thumbnail (wrong-bytes cross-object response).
+		bodyB1 := thumbGetOK(t, srv.URL+"/v1/files/coll-b.png/thumbnail?w=32&h=32", 1)
+		bodyB2 := thumbGetOK(t, srv.URL+"/v1/files/coll-b.png/thumbnail?w=32&h=32", 2)
+		if bytes.Equal(bodyA, bodyB1) {
+			t.Fatal("B's thumbnail must not be A's bytes — the shared forged ETag must not collide in the cache")
+		}
+		if !bytes.Equal(bodyB1, bodyB2) {
+			t.Fatal("B's repeat thumbnail must be byte-identical (deterministic pipeline)")
+		}
+		if n := store.gets.Load(); n != 3 {
+			t.Fatalf("storage Get count = %d, want 3 (never cached under the shared forged ETag)", n)
+		}
+	})
+
+	t.Run("pinned version with non-content-derived ETag never cached", func(t *testing.T) {
+		srv, store, repo := newHarness(t)
+		hdr := map[string]string{"Content-Type": "image/png"}
+		ctx := context.Background()
+		if err := repo.SetBucketVersioning(ctx, "default", "default", true); err != nil {
+			t.Fatalf("enable versioning: %v", err)
+		}
+		u := srv.URL + "/v1/files/pinned.png"
+		if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT v1: %d", resp.StatusCode)
+		}
+		obj, err := repo.GetObject(ctx, "default", "default", "pinned.png")
+		if err != nil {
+			t.Fatalf("get v1: %v", err)
+		}
+		v1ID := obj.VersionID
+		// Forge v1's ETag while it is still the current row, THEN overwrite
+		// with different bytes: the historical v1 row keeps the forged ETag
+		// while the current v2 row carries a genuine 32-hex MD5 — so a pinned
+		// request and an unpinned request evaluate DIFFERENT rows, proving
+		// the gate reads the pinned row, not the current one (parity claim).
+		forgeETag(t, repo, "pinned.png", "0123456789abcdef0123456789abcdef0123")
+		if resp, _ := req(t, "PUT", u, pngBytesAlt(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT v2: %d", resp.StatusCode)
+		}
+		pinned := u + "/thumbnail?w=32&h=32&version=" + v1ID
+		for i := 0; i < 3; i++ {
+			thumbGetOK(t, pinned, i)
+		}
+		if n := store.gets.Load(); n != 3 {
+			t.Fatalf("pinned storage Get count = %d, want 3 (pinned forged ETag never cached)", n)
+		}
+		// Parity control: the same handler, unpinned, reads the CURRENT v2
+		// row with a genuine 32-hex MD5 — cacheable, delta exactly 1.
+		before := store.gets.Load()
+		unpinned := u + "/thumbnail?w=32&h=32"
+		thumbGetOK(t, unpinned, 0)
+		thumbGetOK(t, unpinned, 1)
+		thumbGetOK(t, unpinned, 2)
+		if delta := store.gets.Load() - before; delta != 1 {
+			t.Fatalf("unpinned gets delta=%d want exactly 1 (current v2 ETag admits caching)", delta)
+		}
+	})
+
+	t.Run("genuine 32-hex MD5 ETag without SSE metadata admits caching", func(t *testing.T) {
+		srv, store, _ := newHarness(t)
+		base := srv.URL + "/v1/files/plain.png"
+		thumb := base + "/thumbnail?w=32&h=32"
+		hdr := map[string]string{"Content-Type": "image/png"}
+		if resp, _ := req(t, "PUT", base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT: %d", resp.StatusCode)
+		}
+		// Documented residual (accepted): a 32-hex ETag without SSE-C/SSE-KMS
+		// metadata is admitted — the gate cannot see provider ETags the
+		// codebase never wrote. Pins intent so a future hardening does not
+		// accidentally over-bypass the safe path.
+		thumbGetOK(t, thumb, 0)
+		thumbGetOK(t, thumb, 1)
+		if n := store.gets.Load(); n != 1 {
+			t.Fatalf("plain storage Get count = %d, want 1 (content-addressed ETag caches)", n)
+		}
+	})
 }
 
 // TestThumbnailCacheTTLExpiryRegenerates (AC-3) pins the retention contract
@@ -867,6 +1040,39 @@ func TestThumbnailUnversionedNoVersionHeader(t *testing.T) {
 			t.Fatalf("unversioned bucket response %d must not carry X-Version-Id (got %q)", i+1, got)
 		}
 	}
+}
+
+// forgeETag rewrites the live object row's ETag column — the repo-row
+// rewrite technique the multipart subtest established. The gate reads the row
+// via statPinned and the opener's opened.ETag is the same row value, so
+// storeCached would store under the forged key — exactly how a foreign/forged
+// row (or a provider backend's verbatim-copied non-MD5 ETag) reproduces the
+// collision end-to-end.
+func forgeETag(t *testing.T, repo repository.Repository, key, etag string) {
+	t.Helper()
+	obj, err := repo.GetObject(context.Background(), "default", "default", key)
+	if err != nil {
+		t.Fatalf("get object: %v", err)
+	}
+	obj.ETag = etag
+	if _, err := repo.UpsertObject(context.Background(), obj); err != nil {
+		t.Fatalf("rewrite etag: %v", err)
+	}
+}
+
+// thumbGetOK issues one thumbnail GET and asserts a 200 with a JPEG-decodable
+// body — proof the full pipeline ran (not a 304, an error, or an empty body).
+// i is the request index for failure messages.
+func thumbGetOK(t *testing.T, thumb string, i int) []byte {
+	t.Helper()
+	resp, body := req(t, "GET", thumb, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %d: status=%d want 200, body=%s", i, resp.StatusCode, body)
+	}
+	if _, err := jpeg.Decode(bytes.NewReader(body)); err != nil {
+		t.Fatalf("GET %d: thumbnail is not a decodable JPEG: %v", i, err)
+	}
+	return body
 }
 
 // objMeta fetches the live object row's metadata (for the SSE-C predicate

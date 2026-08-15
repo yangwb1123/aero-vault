@@ -9,6 +9,7 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
 // thumbFreshnessMaxAge bounds the client-side freshness of the derived
@@ -69,6 +70,28 @@ func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (
 		return h.svc.Stat(ctx, tenant, service.DefaultBucket, key)
 	}
 	return h.svc.StatVersionWithOptions(ctx, tenant, service.DefaultBucket, key, version, service.ReadOptions{})
+}
+
+// thumbnailCacheAdmissible reports whether the source object may seed the
+// server-side thumbnail cache — the handler's admission gate. An object is
+// admissible only when its ETag is provably a whole-object content MD5
+// (exactly 32 lowercase hex: the shape local storage emits for single-PUT
+// objects, and the shape S3/OSS/COS echo for plain uploads) AND it is
+// neither SSE-C nor SSE-KMS. SSE-C-derived bytes must never persist in
+// server memory beyond the request; AWS documents SSE-KMS ETags as non-MD5
+// (they may even be 32-hex-shaped), so only the metadata gate — not the
+// shape test — keeps that class out. AES256 (SSE-S3 / local envelope) is
+// not bypassed: its ETag remains the content MD5. Pinned and unpinned
+// requests are identical here: both arms pass the statPinned row, so the
+// gate evaluates the pinned version's metadata and ETag for a pinned read.
+func thumbnailCacheAdmissible(obj repository.Object) bool {
+	if _, _, ssec := service.SSECustomerInfo(obj.Metadata); ssec {
+		return false
+	}
+	if algo, _, ok := service.ServerSideEncryptionInfo(obj.Metadata); ok && algo == "aws:kms" {
+		return false
+	}
+	return thumbnail.ContentMD5ETag(obj.ETag)
 }
 
 // bucketVersioning reports whether the default bucket has versioning enabled.

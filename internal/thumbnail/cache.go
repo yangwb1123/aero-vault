@@ -14,8 +14,10 @@ import (
 const CacheKeyVersion = 1
 
 // CacheKey identifies one cacheable thumbnail output: the tenant (cross-tenant
-// isolation), the source object's content ETag (opaque — local storage uses
-// hex MD5 of content), and the EFFECTIVE bounds EffectiveDims applies inside
+// isolation), the source object's content ETag (opaque; the handler's
+// admission gate guarantees it is a whole-object content MD5 — exactly 32
+// lowercase hex — for every stored entry, and SSE-C/SSE-KMS objects never
+// seed a key), and the EFFECTIVE bounds EffectiveDims applies inside
 // generateLocked, plus the key schema version. Bucket and object key are
 // deliberately excluded: the output is a pure function of source bytes +
 // effective dims, so two objects with identical bytes share one correct

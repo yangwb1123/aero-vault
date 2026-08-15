@@ -318,34 +318,32 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	// GenerateContextWithOpenerCached acquires, then invokes the opener
 	// (svc.Get), then decodes — so at most maxConcurrentDecodes object
 	// streams are open at once, and a request parked on the semaphore holds
-	// no stream at all (waiter holds nothing: no fd, no in-flight storage
-	// GET). The server-side cache (THUMBNAIL_CACHE_BYTES; keyed by tenant +
-	// source ETag + effective dims) is consulted after full authorization
-	// and the 304 fast path; a hit returns the stored JPEG with NO slot, NO
-	// opener, NO decode (it also emits the access event below so every 200
-	// emits exactly one EventAccessed). Open failures surface as *OpenError
-	// and keep today's writeError classification verbatim; decode and
-	// context errors keep the branch below. The stream lifecycle (close on
-	// every path, close-before-release) lives inside the API.
-	// The server-side cache (THUMBNAIL_CACHE_BYTES; keyed by tenant + source
-	// ETag + effective dims + key version) is consulted after full
-	// authorization and the 304 fast path; a hit returns the stored JPEG
-	// with NO slot, NO opener, NO decode (it also emits the access event
-	// below so every 200 emits exactly one EventAccessed). Two admission
-	// gates bypass the cache by design (pre-launch conditions):
-	//   - SSE-C objects (SSECustomerInfo ok): the operator's expectation is
-	//     that the server never holds bytes derived from customer-keyed
-	//     decryption beyond the request — caching the derived JPEG would
-	//     persist them indefinitely in server memory.
-	//   - multipart uploads (ETag "<md5>-<n>" contains a dash): the ETag is
-	//     not content-derived, so the key could pair stale bytes with a
+	// no stream at all. The server-side cache (THUMBNAIL_CACHE_BYTES; keyed
+	// by tenant + source ETag + effective dims + key version) is consulted
+	// after full authorization and the 304 fast path; a hit returns the
+	// stored JPEG with NO slot, NO opener, NO decode (it also emits the
+	// access event below so every 200 emits exactly one EventAccessed). Open
+	// failures surface as *OpenError and keep today's writeError
+	// classification verbatim; decode and context errors keep the branch
+	// below. The stream lifecycle (close on every path, close-before-
+	// release) lives inside the API. Three admission gates bypass the cache
+	// by design (pre-launch conditions):
+	//   - SSE-C objects (SSECustomerInfo ok): the server never holds bytes
+	//     derived from customer-keyed decryption beyond the request —
+	//     caching the derived JPEG would persist them indefinitely in
+	//     server memory.
+	//   - SSE-KMS objects (ServerSideEncryptionInfo reports aws:kms): AWS
+	//     documents SSE-KMS ETags as non-MD5 — they may even be 32-hex-
+	//     shaped — the metadata gate, not shape, excludes them.
+	//   - any other source ETag not exactly 32 lowercase hex (multipart
+	//     "<md5>-<n>" contains a dash; OSS/COS provider quirks): the ETag
+	//     is not content-derived, so the key could pair stale bytes with a
 	//     legitimately changed object; only whole-object content MD5 ETags
 	//     admit caching.
-	// For a pinned request both gates evaluate the PINNED version's metadata
-	// and ETag, and the lookup key carries the pinned version's ETag — the
-	// existing CacheKey schema, no bump.
+	// For a pinned request all gates evaluate the PINNED version's metadata
+	// and ETag (the lookup key carries its ETag; no CacheKeyVersion bump).
 	cache := h.thumbnailCache
-	if _, _, ssec := service.SSECustomerInfo(obj.Metadata); ssec || strings.Contains(obj.ETag, "-") {
+	if !thumbnailCacheAdmissible(obj) {
 		cache = nil
 	}
 	// The 200-path validator must describe the bytes actually decoded, so
