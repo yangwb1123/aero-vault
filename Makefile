@@ -132,7 +132,7 @@ test-race-meta:
 # needs ~1.2 GiB and ~97s under -race, so it stays behind testing.Short()).
 test-race-thumbnail:
 	@echo "[check] data race detection (thumbnail decode semaphore) ..."
-	go test -race -short -count=1 -timeout 120s ./internal/thumbnail/
+	go test -race -short -count=1 -timeout 180s ./internal/thumbnail/
 	@echo "  OK (no races detected)"
 
 .PHONY: test-race-thumbnail

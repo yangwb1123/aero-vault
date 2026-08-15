@@ -52,7 +52,7 @@ var ErrMetadataTooLarge = errors.New("thumbnail: image metadata exceeds MaxMetad
 // ErrUnsupported (corrupt/non-image input → client 400), ErrImageTooLarge
 // (declared dimensions), and ErrMetadataTooLarge (metadata budget) so callers
 // can tell a source-payload-budget rejection from each of the others.
-var ErrSourceTooLarge = errors.New("thumbnail: source payload exceeds MaxSourceBytes")
+var ErrSourceTooLarge = errors.New("thumbnail: source payload exceeds MaxSourceBytes (128 MiB)")
 
 // errMetadataBudgetExceeded is the internal overflow cause written by
 // limitedBuffer. Generate maps it to ErrMetadataTooLarge; keeping the cause

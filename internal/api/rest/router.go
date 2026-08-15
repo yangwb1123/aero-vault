@@ -61,7 +61,7 @@ func init() {
 			Responses: map[int]string{
 				http.StatusUnsupportedMediaType:  "Object content-type is not one of the supported image formats (image/jpeg, image/png, image/gif)",
 				http.StatusGone:                  "Object is marked as corrupt (scrub) — the corrupt-state error is surfaced verbatim, never flattened to a 400 invalid-image error",
-				http.StatusRequestEntityTooLarge: "Source dimensions exceed the decode caps (MaxSourceDim / MaxProgressiveSourceDim / Max16BitSourceDim) or the image metadata exceeds the 8 MiB budget",
+				http.StatusRequestEntityTooLarge: "Source dimensions exceed the decode caps (MaxSourceDim / MaxProgressiveSourceDim / Max16BitSourceDim), the image metadata exceeds the 8 MiB budget, or the compressed source exceeds the 128 MiB processing cap (MaxSourceBytes)",
 			}},
 		{
 			Method: "POST", Path: "/v1/files/{key}/presign",

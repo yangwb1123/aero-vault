@@ -132,7 +132,8 @@ func classify(err error) (string, string, int) {
 		// defense), and errors.Is on the raw sentinel never matches
 		// ErrInvalidArgs — without this case the raw sentinel would fall
 		// through to default → 500 InternalError. The class is 413 per RFC
-		// 9110 §15.5.17 (Payload Too Large): the request's source image
+		// 9110 §15.5.17 (Content Too Large — the RFC 9110 successor to the
+		// RFC 7231 "Payload Too Large" title): the request's source image
 		// payload exceeds the server's 128 MiB compressed-input processing
 		// budget (MaxSourceBytes) and was cut mid-decode by the read cap.
 		return "SourceTooLarge", err.Error(), http.StatusRequestEntityTooLarge
