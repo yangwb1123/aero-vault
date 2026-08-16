@@ -250,6 +250,7 @@ func TestThumbnailCacheCountersSurface(t *testing.T) {
 	IncThumbnailCacheHit(ctx)
 	IncThumbnailCacheHit(ctx)
 	IncThumbnailCacheMiss(ctx)
+	IncThumbnailCacheExpired(ctx)
 	IncThumbnailCacheEviction(ctx, 3)
 	IncThumbnailCacheSwept(ctx, 4)
 	IncThumbnailCacheSweepRun(ctx)
@@ -260,6 +261,12 @@ func TestThumbnailCacheCountersSurface(t *testing.T) {
 	}
 	if v, ok := scrapeValue(body, "thumbnail_cache_misses_total"); !ok || v != 1 {
 		t.Fatalf("thumbnail_cache_misses_total = %v (ok=%v), want 1", v, ok)
+	}
+	// Independence pin: the expired record contributes exactly 1 to its own
+	// series and 0 to the miss series — the two series are recorded
+	// independently (an expired read is never a hit-ratio miss).
+	if v, ok := scrapeValue(body, "thumbnail_cache_expired_total"); !ok || v != 1 {
+		t.Fatalf("thumbnail_cache_expired_total = %v (ok=%v), want 1", v, ok)
 	}
 	if v, ok := scrapeValue(body, "thumbnail_cache_evictions_total"); !ok || v != 3 {
 		t.Fatalf("thumbnail_cache_evictions_total = %v (ok=%v), want 3", v, ok)

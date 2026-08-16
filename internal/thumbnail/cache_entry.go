@@ -113,14 +113,21 @@ func GenerateContextWithOpenerCached(
 // short-circuit. On a hit it re-checks ctx (a request that went dead while
 // the cache lock was held must not receive cached bytes — the handler's
 // classification, Canceled → silent / DeadlineExceeded → 504, is preserved)
-// and returns the stored bytes. On a miss it counts the miss and returns
-// hit=false; a nil/disabled cache is a miss that counts nothing.
+// and returns the stored bytes. On a genuine miss it counts the miss; on a
+// TTL-expired read it counts the expired class (thumbnail.cache.expired_total
+// — never the hit-ratio miss class) and returns hit=false exactly like a
+// miss, so the caller runs the full miss body and re-stores with a fresh
+// expiry. A nil/disabled cache is a miss that counts nothing.
 func lookupCached(ctx context.Context, cache *Cache, key CacheKey) (img []byte, hit bool, err error) {
 	if cache == nil || cache.disabled {
 		return nil, false, nil
 	}
-	img, hit = cache.Get(key)
-	if !hit {
+	img, outcome := cache.Get(key)
+	switch outcome {
+	case GetExpired:
+		telemetry.IncThumbnailCacheExpired(ctx)
+		return nil, false, nil
+	case GetMiss:
 		telemetry.IncThumbnailCacheMiss(ctx)
 		return nil, false, nil
 	}

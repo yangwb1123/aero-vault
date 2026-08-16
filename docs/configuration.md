@@ -481,10 +481,13 @@ produced it** (a fixed TTL from the last `Put`; hits do **not** extend the
 deadline — a hot key whose inter-request gap exceeds the TTL regenerates on
 each request, so size the TTL above the expected inter-request gap of hot
 keys, e.g. `3600` for thumbnails hit at ≥ 1/min). Expiry is lazy: an expired
-entry is removed on the next `Get` of its key and surfaces as an ordinary
-miss (no new metric; watch `thumbnail.cache.misses_total` and the
-`ThumbnailCacheHitRatioLow` alert — a miss-rate rise proportional to the
-working-set fraction with inter-request gap > TTL is the intended signal).
+entry is removed on the next `Get` of its key and surfaces as a distinct
+expired outcome, counted in `thumbnail.cache.expired_total` — **not** in the
+miss class — so the hit-ratio panel and `ThumbnailCacheHitRatioLow` measure
+genuine effectiveness only: a TTL below the hot-key inter-request gap raises
+`expired_total` instead of firing the alert on a healthy cache (an
+all-expired workload reads hits=0 ∧ misses=0, keeping the alert's activity
+guard false).
 The default `0` keeps the pre-TTL behavior byte-for-byte (entries live until
 LRU byte-budget pressure evicts them); the server logs a startup warning
 when the cache is enabled (`THUMBNAIL_CACHE_BYTES > 0`) without a TTL.
@@ -494,8 +497,9 @@ GET (no opener), and the decode itself — the amplification the cache targets.
 On the REST path the cache is consulted only after bucket-policy and
 anonymous-read authorization and after the 304 fast path; the tenant
 component of the key isolates tenants. Observability: `thumbnail.cache.hits_total`
-/ `misses_total` / `evictions_total` / `swept_total` (sweep removals) at `/metrics`
-(`PROMETHEUS_ENABLED=true`).
+/ `misses_total` / `evictions_total` / `expired_total` (TTL-expired reads;
+excluded from the hit-ratio miss class) / `swept_total` (sweep removals) at
+`/metrics` (`PROMETHEUS_ENABLED=true`).
 
 **Compliance & retention notes (what an auditor can cite):** the cache holds
 derived JPEG bytes only, keyed by (tenant, ETag, effective dims); bytes are

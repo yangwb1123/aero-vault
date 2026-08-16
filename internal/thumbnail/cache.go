@@ -13,6 +13,21 @@ import (
 // bounded LRU evicts them naturally.
 const CacheKeyVersion = 1
 
+// GetOutcome classifies one Cache.Get result. GetHit: stored bytes served,
+// LRU recency refreshed (expiry deadline NOT extended — fixed from the last
+// Put). GetMiss: genuine miss — key absent, or disabled cache (counted by
+// nothing on the disabled path). GetExpired: the entry existed but
+// now.After(expiresAt); it is removed here and NOT served, and it is neither
+// a miss (the hit-ratio class) nor an LRU eviction — it increments Cache's
+// expired counter / thumbnail.cache.expired_total.
+type GetOutcome uint8
+
+const (
+	GetHit     GetOutcome = iota // served from cache; recency refreshed
+	GetMiss                      // genuine miss: absent key, or disabled cache
+	GetExpired                   // entry existed but now.After(expiresAt); removed here, not served
+)
+
 // CacheKey identifies one cacheable thumbnail output: the tenant (cross-tenant
 // isolation), the source object's content ETag, and the EFFECTIVE bounds
 // EffectiveDims applies inside generateLocked, plus the key schema version.
@@ -62,7 +77,9 @@ type entry struct {
 // Retention model (THUMBNAIL_CACHE_TTL): when ttl > 0, every stored entry
 // expires that long after the Put that produced it — a fixed TTL from the
 // last store, never extended by hits — and is never served after expiry
-// (lazy expiry on Get; an expired read is an ordinary miss). When ttl <= 0
+// (lazy expiry on Get; an expired read is a distinct outcome — removed, not
+// served, counted in the cache's expired counter / thumbnail.cache.expired_total,
+// never in the hit-ratio miss class). When ttl <= 0
 // (default) entries live until LRU byte-budget pressure evicts them,
 // byte-for-byte the pre-TTL behavior. Lazy expiry bounds served retention
 // strictly; SweepExpired additionally bounds physical retention of
@@ -86,6 +103,7 @@ type Cache struct {
 	hits      uint64 // Stats surface (deterministic tests; telemetry forwards from the entry point)
 	misses    uint64
 	evictions uint64
+	expired   uint64        // TTL-lazy-expiry removals; distinct from misses (hit-ratio class) and evictions
 	disabled  bool          // immutable after NewCache
 	ttl       time.Duration // immutable after NewCache; <= 0 = no expiry
 }
@@ -111,19 +129,20 @@ func NewCache(maxBytes int64, ttl time.Duration) *Cache {
 	return c
 }
 
-// Get returns the cached payload for k. On a hit the entry's recency is
-// refreshed (moved to the front of the LRU list) and the stored slice is
-// returned by reference — callers must treat it as read-only so the byte
-// budget stays exact (the sole production caller writes it only to the
-// response). Expiry is NOT extended on hits: the retention deadline is set
-// by the last Put (a hit proves the entry is being served, but the deadline
-// is fixed by the generation that produced it — this is what guarantees no
-// entry is served beyond TTL after its producing generation). On a miss, on
-// a TTL-expired entry (removed here, counted as a miss) or on a disabled
-// cache it returns (nil, false).
-func (c *Cache) Get(k CacheKey) ([]byte, bool) {
+// Get returns the cached payload for k classified by GetOutcome. On a hit
+// the entry's recency is refreshed (moved to the front of the LRU list) and
+// the stored slice is returned by reference — callers must treat it as
+// read-only so the byte budget stays exact (the sole production caller
+// writes it only to the response). Expiry is NOT extended on hits: the
+// retention deadline is set by the last Put (a hit proves the entry is being
+// served, but the deadline is fixed by the generation that produced it —
+// this is what guarantees no entry is served beyond TTL after its producing
+// generation). On a TTL-expired entry it returns GetExpired (removed here —
+// not a miss, not an LRU eviction); on a genuine miss or a disabled cache it
+// returns GetMiss with nil bytes.
+func (c *Cache) Get(k CacheKey) ([]byte, GetOutcome) {
 	if c.disabled {
-		return nil, false
+		return nil, GetMiss // counted by nothing; lookupCached's own guard makes this unreachable in production
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -131,24 +150,23 @@ func (c *Cache) Get(k CacheKey) ([]byte, bool) {
 		e := el.Value.(*entry)
 		if c.ttl > 0 && time.Now().After(e.expiresAt) {
 			// TTL-expired: remove exactly (map delete + list removal) and
-			// decrement the byte accounting; report a miss. This is not an
-			// LRU eviction — the eviction counter is untouched, and the
-			// expired entry must not earn a fresh LRU lease. The miss is
-			// counted here so Cache-level Stats stay coherent with the entry
-			// point (lookupCached forwards the same (nil, false) to
-			// IncThumbnailCacheMiss — zero new telemetry plumbing).
+			// decrement the byte accounting; report GetExpired. This is not
+			// an LRU eviction — the eviction counter is untouched, and the
+			// expired entry must not earn a fresh LRU lease — and it is not
+			// a miss (the hit-ratio class): the expired class is its own
+			// counter, forwarded by lookupCached to thumbnail.cache.expired_total.
 			c.ll.Remove(el)
 			delete(c.m, k)
 			c.bytes -= int64(len(e.data))
-			c.misses++
-			return nil, false
+			c.expired++
+			return nil, GetExpired
 		}
 		c.ll.MoveToFront(el)
 		c.hits++
-		return e.data, true
+		return e.data, GetHit
 	}
 	c.misses++
-	return nil, false
+	return nil, GetMiss
 }
 
 // Put stores a COPY of img under key k (the caller's slice is never
@@ -228,9 +246,9 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 // now.After(e.expiresAt) — the same strict-after predicate Get's lazy
 // branch uses, so "expired" has one definition across both paths. Each
 // removal decrements c.bytes by exactly len(e.data) (invariant: bytes ==
-// Σ len(stored payloads)) and does not touch the hit/miss/eviction
-// counters: an expired removal by sweep is not a read (the lazy path's miss
-// counting does not apply) and it is not an LRU eviction. Live entries
+// Σ len(stored payloads)) and does not touch the hit/miss/eviction/expired
+// counters: an expired removal by sweep is not a read (the lazy path's
+// expired counting does not apply) and it is not an LRU eviction. Live entries
 // (including the boundary expiresAt == now) are left completely alone — no
 // recency refresh, no reorder; the LRU order of survivors is unchanged and
 // they are still served by Get with byte-identical payloads.
@@ -286,13 +304,15 @@ func (c *Cache) Bytes() int64 {
 	return c.bytes
 }
 
-// Stats returns the cumulative hit/miss/eviction counters. A disabled cache
-// always reports zeros — the entry point never consults or counts through it.
-func (c *Cache) Stats() (hits, misses, evictions uint64) {
+// Stats returns the cumulative hit/miss/eviction/expired counters. A disabled
+// cache always reports zeros — the entry point never consults or counts
+// through it. expired counts lazy TTL-expiry removals only (SweepExpired
+// removals are not reads and touch none of these counters).
+func (c *Cache) Stats() (hits, misses, evictions, expired uint64) {
 	if c.disabled {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.hits, c.misses, c.evictions
+	return c.hits, c.misses, c.evictions, c.expired
 }

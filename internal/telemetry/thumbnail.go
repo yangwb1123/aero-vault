@@ -15,6 +15,7 @@ var (
 	mThumbnailCacheHits            metric.Int64Counter
 	mThumbnailCacheMisses          metric.Int64Counter
 	mThumbnailCacheEvictions       metric.Int64Counter
+	mThumbnailCacheExpired         metric.Int64Counter
 	mThumbnailCacheSwept           metric.Int64Counter
 	mThumbnailCacheSweepRuns       metric.Int64Counter
 	mThumbnailCacheSweepLastRun    metric.Int64Gauge
@@ -44,6 +45,21 @@ func IncThumbnailCacheHit(ctx context.Context) {
 func IncThumbnailCacheMiss(ctx context.Context) {
 	initDomain()
 	mThumbnailCacheMisses.Add(ctx, 1)
+}
+
+// IncThumbnailCacheExpired counts one server-side thumbnail cache read that
+// found its entry TTL-expired (entry removed, not served). Expired reads are
+// a distinct class from misses: they contribute to neither the hit-ratio
+// miss class nor the eviction counters (see cache.go GetOutcome), so the
+// hit-ratio panel and ThumbnailCacheHitRatioLow measure genuine
+// effectiveness — a sparse-TTL workload (TTL below the hot-key inter-request
+// gap) raises this counter instead of depressing the hit ratio. This is
+// monitoring telemetry (CC7.3 observability), not audit evidence under
+// ISO 27001 A.12.4.1 — per-event audit records for the retention control
+// belong to the platform L0/L1/L2 audit hierarchy and are out of scope here.
+func IncThumbnailCacheExpired(ctx context.Context) {
+	initDomain()
+	mThumbnailCacheExpired.Add(ctx, 1)
 }
 
 // IncThumbnailCacheEviction counts n entries evicted from the server-side
@@ -87,6 +103,24 @@ func SetThumbnailCacheSweepCadence(ctx context.Context, intervalSeconds, lastRun
 	if mThumbnailCacheSweepLastRun != nil {
 		mThumbnailCacheSweepLastRun.Record(ctx, lastRunUnix)
 	}
+}
+
+// initThumbnailInstruments binds the thumbnail-domain instruments to the
+// meter created by initDomain. It lives here — not in metrics.go — so the
+// metric.go file stays under the 500-line gate (AGENTS.md); initDomain
+// calls it once, inside the domainOnce closure, after creating the meter.
+func initThumbnailInstruments(m metric.Meter) {
+	mThumbnailCacheHits, _ = m.Int64Counter("thumbnail.cache.hits_total")
+	mThumbnailCacheMisses, _ = m.Int64Counter("thumbnail.cache.misses_total")
+	mThumbnailCacheEvictions, _ = m.Int64Counter("thumbnail.cache.evictions_total")
+	mThumbnailCacheExpired, _ = m.Int64Counter("thumbnail.cache.expired_total")
+	mThumbnailCacheSwept, _ = m.Int64Counter("thumbnail.cache.swept_total")
+	mThumbnailCacheSweepRuns, _ = m.Int64Counter("thumbnail.cache.sweep_runs_total")
+	mThumbnailCacheSweepLastRun, _ = m.Int64Gauge("thumbnail.cache.sweep_last_run_seconds")
+	mThumbnailCacheSweepInterv, _ = m.Int64Gauge("thumbnail.cache.sweep_interval_seconds")
+	mThumbnail304, _ = m.Int64Counter("thumbnail.304_total")
+	mThumbnailGenerationSuccess, _ = m.Int64Counter("thumbnail.generation.success_total")
+	mThumbnailGenerationRejections, _ = m.Int64Counter("thumbnail.generation.rejections_total")
 }
 
 // IncThumbnail304 counts one certified 304 revalidation of the derived

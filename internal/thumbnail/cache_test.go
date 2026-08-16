@@ -32,8 +32,8 @@ func TestCacheHitMiss(t *testing.T) {
 	// 1. Put then hit: same bytes, exact budget accounting, single entry.
 	a := payload(100, 'a')
 	c.Put(k1, a)
-	got, ok := c.Get(k1)
-	if !ok {
+	got, outcome := c.Get(k1)
+	if outcome != GetHit {
 		t.Fatal("Get(k1) after Put: want hit, got miss")
 	}
 	if !bytes.Equal(got, a) {
@@ -47,12 +47,12 @@ func TestCacheHitMiss(t *testing.T) {
 	}
 
 	// 2. Miss for a foreign key; disabled cache is a pure pass-through.
-	if got, ok := c.Get(k2); ok || got != nil {
-		t.Fatalf("Get(k2): want (nil, false), got (%v, %v)", got, ok)
+	if got, outcome := c.Get(k2); outcome != GetMiss || got != nil {
+		t.Fatalf("Get(k2): want (nil, GetMiss), got (%v, %v)", got, outcome)
 	}
 	dis := NewCache(0, 0)
-	if got, ok := dis.Get(k1); ok || got != nil {
-		t.Fatalf("disabled Get: want (nil, false), got (%v, %v)", got, ok)
+	if got, outcome := dis.Get(k1); outcome != GetMiss || got != nil {
+		t.Fatalf("disabled Get: want (nil, GetMiss), got (%v, %v)", got, outcome)
 	}
 	dis.Put(k1, a)
 	if dis.Bytes() != 0 || dis.Len() != 0 {
@@ -65,9 +65,9 @@ func TestCacheHitMiss(t *testing.T) {
 	if c.Len() != 1 {
 		t.Fatalf("Len() after replace = %d, want 1 (no duplicate entry)", c.Len())
 	}
-	got, ok = c.Get(k1)
-	if !ok || !bytes.Equal(got, b) {
-		t.Fatalf("Get(k1) after replace: want (b, true), got ok=%v bytes=%q", ok, got)
+	got, outcome = c.Get(k1)
+	if outcome != GetHit || !bytes.Equal(got, b) {
+		t.Fatalf("Get(k1) after replace: want (b, GetHit), got outcome=%v bytes=%q", outcome, got)
 	}
 	if c.Bytes() != int64(len(b)) {
 		t.Fatalf("Bytes() after replace = %d, want %d", c.Bytes(), len(b))
@@ -75,8 +75,8 @@ func TestCacheHitMiss(t *testing.T) {
 
 	// 4. Empty payload is a strict no-op (existing entry untouched).
 	c.Put(k1, nil)
-	if got, ok := c.Get(k1); !ok || !bytes.Equal(got, b) {
-		t.Fatalf("empty Put must not disturb the existing entry: ok=%v bytes=%q", ok, got)
+	if got, outcome := c.Get(k1); outcome != GetHit || !bytes.Equal(got, b) {
+		t.Fatalf("empty Put must not disturb the existing entry: outcome=%v bytes=%q", outcome, got)
 	}
 }
 
@@ -97,10 +97,10 @@ func TestCacheByteBudgetEviction(t *testing.T) {
 	if cache.Bytes() != budget {
 		t.Fatalf("Bytes() = %d, want exact budget %d", cache.Bytes(), budget)
 	}
-	if _, ok := cache.Get(k1); !ok {
+	if _, outcome := cache.Get(k1); outcome != GetHit {
 		t.Fatal("k1 must be present at exact budget")
 	}
-	if _, ok := cache.Get(k2); !ok {
+	if _, outcome := cache.Get(k2); outcome != GetHit {
 		t.Fatal("k2 must be present at exact budget")
 	}
 
@@ -109,13 +109,13 @@ func TestCacheByteBudgetEviction(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("Put(k3) evicted %d entries, want 1", n)
 	}
-	if _, ok := cache.Get(k1); ok {
+	if _, outcome := cache.Get(k1); outcome == GetHit {
 		t.Fatal("k1 must be evicted (oldest)")
 	}
-	if _, ok := cache.Get(k2); !ok {
+	if _, outcome := cache.Get(k2); outcome != GetHit {
 		t.Fatal("k2 must survive eviction")
 	}
-	if _, ok := cache.Get(k3); !ok {
+	if _, outcome := cache.Get(k3); outcome != GetHit {
 		t.Fatal("k3 must be present after insertion")
 	}
 	if cache.Bytes() > budget {
@@ -128,20 +128,20 @@ func TestCacheByteBudgetEviction(t *testing.T) {
 	touched := NewCache(budget, 0)
 	touched.Put(k1, a)
 	touched.Put(k2, b)
-	if _, ok := touched.Get(k2); !ok {
+	if _, outcome := touched.Get(k2); outcome != GetHit {
 		t.Fatal("k2 must be present before touch")
 	}
 	n = touched.Put(k3, c)
 	if n != 1 {
 		t.Fatalf("Put(k3) after touch evicted %d entries, want 1", n)
 	}
-	if _, ok := touched.Get(k1); ok {
+	if _, outcome := touched.Get(k1); outcome == GetHit {
 		t.Fatal("untouched k1 must be the LRU victim (recency-touch)")
 	}
-	if _, ok := touched.Get(k2); !ok {
+	if _, outcome := touched.Get(k2); outcome != GetHit {
 		t.Fatal("touched k2 must survive eviction")
 	}
-	if _, ok := touched.Get(k3); !ok {
+	if _, outcome := touched.Get(k3); outcome != GetHit {
 		t.Fatal("k3 must be present after insertion")
 	}
 
@@ -159,7 +159,7 @@ func TestCacheByteBudgetEviction(t *testing.T) {
 	if cache.Len() != before {
 		t.Fatalf("oversized Put changed Len: %d -> %d", before, cache.Len())
 	}
-	if _, ok := cache.Get(kBig); ok {
+	if _, outcome := cache.Get(kBig); outcome == GetHit {
 		t.Fatal("oversized payload must not be stored under kBig")
 	}
 
@@ -167,15 +167,15 @@ func TestCacheByteBudgetEviction(t *testing.T) {
 	// (its payload must not be served as current) without counting it as a
 	// budget-pressure eviction.
 	cache.Put(k3, c)
-	if _, ok := cache.Get(k3); !ok {
+	if _, outcome := cache.Get(k3); outcome != GetHit {
 		t.Fatal("k3 must be present before oversized replace")
 	}
-	h, m, ev := cache.Stats()
+	h, m, ev, _ := cache.Stats()
 	cache.Put(k3, huge)
-	if _, ok := cache.Get(k3); ok {
+	if _, outcome := cache.Get(k3); outcome == GetHit {
 		t.Fatal("superseded k3 must be removed by oversized replace")
 	}
-	_, _, ev2 := cache.Stats()
+	_, _, ev2, _ := cache.Stats()
 	if ev2 != ev {
 		t.Fatalf("oversized replace counted an eviction (%d -> %d)", ev, ev2)
 	}
@@ -213,17 +213,17 @@ func TestCacheConcurrentAccess(t *testing.T) {
 				c.Put(k, p)
 				hot := CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}
 				c.Put(hot, p)
-				if got, ok := c.Get(k); ok {
+				if got, outcome := c.Get(k); outcome == GetHit {
 					// Payloads are never mutated after storage: any hit must
 					// return a full-length, intact slice.
 					if len(got) != 64 {
 						record("torn payload: got %d bytes, want 64", len(got))
 					}
 				}
-				if got, ok := c.Get(hot); ok && len(got) != 64 {
+				if got, outcome := c.Get(hot); outcome == GetHit && len(got) != 64 {
 					record("torn hot payload: got %d bytes, want 64", len(got))
 				}
-				if _, ok := c.Get(CacheKey{Tenant: "t2", SourceETag: "foreign", EffW: 32, EffH: 32}); ok {
+				if _, outcome := c.Get(CacheKey{Tenant: "t2", SourceETag: "foreign", EffW: 32, EffH: 32}); outcome == GetHit {
 					record("foreign key must never hit")
 				}
 			}
@@ -240,8 +240,8 @@ func TestCacheConcurrentAccess(t *testing.T) {
 		t.Fatal("Len() = 0, want >= 1 (hot key must survive)")
 	}
 	// The hot key was last written by some goroutine with a full payload.
-	if got, ok := c.Get(CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}); !ok || len(got) != 64 {
-		t.Fatalf("hot key: want full payload, got ok=%v len=%d", ok, len(got))
+	if got, outcome := c.Get(CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}); outcome != GetHit || len(got) != 64 {
+		t.Fatalf("hot key: want full payload, got outcome=%v len=%d", outcome, len(got))
 	}
 }
 
@@ -281,28 +281,28 @@ func TestCacheStatsCounters(t *testing.T) {
 	k1 := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
 	k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
 
-	if h, m, e := c.Stats(); h != 0 || m != 0 || e != 0 {
-		t.Fatalf("fresh cache Stats = %d/%d/%d, want 0/0/0", h, m, e)
+	if h, m, e, x := c.Stats(); h != 0 || m != 0 || e != 0 || x != 0 {
+		t.Fatalf("fresh cache Stats = %d/%d/%d/%d, want 0/0/0/0", h, m, e, x)
 	}
 	c.Put(k1, payload(32, 'a'))
 	c.Get(k1) // hit
-	h, m, e := c.Stats()
-	if h != 1 || m != 0 || e != 0 {
-		t.Fatalf("after hit: Stats = %d/%d/%d, want 1/0/0", h, m, e)
+	h, m, e, x := c.Stats()
+	if h != 1 || m != 0 || e != 0 || x != 0 {
+		t.Fatalf("after hit: Stats = %d/%d/%d/%d, want 1/0/0/0", h, m, e, x)
 	}
 	c.Get(k2) // miss
-	h, m, e = c.Stats()
-	if h != 1 || m != 1 || e != 0 {
-		t.Fatalf("after miss: Stats = %d/%d/%d, want 1/1/0", h, m, e)
+	h, m, e, x = c.Stats()
+	if h != 1 || m != 1 || e != 0 || x != 0 {
+		t.Fatalf("after miss: Stats = %d/%d/%d/%d, want 1/1/0/0", h, m, e, x)
 	}
 	c.Put(k2, payload(96, 'b')) // bytes = 32+96 = 128 > 96 → evicts k1 (tail)
-	h, m, e = c.Stats()
-	if h != 1 || m != 1 || e != 1 {
-		t.Fatalf("after eviction: Stats = %d/%d/%d, want 1/1/1", h, m, e)
+	h, m, e, x = c.Stats()
+	if h != 1 || m != 1 || e != 1 || x != 0 {
+		t.Fatalf("after eviction: Stats = %d/%d/%d/%d, want 1/1/1/0", h, m, e, x)
 	}
 	// Disabled cache always reports zeros.
-	if h, m, e := NewCache(0, 0).Stats(); h != 0 || m != 0 || e != 0 {
-		t.Fatalf("disabled Stats = %d/%d/%d, want 0/0/0", h, m, e)
+	if h, m, e, x := NewCache(0, 0).Stats(); h != 0 || m != 0 || e != 0 || x != 0 {
+		t.Fatalf("disabled Stats = %d/%d/%d/%d, want 0/0/0/0", h, m, e, x)
 	}
 }
 
@@ -344,18 +344,92 @@ func TestCacheKeyInjectivity(t *testing.T) {
 	}
 }
 
-// TestCacheTTL (AC-1) pins the TTL contract: an entry read after its TTL is a
-// miss even with zero LRU byte-budget pressure. Expiry state is injected
+// TestCacheExpiredOutcome (AC-1) pins the accounting split introduced by the
+// hit-ratio fix: a TTL-expired read is its OWN outcome class — removed, not
+// served, counted in Cache.expired (telemetry: thumbnail.cache.expired_total)
+// and contributing 0 to the hit-ratio miss count. The no-fire property for
+// ThumbnailCacheHitRatioLow follows directly: an all-expired workload reads
+// hits=0 ∧ misses=0, so the alert's activity guard (hits+misses rate > 0) is
+// false and the alert cannot fire on a healthy sparse-TTL cache. Expiry state
+// is injected white-box (backdating expiresAt per the TestCacheTTL precedent)
+// so the test is sleep-free and -race clean.
+func TestCacheExpiredOutcome(t *testing.T) {
+	// 1. Fresh entry must hit with byte-identical payload.
+	c := NewCache(1<<20, time.Hour)
+	k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
+	img := payload(100, 'a')
+	c.Put(k, img)
+	if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
+		t.Fatalf("fresh entry must hit: outcome=%v bytes_equal=%v", outcome, bytes.Equal(got, img))
+	}
+
+	// 2. Backdate the entry: the TTL has elapsed. The read must report
+	// GetExpired, return nil, and remove the entry exactly.
+	c.mu.Lock()
+	c.m[k].Value.(*entry).expiresAt = time.Now().Add(-time.Second)
+	c.mu.Unlock()
+	got, outcome := c.Get(k)
+	if outcome != GetExpired || got != nil {
+		t.Fatalf("expired read: want (nil, GetExpired), got (%v, %v)", got, outcome)
+	}
+	if c.Len() != 0 || c.Bytes() != 0 {
+		t.Fatalf("expired entry must be removed exactly: Len=%d Bytes=%d, want 0/0", c.Len(), c.Bytes())
+	}
+
+	// 3. An absent key is a genuine miss (GetMiss).
+	if got, outcome := c.Get(k2); outcome != GetMiss || got != nil {
+		t.Fatalf("absent key: want (nil, GetMiss), got (%v, %v)", got, outcome)
+	}
+
+	// 4. The expired read fed neither hits nor misses: h=1 (the fresh hit),
+	// m=1 (the absent-key miss), e=0 (not an LRU eviction), x=1 (expired
+	// class). If the expired read had been counted as a miss the hit-ratio
+	// denominator would inflate and ThumbnailCacheHitRatioLow could fire on
+	// a healthy sparse-TTL cache; it contributes 0 to both, so an all-
+	// expired workload reads 0/0 for hits/misses and the activity guard
+	// keeps the alert silent.
+	h, m, e, x := c.Stats()
+	if h != 1 || m != 1 || e != 0 || x != 1 {
+		t.Fatalf("Stats = %d/%d/%d/%d, want 1/1/0/1 (expired read must not feed the hit-ratio miss count)", h, m, e, x)
+	}
+
+	// 5. Disabled cache (maxBytes <= 0) and ttl=0 cache never return
+	// GetExpired — no wall-clock read on those paths, expired stays 0.
+	dis := NewCache(0, time.Hour)
+	if _, outcome := dis.Get(k); outcome != GetMiss {
+		t.Fatalf("disabled Get: want GetMiss, got %v", outcome)
+	}
+	if _, _, _, x := dis.Stats(); x != 0 {
+		t.Fatalf("disabled cache expired = %d, want 0 (no wall-clock read on the disabled path)", x)
+	}
+	noTTL := NewCache(1<<20, 0)
+	noTTL.Put(k, img)
+	noTTL.mu.Lock()
+	noTTL.m[k].Value.(*entry).expiresAt = time.Now().Add(-time.Second) // expired-looking, but ttl==0 never consults it
+	noTTL.mu.Unlock()
+	if _, outcome := noTTL.Get(k); outcome != GetHit {
+		t.Fatalf("ttl=0 cache must ignore the backdated expiry and hit, got %v", outcome)
+	}
+	if _, _, _, x := noTTL.Stats(); x != 0 {
+		t.Fatalf("ttl=0 cache expired = %d, want 0 (GetExpired unreachable without ttl > 0)", x)
+	}
+}
+
+// TestCacheTTL (AC-1) pins the TTL contract: an entry read after its TTL is
+// removed and reported as GetExpired — its own outcome class, distinct from a
+// genuine miss (which feeds the hit-ratio count) and from an LRU eviction —
+// even with zero LRU byte-budget pressure. Expiry state is injected
 // white-box (backdating expiresAt, per the result_cache precedent) so the
 // tests are sleep-free and -race-clean; one wall-clock subtest covers the
 // end-to-end path.
 func TestCacheTTL(t *testing.T) {
-	t.Run("expired entry is a miss with zero budget pressure", func(t *testing.T) {
+	t.Run("expired entry is its own class (expired), not a miss and not an LRU eviction", func(t *testing.T) {
 		c := NewCache(1<<20, time.Hour) // 1 MiB: no eviction pressure
 		k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
 		img := payload(100, 'a')
 		c.Put(k, img)
-		if got, ok := c.Get(k); !ok || !bytes.Equal(got, img) {
+		if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
 			t.Fatal("fresh entry must hit")
 		}
 		// Backdate the stored entry: the TTL has elapsed without any wall
@@ -363,15 +437,15 @@ func TestCacheTTL(t *testing.T) {
 		c.mu.Lock()
 		c.m[k].Value.(*entry).expiresAt = time.Now().Add(-time.Second)
 		c.mu.Unlock()
-		if got, ok := c.Get(k); ok || got != nil {
-			t.Fatalf("expired entry must miss even with zero budget pressure, got (%v, %v)", got, ok)
+		if got, outcome := c.Get(k); outcome != GetExpired || got != nil {
+			t.Fatalf("expired entry must report GetExpired with nil bytes, got (%v, %v)", got, outcome)
 		}
 		if c.Len() != 0 || c.Bytes() != 0 {
 			t.Fatalf("expired entry must be removed exactly: Len=%d Bytes=%d, want 0/0", c.Len(), c.Bytes())
 		}
-		h, m, e := c.Stats()
-		if h != 1 || m != 1 || e != 0 {
-			t.Fatalf("Stats after expiry = %d/%d/%d, want 1/1/0 (expired read is an ordinary miss, not an LRU eviction)", h, m, e)
+		h, m, e, x := c.Stats()
+		if h != 1 || m != 0 || e != 0 || x != 1 {
+			t.Fatalf("Stats after expiry = %d/%d/%d/%d, want 1/0/0/1 (expired read is its own class — it must not feed the hit-ratio miss count)", h, m, e, x)
 		}
 	})
 
@@ -387,8 +461,8 @@ func TestCacheTTL(t *testing.T) {
 		c.mu.Unlock()
 		b := payload(20, 'b')
 		c.Put(k, b) // replace = new generation -> fresh expiry
-		if got, ok := c.Get(k); !ok || !bytes.Equal(got, b) {
-			t.Fatalf("re-Put must refresh the expiry so the new generation hits: ok=%v bytes=%q", ok, got)
+		if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, b) {
+			t.Fatalf("re-Put must refresh the expiry so the new generation hits: outcome=%v bytes=%q", outcome, got)
 		}
 		c.mu.Lock()
 		exp := c.m[k].Value.(*entry).expiresAt
@@ -403,8 +477,8 @@ func TestCacheTTL(t *testing.T) {
 		k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
 		c.Put(k, payload(10, 'a'))
 		time.Sleep(2 * time.Millisecond) // bounded, sub-ms scale
-		if got, ok := c.Get(k); ok || got != nil {
-			t.Fatalf("entry past its TTL must miss on the wall-clock path, got (%v, %v)", got, ok)
+		if got, outcome := c.Get(k); outcome != GetExpired || got != nil {
+			t.Fatalf("entry past its TTL must report GetExpired on the wall-clock path, got (%v, %v)", got, outcome)
 		}
 		if c.Len() != 0 || c.Bytes() != 0 {
 			t.Fatalf("expired entry must be removed: Len=%d Bytes=%d, want 0/0", c.Len(), c.Bytes())
@@ -424,7 +498,7 @@ func TestCacheTTL(t *testing.T) {
 		k3 := CacheKey{Tenant: "t1", SourceETag: "e3", EffW: 32, EffH: 32}
 		cache.Put(k1, a)
 		cache.Put(k2, b)
-		if _, ok := cache.Get(k2); !ok {
+		if _, outcome := cache.Get(k2); outcome != GetHit {
 			t.Fatal("k2 must be present before the touch")
 		}
 		cache.mu.Lock()
@@ -434,19 +508,19 @@ func TestCacheTTL(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("overflow Put evicted %d entries, want 1", n)
 		}
-		if _, ok := cache.Get(k1); ok {
+		if _, outcome := cache.Get(k1); outcome == GetHit {
 			t.Fatal("expired tail entry must be gone after overflow")
 		}
-		if _, ok := cache.Get(k2); !ok {
+		if _, outcome := cache.Get(k2); outcome != GetHit {
 			t.Fatal("touched k2 must survive")
 		}
-		if _, ok := cache.Get(k3); !ok {
+		if _, outcome := cache.Get(k3); outcome != GetHit {
 			t.Fatal("k3 must be present after insertion")
 		}
 		if cache.Len() != 2 || cache.Bytes() != int64(len(b)+len(c3)) {
 			t.Fatalf("byte accounting broken: Len=%d Bytes=%d, want 2/%d", cache.Len(), cache.Bytes(), len(b)+len(c3))
 		}
-		if _, _, e := cache.Stats(); e != 1 {
+		if _, _, e, _ := cache.Stats(); e != 1 {
 			t.Fatalf("evictions = %d, want exactly 1 (budget-pressure eviction, not a double-counted TTL removal)", e)
 		}
 	})
@@ -461,21 +535,32 @@ func TestCacheTTLDisabled(t *testing.T) {
 	k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
 	img := payload(100, 'a')
 	c.Put(k, img)
-	if got, ok := c.Get(k); !ok || !bytes.Equal(got, img) {
-		t.Fatalf("ttl=0 must hit with the byte-identical payload: ok=%v", ok)
+	if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
+		t.Fatalf("ttl=0 must hit with the byte-identical payload: outcome=%v", outcome)
 	}
 	// Backdating expiresAt must be a no-op when ttl == 0 (the expiry field
 	// is never consulted — no wall-clock reads on the disabled path).
 	c.mu.Lock()
 	c.m[k].Value.(*entry).expiresAt = time.Now().Add(-time.Second)
 	c.mu.Unlock()
-	if got, ok := c.Get(k); !ok || !bytes.Equal(got, img) {
-		t.Fatal("ttl=0 must never consult expiry: expired-looking entry still hits")
+	if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
+		t.Fatalf("ttl=0 must never consult expiry: expired-looking entry still hits (outcome=%v)", outcome)
 	}
-	// Counter parity: hit, hit — no misses, no evictions (pre-TTL behavior).
-	h, m, e := c.Stats()
-	if h != 2 || m != 0 || e != 0 {
-		t.Fatalf("Stats = %d/%d/%d, want 2/0/0 (ttl=0 preserves the current counter behavior)", h, m, e)
+	// Counter parity: hit, hit — no misses, no evictions, no expired (pre-TTL
+	// behavior: a ttl<=0 cache can never yield GetExpired).
+	h, m, e, x := c.Stats()
+	if h != 2 || m != 0 || e != 0 || x != 0 {
+		t.Fatalf("Stats = %d/%d/%d/%d, want 2/0/0/0 (ttl=0 preserves the current counter behavior)", h, m, e, x)
+	}
+	// Disabled cache (maxBytes <= 0): every Get is a GetMiss and Stats stays
+	// 0/0/0/0 — no wall-clock read, no expired class possible.
+	dis := NewCache(0, time.Hour)
+	if got, outcome := dis.Get(k); outcome != GetMiss || got != nil {
+		t.Fatalf("disabled Get: want (nil, GetMiss), got (%v, %v)", got, outcome)
+	}
+	h, m, e, x = dis.Stats()
+	if h != 0 || m != 0 || e != 0 || x != 0 {
+		t.Fatalf("disabled Stats = %d/%d/%d/%d, want 0/0/0/0", h, m, e, x)
 	}
 }
 
@@ -511,10 +596,10 @@ func TestCacheTTLConcurrent(t *testing.T) {
 				}
 				hot := CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}
 				c.Put(hot, p)
-				if got, ok := c.Get(k); ok && len(got) != 64 {
+				if got, outcome := c.Get(k); outcome == GetHit && len(got) != 64 {
 					record("torn payload under TTL: %d bytes, want 64", len(got))
 				}
-				if got, ok := c.Get(hot); ok && len(got) != 64 {
+				if got, outcome := c.Get(hot); outcome == GetHit && len(got) != 64 {
 					record("torn hot payload under TTL: %d bytes, want 64", len(got))
 				}
 			}
@@ -566,7 +651,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		}
 		beforeOrder := listOrder(c) // [k4 k3 k2 k1 k0]
 		beforeBytes := c.bytes
-		h0, m0, e0 := c.hits, c.misses, c.evictions
+		h0, m0, e0, x0 := c.hits, c.misses, c.evictions, c.expired
 		c.mu.Unlock()
 		if wantBefore := []CacheKey{keys[4], keys[3], keys[2], keys[1], keys[0]}; !slices.Equal(beforeOrder, wantBefore) {
 			t.Fatalf("pre-sweep LRU order = %v, want %v (insert order, head-first)", beforeOrder, wantBefore)
@@ -588,7 +673,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		c.mu.Lock()
 		afterOrder := listOrder(c)
 		afterBytes := c.bytes
-		afterH, afterM, afterE := c.hits, c.misses, c.evictions
+		afterH, afterM, afterE, afterX := c.hits, c.misses, c.evictions, c.expired
 		c.mu.Unlock()
 		wantOrder := []CacheKey{keys[3], keys[1]}
 		if !slices.Equal(afterOrder, wantOrder) {
@@ -597,22 +682,22 @@ func TestCacheSweepExpired(t *testing.T) {
 		if afterBytes != c.Bytes() {
 			t.Fatalf("post-sweep accounting drift: %d vs Bytes() %d", afterBytes, c.Bytes())
 		}
-		if afterH != h0 || afterM != m0 || afterE != e0 {
-			t.Fatalf("Stats after sweep = %d/%d/%d, want %d/%d/%d (sweep must not touch counters)", afterH, afterM, afterE, h0, m0, e0)
+		if afterH != h0 || afterM != m0 || afterE != e0 || afterX != x0 {
+			t.Fatalf("Stats after sweep = %d/%d/%d/%d, want %d/%d/%d/%d (sweep must not touch counters)", afterH, afterM, afterE, afterX, h0, m0, e0, x0)
 		}
 		// Live entries still hit byte-identically; swept keys miss.
 		for _, i := range []int{1, 3} {
-			got, ok := c.Get(keys[i])
-			if !ok || !bytes.Equal(got, payload(sizes[i], byte('a'+i))) {
-				t.Fatalf("live key %d must survive and hit byte-identically: ok=%v", i, ok)
+			got, outcome := c.Get(keys[i])
+			if outcome != GetHit || !bytes.Equal(got, payload(sizes[i], byte('a'+i))) {
+				t.Fatalf("live key %d must survive and hit byte-identically: outcome=%v", i, outcome)
 			}
 		}
 		for _, i := range []int{0, 2, 4} {
-			if got, ok := c.Get(keys[i]); ok || got != nil {
-				t.Fatalf("swept key %d must miss: got (%v, %v)", i, got, ok)
+			if got, outcome := c.Get(keys[i]); outcome == GetHit || got != nil {
+				t.Fatalf("swept key %d must miss: got (%v, %v)", i, got, outcome)
 			}
 		}
-		if _, _, e := c.Stats(); e != 0 {
+		if _, _, e, _ := c.Stats(); e != 0 {
 			t.Fatalf("evictions = %d, want 0 (sweep is not an LRU eviction)", e)
 		}
 	})
@@ -651,7 +736,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		if !bytes.Equal(data, payload(100, 'a')) {
 			t.Fatal("boundary entry payload must be byte-identical")
 		}
-		if _, ok := c.Get(past); ok {
+		if _, outcome := c.Get(past); outcome == GetHit {
 			t.Fatal("past-deadline entry must be swept")
 		}
 	})
@@ -672,7 +757,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		if c.Len() != 1 || c.Bytes() != int64(len(img)) {
 			t.Fatalf("ttl=0 sweep must not touch state: Len=%d Bytes=%d, want 1/%d", c.Len(), c.Bytes(), len(img))
 		}
-		if got, ok := c.Get(k); !ok || !bytes.Equal(got, img) {
+		if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
 			t.Fatal("ttl=0 sweep must never consult expiry: backdated entry still hits byte-identically")
 		}
 		// Disabled cache (maxBytes <= 0): no-op without acquiring state, no panic.
@@ -683,8 +768,8 @@ func TestCacheSweepExpired(t *testing.T) {
 		if dis.Len() != 0 || dis.Bytes() != 0 {
 			t.Fatalf("disabled cache must stay empty: Len=%d Bytes=%d", dis.Len(), dis.Bytes())
 		}
-		if h, m, e := dis.Stats(); h != 0 || m != 0 || e != 0 {
-			t.Fatalf("disabled Stats = %d/%d/%d, want 0/0/0", h, m, e)
+		if h, m, e, x := dis.Stats(); h != 0 || m != 0 || e != 0 || x != 0 {
+			t.Fatalf("disabled Stats = %d/%d/%d/%d, want 0/0/0/0", h, m, e, x)
 		}
 	})
 
@@ -717,13 +802,13 @@ func TestCacheSweepExpired(t *testing.T) {
 		if ev := ctrl.Put(k4, d); ev != 1 {
 			t.Fatalf("control Put evicted %d entries, want 1 (live tail evicted)", ev)
 		}
-		if _, ok := ctrl.Get(k1); ok {
+		if _, outcome := ctrl.Get(k1); outcome == GetHit {
 			t.Fatal("control: live k1 must be evicted without the sweep")
 		}
-		if _, ok := ctrl.Get(k2); ok {
-			t.Fatal("control: expired k2 must still be resident without the sweep")
+		if _, outcome := ctrl.Get(k2); outcome != GetExpired {
+			t.Fatalf("control: expired k2 must be resident and lazy-expired by this Get (got %v, want GetExpired)", outcome)
 		}
-		if _, _, e := ctrl.Stats(); e != 1 {
+		if _, _, e, _ := ctrl.Stats(); e != 1 {
 			t.Fatalf("control evictions = %d, want 1 (an expired entry cost a budget eviction)", e)
 		}
 		// With the sweep: the expired k2 is removed for free (no counter
@@ -737,14 +822,14 @@ func TestCacheSweepExpired(t *testing.T) {
 			t.Fatalf("live Put after sweep evicted %d entries, want 0 (budget freed by the sweep)", ev)
 		}
 		for name, k := range map[string]CacheKey{"k1": k1, "k3": k3, "k4": k4} {
-			if _, ok := c.Get(k); !ok {
+			if _, outcome := c.Get(k); outcome != GetHit {
 				t.Fatalf("%s must survive the post-sweep Put", name)
 			}
 		}
-		if _, ok := c.Get(k2); ok {
+		if _, outcome := c.Get(k2); outcome == GetHit {
 			t.Fatal("expired k2 must be gone after the sweep")
 		}
-		if _, _, e := c.Stats(); e != 0 {
+		if _, _, e, _ := c.Stats(); e != 0 {
 			t.Fatalf("evictions = %d, want 0 (sweep removals are not LRU evictions)", e)
 		}
 	})
@@ -758,15 +843,15 @@ func TestCacheSweepExpired(t *testing.T) {
 			c.Put(keys[i], payload(sz, byte('a'+i)))
 		}
 		before, beforeLen := c.Bytes(), c.Len()
-		h0, m0, e0 := c.Stats()
+		h0, m0, e0, x0 := c.Stats()
 		if n := c.SweepExpired(time.Now()); n != 0 {
 			t.Fatalf("SweepExpired with nothing expired = %d, want 0 (full walk, zero removals)", n)
 		}
 		if c.Bytes() != before || c.Len() != beforeLen {
 			t.Fatalf("state changed with nothing expired: Bytes=%d/%d Len=%d/%d", c.Bytes(), before, c.Len(), beforeLen)
 		}
-		if h, m, e := c.Stats(); h != h0 || m != m0 || e != e0 {
-			t.Fatalf("Stats changed with nothing expired: %d/%d/%d -> %d/%d/%d", h0, m0, e0, h, m, e)
+		if h, m, e, x := c.Stats(); h != h0 || m != m0 || e != e0 || x != x0 {
+			t.Fatalf("Stats changed with nothing expired: %d/%d/%d/%d -> %d/%d/%d/%d", h0, m0, e0, x0, h, m, e, x)
 		}
 	})
 
@@ -790,8 +875,8 @@ func TestCacheSweepExpired(t *testing.T) {
 		if c.Len() != 0 || c.Bytes() != 0 {
 			t.Fatalf("cache must be empty after the full sweep: Len=%d Bytes=%d", c.Len(), c.Bytes())
 		}
-		if got, ok := c.Get(keys[0]); ok || got != nil {
-			t.Fatalf("Get after the full sweep: want (nil, false), got (%v, %v)", got, ok)
+		if got, outcome := c.Get(keys[0]); outcome != GetMiss || got != nil {
+			t.Fatalf("Get after the full sweep: want (nil, GetMiss), got (%v, %v)", got, outcome)
 		}
 		if c.Len() != 0 || c.Bytes() != 0 {
 			t.Fatal("post-sweep Get must not resurrect entries")
@@ -836,10 +921,10 @@ func TestCacheSweepExpiredConcurrent(t *testing.T) {
 				}
 				hot := CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}
 				c.Put(hot, p)
-				if got, ok := c.Get(k); ok && len(got) != 64 {
+				if got, outcome := c.Get(k); outcome == GetHit && len(got) != 64 {
 					record("torn payload under sweep: %d bytes, want 64", len(got))
 				}
-				if got, ok := c.Get(hot); ok && len(got) != 64 {
+				if got, outcome := c.Get(hot); outcome == GetHit && len(got) != 64 {
 					record("torn hot payload under sweep: %d bytes, want 64", len(got))
 				}
 			}
@@ -951,7 +1036,7 @@ func BenchmarkCacheGetTTL(b *testing.B) {
 		b.Run(fmt.Sprintf("ttl=%v", ttl), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if _, ok := c.Get(k); !ok {
+				if _, outcome := c.Get(k); outcome != GetHit {
 					b.Fatal("must hit")
 				}
 			}
@@ -984,7 +1069,7 @@ func TestCacheStampedeConcurrentMisses(t *testing.T) {
 			// another goroutine's store (the store is atomic); every
 			// goroutine must observe a correct outcome either way, and the
 			// stats below account for both branches.
-			if _, hit := c.Get(key); !hit {
+			if _, outcome := c.Get(key); outcome != GetHit {
 				c.Put(key, payload)
 			}
 		}()
@@ -994,14 +1079,15 @@ func TestCacheStampedeConcurrentMisses(t *testing.T) {
 	if got := c.Len(); got != 1 {
 		t.Fatalf("Len = %d, want exactly 1 entry after a same-key stampede", got)
 	}
-	got, hit := c.Get(key)
-	if !hit || !bytes.Equal(got, payload) {
-		t.Fatalf("post-stampede Get: hit=%v len=%d want hit=true len=%d (identical payload)", hit, len(got), len(payload))
+	got, outcome := c.Get(key)
+	if outcome != GetHit || !bytes.Equal(got, payload) {
+		t.Fatalf("post-stampede Get: outcome=%v len=%d want GetHit len=%d (identical payload)", outcome, len(got), len(payload))
 	}
 	// Stats: the n goroutine Gets split into misses (each followed by a
 	// store) and hits (store landed first); the verification Get is one
-	// more hit. Total = n + 1, and every miss stored exactly once.
-	hits, misses, _ := c.Stats()
+	// more hit. Total = n + 1, and every miss stored exactly once. The 4th
+	// value is the expired counter — unreachable here (ttl=0), discarded.
+	hits, misses, _, _ := c.Stats()
 	if hits+misses != n+1 {
 		t.Fatalf("hits+misses = %d, want %d (n goroutine Gets + 1 verification)", hits+misses, n+1)
 	}

@@ -272,8 +272,25 @@ when set (unchanged for existing deployments), else one sweep per TTL — the
 default-config bound, worst case physical retention of a never-read expired
 key ≤ 2×TTL. Observability: `thumbnail.cache.sweep_runs_total` per executed
 pass (liveness), `thumbnail.cache.swept_total` entries removed; alert
-`ThumbnailCacheSweepStalled` (alerts.yml) fires when no pass executes for 1h
-while the counter exists. **No action required for existing deployments —
+`ThumbnailCacheSweepStalled` (alerts.yml) fires when no pass executes within
+3× the sweep interval (envelope-adaptive since `d21de9c`, not a static 1h
+window). **No action required for existing deployments —
 `RECONCILE_INTERVAL_MINUTES > 0` deployments see zero cadence change**;
 `TTL = 0` deployments see zero change (no driver, lazy-only bound). The
 sweep is a memory curve change only.
+
+## Thumbnail cache hit-ratio accounting (2026-08-16)
+
+TTL-expired reads are now a **distinct class** from genuine misses:
+`thumbnail.cache.misses_total` drops to genuine-miss levels, the new
+`thumbnail_cache_expired_total` counter rises for expired reads, and
+`ThumbnailCacheHitRatioLow` (plus the hit-ratio panel) no longer counts
+expired reads as misses — a class of deployments that previously paged on the
+alert (TTL below the hot-key inter-request gap) will silently stop paging,
+by design. An all-expired workload shows **no data** on the hit-ratio panel
+(hits=0 ∧ misses=0, activity guard false) while `expired_total` rises —
+visually identical to an idle/disabled cache; triage via
+`rate(thumbnail_cache_expired_total[5m])` and size `THUMBNAIL_CACHE_TTL`
+above the hot-key inter-request interval. `thumbnail_cache_misses_total` is a
+semantics change for any external dashboard consuming it (in-repo panel +
+alert are description-updated); no config change, no migration.

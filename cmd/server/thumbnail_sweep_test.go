@@ -158,9 +158,9 @@ func TestThumbnailCacheSweepDriver(t *testing.T) {
 		t.Fatalf("entry dropped after %v, want within TTL+interval+grace (~230ms)", elapsed)
 	}
 
-	hits, misses, evictions := cache.Stats()
-	if hits != 0 || misses != 0 || evictions != 0 {
-		t.Fatalf("Cache.Stats touched by sweep removal: hits=%d misses=%d evictions=%d", hits, misses, evictions)
+	hits, misses, evictions, expired := cache.Stats()
+	if hits != 0 || misses != 0 || evictions != 0 || expired != 0 {
+		t.Fatalf("Cache.Stats touched by sweep removal: hits=%d misses=%d evictions=%d expired=%d", hits, misses, evictions, expired)
 	}
 
 	// No leaked goroutines: the driver must exit on ctx cancel.

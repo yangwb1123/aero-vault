@@ -1136,7 +1136,7 @@
           "refId": "A"
         }
       ],
-      "description": "Server-side thumbnail cache hit ratio (hits/(hits+misses) over 5m). Sustained < 0.5 fires ThumbnailCacheHitRatioLow; disabled cache emits no series."
+      "description": "Server-side thumbnail cache hit ratio (hits/(hits+misses) over 5m). Excludes TTL-expired reads — an expired read is counted in thumbnail_cache_expired_total, not in misses, so the ratio measures genuine effectiveness; a low ratio alongside a high expired rate indicates THUMBNAIL_CACHE_TTL below the hot-key inter-request interval, not budget pressure. An all-expired workload shows no data (hits=0 and misses=0) while thumbnail_cache_expired_total rises — visually identical to an idle/disabled cache; triage with rate(thumbnail_cache_expired_total[5m]). Sustained < 0.5 fires ThumbnailCacheHitRatioLow; disabled cache emits no series."
     }
   ]
 }

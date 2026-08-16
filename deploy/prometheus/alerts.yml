@@ -215,7 +215,12 @@ groups:
       # (evictions racing requests — LRU working set > budget) or the admission
       # gates are accidentally excluding the dominant path. The denominator
       # guard (sum of rates > 0) keeps the rule silent on idle caches and on
-      # disabled caches (no counters emitted).
+      # disabled caches (no counters emitted). The miss class counts genuine
+      # misses only: TTL-expired reads are a separate class
+      # (thumbnail_cache_expired_total) and never depress this ratio — an
+      # all-expired workload stays silent (hits=0 and misses=0 make the
+      # activity guard false) while expired_total rises, by design; triage the
+      # expired rate before budget-sizing.
       # Sweep-driver liveness (SRE F1 Option C): the driver records its
       # cadence envelope as gauges — the per-pass interval
       # (thumbnail_cache_sweep_interval_seconds) and the wall-clock time of
@@ -250,7 +255,7 @@ groups:
           severity: warning
         annotations:
           summary: "Thumbnail cache hit ratio below 50% for 15m"
-          description: "The server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail_cache_evictions_total; raise the budget or review the admission gates (SSE-C, SSE-KMS, and non-content-MD5-ETag objects bypass the cache by design; raising the budget will not recover their hits)."
+          description: "The ratio excludes TTL-expired reads (counted separately as thumbnail_cache_expired_total — an expired read is not a miss): first triage the expired rate — a high expired rate alongside a low ratio indicates THUMBNAIL_CACHE_TTL below the hot-key inter-request interval (size the TTL above it), not budget pressure. Genuine miss pressure: the server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail_cache_evictions_total; raise the budget or review the admission gates (SSE-C, SSE-KMS, and non-content-MD5-ETag objects bypass the cache by design; raising the budget will not recover their hits)."
 
       # Client-side revalidation fan-out ceiling: bounded freshness
       # (max-age=300, must-revalidate on the derived thumbnail) converts
