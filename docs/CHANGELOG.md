@@ -24,6 +24,16 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ---
 
+## 2026-08-15
+
+### Changed
+- **Thumbnail cache TTL physical purge wired to a production timer driver** (`cmd/server/thumbnail_sweep.go`, `cmd/server/main.go`, `internal/thumbnail/cache.go`)
+  - `Cache.SweepExpired` (previously a documented TODO) is now driven by a per-process timer at the `RECONCILE_INTERVAL_MINUTES` cadence (initial pass at start, then per interval; no singleton lease — the cache is in-process memory, only the local process can purge its own). Physical retention of never-read expired keys is bounded to TTL + sweep interval; with `RECONCILE_INTERVAL_MINUTES = 0` (default) the lazy-only bound applies (served retention is always strictly TTL-bounded regardless).
+  - **Upgrade note for existing `RECONCILE_INTERVAL_MINUTES > 0` deployments with `THUMBNAIL_CACHE_TTL_SECONDS > 0`:** the cache now periodically drops expired entries in place (previously it retained them until LRU pressure). No correctness impact (expired entries were never served), only the expected memory curve.
+  - New telemetry: `thumbnail.cache.sweep_runs_total` (per executed pass — the driver's liveness signal) and `thumbnail.cache.swept_total` (entries removed). New alert `ThumbnailCacheSweepStalled` fires when no pass executes for 1h while the counter exists; `ThumbnailCacheHitRatioLow` description updated for the admission-gate classes (SSE-C / SSE-KMS / non-content-MD5 ETags bypass by design).
+
+---
+
 ## 2026-08-12
 
 ### Added
@@ -43,6 +53,16 @@ All functional changes, in reverse-chronological order. Dates are UTC.
   - `?w=`/`?h=` values that are not non-negative integers (`?w=abc`, `?h=-1`, `?w=` empty, overflow) now return **400 InvalidArgument** naming the parameter, validated before the ETag/`If-None-Match` handling and before any decode — previously they were silently ignored and produced a default 256px thumbnail whose garbage-derived ETag polluted shared caches. `?w=0`/absent still means default 256; `> 2048` still clamps server-side.
   - `/openapi.json` documents the thumbnail route's 415 response (`apiRoute.Responses` extension; all other routes' specs are byte-identical).
   - Compatibility note: the gate keys off the **declared** Content-Type (no byte sniffing), so a webp-declared object with PNG bytes is 415; aliases that normalize to the decodable set (`Image/JPEG`, `image/jpeg; charset=utf-8`) keep 200.
+
+---
+
+## 2026-08-15
+
+### Changed
+- **Thumbnail cache TTL physical purge wired to a production timer driver** (`cmd/server/thumbnail_sweep.go`, `cmd/server/main.go`, `internal/thumbnail/cache.go`)
+  - `Cache.SweepExpired` (previously a documented TODO) is now driven by a per-process timer at the `RECONCILE_INTERVAL_MINUTES` cadence (initial pass at start, then per interval; no singleton lease — the cache is in-process memory, only the local process can purge its own). Physical retention of never-read expired keys is bounded to TTL + sweep interval; with `RECONCILE_INTERVAL_MINUTES = 0` (default) the lazy-only bound applies (served retention is always strictly TTL-bounded regardless).
+  - **Upgrade note for existing `RECONCILE_INTERVAL_MINUTES > 0` deployments with `THUMBNAIL_CACHE_TTL_SECONDS > 0`:** the cache now periodically drops expired entries in place (previously it retained them until LRU pressure). No correctness impact (expired entries were never served), only the expected memory curve.
+  - New telemetry: `thumbnail.cache.sweep_runs_total` (per executed pass — the driver's liveness signal) and `thumbnail.cache.swept_total` (entries removed). New alert `ThumbnailCacheSweepStalled` fires when no pass executes for 1h while the counter exists; `ThumbnailCacheHitRatioLow` description updated for the admission-gate classes (SSE-C / SSE-KMS / non-content-MD5 ETags bypass by design).
 
 ---
 

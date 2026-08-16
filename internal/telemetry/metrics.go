@@ -16,54 +16,50 @@ import (
 // exists at package-init time. They surface at /metrics with names like
 // ai_requests_total, ai_cost_micros_total, reconcile_orphan_blobs_total, etc.
 var (
-	domainOnce               sync.Once
-	mAIRequests              metric.Int64Counter
-	mAITokens                metric.Int64Counter
-	mAICostMicros            metric.Int64Counter
-	mAIEmbedRequests         metric.Int64Counter
-	mAIEmbedTokens           metric.Int64Counter
-	mAISearchLatency         metric.Float64Histogram
-	mAIEmbedLatency          metric.Float64Histogram
-	mReconcileOrphanBlobs    metric.Int64Counter
-	mReconcileDeleted        metric.Int64Counter
-	mIdempotencyReplays      metric.Int64Counter
-	mEventsDropped           metric.Int64Counter
-	mIndexerSkip             metric.Int64Counter
-	mSearchDegraded          metric.Int64Counter
-	mJobsCompleted           metric.Int64Counter
-	mJobsFailed              metric.Int64Counter
-	mJobsRetried             metric.Int64Counter
-	mScrubTotal              metric.Int64Counter
-	mWebhookRetries          metric.Int64Counter
-	mWebhookDelivery         metric.Int64Counter
-	mWebhookDeliveryLatency  metric.Float64Histogram
-	mWebhookDeadLetter       metric.Int64Counter
-	mStorageSizeMismatch     metric.Int64Counter
-	mETagVerifyMismatch      metric.Int64Counter
-	mPresignGenerated        metric.Int64Counter
-	mPresignConsumed         metric.Int64Counter
-	mMiddlewareDuration      metric.Float64Histogram
-	mSQLQueryDuration        metric.Float64Histogram
-	mSQLQueryCount           metric.Int64Counter
-	mNotifDelivered          metric.Int64Counter
-	mNotifFailed             metric.Int64Counter
-	mEventOutboxDelivered    metric.Int64Counter
-	mEventOutboxRetried      metric.Int64Counter
-	mEventOutboxFailed       metric.Int64Counter
-	mEventOutboxClaimLost    metric.Int64Counter
-	mEventOutboxPruned       metric.Int64Counter
-	mEventOutboxL2Delivered  metric.Int64Counter
-	mEventOutboxL2Unbound    metric.Int64Counter
-	mEventOutboxL2Rejected   metric.Int64Counter
-	mAuditGovRelayAttempted  metric.Int64Counter
-	mAuditGovRelayDelivered  metric.Int64Counter
-	mAuditGovRelayFailed     metric.Int64Counter
-	mAuditGovRelayDead       metric.Int64Counter
-	mThumbnailCacheHits      metric.Int64Counter
-	mThumbnailCacheMisses    metric.Int64Counter
-	mThumbnailCacheEvictions metric.Int64Counter
-	mThumbnailCacheSwept     metric.Int64Counter
-	mThumbnail304            metric.Int64Counter
+	domainOnce              sync.Once
+	mAIRequests             metric.Int64Counter
+	mAITokens               metric.Int64Counter
+	mAICostMicros           metric.Int64Counter
+	mAIEmbedRequests        metric.Int64Counter
+	mAIEmbedTokens          metric.Int64Counter
+	mAISearchLatency        metric.Float64Histogram
+	mAIEmbedLatency         metric.Float64Histogram
+	mReconcileOrphanBlobs   metric.Int64Counter
+	mReconcileDeleted       metric.Int64Counter
+	mIdempotencyReplays     metric.Int64Counter
+	mEventsDropped          metric.Int64Counter
+	mIndexerSkip            metric.Int64Counter
+	mSearchDegraded         metric.Int64Counter
+	mJobsCompleted          metric.Int64Counter
+	mJobsFailed             metric.Int64Counter
+	mJobsRetried            metric.Int64Counter
+	mScrubTotal             metric.Int64Counter
+	mWebhookRetries         metric.Int64Counter
+	mWebhookDelivery        metric.Int64Counter
+	mWebhookDeliveryLatency metric.Float64Histogram
+	mWebhookDeadLetter      metric.Int64Counter
+	mStorageSizeMismatch    metric.Int64Counter
+	mETagVerifyMismatch     metric.Int64Counter
+	mPresignGenerated       metric.Int64Counter
+	mPresignConsumed        metric.Int64Counter
+	mMiddlewareDuration     metric.Float64Histogram
+	mSQLQueryDuration       metric.Float64Histogram
+	mSQLQueryCount          metric.Int64Counter
+	mNotifDelivered         metric.Int64Counter
+	mNotifFailed            metric.Int64Counter
+	mEventOutboxDelivered   metric.Int64Counter
+	mEventOutboxRetried     metric.Int64Counter
+	mEventOutboxFailed      metric.Int64Counter
+	mEventOutboxClaimLost   metric.Int64Counter
+	mEventOutboxPruned      metric.Int64Counter
+	mEventOutboxL2Delivered metric.Int64Counter
+	mEventOutboxL2Unbound   metric.Int64Counter
+	mEventOutboxL2Rejected  metric.Int64Counter
+	mAuditGovRelayAttempted metric.Int64Counter
+	mAuditGovRelayDelivered metric.Int64Counter
+	mAuditGovRelayFailed    metric.Int64Counter
+	mAuditGovRelayDead      metric.Int64Counter
+	mThumbnail304           metric.Int64Counter
 )
 
 func initDomain() {
@@ -115,6 +111,7 @@ func initDomain() {
 		mThumbnailCacheMisses, _ = m.Int64Counter("thumbnail.cache.misses_total")
 		mThumbnailCacheEvictions, _ = m.Int64Counter("thumbnail.cache.evictions_total")
 		mThumbnailCacheSwept, _ = m.Int64Counter("thumbnail.cache.swept_total")
+		mThumbnailCacheSweepRuns, _ = m.Int64Counter("thumbnail.cache.sweep_runs_total")
 		mThumbnail304, _ = m.Int64Counter("thumbnail.304_total")
 	})
 }

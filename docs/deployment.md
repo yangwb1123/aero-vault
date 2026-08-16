@@ -262,3 +262,16 @@ make check
 sudo systemctl restart aero-vault.service
 curl -fsS https://source.ywbsd.site/readyz
 ```
+
+## Thumbnail cache TTL purge (2026-08-15)
+
+With `THUMBNAIL_CACHE_TTL_SECONDS > 0` and `RECONCILE_INTERVAL_MINUTES > 0`, the
+server-side thumbnail cache is physically purged by a per-process timer at the
+reconcile cadence (`thumbnail.cache.sweep_runs_total` per pass,
+`thumbnail.cache.swept_total` entries removed). Alert
+`ThumbnailCacheSweepStalled` (alerts.yml) fires when no pass executes for 1h
+while the counter exists. With `RECONCILE_INTERVAL_MINUTES = 0` (default),
+served retention stays strictly TTL-bounded via lazy expiry; only physical
+retention of never-read expired keys is unbounded (documented lazy-only
+fallback). No action required for existing deployments; the sweep is a memory
+curve change only.

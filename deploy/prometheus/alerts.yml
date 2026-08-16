@@ -216,6 +216,25 @@ groups:
       # gates are accidentally excluding the dominant path. The denominator
       # guard (sum of rates > 0) keeps the rule silent on idle caches and on
       # disabled caches (no counters emitted).
+      # Sweep-driver liveness: with THUMBNAIL_CACHE_TTL_SECONDS > 0, the
+      # per-pass counter must increase at the RECONCILE_INTERVAL_MINUTES
+      # cadence; a stall means the timer driver died (goroutine panic,
+      # shutdown race) and physical retention of never-read expired keys is
+      # now unbounded (lazy expiry still bounds served retention, so this is
+      # a resource-retention warning, not a correctness alert). The
+      # "increase is zero while the counter exists" predicate distinguishes a
+      # dead driver from a healthy-but-idle one (swept_total alone cannot).
+      - alert: ThumbnailCacheSweepStalled
+        expr: |
+          increase(thumbnail.cache.sweep_runs_total[1h]) == 0
+            and on() (sum(thumbnail.cache.sweep_runs_total) > 0)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thumbnail cache sweep driver stalled (no pass in 1h)"
+          description: "thumbnail.cache.sweep_runs_total did not increase for 1h while the counter exists — the TTL physical-purge driver is not executing (RECONCILE_INTERVAL_MINUTES > 0 with THUMBNAIL_CACHE_TTL_SECONDS > 0 expected). Check for a goroutine panic in the sweep driver; served retention stays bounded by lazy expiry, but physical retention of never-read expired keys is unbounded until the driver resumes."
+
       - alert: ThumbnailCacheHitRatioLow
         expr: |
           (sum by (instance) (rate(thumbnail.cache.hits_total[5m])) /

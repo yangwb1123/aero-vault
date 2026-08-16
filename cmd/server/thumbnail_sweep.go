@@ -53,6 +53,11 @@ func runThumbnailCacheSweep(ctx context.Context, cache *thumbnail.Cache, interva
 // count to telemetry. Cache.Stats is untouched by design — the sweep counter is
 // the driver's own observability surface.
 func sweepThumbnailCache(ctx context.Context, cache *thumbnail.Cache, logger *slog.Logger) {
+	// The per-pass counter increments on EVERY executed pass (even n == 0):
+	// it is the driver's liveness signal — swept_total alone would read zero
+	// both when the driver is healthy-but-idle and when it is dead, so the
+	// stalled-sweep alert keys off this counter's increase.
+	telemetry.IncThumbnailCacheSweepRun(ctx)
 	if n := cache.SweepExpired(time.Now()); n > 0 {
 		telemetry.IncThumbnailCacheSwept(ctx, int64(n))
 		logger.Debug("thumbnail cache sweep removed expired entries", "n", n)

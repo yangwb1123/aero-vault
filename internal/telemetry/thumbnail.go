@@ -1,6 +1,22 @@
 package telemetry
 
-import "context"
+import (
+	"context"
+
+	"go.opentelemetry.io/otel/metric"
+)
+
+// Thumbnail-cache domain counters. The instruments themselves live here
+// (the wrapper trio's Add calls) rather than in metrics.go's var block so
+// the metric.go file stays under the 500-line gate; initDomain binds them
+// to whichever MeterProvider is installed at runtime.
+var (
+	mThumbnailCacheHits      metric.Int64Counter
+	mThumbnailCacheMisses    metric.Int64Counter
+	mThumbnailCacheEvictions metric.Int64Counter
+	mThumbnailCacheSwept     metric.Int64Counter
+	mThumbnailCacheSweepRuns metric.Int64Counter
+)
 
 // Thumbnail-cache domain counters. The wrapper trio mirrors the
 // IncIndexerSkip pattern (metrics.go): counters are created lazily inside
@@ -38,6 +54,16 @@ func IncThumbnailCacheEviction(ctx context.Context, n int64) {
 func IncThumbnailCacheSwept(ctx context.Context, n int64) {
 	initDomain()
 	mThumbnailCacheSwept.Add(ctx, n)
+}
+
+// IncThumbnailCacheSweepRun counts one sweep pass EXECUTED by the driver —
+// regardless of how many entries were removed (even 0). It is the control's
+// liveness signal: swept_total alone reads zero both when the driver is
+// healthy-but-idle and when it is dead, so the stalled-sweep alert keys off
+// the per-pass counter instead.
+func IncThumbnailCacheSweepRun(ctx context.Context) {
+	initDomain()
+	mThumbnailCacheSweepRuns.Add(ctx, 1)
 }
 
 // IncThumbnail304 counts one certified 304 revalidation of the derived
