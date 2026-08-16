@@ -285,6 +285,41 @@ func TestThumbnail304CounterSurface(t *testing.T) {
 	}
 }
 
+// TestThumbnailGenerationCountersSurface records the derivation-outcome
+// counters (success + one rejection per reason) and verifies each appears in
+// the Prometheus scrape body with the exact value (AC-1). Only this test
+// touches the counters in this test binary, so the absolute values are exact;
+// scrapeValueLabel pins the exported names (dots → underscores, _total suffix)
+// and the fixed reason-label set against drift.
+func TestThumbnailGenerationCountersSurface(t *testing.T) {
+	if sharedPromHandler == nil {
+		t.Skip("sharedPromHandler not initialized")
+	}
+	ctx := context.Background()
+	for _, r := range []string{
+		"image_too_large", "metadata_too_large", "source_too_large",
+		"unsupported", "unsupported_format", "not_an_image",
+	} {
+		IncThumbnailGenerationRejection(ctx, r)
+	}
+	IncThumbnailGenerationSuccess(ctx)
+	IncThumbnailGenerationSuccess(ctx)
+
+	body := scrapeShared(t)
+	if v, ok := scrapeValue(body, "thumbnail_generation_success_total"); !ok || v != 2 {
+		t.Fatalf("thumbnail_generation_success_total = %v (ok=%v), want 2", v, ok)
+	}
+	for _, r := range []string{
+		"image_too_large", "metadata_too_large", "source_too_large",
+		"unsupported", "unsupported_format", "not_an_image",
+	} {
+		v, ok := scrapeValueLabel(body, "thumbnail_generation_rejections_total", "reason", r)
+		if !ok || v != 1 {
+			t.Errorf("thumbnail_generation_rejections_total{reason=%q} = %v (ok=%v), want 1", r, v, ok)
+		}
+	}
+}
+
 // scrapeShared runs one /metrics scrape through the shared handler.
 func scrapeShared(t *testing.T) string {
 	t.Helper()

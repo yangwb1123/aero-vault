@@ -13,6 +13,7 @@ import (
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
@@ -23,6 +24,71 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 	writeJSON(w, status, errorBody{Error: errorPayload{
 		Code: code, Message: message, RequestID: mw.RequestIDFrom(r.Context()),
 	}})
+}
+
+// thumbnailRejectionReason maps a thumbnail derivation error to exactly one
+// rejection reason label, or ("", true) when the failure is silent (client
+// disconnect — no response is emitted, so no counter). Branch order mirrors
+// writeThumbnailGenerateError/classify precedence so the reason always matches
+// the classify outcome of the error writeError receives; the checks MUST NOT be
+// reordered. The sentinel checks (errors.Is) precede the OpenError/SourceReadError
+// class checks (errors.As) because Is/As traverse Unwrap chains — that traversal
+// is what surfaces the sniff 415/400 reasons (ErrUnsupportedFormat, wrapped
+// ErrInvalidArgs→ErrNotAnImage) through *OpenError.
+//
+// The catch-all returns invalid_argument: writeThumbnailGenerateError's generic
+// wrap (fmt.Errorf("%w: %v", service.ErrInvalidArgs, err)) classifies every
+// unknown error as 400 InvalidArgument, so the label matches the wire outcome.
+// Known edge: an *OpenError whose inner error is context.Canceled races the
+// client-disconnect check (the pipeline fast-fails before the opener observes
+// the cancel) and wires as 500 while the reason is silent — a sub-millisecond
+// window, pre-existing wire behavior (OpenError is unwrapped first), accepted.
+func thumbnailRejectionReason(err error) (reason string, silent bool) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout", false
+	}
+	if errors.Is(err, context.Canceled) {
+		return "", true
+	}
+	if errors.Is(err, thumbnail.ErrImageTooLarge) {
+		return "image_too_large", false
+	}
+	if errors.Is(err, thumbnail.ErrMetadataTooLarge) {
+		return "metadata_too_large", false
+	}
+	if errors.Is(err, thumbnail.ErrSourceTooLarge) {
+		return "source_too_large", false
+	}
+	if errors.Is(err, thumbnail.ErrUnsupportedFormat) {
+		return "unsupported_format", false
+	}
+	if errors.Is(err, thumbnail.ErrNotAnImage) {
+		return "not_an_image", false
+	}
+	if errors.Is(err, thumbnail.ErrUnsupported) {
+		return "unsupported", false
+	}
+	if errors.Is(err, service.ErrInvalidArgs) {
+		return "invalid_argument", false
+	}
+	var oe *thumbnail.OpenError
+	var sre *thumbnail.SourceReadError
+	if errors.As(err, &oe) || errors.As(err, &sre) {
+		return "source_error", false
+	}
+	return "invalid_argument", false
+}
+
+// writeThumbnailError counts a derivation-phase rejection (unless silent) and
+// delegates to writeError for the wire response. It is the counting seam for
+// the four gate paths in thumbnailDerive that bypass writeThumbnailGenerateError
+// (declared non-image 400, declared unsupported 415, ?w=/?h= dims 400) so every
+// derivation rejection is observed at the boundary, not just pipeline errors.
+func (h *Handler) writeThumbnailError(w http.ResponseWriter, r *http.Request, err error) {
+	if reason, silent := thumbnailRejectionReason(err); !silent {
+		telemetry.IncThumbnailGenerationRejection(r.Context(), reason)
+	}
+	h.writeError(w, r, err)
 }
 
 // writeThumbnailGenerateError classifies and writes the error returned by the
@@ -37,6 +103,11 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 // %v, destroying the errors.Is chain) — then the marked source-stream failure,
 // then the catch-all.
 func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Request, err error) {
+	// Outcome observability: count the rejection class up front. Silent client
+	// disconnects (context.Canceled) are not counted — no response is emitted.
+	if reason, silent := thumbnailRejectionReason(err); !silent {
+		telemetry.IncThumbnailGenerationRejection(r.Context(), reason)
+	}
 	var oe *thumbnail.OpenError
 	if errors.As(err, &oe) {
 		h.writeError(w, r, oe.Err)

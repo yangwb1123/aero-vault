@@ -174,14 +174,14 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	mediaType, _, perr := mime.ParseMediaType(obj.ContentType)
 	sniffBytes := perr != nil || mediaType == "application/octet-stream"
 	if !sniffBytes && !strings.HasPrefix(mediaType, "image/") {
-		h.writeError(w, r, fmt.Errorf("%w: object is not an image (content-type %q)", service.ErrInvalidArgs, obj.ContentType))
+		h.writeThumbnailError(w, r, fmt.Errorf("%w: object is not an image (content-type %q)", service.ErrInvalidArgs, obj.ContentType))
 		return
 	}
 	if !sniffBytes {
 		switch mediaType {
 		case "image/jpeg", "image/png", "image/gif":
 		default:
-			h.writeError(w, r, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
+			h.writeThumbnailError(w, r, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
 				thumbnail.ErrUnsupportedFormat, obj.ContentType))
 			return
 		}
@@ -194,12 +194,12 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	q := r.URL.Query()
 	maxW, err := parseThumbDim(q, "w")
 	if err != nil {
-		h.writeError(w, r, err)
+		h.writeThumbnailError(w, r, err)
 		return
 	}
 	maxH, err := parseThumbDim(q, "h")
 	if err != nil {
-		h.writeError(w, r, err)
+		h.writeThumbnailError(w, r, err)
 		return
 	}
 
@@ -397,7 +397,7 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 					return nil, "", fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
 						thumbnail.ErrUnsupportedFormat, "webp")
 				}
-				return nil, "", fmt.Errorf("%w: %v", service.ErrInvalidArgs, aerr)
+				return nil, "", fmt.Errorf("%w: %w", service.ErrInvalidArgs, aerr)
 			}
 			// Admission by magic is a gate input only: the decode pipeline stays
 			// the final validity authority (ErrUnsupported → 400). Close must
@@ -447,6 +447,9 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		// describes the served bytes).
 		w.Header().Set("X-Version-Id", versionID)
 	}
+	// The 200 outcome is the contract (cache hit or miss alike); 304s returned
+	// before this point, so exactly one success per 200 response.
+	telemetry.IncThumbnailGenerationSuccess(r.Context())
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(img)
 }

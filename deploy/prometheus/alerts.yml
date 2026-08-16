@@ -266,3 +266,24 @@ groups:
         annotations:
           summary: "Thumbnail revalidation rate above 2000/s for 15m"
           description: "Sustained If-None-Match revalidations of derived thumbnails exceeded 2000/s over 5m (15m sustained). Bounded client freshness (max-age=300, must-revalidate) makes this the dominant read path per active client per thumbnail URL. Mitigation: arm RATE_LIMIT_RPS for per-tenant ceilings, front high-fan-out deployments with a CDN edge (one conditional per URL per 300 s instead of per client), enable THUMBNAIL_CACHE_BYTES, and inspect the access log for a misconfigured client fleet. The 300 s bound is the single package constant thumbFreshnessMaxAge."
+
+  - name: aero-vault-thumbnail-generation
+    rules:
+      # Derivation-outcome observability: every rejection class is counted at
+      # the REST boundary (thumbnail.generation.rejections_total{reason=...},
+      # scraped as thumbnail_generation_rejections_total) so a workload spike
+      # of oversized/metadata-flooded images (the memory-DoS defenses) or a
+      # 415 flood from undeclared WebP uploads is visible before requests
+      # fail. Threshold 100/s is a tunable default (no measured ceiling
+      # exists; calibrate per fleet). Uses the underscored scrape name (OTel
+      # maps dots→underscores) — unlike the pre-existing cache rules, which
+      # reference dotted names and never match the scrape surface.
+      - alert: ThumbnailRejectionRateHigh
+        expr: |
+          sum by (instance, reason) (rate(thumbnail_generation_rejections_total[5m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thumbnail generation rejections > 100/s for 10m (reason={{ $labels.reason }})"
+          description: "{{ $labels.reason }} thumbnail rejections sustained above 100/s for 10m. image_too_large/metadata_too_large/source_too_large: oversized or metadata-flooded uploads (memory-DoS defenses engaged); unsupported_format: undeclared WebP or other unsupported uploads; timeout: check REQUEST_TIMEOUT_SECONDS and decode-slot saturation."

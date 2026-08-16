@@ -5352,3 +5352,231 @@ func TestThumbnailLastModifiedDerivedFromOpenedObjectVersioned(t *testing.T) {
 		t.Fatal("versioned row must carry a VersionID")
 	}
 }
+
+// ── Derivation-outcome counter surface (AC-2) ────────────────────────────────
+
+// thumbRejectionReasons is the closed reason-label set produced by
+// thumbnailRejectionReason (the single source of truth for labels). The delta
+// assertions walk this list so a label that fires unexpectedly is caught.
+var thumbRejectionReasons = []string{
+	"image_too_large", "metadata_too_large", "source_too_large",
+	"unsupported_format", "not_an_image", "unsupported",
+	"invalid_argument", "source_error", "timeout",
+}
+
+// snapshotThumbCounters records the current value of the success counter and
+// every rejection reason. Deltas between two snapshots are asserted per
+// request — order-independent because other tests in the binary also generate
+// thumbnails (success/rejection series are cumulative, only deltas are
+// asserted; no t.Parallel exists in this package, so no mid-request mutation).
+func snapshotThumbCounters(t *testing.T) map[string]float64 {
+	t.Helper()
+	body := scrapeMetricsBody(t)
+	out := make(map[string]float64, len(thumbRejectionReasons)+1)
+	if v, ok := scrapeValue(body, "thumbnail_generation_success_total"); ok {
+		out[""] = v
+	}
+	for _, r := range thumbRejectionReasons {
+		if v, ok := scrapeValueLabel(body, "thumbnail_generation_rejections_total", "reason", r); ok {
+			out[r] = v
+		}
+	}
+	return out
+}
+
+// assertThumbDeltas asserts the counter movement between pre and now: the
+// firedReason rejection moved by exactly +1, every other rejection reason did
+// not move, and the success counter moved by successDelta.
+func assertThumbDeltas(t *testing.T, pre map[string]float64, firedReason string, successDelta float64) {
+	t.Helper()
+	post := snapshotThumbCounters(t)
+	for _, r := range thumbRejectionReasons {
+		want := 0.0
+		if r == firedReason {
+			want = 1
+		}
+		if got := post[r] - pre[r]; got != want {
+			t.Errorf("rejections_total{reason=%q} delta=%v want %v", r, got, want)
+		}
+	}
+	if got := post[""] - pre[""]; got != successDelta {
+		t.Errorf("success_total delta=%v want %v", got, successDelta)
+	}
+}
+
+// TestThumbnailGenerationCounterDeltas pins the counter-per-request invariant
+// at the REST boundary (AC-2): each derivation outcome increments exactly one
+// of {success, rejection-with-one-reason}, and never both; 304s and silent
+// disconnects increment neither.
+func TestThumbnailGenerationCounterDeltas(t *testing.T) {
+	t.Run("image_too_large_413", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/bomb.png"
+		req(t, "PUT", u, bombPNG(t, 100000, 100000), map[string]string{"Content-Type": "image/png"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("bomb thumbnail: status=%d want 413", resp.StatusCode)
+		}
+		assertThumbDeltas(t, pre, "image_too_large", 0)
+	})
+
+	t.Run("metadata_too_large_413", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/meta.jpg"
+		req(t, "PUT", u, appnPaddedJPEG(t, 9<<20), map[string]string{"Content-Type": "image/jpeg"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("metadata bomb thumbnail: status=%d want 413", resp.StatusCode)
+		}
+		// Sibling-run C1 fold-in: the 413 arm must not emit cache validators
+		// (a rejected derivation must not seed any cache).
+		for _, hdr := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+			if v := resp.Header.Get(hdr); v != "" {
+				t.Errorf("413 %s=%q must be absent (cache hygiene)", hdr, v)
+			}
+		}
+		assertThumbDeltas(t, pre, "metadata_too_large", 0)
+	})
+
+	t.Run("unsupported_format_declared_415", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/pic.webp"
+		req(t, "PUT", u, webpBytes, map[string]string{"Content-Type": "image/webp"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusUnsupportedMediaType {
+			t.Fatalf("declared webp thumbnail: status=%d want 415", resp.StatusCode)
+		}
+		assertThumbDeltas(t, pre, "unsupported_format", 0)
+	})
+
+	t.Run("unsupported_format_sniffed_415", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/generic.webp"
+		req(t, "PUT", u, webpBytes, map[string]string{"Content-Type": "application/octet-stream"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusUnsupportedMediaType {
+			t.Fatalf("sniffed webp thumbnail: status=%d want 415", resp.StatusCode)
+		}
+		// The sniff 415 surfaces through *OpenError: the sentinel check must
+		// traverse the wrap chain (unsupported_format, not source_error).
+		assertThumbDeltas(t, pre, "unsupported_format", 0)
+	})
+
+	t.Run("not_an_image_400", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/generic.txt"
+		req(t, "PUT", u, []byte("hello"), map[string]string{"Content-Type": "application/octet-stream"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("octet-stream text thumbnail: status=%d want 400", resp.StatusCode)
+		}
+		// Exercises the %w:%w sniff wrap (FR-6): ErrNotAnImage must survive
+		// the chain to the counting point (not_an_image, not invalid_argument).
+		assertThumbDeltas(t, pre, "not_an_image", 0)
+	})
+
+	t.Run("timeout_504", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		dir := t.TempDir()
+		repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "dl.db"))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if err := repo.Migrate(context.Background()); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+		h := NewHandler(service.NewFileService(&stallStore{Storage: store, img: pngBytes(t, 64, 64)}, repo, nil), nil)
+		h.thumbnailTimeout = 100 * time.Millisecond
+		r := chi.NewRouter()
+		r.Put("/v1/files/*", h.putKey)
+		r.Get("/v1/files/*", h.getKey)
+		srv := httptest.NewServer(r)
+		t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+		u := srv.URL + "/v1/files/img.png"
+		req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"})
+		resp, _ := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, nil)
+		if resp.StatusCode != http.StatusGatewayTimeout {
+			t.Fatalf("mid-decode deadline: status=%d want 504", resp.StatusCode)
+		}
+		assertThumbDeltas(t, pre, "timeout", 0)
+	})
+
+	t.Run("success_200", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/ok.png"
+		req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("thumbnail: status=%d want 200", resp.StatusCode)
+		}
+		assertThumbDeltas(t, pre, "", 1)
+	})
+
+	t.Run("revalidation_304", func(t *testing.T) {
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/ok.png"
+		req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			t.Fatal("200 thumbnail missing ETag")
+		}
+		pre := snapshotThumbCounters(t) // snapshot AFTER the 200: only the 304's movement is asserted
+		resp2, _ := req(t, "GET", u+"/thumbnail", nil, map[string]string{"If-None-Match": etag})
+		if resp2.StatusCode != http.StatusNotModified {
+			t.Fatalf("thumbnail If-None-Match: status=%d want 304", resp2.StatusCode)
+		}
+		// The 304 fast path ran (IncThumbnail304 covers it) — success and
+		// rejection counters must not move.
+		assertThumbDeltas(t, pre, "", 0)
+	})
+}
+
+// TestThumbnailRejectionReasonUnit pins thumbnailRejectionReason for the
+// shapes the production paths produce (raw sentinels, OpenError/SourceReadError
+// wraps, context errors, unknown residue) — including source_too_large,
+// invalid_argument, and the silent Canceled case cheaply without a 128 MiB
+// fixture. Ordering assertions are implicit: each error must map to exactly
+// one non-silent reason.
+func TestThumbnailRejectionReasonUnit(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantReason string
+		wantSilent bool
+	}{
+		{"image too large", thumbnail.ErrImageTooLarge, "image_too_large", false},
+		{"metadata too large", thumbnail.ErrMetadataTooLarge, "metadata_too_large", false},
+		{"source too large", thumbnail.ErrSourceTooLarge, "source_too_large", false},
+		{"unsupported format", thumbnail.ErrUnsupportedFormat, "unsupported_format", false},
+		{"not an image", thumbnail.ErrNotAnImage, "not_an_image", false},
+		{"unsupported", thumbnail.ErrUnsupported, "unsupported", false},
+		{"invalid args", service.ErrInvalidArgs, "invalid_argument", false},
+		{"deadline exceeded", context.DeadlineExceeded, "timeout", false},
+		{"canceled silent", context.Canceled, "", true},
+		{"open error declared unsupported", &thumbnail.OpenError{
+			Err: fmt.Errorf("%w: unsupported image format %q", thumbnail.ErrUnsupportedFormat, "webp"),
+		}, "unsupported_format", false},
+		{"open error sniffed not an image", &thumbnail.OpenError{
+			Err: fmt.Errorf("%w: %w", service.ErrInvalidArgs, thumbnail.ErrNotAnImage),
+		}, "not_an_image", false},
+		{"open error object state", &thumbnail.OpenError{Err: service.ErrNotFound}, "source_error", false},
+		{"source read error", &thumbnail.SourceReadError{Err: service.ErrObjectCorrupt}, "source_error", false},
+		{"unknown residue", errors.New("boom"), "invalid_argument", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, silent := thumbnailRejectionReason(tc.err)
+			if reason != tc.wantReason || silent != tc.wantSilent {
+				t.Fatalf("reason=%q silent=%v want reason=%q silent=%v", reason, silent, tc.wantReason, tc.wantSilent)
+			}
+		})
+	}
+}

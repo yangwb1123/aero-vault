@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -11,11 +12,13 @@ import (
 // the metric.go file stays under the 500-line gate; initDomain binds them
 // to whichever MeterProvider is installed at runtime.
 var (
-	mThumbnailCacheHits      metric.Int64Counter
-	mThumbnailCacheMisses    metric.Int64Counter
-	mThumbnailCacheEvictions metric.Int64Counter
-	mThumbnailCacheSwept     metric.Int64Counter
-	mThumbnailCacheSweepRuns metric.Int64Counter
+	mThumbnailCacheHits            metric.Int64Counter
+	mThumbnailCacheMisses          metric.Int64Counter
+	mThumbnailCacheEvictions       metric.Int64Counter
+	mThumbnailCacheSwept           metric.Int64Counter
+	mThumbnailCacheSweepRuns       metric.Int64Counter
+	mThumbnailGenerationSuccess    metric.Int64Counter
+	mThumbnailGenerationRejections metric.Int64Counter
 )
 
 // Thumbnail-cache domain counters. The wrapper trio mirrors the
@@ -74,4 +77,25 @@ func IncThumbnailCacheSweepRun(ctx context.Context) {
 func IncThumbnail304(ctx context.Context) {
 	initDomain()
 	mThumbnail304.Add(ctx, 1)
+}
+
+// IncThumbnailGenerationSuccess counts one thumbnail derivation request that
+// resolves to HTTP 200 — cache hit or miss alike; the 200 outcome is the
+// contract, not the decode path (a cache hit serves the stored JPEG with no
+// slot, opener, or decode but is still a successful derivation response). 304s
+// are excluded: IncThumbnail304 already covers the revalidation fast path.
+func IncThumbnailGenerationSuccess(ctx context.Context) {
+	initDomain()
+	mThumbnailGenerationSuccess.Add(ctx, 1)
+}
+
+// IncThumbnailGenerationRejection counts one derivation-phase rejection tagged
+// with exactly one reason label (the closed set produced by the REST boundary's
+// thumbnailRejectionReason: image_too_large | metadata_too_large |
+// source_too_large | unsupported_format | not_an_image | unsupported |
+// invalid_argument | source_error | timeout). Silent client disconnects are not
+// counted — no response is emitted for them.
+func IncThumbnailGenerationRejection(ctx context.Context, reason string) {
+	initDomain()
+	mThumbnailGenerationRejections.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }

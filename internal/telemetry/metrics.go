@@ -113,6 +113,8 @@ func initDomain() {
 		mThumbnailCacheSwept, _ = m.Int64Counter("thumbnail.cache.swept_total")
 		mThumbnailCacheSweepRuns, _ = m.Int64Counter("thumbnail.cache.sweep_runs_total")
 		mThumbnail304, _ = m.Int64Counter("thumbnail.304_total")
+		mThumbnailGenerationSuccess, _ = m.Int64Counter("thumbnail.generation.success_total")
+		mThumbnailGenerationRejections, _ = m.Int64Counter("thumbnail.generation.rejections_total")
 	})
 }
 
