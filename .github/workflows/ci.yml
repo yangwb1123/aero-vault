@@ -159,7 +159,7 @@ jobs:
         # -parallel=1 keeps the 386 run deterministic under the race-free
         # channel semantics; the corpus files land in testdata/fuzz and are
         # picked up by the amd64 seed phase of the next run.
-        run: GOARCH=386 go test -fuzz=FuzzExifOrientation -run '^$' -fuzztime=30s -parallel=1 ./internal/thumbnail/ && GOARCH=386 go test -fuzz=FuzzProgressiveJPEG -run '^$' -fuzztime=30s -parallel=1 ./internal/thumbnail/
+        run: GOARCH=386 go test -fuzz=FuzzExifOrientation -run '^$' -fuzztime=30s -parallel=1 ./internal/thumbnail/ && GOARCH=386 go test -fuzz=FuzzProgressiveJPEG -run '^$' -fuzztime=30s -parallel=1 ./internal/thumbnail/ && GOARCH=386 go test -fuzz=FuzzPNGOrientation -run '^$' -fuzztime=30s -parallel=1 ./internal/thumbnail/
 
       - name: Reproduce pinned crashers (both word sizes)
         run: go test -run 'TestFuzzCorpusReproduction' -count=1 ./internal/thumbnail/ && GOARCH=386 go test -run 'TestFuzzCorpusReproduction' -count=1 ./internal/thumbnail/

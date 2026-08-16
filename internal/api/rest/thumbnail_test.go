@@ -5655,3 +5655,46 @@ func TestThumbnailGenerationSourceErrorDelta(t *testing.T) {
 	}
 	assertThumbDeltas(t, pre, "source_error", 0)
 }
+
+// TestThumbnailPNGeXIfHugeLengthWireFlip pins F-1: a PNG whose eXIf chunk
+// declares a length ≥ 2³¹ (image/png's FormatError class) changes wire class
+// from the pre-fix 413 MetadataTooLarge to 400 InvalidArgument — the
+// observable flip must be pinned through the HTTP handler, not just the
+// module seam. The telemetry label follows (unsupported, not
+// metadata_too_large) via the shared rejection path.
+func TestThumbnailPNGeXIfHugeLengthWireFlip(t *testing.T) {
+	pre := snapshotThumbCounters(t)
+	s := newRESTTest(t)
+	// A real PNG whose pre-IDAT region carries an eXIf chunk header declaring
+	// length 0x80000000 (>= 2³¹): the walk hoist returns "orientation 1" and
+	// Decode re-reads the same bytes → image/png FormatError → ErrUnsupported
+	// → 400 InvalidArgument (pre-fix: the length was treated as a metadata
+	// budget overrun → 413 MetadataTooLarge).
+	base := pngBytes(t, 32, 32)
+	fixture := append(append([]byte(nil), base[:33]...), append(pngChunkHeaderBytes(t, "eXIf", 0x80000000), base[33:]...)...)
+	u := s.URL + "/v1/files/hugelen.png"
+	req(t, "PUT", u, fixture, map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("eXIf huge-length thumbnail: status=%d want 400 (body=%q)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":"InvalidArgument"`)) {
+		t.Fatalf("expected code InvalidArgument, body: %s", body)
+	}
+	// The telemetry label flipped with the wire class: the rejection counts
+	// under unsupported, not metadata_too_large.
+	assertThumbDeltas(t, pre, "unsupported", 0)
+}
+
+// pngChunkHeaderBytes builds a raw PNG chunk header (length + type) for the
+// huge-length wire-flip fixture — the rest-package analogue of the thumbnail
+// package's test helper.
+func pngChunkHeaderBytes(t *testing.T, chunkType string, length uint32) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], length)
+	out.Write(l[:])
+	out.WriteString(chunkType)
+	return out.Bytes()
+}
