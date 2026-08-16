@@ -9,8 +9,12 @@ import (
 // CacheKeyVersion is the cache-key schema version: bump it whenever the
 // generated thumbnail bytes can change for the same source ETag + effective
 // dims (pipeline output changes — quality, composite, rotation, format
-// defaults). Stale entries under an old version are never looked up; the
-// bounded LRU evicts them naturally.
+// defaults). The REST thumbnail wire validator (rest.thumbValidatorETag)
+// embeds the same version, so a bump also invalidates every client-held
+// validator in lockstep — server cache key and client validator move
+// together, and the const-derived endpoint pins keep that coupling honest.
+// Stale entries under an old version are never looked up; the bounded LRU
+// evicts them naturally.
 const CacheKeyVersion = 1
 
 // GetOutcome classifies one Cache.Get result. GetHit: stored bytes served,

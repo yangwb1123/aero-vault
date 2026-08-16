@@ -319,6 +319,11 @@ func TestCacheKeyInjectivity(t *testing.T) {
 		{"etag", func(k CacheKey) CacheKey { k.SourceETag = "e2"; return k }},
 		{"effW", func(k CacheKey) CacheKey { k.EffW = 33; return k }},
 		{"effH", func(k CacheKey) CacheKey { k.EffH = 33; return k }},
+		// The pipeline version is key identity too: cache_entry.go:84 keys
+		// the entry by it and the REST wire validator (rest.thumbValidatorETag)
+		// embeds it, so a future bump must never collide entries across
+		// incompatible pipeline outputs.
+		{"version", func(k CacheKey) CacheKey { k.Version = 2; return k }},
 		{"etag-quoted", func(k CacheKey) CacheKey { k.SourceETag = `"e1"`; return k }},
 		{"etag-multipart", func(k CacheKey) CacheKey { k.SourceETag = "md5hex-4"; return k }},
 	}
