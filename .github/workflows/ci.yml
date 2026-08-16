@@ -101,7 +101,7 @@ jobs:
         # etagSwapRepo seam (swap/fail arms), so they race under the same
         # detector too. Scoped via -run so the full REST package is not
         # covered here.
-        run: go test -race -short -count=1 -timeout 120s ./internal/api/rest/ -run 'TestThumbnailMidDecode|TestThumbnail304RevalidatesAfterStat|TestThumbnail304ShortCircuitsBeforeOpen'
+        run: go test -race -short -count=1 -timeout 120s ./internal/api/rest/ -run 'TestThumbnailMidDecode|TestThumbnail304RevalidatesAfterStat|TestThumbnail304ShortCircuitsBeforeOpen|TestThumbnailGeneration'
 
       - name: Coverage
         run: |

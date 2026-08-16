@@ -3234,6 +3234,31 @@ func (s *failingGetStore) Get(ctx context.Context, key string) (io.ReadCloser, s
 	return nil, storage.ObjectInfo{}, s.err
 }
 
+// newThumbnailFailingGetServer returns a REST server whose storage Get
+// always fails (the failingGetStore seam) — the deterministic e2e fixture
+// for the source_error counter arm.
+func newThumbnailFailingGetServer(t *testing.T) (*httptest.Server, *failingGetStore, *service.FileService, *chi.Mux) {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "fg.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store, _ := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	fs := &failingGetStore{Storage: store, err: storage.ErrNotFound}
+	svc := service.NewFileService(fs, repo, nil)
+	h := NewHandler(svc, nil)
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+	return srv, fs, svc, r
+}
+
 // TestThumbnailOpenErrorAfterStatRace404 pins FR-4 outcome parity: an object
 // that passes the Stat pre-check but fails at open time (deleted between
 // Stat and Get) surfaces through *OpenError as today's writeError
@@ -5579,4 +5604,54 @@ func TestThumbnailRejectionReasonUnit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestThumbnailGenerationCounterDeltasGateSites pins the two remaining
+// gate-wiring delta sites (condition 2a): a garbage ?w=/?h= request and a
+// declared non-image (bucket-4) request must each fire exactly
+// invalid_argument — the catch-all reason the helper falls back to — proving
+// the gate sites are wired into the counter path, not just the unit seam.
+func TestThumbnailGenerationCounterDeltasGateSites(t *testing.T) {
+	t.Run("invalid_dims_400", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/img.png"
+		req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"})
+		resp, _ := req(t, "GET", u+"/thumbnail?w=abc", nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("garbage dims thumbnail: status=%d want 400", resp.StatusCode)
+		}
+		assertThumbDeltas(t, pre, "invalid_argument", 0)
+	})
+
+	t.Run("declared_non_image_400", func(t *testing.T) {
+		pre := snapshotThumbCounters(t)
+		s := newRESTTest(t)
+		u := s.URL + "/v1/files/note.txt"
+		req(t, "PUT", u, []byte("hello"), map[string]string{"Content-Type": "text/plain"})
+		resp, _ := req(t, "GET", u+"/thumbnail", nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("declared non-image thumbnail: status=%d want 400", resp.StatusCode)
+		}
+		assertThumbDeltas(t, pre, "invalid_argument", 0)
+	})
+}
+
+// TestThumbnailGenerationSourceErrorDelta pins condition 2b: the
+// deterministic e2e fixture (failingGetStore — a storage Get that fails
+// after the Stat raced) must fire exactly source_error at the counter level,
+// not the catch-all — the e2e arm of the source-error classification.
+func TestThumbnailGenerationSourceErrorDelta(t *testing.T) {
+	pre := snapshotThumbCounters(t)
+	srv, _, _, _ := newThumbnailFailingGetServer(t)
+	u := srv.URL + "/v1/files/pic.png"
+	req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"})
+	// The 404 race fixture: the pre-open Stat sees the object; the opener's
+	// storage Get fails (the failingGetStore seam) → *OpenError path →
+	// source_error.
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("failing-get thumbnail: status=%d want 404 (body=%q)", resp.StatusCode, body)
+	}
+	assertThumbDeltas(t, pre, "source_error", 0)
 }

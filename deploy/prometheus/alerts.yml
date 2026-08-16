@@ -226,28 +226,28 @@ groups:
       # dead driver from a healthy-but-idle one (swept_total alone cannot).
       - alert: ThumbnailCacheSweepStalled
         expr: |
-          increase(thumbnail.cache.sweep_runs_total[1h]) == 0
-            and on() (sum(thumbnail.cache.sweep_runs_total) > 0)
+          increase(thumbnail_cache_sweep_runs_total[1h]) == 0
+            and on() (sum(thumbnail_cache_sweep_runs_total) > 0)
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Thumbnail cache sweep driver stalled (no pass in 1h)"
-          description: "thumbnail.cache.sweep_runs_total did not increase for 1h while the counter exists — the TTL physical-purge driver is not executing (RECONCILE_INTERVAL_MINUTES > 0 with THUMBNAIL_CACHE_TTL_SECONDS > 0 expected). Check for a goroutine panic in the sweep driver; served retention stays bounded by lazy expiry, but physical retention of never-read expired keys is unbounded until the driver resumes."
+          description: "thumbnail_cache_sweep_runs_total did not increase for 1h while the counter exists — the TTL physical-purge driver is not executing (RECONCILE_INTERVAL_MINUTES > 0 with THUMBNAIL_CACHE_TTL_SECONDS > 0 expected). Check for a goroutine panic in the sweep driver; served retention stays bounded by lazy expiry, but physical retention of never-read expired keys is unbounded until the driver resumes."
 
       - alert: ThumbnailCacheHitRatioLow
         expr: |
-          (sum by (instance) (rate(thumbnail.cache.hits_total[5m])) /
-           (sum by (instance) (rate(thumbnail.cache.hits_total[5m])) +
-            sum by (instance) (rate(thumbnail.cache.misses_total[5m])))) < 0.5
-            and on(instance) (sum by (instance) (rate(thumbnail.cache.hits_total[5m]))
-            + sum by (instance) (rate(thumbnail.cache.misses_total[5m]))) > 0
+          (sum by (instance) (rate(thumbnail_cache_hits_total[5m])) /
+           (sum by (instance) (rate(thumbnail_cache_hits_total[5m])) +
+            sum by (instance) (rate(thumbnail_cache_misses_total[5m])))) < 0.5
+            and on(instance) (sum by (instance) (rate(thumbnail_cache_hits_total[5m]))
+            + sum by (instance) (rate(thumbnail_cache_misses_total[5m]))) > 0
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Thumbnail cache hit ratio below 50% for 15m"
-          description: "The server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail.cache.evictions_total; raise the budget or review the admission gates (SSE-C, SSE-KMS, and non-content-MD5-ETag objects bypass the cache by design; raising the budget will not recover their hits)."
+          description: "The server-side thumbnail cache is serving less than half of requests from cache (hits/(hits+misses) < 0.5 for 15m while active). Check THUMBNAIL_CACHE_BYTES sizing against the working set and thumbnail_cache_evictions_total; raise the budget or review the admission gates (SSE-C, SSE-KMS, and non-content-MD5-ETag objects bypass the cache by design; raising the budget will not recover their hits)."
 
       # Client-side revalidation fan-out ceiling: bounded freshness
       # (max-age=300, must-revalidate on the derived thumbnail) converts
