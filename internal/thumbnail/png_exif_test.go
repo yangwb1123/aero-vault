@@ -337,6 +337,35 @@ func TestGeneratePNGRejectsOversizedMetadata(t *testing.T) {
 	}
 }
 
+// AC-2: a PNG declaring a pre-IDAT chunk length ≥ 2³¹ (image/png's "Bad
+// chunk length" FormatError threshold) must classify ErrUnsupported (HTTP
+// 400) byte-for-byte the same whether the chunk is eXIf or any other type
+// (tEXt sibling). Pre-fix, the eXIf walk's budget pre-check fired first
+// (remaining+headAvail ≤ MaxMetadataBytes−33 < 2³¹) and misclassified the
+// input as errMetadataBudgetExceeded → ErrMetadataTooLarge (HTTP 413); the
+// walk now stops at the header with (1, nil) and Decode re-reads the same
+// bytes through the replay tee and hits the FormatError, in parity with the
+// tEXt sibling.
+func TestGeneratePNGeXIfInvalidChunkLengthIsUnsupported(t *testing.T) {
+	base := makePNG(t, 64, 64)
+	exifFixture := append(append([]byte(nil), base[:33]...), append(pngChunkHeader(t, "eXIf", 0x80000000), base[33:]...)...)
+	textFixture := append(append([]byte(nil), base[:33]...), append(pngChunkHeader(t, "tEXt", 0x80000000), base[33:]...)...)
+	imgExif, errExif := Generate(bytes.NewReader(exifFixture), 64, 64)
+	imgText, errText := Generate(bytes.NewReader(textFixture), 64, 64)
+	if imgExif != nil || !errors.Is(errExif, ErrUnsupported) {
+		t.Fatalf("eXIf fixture: expected ErrUnsupported with nil payload, got img!=nil=%v err=%v", imgExif != nil, errExif)
+	}
+	if imgText != nil || !errors.Is(errText, ErrUnsupported) {
+		t.Fatalf("tEXt fixture: expected ErrUnsupported with nil payload, got img!=nil=%v err=%v", imgText != nil, errText)
+	}
+	if errors.Is(errExif, ErrMetadataTooLarge) || errors.Is(errText, ErrMetadataTooLarge) {
+		t.Fatalf("neither fixture may classify MetadataTooLarge: exif=%v text=%v", errExif, errText)
+	}
+	if errors.Is(errExif, ErrUnsupported) != errors.Is(errText, ErrUnsupported) || errExif.Error() != errText.Error() {
+		t.Fatalf("class parity broken: exif=%v text=%v", errExif, errText)
+	}
+}
+
 // AC-5b: an eXIf chunk placed AFTER the first IDAT chunk must be ignored —
 // the walk terminates at IDAT (compressed data is never scanned), so the
 // output is the absent-EXIF 256×128 red-on-top shape.
@@ -464,6 +493,7 @@ func TestPNGOrientationDefensive(t *testing.T) {
 		{"idat first stops", ihdr, bytes.NewReader(pngChunkHeader(t, "IDAT", 0)), context.Background(), 1, nil},
 		{"iend first stops", ihdr, bytes.NewReader(pngChunkHeader(t, "IEND", 0)), context.Background(), 1, nil},
 		{"length over 2^31 stops", ihdr, bytes.NewReader(pngChunkHeader(t, "tEXt", 0x80000000)), context.Background(), 1, nil},
+		{"exif length over 2^31 stops", ihdr, bytes.NewReader(pngChunkHeader(t, "eXIf", 0x80000000)), context.Background(), 1, nil},
 		{"exif length beyond budget aborts before allocation",
 			ihdr,
 			&eXIfHeaderReader{hdr: pngChunkHeader(t, "eXIf", uint32(MaxMetadataBytes-33+1))},
@@ -763,9 +793,10 @@ func FuzzPNGOrientation(f *testing.F) {
 	f.Add(oriented, []byte(nil))                                                      // whole stream in head
 	f.Add(orientedPNG(f, 64, 64, 6, true)[:33], orientedPNG(f, 64, 64, 6, true)[33:]) // prefixed deviation
 	after := spliceAfterIDAT(f, orientedPNG(f, 64, 64, 0, false), "eXIf", bareExifPayload(6, binary.LittleEndian))
-	f.Add(after[:33], after[33:])         // post-IDAT eXIf (ignored)
-	f.Add([]byte("garbage"), []byte(nil)) // not a PNG header
-	f.Add(ihdr[:33], []byte{0x00, 0x01})  // truncated chunk header
+	f.Add(after[:33], after[33:])                           // post-IDAT eXIf (ignored)
+	f.Add([]byte("garbage"), []byte(nil))                   // not a PNG header
+	f.Add(ihdr[:33], []byte{0x00, 0x01})                    // truncated chunk header
+	f.Add(ihdr[:33], pngChunkHeader(f, "eXIf", 0x80000000)) // ≥2³¹ eXIf declared length: clean stop, Decode classifies (AC-1 branch)
 
 	f.Fuzz(func(t *testing.T, head, tail []byte) {
 		orient, err := pngOrientation(context.Background(), head, bytes.NewReader(tail))

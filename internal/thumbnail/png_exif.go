@@ -119,6 +119,9 @@ func pngOrientation(ctx context.Context, head []byte, r io.Reader) (int, error) 
 			return 0, err // raw; generateLocked classifies (FR-5)
 		}
 		length := int64(binary.BigEndian.Uint32(hdr[:4]))
+		if length > 0x7fffffff {
+			return 1, nil // image/png FormatError; Decode re-reads the same bytes and classifies → ErrUnsupported (uniform for every chunk type, incl. eXIf)
+		}
 		switch {
 		case hdr[4] == 'I' && hdr[5] == 'D' && hdr[6] == 'A' && hdr[7] == 'T',
 			hdr[4] == 'I' && hdr[5] == 'E' && hdr[6] == 'N' && hdr[7] == 'D':
@@ -139,9 +142,6 @@ func pngOrientation(ctx context.Context, head []byte, r io.Reader) (int, error) 
 			}
 			return pngExifOrientation(data), nil // first eXIf wins; CRC left for Decode
 		default:
-			if length > 0x7fffffff {
-				return 1, nil // image/png FormatError; Decode re-reads and classifies → ErrUnsupported
-			}
 			if length+4 > int64(c.remaining)+int64(c.headAvail()) {
 				return 0, errMetadataBudgetExceeded
 			}
