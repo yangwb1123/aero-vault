@@ -5698,3 +5698,74 @@ func pngChunkHeaderBytes(t *testing.T, chunkType string, length uint32) []byte {
 	out.WriteString(chunkType)
 	return out.Bytes()
 }
+
+// TestThumbnailExactKeyPreservesContentEncoding pins the QA F1 approval
+// condition of the content-encoding direction: an object stored at a FULL
+// key ending in "/thumbnail" with a Content-Encoding header is raw-downloaded
+// by the exact-key dispatch arm — 200 with the stored encoding RE-EMITTED
+// (writeContentResponseHeaders, handler_helpers.go) — never derived into a
+// thumbnail. The identity value is stored and re-emitted verbatim (the
+// metadata round-trip is byte-transparent; the derivation arm, which serves
+// generated JPEG bytes, never carries the source's encoding).
+//
+// Ledger (corrected from the design doc's drift — the five non-test sites
+// are: service/file_crud.go:317 store, service/file_copy.go:39 copy
+// preservation, rest/handler_helpers.go:354 re-emit, s3compat/handler.go:369
+// re-emit, webdav/dav.go:172 copy preservation).
+func TestThumbnailExactKeyPreservesContentEncoding(t *testing.T) {
+	s, tok, repo := newAuthRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	authH := map[string]string{"Authorization": tok}
+	u := s.URL + "/v1/files/dir"
+	if resp, _ := req(t, "PUT", u, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png", "Authorization": tok}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT dir: %d", resp.StatusCode)
+	}
+	uFull := u + "/thumbnail"
+	// An encoded object at the exact key: gzip (the real-world case) and the
+	// identity value (FM-9: stored and re-emitted verbatim, never dropped).
+	for _, enc := range []string{"gzip", "identity"} {
+		if resp, _ := req(t, "PUT", uFull, []byte("encoded object bytes"), map[string]string{
+			"Content-Type": "text/plain", "Content-Encoding": enc, "Authorization": tok,
+		}); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT %s: %d", enc, resp.StatusCode)
+		}
+		// Accept-Encoding: identity — the realistic storage-client posture.
+		// Go's Transport transparently gunzips responses when IT added
+		// Accept-Encoding: gzip (and strips the header), which would mask
+		// the re-emission under test.
+		getH := map[string]string{"Authorization": tok, "Accept-Encoding": "identity"}
+		resp, body := req(t, "GET", uFull, nil, getH)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status=%d want 200 (raw download, not a derived thumbnail)", enc, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Content-Encoding"); got != enc {
+			t.Fatalf("GET %s: Content-Encoding=%q want %q (re-emitted by the exact-key arm)", enc, got, enc)
+		}
+		if !bytes.Equal(body, []byte("encoded object bytes")) {
+			t.Fatalf("GET %s: body=%q want the raw object bytes", enc, body)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
+			t.Fatalf("GET %s: content-type=%q want text/plain", enc, ct)
+		}
+	}
+	// Control: an encoded SOURCE object at the TRIMMED key derives a JPEG —
+	// the derivation response carries the generated image, never the source's
+	// encoding (the derived bytes are not gzip).
+	uSrc := s.URL + "/v1/files/photo"
+	if resp, _ := req(t, "PUT", uSrc, pngBytes(t, 64, 64), map[string]string{
+		"Content-Type": "image/png", "Content-Encoding": "gzip", "Authorization": tok,
+	}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT photo: %d", resp.StatusCode)
+	}
+	resp, _ := req(t, "GET", uSrc+"/thumbnail", nil, authH)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("derived thumbnail: %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Fatalf("derived thumbnail Content-Encoding=%q, want absent (the JPEG is not the source's encoding)", got)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("derived thumbnail content-type=%q want image/jpeg", ct)
+	}
+	_ = repo
+}
