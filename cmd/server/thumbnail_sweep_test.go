@@ -212,11 +212,30 @@ func TestThumbnailCacheSweepForwardingLine(t *testing.T) {
 	if cache.Len() != 0 {
 		t.Fatalf("sweep did not purge the expired entry: len=%d", cache.Len())
 	}
-	// The counters are observable via the scrape surface; the driver tests
-	// here assert the telemetry wrappers fired by counting through the
-	// package's own registered instruments is out of reach — the forwarding
-	// contract is pinned by the per-pass runs counter path being exercised
-	// above (both arms) plus the metrics_test.go scrape pin for swept_total.
+	// The forwarding contract is asserted through the REAL scrape surface:
+	// two executed passes → sweep_runs_total delta +2 (the per-pass liveness
+	// counter, n==0 arm included), and the one removed entry → swept_total
+	// delta +1 (the n>0 arm). A regression that drops either forwarding
+	// line now fails here, through the production path.
+	runsPre, _ := cmdScrapeValue(t, "thumbnail_cache_sweep_runs_total")
+	sweptPre, _ := cmdScrapeValue(t, "thumbnail_cache_swept_total")
+	// Pass 3: an empty cache — runs +1, swept +0 (the n==0 arm again, after
+	// the scrape baseline).
+	sweepThumbnailCache(ctx, cache, logger)
+	runsPost, _ := cmdScrapeValue(t, "thumbnail_cache_sweep_runs_total")
+	sweptPost, _ := cmdScrapeValue(t, "thumbnail_cache_swept_total")
+	if runsPost-runsPre != 1 {
+		t.Fatalf("sweep_runs_total delta = %v, want 1 (per-pass forwarding through the production path)", runsPost-runsPre)
+	}
+	if sweptPost-sweptPre != 0 {
+		t.Fatalf("swept_total delta = %v, want 0 (empty pass must not forward a count)", sweptPost-sweptPre)
+	}
+	if runsPost < 2 {
+		t.Fatalf("sweep_runs_total = %v, want >= 2 (the two earlier passes were forwarded)", runsPost)
+	}
+	if sweptPost < 1 {
+		t.Fatalf("swept_total = %v, want >= 1 (the expired-entry pass forwarded its count)", sweptPost)
+	}
 	_ = payload
 }
 

@@ -216,25 +216,27 @@ groups:
       # gates are accidentally excluding the dominant path. The denominator
       # guard (sum of rates > 0) keeps the rule silent on idle caches and on
       # disabled caches (no counters emitted).
-      # Sweep-driver liveness: with THUMBNAIL_CACHE_TTL > 0, the
-      # per-pass counter must increase at the sweep cadence — the
-      # RECONCILE_INTERVAL_MINUTES interval when set, else one sweep per
-      # TTL; a stall means the timer driver died (goroutine panic,
-      # shutdown race) and physical retention of never-read expired keys is
-      # now unbounded (lazy expiry still bounds served retention, so this is
-      # a resource-retention warning, not a correctness alert). The
-      # "increase is zero while the counter exists" predicate distinguishes a
-      # dead driver from a healthy-but-idle one (swept_total alone cannot).
+      # Sweep-driver liveness (SRE F1 Option C): the driver records its
+      # cadence envelope as gauges — the per-pass interval
+      # (thumbnail_cache_sweep_interval_seconds) and the wall-clock time of
+      # the last pass (thumbnail_cache_sweep_last_run_seconds) — and the
+      # rule derives its staleness window from them: (now - last_run) > 3 *
+      # interval. Unlike a static lookback (which would permanently fire for
+      # a TTL-driven cadence beyond the lookback window), the envelope
+      # adapts to the validated 1s..1y TTL range. The interval > 0 guard
+      # keeps the rule silent when no driver is armed (RECONCILE=0 or
+      # TTL=0), and the last-run gauge is refreshed on every pass — a dead
+      # driver is distinguishable from a healthy-but-idle one.
       - alert: ThumbnailCacheSweepStalled
         expr: |
-          increase(thumbnail_cache_sweep_runs_total[1h]) == 0
-            and on() (sum(thumbnail_cache_sweep_runs_total) > 0)
+          (time() - thumbnail_cache_sweep_last_run_seconds) > 3 * thumbnail_cache_sweep_interval_seconds
+            and on() (thumbnail_cache_sweep_interval_seconds > 0)
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "Thumbnail cache sweep driver stalled (no pass in 1h)"
-          description: "thumbnail_cache_sweep_runs_total did not increase for 1h while the counter exists — the TTL physical-purge driver is not executing (THUMBNAIL_CACHE_TTL > 0 expected; cadence = RECONCILE_INTERVAL_MINUTES when set, else the TTL-derived default — one sweep per TTL). Check for a goroutine panic in the sweep driver; served retention stays bounded by lazy expiry, but physical retention of never-read expired keys is unbounded until the driver resumes."
+          summary: "Thumbnail cache sweep driver stalled (no pass within 3× interval)"
+          description: "time() - thumbnail_cache_sweep_last_run_seconds exceeded 3 × thumbnail_cache_sweep_interval_seconds for 15m — the TTL physical-purge driver is not executing (goroutine panic or shutdown race). Served retention stays bounded by lazy expiry; physical retention of never-read expired keys is unbounded until the driver resumes."
 
       - alert: ThumbnailCacheHitRatioLow
         expr: |

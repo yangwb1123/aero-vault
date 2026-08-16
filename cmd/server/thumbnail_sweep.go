@@ -58,6 +58,10 @@ func runThumbnailCacheSweep(ctx context.Context, cache *thumbnail.Cache, interva
 	if cache == nil || interval <= 0 {
 		return
 	}
+	// Record the cadence envelope once: the stalled-sweep alert derives its
+	// window from (now - last_run) > 3 * interval (SRE F1 Option C), so the
+	// interval gauge must exist before the first pass can be judged stale.
+	telemetry.SetThumbnailCacheSweepCadence(ctx, int64(interval.Seconds()), time.Now().Unix())
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	sweepThumbnailCache(ctx, cache, logger)
@@ -80,6 +84,8 @@ func sweepThumbnailCache(ctx context.Context, cache *thumbnail.Cache, logger *sl
 	// both when the driver is healthy-but-idle and when it is dead, so the
 	// stalled-sweep alert keys off this counter's increase.
 	telemetry.IncThumbnailCacheSweepRun(ctx)
+	// Refresh the last-run gauge on EVERY pass — the alert's staleness basis.
+	telemetry.SetThumbnailCacheSweepCadence(ctx, 0, time.Now().Unix())
 	if n := cache.SweepExpired(time.Now()); n > 0 {
 		telemetry.IncThumbnailCacheSwept(ctx, int64(n))
 		logger.Debug("thumbnail cache sweep removed expired entries", "n", n)

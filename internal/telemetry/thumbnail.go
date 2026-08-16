@@ -17,6 +17,8 @@ var (
 	mThumbnailCacheEvictions       metric.Int64Counter
 	mThumbnailCacheSwept           metric.Int64Counter
 	mThumbnailCacheSweepRuns       metric.Int64Counter
+	mThumbnailCacheSweepLastRun    metric.Int64Gauge
+	mThumbnailCacheSweepInterv     metric.Int64Gauge
 	mThumbnailGenerationSuccess    metric.Int64Counter
 	mThumbnailGenerationRejections metric.Int64Counter
 )
@@ -67,6 +69,24 @@ func IncThumbnailCacheSwept(ctx context.Context, n int64) {
 func IncThumbnailCacheSweepRun(ctx context.Context) {
 	initDomain()
 	mThumbnailCacheSweepRuns.Add(ctx, 1)
+}
+
+// SetThumbnailCacheSweepCadence records the sweep driver's cadence envelope:
+// the per-pass interval (seconds) and the wall-clock time of the most recent
+// pass (unix seconds). The stalled-sweep alert is derived from these gauges
+// ((now - last_run) > 3 * interval) instead of a static lookback window, so
+// a TTL-driven cadence anywhere in the validated 1s..1y envelope stays
+// alert-correct — a static 1h window would permanently fire for TTL >= ~75m.
+// The driver calls this on every pass (lastRun) and once at start (interval);
+// zero values are never consulted by the alert (interval > 0 guard).
+func SetThumbnailCacheSweepCadence(ctx context.Context, intervalSeconds, lastRunUnix int64) {
+	initDomain()
+	if mThumbnailCacheSweepInterv != nil {
+		mThumbnailCacheSweepInterv.Record(ctx, intervalSeconds)
+	}
+	if mThumbnailCacheSweepLastRun != nil {
+		mThumbnailCacheSweepLastRun.Record(ctx, lastRunUnix)
+	}
 }
 
 // IncThumbnail304 counts one certified 304 revalidation of the derived
