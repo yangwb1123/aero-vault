@@ -504,11 +504,13 @@ is enforced before any cache lookup: deleted objects 404 via the Stat gate
 and overwritten objects key-miss via the content ETag, so retained bytes are
 never served after delete/overwrite. With a TTL set, physical retention of a
 never-read key is bounded by TTL + the sweep interval: a timer driver in
-`cmd/server` calls `SweepExpired` on the `RECONCILE_INTERVAL_MINUTES` cadence
-(an initial sweep at start, then once per interval, alongside the Reconcile
-ticker); when `RECONCILE_INTERVAL_MINUTES = 0` (reconcile disabled, the
-default) no timer sweep runs and the lazy bound applies — set the interval to
-obtain the physical bound. Without a TTL, the residual bound is the LRU byte
+`cmd/server` calls `SweepExpired` at the reconcile cadence when
+`RECONCILE_INTERVAL_MINUTES > 0` (initial sweep at start, then once per
+interval, alongside the Reconcile ticker) and otherwise on a TTL-derived
+cadence — one sweep per `THUMBNAIL_CACHE_TTL` (activation is independent of
+reconcile: the driver runs whenever the TTL is positive, so the default
+config enforces the bound too; worst case ≤ 2×TTL). Without a TTL, the
+residual bound is the LRU byte
 budget.
 **Admission gate:** SSE-C, SSE-KMS, and non-content-MD5-ETag objects never
 enter the cache: the gate admits only whole-object content MD5 ETags

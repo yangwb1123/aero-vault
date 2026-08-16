@@ -142,8 +142,8 @@ func run() error {
 	// the same instance is served by the REST handler (WithThumbnailCache inside
 	// buildRouter) and physically purged by the TTL sweep timer driver below.
 	thumbCache := thumbnail.NewCache(cfg.App.ThumbnailCacheBytes, time.Duration(cfg.App.ThumbnailCacheTTL)*time.Second)
-	if cfg.Reconcile.IntervalMinutes > 0 {
-		startThumbnailCacheSweep(ctx, thumbCache, time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute, logger)
+	if interval := thumbnailSweepInterval(cfg); interval > 0 {
+		startThumbnailCacheSweep(ctx, thumbCache, interval, logger)
 	}
 
 	authReg := buildAuthRegistry(ctx, cfg, logger, repo)

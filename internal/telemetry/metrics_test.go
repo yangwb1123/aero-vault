@@ -252,6 +252,7 @@ func TestThumbnailCacheCountersSurface(t *testing.T) {
 	IncThumbnailCacheMiss(ctx)
 	IncThumbnailCacheEviction(ctx, 3)
 	IncThumbnailCacheSwept(ctx, 4)
+	IncThumbnailCacheSweepRun(ctx)
 
 	body := scrapeShared(t)
 	if v, ok := scrapeValue(body, "thumbnail_cache_hits_total"); !ok || v != 2 {
@@ -265,6 +266,13 @@ func TestThumbnailCacheCountersSurface(t *testing.T) {
 	}
 	if v, ok := scrapeValue(body, "thumbnail_cache_swept_total"); !ok || v != 4 {
 		t.Fatalf("thumbnail_cache_swept_total = %v (ok=%v), want 4", v, ok)
+	}
+	// The per-pass liveness counter — the exact series ThumbnailCacheSweepStalled
+	// keys off — surfaces on the scrape; cmd/server callers run in a different
+	// test binary, so within this package the value is exactly the single
+	// record above.
+	if v, ok := scrapeValue(body, "thumbnail_cache_sweep_runs_total"); !ok || v != 1 {
+		t.Fatalf("thumbnail_cache_sweep_runs_total = %v (ok=%v), want 1", v, ok)
 	}
 }
 

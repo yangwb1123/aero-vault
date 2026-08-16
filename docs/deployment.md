@@ -263,15 +263,17 @@ sudo systemctl restart aero-vault.service
 curl -fsS https://source.ywbsd.site/readyz
 ```
 
-## Thumbnail cache TTL purge (2026-08-15)
+## Thumbnail cache TTL purge (2026-08-16)
 
-With `THUMBNAIL_CACHE_TTL_SECONDS > 0` and `RECONCILE_INTERVAL_MINUTES > 0`, the
-server-side thumbnail cache is physically purged by a per-process timer at the
-reconcile cadence (`thumbnail.cache.sweep_runs_total` per pass,
-`thumbnail.cache.swept_total` entries removed). Alert
+Activation is **independent of the Reconcile ticker**: `THUMBNAIL_CACHE_TTL > 0`
+alone starts the per-process physical-purge driver (initial sweep at start,
+then once per cadence). Cadence = the `RECONCILE_INTERVAL_MINUTES` interval
+when set (unchanged for existing deployments), else one sweep per TTL — the
+default-config bound, worst case physical retention of a never-read expired
+key ≤ 2×TTL. Observability: `thumbnail.cache.sweep_runs_total` per executed
+pass (liveness), `thumbnail.cache.swept_total` entries removed; alert
 `ThumbnailCacheSweepStalled` (alerts.yml) fires when no pass executes for 1h
-while the counter exists. With `RECONCILE_INTERVAL_MINUTES = 0` (default),
-served retention stays strictly TTL-bounded via lazy expiry; only physical
-retention of never-read expired keys is unbounded (documented lazy-only
-fallback). No action required for existing deployments; the sweep is a memory
-curve change only.
+while the counter exists. **No action required for existing deployments —
+`RECONCILE_INTERVAL_MINUTES > 0` deployments see zero cadence change**;
+`TTL = 0` deployments see zero change (no driver, lazy-only bound). The
+sweep is a memory curve change only.

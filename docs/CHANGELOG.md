@@ -4,6 +4,14 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ---
 
+## 2026-08-16
+
+### Changed
+- **Thumbnail: TTL physical-purge sweep activation decoupled from the Reconcile ticker** (`cmd/server/main.go`, `cmd/server/thumbnail_sweep.go`)
+  - `THUMBNAIL_CACHE_TTL > 0` now starts the TTL physical-purge driver in the default config (`RECONCILE_INTERVAL_MINUTES = 0`), so the knob's documented retention contract — bounded physical retention — holds without enabling reconcile. Cadence: the reconcile interval when `RECONCILE_INTERVAL_MINUTES > 0` (unchanged, byte-for-byte for existing deployments); otherwise one sweep per TTL (physical retention of a never-read expired key ≤ TTL + sweep interval ≤ 2×TTL). New pure helper `thumbnailSweepInterval` pins the activation decision; driver semantics, telemetry instruments, and `internal/thumbnail` are unchanged. `thumbnail_cache_sweep_runs_total` is now emitted in default configs with a positive TTL, making the self-guarding `ThumbnailCacheSweepStalled` alert observable wherever the TTL control is armed. No new config, no migration.
+
+---
+
 ## 2026-08-15
 
 ### Changed

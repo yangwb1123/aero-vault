@@ -19,11 +19,97 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/api/rest"
 	"github.com/aero-vault/aero-vault/internal/auth"
+	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
+
+// TestThumbnailSweepInterval pins the pure activation decision (AC1 step 1):
+// THUMBNAIL_CACHE_TTL > 0 activates the TTL physical-purge driver in the
+// default config (Reconcile.IntervalMinutes == 0), the reconcile arm is
+// preserved byte-for-byte, and reconcile wins when both are set (existing
+// deployments see zero cadence change).
+func TestThumbnailSweepInterval(t *testing.T) {
+	cases := []struct {
+		name      string
+		ttl       int
+		reconcile int
+		want      time.Duration
+	}{
+		{"default config, TTL set — the fix", 3600, 0, 3600 * time.Second},
+		{"default config, no TTL — no driver", 0, 0, 0},
+		{"reconcile set, no TTL — reconcile cadence", 0, 30, 30 * time.Minute},
+		{"both set — reconcile wins (existing deployments unchanged)", 3600, 30, 30 * time.Minute},
+		{"min TTL — one sweep per second", 1, 0, time.Second},
+		{"max TTL — no duration overflow", 31536000, 0, 31536000 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{
+				App:       config.AppConfig{ThumbnailCacheTTL: tc.ttl},
+				Reconcile: config.ReconcileCfg{IntervalMinutes: tc.reconcile},
+			}
+			if got := thumbnailSweepInterval(cfg); got != tc.want {
+				t.Fatalf("thumbnailSweepInterval = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestThumbnailSweepActivatesInDefaultConfig proves the fix end to end (AC1
+// step 2): under the default reconcile config (IntervalMinutes == 0) with a
+// positive TTL, the driver goroutine starts and physically purges an expired
+// entry with NO intervening Get — the strongest possible proof that a sweep
+// goroutine started. The "started" Info line is written synchronously by
+// startThumbnailCacheSweep before it returns, so reading buf here is
+// race-free; after cancel() no cache/buf access happens, keeping -race clean.
+func TestThumbnailSweepActivatesInDefaultConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := &config.Config{
+		App:       config.AppConfig{ThumbnailCacheBytes: 1 << 20, ThumbnailCacheTTL: 1},
+		Reconcile: config.ReconcileCfg{IntervalMinutes: 0}, // the default config
+	}
+	cache := thumbnail.NewCache(cfg.App.ThumbnailCacheBytes, time.Duration(cfg.App.ThumbnailCacheTTL)*time.Second)
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	// The exact production activation shape (main.go): the helper decides, the
+	// driver starts.
+	if interval := thumbnailSweepInterval(cfg); interval > 0 {
+		startThumbnailCacheSweep(ctx, cache, interval, logger)
+	} else {
+		t.Fatal("thumbnailSweepInterval = 0 in the default config with TTL > 0")
+	}
+	if !strings.Contains(buf.String(), "thumbnail cache sweep started") {
+		t.Fatalf("driver did not start:\n%s", buf.String())
+	}
+
+	key := thumbnail.CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	payload := make([]byte, 1000)
+	cache.Put(key, payload)
+	if cache.Len() != 1 || cache.Bytes() != int64(len(payload)) {
+		t.Fatalf("entry not stored: len=%d bytes=%d", cache.Len(), cache.Bytes())
+	}
+
+	// Never Get the key: removal within TTL + interval + grace is only
+	// possible via a driver sweep pass — the strongest proof that a sweep
+	// goroutine started under the default reconcile config.
+	deadline := time.Now().Add(time.Duration(cfg.App.ThumbnailCacheTTL)*time.Second + time.Second + 100*time.Millisecond)
+	for cache.Len() != 0 || cache.Bytes() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expired entry not physically purged in the default config: len=%d bytes=%d", cache.Len(), cache.Bytes())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Bounded exit: cancel stops the driver at its next select iteration; no
+	// cache/buf access after cancel, so -race observes no shared state (the
+	// loop's join contract itself is pinned by TestThumbnailCacheSweepDriver).
+	cancel()
+}
 
 // TestThumbnailCacheSweepDriver proves the TTL physical-purge contract end to
 // end (acceptance #1): an entry stored with a TTL and NO intervening Get is

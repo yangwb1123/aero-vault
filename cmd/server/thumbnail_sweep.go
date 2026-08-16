@@ -5,17 +5,39 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
+// thumbnailSweepInterval returns the TTL physical-purge driver cadence for
+// the given config, or 0 when no driver should run. Decoupled from the
+// Reconcile ticker by design (AGENTS.md §2.4): THUMBNAIL_CACHE_TTL's
+// documented contract — "bounded retention" — must hold in the default
+// config (reconcile off), and the sweep-liveness counter must exist
+// whenever TTL > 0 so the ThumbnailCacheSweepStalled alert class is
+// observable. Reconcile cadence wins when both are configured, preserving
+// existing deployments byte-for-byte.
+func thumbnailSweepInterval(cfg *config.Config) time.Duration {
+	if cfg.Reconcile.IntervalMinutes > 0 {
+		return time.Duration(cfg.Reconcile.IntervalMinutes) * time.Minute
+	}
+	if cfg.App.ThumbnailCacheTTL > 0 {
+		return time.Duration(cfg.App.ThumbnailCacheTTL) * time.Second
+	}
+	return 0
+}
+
 // startThumbnailCacheSweep starts the TTL physical-purge timer driver for the
 // server-side thumbnail cache — the pinned follow-up to Cache.SweepExpired.
-// Cadence: RECONCILE_INTERVAL_MINUTES (the same interval driving the Reconcile
-// ticker, AGENTS.md §2.4). When the interval is 0 (reconcile disabled, the
-// default) no driver starts and the documented lazy-only bound applies. The
-// driver is a goroutine owned by cmd/server — never by Cache (which spawns no
-// goroutines and owns no timers) and never on the request path.
+// Activation and cadence are computed by thumbnailSweepInterval and decoupled
+// from the Reconcile ticker by design (AGENTS.md §2.4): the driver runs
+// whenever THUMBNAIL_CACHE_TTL > 0, at the reconcile interval when
+// RECONCILE_INTERVAL_MINUTES > 0 (unchanged for existing deployments),
+// otherwise at a TTL-derived cadence (one sweep per TTL — the default-config
+// retention bound, worst case ≤ 2×TTL). The driver is a goroutine owned by
+// cmd/server — never by Cache (which spawns no goroutines and owns no timers)
+// and never on the request path.
 func startThumbnailCacheSweep(ctx context.Context, cache *thumbnail.Cache, interval time.Duration, logger *slog.Logger) {
 	if cache == nil || interval <= 0 {
 		return
