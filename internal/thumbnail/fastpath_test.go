@@ -421,4 +421,52 @@ func TestGenerateDownscaleAllocCeiling(t *testing.T) {
 	if n16 >= 40000 {
 		t.Fatalf("Generate depth-16 PNG downscale allocated %.0f objects/op, want < 40000 (pre-kernel baseline: 393,251)", n16)
 	}
+
+	// RGBA64 arm: an OPAQUE depth-16 PNG (cbTC16 → *image.RGBA64) — the
+	// scaleRGBA64 kernel's generate-level gate. The stdlib round-trip
+	// reproduces this class (the reviewers' exclusion rationale was
+	// disproven), so the arm is machine-checkable, not vacuous.
+	fixtureRGBA64 := realOpaqueDepth16PNG(t, 1024, 1024)
+	decRGBA64, _, err := image.Decode(bytes.NewReader(fixtureRGBA64))
+	if err != nil {
+		t.Fatalf("opaque depth-16 fixture decode: %v", err)
+	}
+	if _, ok := decRGBA64.(*image.RGBA64); !ok {
+		t.Fatalf("opaque depth-16 fixture decoded to %T, want *image.RGBA64", decRGBA64)
+	}
+	nRGBA64 := testing.AllocsPerRun(20, func() {
+		out, err := Generate(bytes.NewReader(fixtureRGBA64), 256, 256)
+		if err != nil {
+			t.Fatalf("generate opaque depth-16: %v", err)
+		}
+		if len(out) == 0 {
+			t.Fatal("generate opaque depth-16 returned empty output")
+		}
+	})
+	if nRGBA64 >= 40000 {
+		t.Fatalf("Generate RGBA64 downscale allocated %.0f objects/op, want < 40000", nRGBA64)
+	}
+
+	// Gray16 arm: a depth-16 gray PNG (color type 0 → *image.Gray16) — the
+	// scaleGray16 kernel's generate-level gate, same stdlib round-trip.
+	fixtureGray16 := realGray16PNG(t, 1024, 1024)
+	decGray16, _, err := image.Decode(bytes.NewReader(fixtureGray16))
+	if err != nil {
+		t.Fatalf("gray16 fixture decode: %v", err)
+	}
+	if _, ok := decGray16.(*image.Gray16); !ok {
+		t.Fatalf("gray16 fixture decoded to %T, want *image.Gray16", decGray16)
+	}
+	nGray16 := testing.AllocsPerRun(20, func() {
+		out, err := Generate(bytes.NewReader(fixtureGray16), 256, 256)
+		if err != nil {
+			t.Fatalf("generate gray16: %v", err)
+		}
+		if len(out) == 0 {
+			t.Fatal("generate gray16 returned empty output")
+		}
+	})
+	if nGray16 >= 40000 {
+		t.Fatalf("Generate Gray16 downscale allocated %.0f objects/op, want < 40000", nGray16)
+	}
 }

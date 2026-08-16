@@ -979,3 +979,38 @@ func (s *errAfterSource) Read(p []byte) (int, error) {
 	s.off += len(p) // zeros count toward the total
 	return len(p), nil
 }
+
+// realOpaqueDepth16PNG builds a genuinely stdlib-decodable depth-16 PNG of
+// the OPAQUE class: color type 2 (cbTC16) — the stdlib encoder drops alpha
+// to type 2 for opaque NRGBA64 sources, and DecodeConfig reports
+// RGBA64Model. The RGBA64 generate-level alloc arm's self-check.
+func realOpaqueDepth16PNG(t testing.TB, w, h int) []byte {
+	t.Helper()
+	img := image.NewNRGBA64(image.Rect(0, 0, w, h))
+	for i := 0; i+8 <= len(img.Pix); i += 8 {
+		img.Pix[i], img.Pix[i+1] = 0x10, 0x20   // R = 0x1020
+		img.Pix[i+2], img.Pix[i+3] = 0x30, 0x40 // G = 0x3040
+		img.Pix[i+4], img.Pix[i+5] = 0x50, 0x60 // B = 0x5060
+		img.Pix[i+6], img.Pix[i+7] = 0xFF, 0xFF // A = opaque → cbTC16 → RGBA64
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode opaque depth-16 png: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// realGray16PNG builds a genuinely stdlib-decodable depth-16 gray PNG (color
+// type 0) — the Gray16 generate-level alloc arm's fixture.
+func realGray16PNG(t testing.TB, w, h int) []byte {
+	t.Helper()
+	img := image.NewGray16(image.Rect(0, 0, w, h))
+	for i := 0; i+2 <= len(img.Pix); i += 2 {
+		img.Pix[i], img.Pix[i+1] = 0x12, 0x34 // Y = 0x1234
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode gray16 png: %v", err)
+	}
+	return buf.Bytes()
+}

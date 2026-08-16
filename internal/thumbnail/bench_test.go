@@ -11,6 +11,7 @@ package thumbnail
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"image"
 	"image/jpeg"
 	"io"
@@ -308,6 +309,26 @@ func BenchmarkGeneratePNGPlain(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := Generate(bytes.NewReader(fixture), 64, 64); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGenerateHardMaxOrientedDepth16 pins the heaviest production shape
+// (Perf F-1/F-2): an oriented (eXIf 6) depth-16 PNG at Max16BitSourceDim
+// decoded to a HardMax box — the class with the largest generic-path win
+// (generic ≈ 33.5M allocs / ~320 MB / ~400 ms; the NRGBA64 kernels +
+// rotateNRGBA64 reduce it to fixed scaffolding). The fixture is built once
+// outside the loop; the eXIf chunk drives applyOrientation through the
+// rotateNRGBA64 kernel.
+func BenchmarkGenerateHardMaxOrientedDepth16(b *testing.B) {
+	base := realDepth16PNG(b, Max16BitSourceDim, Max16BitSourceDim)
+	fixture := splicePNGChunk(b, base, "eXIf", bareExifPayload(6, binary.LittleEndian))
+	b.SetBytes(int64(len(fixture)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Generate(bytes.NewReader(fixture), HardMax, HardMax); err != nil {
 			b.Fatal(err)
 		}
 	}
