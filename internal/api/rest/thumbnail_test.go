@@ -267,6 +267,82 @@ func TestThumbnailMetadataBudgetAtExactCap(t *testing.T) {
 	}
 }
 
+// pngTEXtAfterIHDR splices a tEXt chunk (keyword "Comment\x00" + dataLen
+// payload bytes, valid CRC) as the FIRST post-IHDR chunk of a small RGBA PNG
+// — the PNG-parallel of appnPaddedJPEG's pre-SOS metadata flood. A fixture ≫
+// 4 KiB makes DecodeConfig's 4096-byte bufio fill pull exactly 4096 bytes
+// through the config-scan tee, so the tEXt's leading 4063 bytes land in head
+// and headAvail = 4055 at the walk's declared-size pre-check.
+func pngTEXtAfterIHDR(t *testing.T, dataLen int) []byte {
+	t.Helper()
+	b := pngBytes(t, 64, 64)
+	if len(b) < 33 {
+		t.Fatalf("png fixture too short: %d", len(b))
+	}
+	data := append([]byte("Comment\x00"), make([]byte, dataLen-len("Comment\x00"))...)
+	var out bytes.Buffer
+	out.Write(b[:33])
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(data)))
+	out.Write(l[:])
+	out.WriteString("tEXt")
+	out.Write(data)
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write([]byte("tEXt"))
+	_, _ = crc.Write(data)
+	binary.BigEndian.PutUint32(l[:], crc.Sum32())
+	out.Write(l[:])
+	out.Write(b[33:])
+	return out.Bytes()
+}
+
+// TestThumbnailPNGHeadResidentMetadataFlip pins the 413→200 flip this
+// direction exists to ship, end-to-end at the REST layer (qa F3): a PNG
+// whose first post-IHDR tEXt chunk is within-budget on its true r-cost
+// (declared MaxMetadataBytes−3000, 4063 bytes head-resident) now thumbnails
+// with 200 + a decodable JPEG. The classify seam at
+// TestThumbnailMetadataTooLargeClassifySeam pins only the sentinel→413
+// mapping; this test pins the wiring from the HTTP surface through
+// Generate — a future handler/pre-check regression would re-expose the
+// false 413 with the module tests all green. The over-by-one control still
+// maps to 413 MetadataTooLarge: no under-rejection at the HTTP surface.
+func TestThumbnailPNGHeadResidentMetadataFlip(t *testing.T) {
+	s := newRESTTest(t)
+
+	// The fix's target: declared MaxMetadataBytes−3000, true r-cost fits the
+	// r-budget → the thumbnail is generated (the pre-fix walk falsely
+	// rejected → false 413).
+	u := s.URL + "/v1/files/resident.png"
+	req(t, "PUT", u, pngTEXtAfterIHDR(t, thumbnail.MaxMetadataBytes-3000), map[string]string{"Content-Type": "image/png"})
+	resp, body := req(t, "GET", u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("head-resident-budget thumbnail: status=%d want 200 (body=%s)", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type=%q want image/jpeg", ct)
+	}
+	img, format, err := image.Decode(bytes.NewReader(body))
+	if err != nil || format != "jpeg" {
+		t.Fatalf("decode thumb: %v fmt=%s", err, format)
+	}
+	if img.Bounds().Dx() != 64 || img.Bounds().Dy() != 64 {
+		t.Fatalf("thumb dims %dx%d want 64x64", img.Bounds().Dx(), img.Bounds().Dy())
+	}
+
+	// Over-by-one control: declared MaxMetadataBytes−44 (length+4 =
+	// remaining + headAvail + 1) still maps to 413 MetadataTooLarge — the
+	// flip is bounded to within-budget inputs, no under-rejection.
+	u2 := s.URL + "/v1/files/over.png"
+	req(t, "PUT", u2, pngTEXtAfterIHDR(t, thumbnail.MaxMetadataBytes-44), map[string]string{"Content-Type": "image/png"})
+	resp2, body2 := req(t, "GET", u2+"/thumbnail", nil, nil)
+	if resp2.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over-by-one thumbnail: status=%d want 413 (body=%s)", resp2.StatusCode, body2)
+	}
+	if !bytes.Contains(body2, []byte(`"code":"MetadataTooLarge"`)) {
+		t.Fatalf("over-by-one: expected code MetadataTooLarge, body: %s", body2)
+	}
+}
+
 func TestThumbnailInvalidW(t *testing.T) {
 	// The metadata-budget class (413 MetadataTooLarge) and the garbage-
 	// dimension class (400 InvalidArgument) must remain distinct: garbage

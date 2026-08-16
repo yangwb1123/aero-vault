@@ -22,6 +22,12 @@ import (
 // budget. readN checks the budget BEFORE the r-read (FR-3): a chunk whose
 // declared size cannot fit is rejected before any buffer is allocated.
 //
+// headAvail is the number of unread bytes remaining in head at a pre-check
+// point: head bytes were already counted against MaxMetadataBytes by
+// generateLocked's config-scan tee, so the declared-size pre-checks credit
+// them against the r-budget (readN already charges only r-bytes).
+func (c *pngChunkCursor) headAvail() int { return max(0, len(c.head)-c.off) }
+
 // In generateLocked the walk's r is io.TeeReader(stream, replay), so every
 // byte served from the stream also lands in the replay buffer and Decode
 // re-reads the identical byte stream (FR-4). Chunk headers/data straddling
@@ -35,7 +41,9 @@ type pngChunkCursor struct {
 }
 
 // readN fills p from the cursor (head portion first, then r), charging only
-// r-bytes against remaining. The budget check precedes the r-read.
+// r-bytes against remaining. The budget check precedes the r-read. The
+// declared-size pre-checks are advisory for the bound — this check and the
+// replay tee are the enforcement.
 func (c *pngChunkCursor) readN(p []byte) error {
 	k := copy(p, c.head[c.off:])
 	c.off += k
@@ -77,6 +85,11 @@ func (c *pngChunkCursor) skipN(n int) error {
 // len(head); checked before every read from r using the declared 4-byte BE
 // chunk length, so no buffer beyond the budget is ever allocated; breach →
 // errMetadataBudgetExceeded, mapped by generateLocked to ErrMetadataTooLarge).
+// A chunk's bytes already resident in head (headAvail = max(0, len(head) −
+// off) at the pre-check) are credited against the declared-size check — the
+// head bytes were counted against MaxMetadataBytes by the config-scan tee, so
+// a chunk whose declared size exceeds the r-budget but whose true r-cost fits
+// is accepted; the total head + walk ≤ MaxMetadataBytes contract is unchanged.
 //
 // Stop conditions: the first eXIf chunk wins (its data is parsed, the CRC is
 // left for Decode — first-wins mirrors the JPEG "first pre-SOS APP1 wins"
@@ -111,7 +124,7 @@ func pngOrientation(ctx context.Context, head []byte, r io.Reader) (int, error) 
 			hdr[4] == 'I' && hdr[5] == 'E' && hdr[6] == 'N' && hdr[7] == 'D':
 			return 1, nil // pixel data / terminator: never scanned
 		case hdr[4] == 'e' && hdr[5] == 'X' && hdr[6] == 'I' && hdr[7] == 'f':
-			if length > int64(c.remaining) {
+			if length > int64(c.remaining)+int64(c.headAvail()) {
 				return 0, errMetadataBudgetExceeded // declared length check, before any allocation
 			}
 			var data []byte
@@ -119,7 +132,7 @@ func pngOrientation(ctx context.Context, head []byte, r io.Reader) (int, error) 
 				data = c.head[c.off : c.off+int(length)] // free slice (common: head holds the whole small PNG)
 				c.off += int(length)
 			} else {
-				data = make([]byte, int(length)) // bounded scratch: length ≤ remaining ≤ 8 MiB
+				data = make([]byte, int(length)) // bounded scratch: length ≤ remaining + headAvail ≤ MaxMetadataBytes − off < 8 MiB
 				if err := c.readN(data); err != nil {
 					return 0, err // r-bytes land in the replay tee for Decode
 				}
@@ -129,7 +142,7 @@ func pngOrientation(ctx context.Context, head []byte, r io.Reader) (int, error) 
 			if length > 0x7fffffff {
 				return 1, nil // image/png FormatError; Decode re-reads and classifies → ErrUnsupported
 			}
-			if length+4 > int64(c.remaining) {
+			if length+4 > int64(c.remaining)+int64(c.headAvail()) {
 				return 0, errMetadataBudgetExceeded
 			}
 			if err := c.skipN(int(length) + 4); err != nil {
