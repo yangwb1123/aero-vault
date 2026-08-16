@@ -32,6 +32,14 @@ func IncThumbnailCacheEviction(ctx context.Context, n int64) {
 	mThumbnailCacheEvictions.Add(ctx, n)
 }
 
+// IncThumbnailCacheSwept counts n entries physically purged from the
+// server-side thumbnail cache by the TTL sweep timer driver (not a read, not
+// an LRU eviction — Cache.Stats is untouched).
+func IncThumbnailCacheSwept(ctx context.Context, n int64) {
+	initDomain()
+	mThumbnailCacheSwept.Add(ctx, n)
+}
+
 // IncThumbnail304 counts one certified 304 revalidation of the derived
 // thumbnail resource (the If-None-Match fast path: three repo point reads,
 // no stream, no decode slot). Bounded client freshness (max-age=300,

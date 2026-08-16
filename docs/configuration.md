@@ -494,7 +494,8 @@ GET (no opener), and the decode itself — the amplification the cache targets.
 On the REST path the cache is consulted only after bucket-policy and
 anonymous-read authorization and after the 304 fast path; the tenant
 component of the key isolates tenants. Observability: `thumbnail.cache.hits_total`
-/ `misses_total` / `evictions_total` at `/metrics` (`PROMETHEUS_ENABLED=true`).
+/ `misses_total` / `evictions_total` / `swept_total` (sweep removals) at `/metrics`
+(`PROMETHEUS_ENABLED=true`).
 
 **Compliance & retention notes (what an auditor can cite):** the cache holds
 derived JPEG bytes only, keyed by (tenant, ETag, effective dims); bytes are
@@ -502,11 +503,13 @@ server-memory-only, regenerable, and cleared on restart. Served-path erasure
 is enforced before any cache lookup: deleted objects 404 via the Stat gate
 and overwritten objects key-miss via the content ETag, so retained bytes are
 never served after delete/overwrite. With a TTL set, physical retention of a
-never-read key is bounded by TTL + time-until-next-same-key-Get today (lazy
-expiry only: `SweepExpired` is implemented at the cache level but not yet
-wired to a timer driver); once the timer driver lands (e.g. the Reconcile
-ticker), the bound becomes TTL + sweep interval; without a TTL, the residual
-bound is the LRU byte budget.
+never-read key is bounded by TTL + the sweep interval: a timer driver in
+`cmd/server` calls `SweepExpired` on the `RECONCILE_INTERVAL_MINUTES` cadence
+(an initial sweep at start, then once per interval, alongside the Reconcile
+ticker); when `RECONCILE_INTERVAL_MINUTES = 0` (reconcile disabled, the
+default) no timer sweep runs and the lazy bound applies — set the interval to
+obtain the physical bound. Without a TTL, the residual bound is the LRU byte
+budget.
 **Admission gate:** SSE-C, SSE-KMS, and non-content-MD5-ETag objects never
 enter the cache: the gate admits only whole-object content MD5 ETags
 (exactly 32 lowercase hex) on objects that are neither SSE-C nor SSE-KMS —

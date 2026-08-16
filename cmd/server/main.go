@@ -22,6 +22,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/server"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
 func main() {
@@ -137,6 +138,14 @@ func run() error {
 		return err
 	}
 
+	// Single construction point for the server-side thumbnail cache (REQ-2.1):
+	// the same instance is served by the REST handler (WithThumbnailCache inside
+	// buildRouter) and physically purged by the TTL sweep timer driver below.
+	thumbCache := thumbnail.NewCache(cfg.App.ThumbnailCacheBytes, time.Duration(cfg.App.ThumbnailCacheTTL)*time.Second)
+	if cfg.Reconcile.IntervalMinutes > 0 {
+		startThumbnailCacheSweep(ctx, thumbCache, time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute, logger)
+	}
+
 	authReg := buildAuthRegistry(ctx, cfg, logger, repo)
 	oidcHandler, err := buildOIDCHandler(cfg)
 	if err != nil {
@@ -154,7 +163,7 @@ func run() error {
 	registerGauges(repo, auditRuntime)
 
 	aiTimeout := time.Duration(cfg.App.RequestTimeoutSec) * time.Second
-	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, accessManager, oidcHandler, promHandler, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider, runtimeReadiness(billingRuntime, auditRuntime))
+	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, accessManager, oidcHandler, promHandler, thumbCache, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider, runtimeReadiness(billingRuntime, auditRuntime))
 	cl := middleware.NewConcurrencyLimiter(cfg.App.MaxInFlight)
 	var concurrencyMW func(http.Handler) http.Handler
 	if cfg.App.PerTenantMax > 0 {

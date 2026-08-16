@@ -153,7 +153,7 @@ func mcpScopeGate(authReg *auth.Registry) func(http.Handler) http.Handler {
 	return authReg.Require(auth.Scope(auditgovernance.RequiredScope))
 }
 
-func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider, extraReady readinessChecker) http.Handler {
+func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, thumbCache *thumbnail.Cache, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider, extraReady readinessChecker) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -178,7 +178,7 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode,
 		func(h *rest.Handler) {
 			h.WithCORSProvider(corsProvider)
-			h.WithThumbnailCache(thumbnail.NewCache(cfg.App.ThumbnailCacheBytes, time.Duration(cfg.App.ThumbnailCacheTTL)*time.Second))
+			h.WithThumbnailCache(thumbCache)
 			if cfg.App.ThumbnailCacheBytes > 0 && cfg.App.ThumbnailCacheTTL == 0 {
 				// Compliance F2 (privacy-by-default posture): the cache is enabled
 				// without a retention bound — derived bytes of deleted/overwritten

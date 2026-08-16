@@ -251,6 +251,7 @@ func TestThumbnailCacheCountersSurface(t *testing.T) {
 	IncThumbnailCacheHit(ctx)
 	IncThumbnailCacheMiss(ctx)
 	IncThumbnailCacheEviction(ctx, 3)
+	IncThumbnailCacheSwept(ctx, 4)
 
 	body := scrapeShared(t)
 	if v, ok := scrapeValue(body, "thumbnail_cache_hits_total"); !ok || v != 2 {
@@ -261,6 +262,9 @@ func TestThumbnailCacheCountersSurface(t *testing.T) {
 	}
 	if v, ok := scrapeValue(body, "thumbnail_cache_evictions_total"); !ok || v != 3 {
 		t.Fatalf("thumbnail_cache_evictions_total = %v (ok=%v), want 3", v, ok)
+	}
+	if v, ok := scrapeValue(body, "thumbnail_cache_swept_total"); !ok || v != 4 {
+		t.Fatalf("thumbnail_cache_swept_total = %v (ok=%v), want 4", v, ok)
 	}
 }
 
