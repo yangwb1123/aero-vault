@@ -105,6 +105,39 @@ func BenchmarkGenerateGIFDownscale(b *testing.B) {
 	}
 }
 
+// BenchmarkGenerateDepth16PNG covers the depth-16 PNG shape: a 1024²
+// translucent depth-16 PNG decodes to *image.NRGBA64 (cbTCA16) and takes
+// the direct-Pix scaleNRGBA64 kernel (pixfast_16.go). Pre-kernel the
+// generic path boxed ≈ 6 allocs/pixel (4 At() boxes + Set box + rgbamodel
+// re-box, pixfast.go:1-10) at ≈ 393,251 allocs/op for the 256² output;
+// post-kernel the figure is the fixed scaffolding class — measured on this
+// box (Go 1.26.5, 2×2s runs): ≈ 10.5 ms/op (10.53/10.31), 58 allocs/op,
+// 10,694-byte fixture — ≈ 6,800× below the pre-kernel generic class, the
+// same O(dst_pixels·6) → O(1)-per-pixel drop the 40000 gate of
+// TestGenerateDownscaleAllocCeiling's depth-16 arm machine-checks. The
+// translucent α keeps the fixture on the NRGBA64 decode path (an opaque
+// NRGBA64 re-encodes to cbTC16/RGBA64Model), so the scaled output pays the
+// transparent compositeOnWhite flatten — the fuller production shape.
+// Run: go test -bench='BenchmarkGenerateDepth16PNG$' -benchmem ./internal/thumbnail/
+func BenchmarkGenerateDepth16PNG(b *testing.B) {
+	fixture := realDepth16PNG(b, 1024, 1024)
+	dec, _, err := image.Decode(bytes.NewReader(fixture))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, ok := dec.(*image.NRGBA64); !ok {
+		b.Fatalf("depth-16 fixture decoded to %T, want *image.NRGBA64", dec)
+	}
+	b.SetBytes(int64(len(fixture)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Generate(bytes.NewReader(fixture), 256, 256); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkGenerateHardMaxOrientedJPEG covers the HardMax EXIF-5..8 JPEG
 // shape (review finding F-3 of the YCbCr-kernel direction): a 2048²
 // orientation-6 JPEG at a HardMax box — the o ≥ 5 box swap keeps both axes

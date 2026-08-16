@@ -40,10 +40,11 @@ var orientIndex = [9]func(r, c, w, h int) (sr, sc int){
 // over w/h bounds, so no read can go out of range.
 //
 // It dispatches on the source's concrete type: *image.RGBA, *image.NRGBA,
-// *image.YCbCr, *image.Gray and *image.Paletted take the direct-Pix fast
-// kernels (pixfast.go / pixfast_more.go); every other type falls through to
-// applyOrientationGeneric — today's At/Set loop, preserved verbatim and
-// byte-identical. Both paths consult ctx at the top of every
+// *image.YCbCr, *image.Gray, *image.Paletted and the depth-16 classes
+// *image.RGBA64 / *image.NRGBA64 / *image.Gray16 take the direct-Pix fast
+// kernels (pixfast.go / pixfast_more.go / pixfast_16.go); every other type
+// falls through to applyOrientationGeneric — today's At/Set loop, preserved
+// verbatim and byte-identical. Both paths consult ctx at the top of every
 // cancelCheckRows-th row and return (nil, ctx.Err()) unwrapped on a done
 // context; the o ≤ 1 / o ≥ 9 fast paths return (img, nil) without consulting
 // ctx and without dispatching (FR-6).
@@ -68,6 +69,12 @@ func applyOrientation(ctx context.Context, img image.Image, o int) (image.Image,
 		return rotateGray(ctx, s, o, w, h, outW, outH)
 	case *image.Paletted:
 		return rotatePaletted(ctx, s, o, w, h, outW, outH)
+	case *image.RGBA64:
+		return rotateRGBA64(ctx, s, o, w, h, outW, outH)
+	case *image.NRGBA64:
+		return rotateNRGBA64(ctx, s, o, w, h, outW, outH)
+	case *image.Gray16:
+		return rotateGray16(ctx, s, o, w, h, outW, outH)
 	default:
 		return applyOrientationGeneric(ctx, img, o, b, w, h, outW, outH)
 	}

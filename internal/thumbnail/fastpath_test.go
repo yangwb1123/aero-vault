@@ -265,6 +265,19 @@ func TestFastPathByteIdentity(t *testing.T) {
 			runFixtureArms(w, h, name, src)
 		}
 	}
+	for _, sz := range moreSizes {
+		w, h := sz[0], sz[1]
+		for name, src := range map[string]image.Image{
+			"rgba64-opaque":     buildRGBA64(w, h),
+			"rgba64-alpha-zero": buildRGBA64AlphaZero(w, h),
+			"nrgba64-opaque":    buildNRGBA64(w, h),
+			"nrgba64-ramp":      buildNRGBA64Ramp(w, h),
+			"gray16-ramp":       buildGray16(w, h),
+			"gray16-solid":      buildGray16Solid(w, h),
+		} {
+			runFixtureArms(w, h, name, src)
+		}
+	}
 
 	// Empty source: same-instance no-op (sw==0 branch).
 	t.Run("empty-source", func(t *testing.T) {
@@ -310,6 +323,10 @@ func TestFastPathByteIdentity(t *testing.T) {
 		}
 		subW, subH := w-k, h-k
 		for name, sub := range map[string]image.Image{
+			"rgba64":            buildRGBA64(w, h).SubImage(image.Rect(k, k, w, h)),
+			"rgba64-alpha-zero": buildRGBA64AlphaZero(w, h).SubImage(image.Rect(k, k, w, h)),
+			"nrgba64-ramp":      buildNRGBA64Ramp(w, h).SubImage(image.Rect(k, k, w, h)),
+			"gray16":            buildGray16(w, h).SubImage(image.Rect(k, k, w, h)),
 			"ycbcr420":          buildYCbCr(w, h, image.YCbCrSubsampleRatio420, ycbcrModeRamp).SubImage(image.Rect(k, k, w, h)),
 			"paletted-gradient": buildPaletted(w, h, palModeGradient).SubImage(image.Rect(k, k, w, h)),
 			"paletted-nrgba":    buildPaletted(w, h, palModeNRGBA).SubImage(image.Rect(k, k, w, h)),
@@ -376,5 +393,32 @@ func TestGenerateDownscaleAllocCeiling(t *testing.T) {
 	})
 	if nJPEG >= 40000 {
 		t.Fatalf("Generate JPEG downscale allocated %.0f objects/op, want < 40000 (pre-kernel baseline: 393,251)", nJPEG)
+	}
+
+	// Depth-16 arm (AC-2): the fixture is a real depth-16 PNG (translucent
+	// α=0x8000 — the cbTCA16 decode path) which self-checks to
+	// *image.NRGBA64, so the arm is not vacuous: Generate's scale phase
+	// must take the scaleNRGBA64 kernel (pixfast_16.go). Pre-kernel the
+	// generic class measured 393,251 — trips the shared 40000 gate; the
+	// kernel class is fixed scaffolding. Same raceEnabled skip.
+	fixture16 := realDepth16PNG(t, 1024, 1024)
+	dec16, _, err := image.Decode(bytes.NewReader(fixture16))
+	if err != nil {
+		t.Fatalf("depth-16 fixture decode: %v", err)
+	}
+	if _, ok := dec16.(*image.NRGBA64); !ok {
+		t.Fatalf("depth-16 fixture decoded to %T, want *image.NRGBA64", dec16)
+	}
+	n16 := testing.AllocsPerRun(20, func() {
+		out, err := Generate(bytes.NewReader(fixture16), 256, 256)
+		if err != nil {
+			t.Fatalf("generate depth-16: %v", err)
+		}
+		if len(out) == 0 {
+			t.Fatal("generate depth-16 returned empty output")
+		}
+	})
+	if n16 >= 40000 {
+		t.Fatalf("Generate depth-16 PNG downscale allocated %.0f objects/op, want < 40000 (pre-kernel baseline: 393,251)", n16)
 	}
 }
