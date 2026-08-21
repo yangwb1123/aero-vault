@@ -3,9 +3,12 @@ package snapshot
 import (
 	"archive/tar"
 	"compress/gzip"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestDBFileFromDSN(t *testing.T) {
@@ -62,7 +65,7 @@ func TestRestore_BadDSNErrors(t *testing.T) {
 	dir := t.TempDir()
 	snap := filepath.Join(dir, "snap.tar.gz")
 	dbDir := t.TempDir()
-	writeFile(t, filepath.Join(dbDir, "aero.db"), []byte("x"))
+	createSQLiteDB(t, filepath.Join(dbDir, "aero.db"))
 	if err := Create(snap, "file:"+filepath.Join(dbDir, "aero.db"), t.TempDir()); err != nil {
 		t.Fatalf("setup Create: %v", err)
 	}
@@ -86,7 +89,7 @@ func TestCreate_MissingObjectsRootIsOK(t *testing.T) {
 	// ErrNotExist is swallowed); the DB file should still be archived.
 	dir := t.TempDir()
 	dbDir := t.TempDir()
-	writeFile(t, filepath.Join(dbDir, "aero.db"), []byte("dbcontent"))
+	createSQLiteDB(t, filepath.Join(dbDir, "aero.db"))
 
 	out := filepath.Join(dir, "snap.tar.gz")
 	missingObjs := filepath.Join(dir, "does-not-exist")
@@ -98,16 +101,14 @@ func TestCreate_MissingObjectsRootIsOK(t *testing.T) {
 	}
 }
 
-// TestRoundTrip is the core test: snapshot a DB (+WAL/SHM sidecars) and an
-// objects tree, restore into fresh directories, and verify byte-for-byte.
+// TestRoundTrip is the core test: snapshot a live SQLite database and an
+// objects tree, restore into fresh directories, and verify both contents.
 func TestRoundTrip(t *testing.T) {
 	srcDB := t.TempDir()
 	srcObjs := t.TempDir()
 
 	dbFile := filepath.Join(srcDB, "aero.db")
-	writeFile(t, dbFile, []byte("SQLite format 3\x00main-db-bytes"))
-	writeFile(t, dbFile+"-wal", []byte("wal-journal-data"))
-	writeFile(t, dbFile+"-shm", []byte("shared-mem"))
+	createSQLiteDB(t, dbFile)
 
 	// A nested objects tree with a couple of files.
 	objFiles := map[string][]byte{
@@ -134,10 +135,7 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 
-	// DB + sidecars restored correctly.
-	assertFileEquals(t, dstDBFile, []byte("SQLite format 3\x00main-db-bytes"))
-	assertFileEquals(t, dstDBFile+"-wal", []byte("wal-journal-data"))
-	assertFileEquals(t, dstDBFile+"-shm", []byte("shared-mem"))
+	assertSQLiteDB(t, dstDBFile)
 
 	// Objects restored correctly, preserving the nested layout.
 	for rel, data := range objFiles {
@@ -148,7 +146,7 @@ func TestRoundTrip(t *testing.T) {
 func TestRoundTrip_OnlyDBNoSidecars(t *testing.T) {
 	srcDB := t.TempDir()
 	dbFile := filepath.Join(srcDB, "aero.db")
-	writeFile(t, dbFile, []byte("just-the-db"))
+	createSQLiteDB(t, dbFile)
 
 	srcObjs := t.TempDir() // empty objects dir
 
@@ -163,7 +161,7 @@ func TestRoundTrip_OnlyDBNoSidecars(t *testing.T) {
 	if err := Restore(snap, "file:"+dstDBFile, dstObjs); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	assertFileEquals(t, dstDBFile, []byte("just-the-db"))
+	assertSQLiteDB(t, dstDBFile)
 
 	// No sidecars should have been created.
 	if _, err := os.Stat(dstDBFile + "-wal"); !os.IsNotExist(err) {
@@ -174,7 +172,7 @@ func TestRoundTrip_OnlyDBNoSidecars(t *testing.T) {
 func TestRestore_OverwritesExisting(t *testing.T) {
 	srcDB := t.TempDir()
 	dbFile := filepath.Join(srcDB, "aero.db")
-	writeFile(t, dbFile, []byte("new-contents"))
+	createSQLiteDB(t, dbFile)
 	srcObjs := t.TempDir()
 	writeFile(t, filepath.Join(srcObjs, "k.txt"), []byte("fresh"))
 
@@ -193,7 +191,7 @@ func TestRestore_OverwritesExisting(t *testing.T) {
 	if err := Restore(snap, "file:"+dstDBFile, dstObjs); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	assertFileEquals(t, dstDBFile, []byte("new-contents"))
+	assertSQLiteDB(t, dstDBFile)
 	assertFileEquals(t, filepath.Join(dstObjs, "k.txt"), []byte("fresh"))
 }
 
@@ -279,7 +277,7 @@ func TestRestoreRejectsTruncatedArchiveBeforeWriting(t *testing.T) {
 
 func TestRestoreDoesNotFollowEscapingDestinationSymlink(t *testing.T) {
 	sourceDB, sourceObjects := t.TempDir(), t.TempDir()
-	writeFile(t, filepath.Join(sourceDB, "aero.db"), []byte("database"))
+	createSQLiteDB(t, filepath.Join(sourceDB, "aero.db"))
 	writeFile(t, filepath.Join(sourceObjects, "linked", "outside.txt"), []byte("object"))
 	archive := filepath.Join(t.TempDir(), "snapshot.tar.gz")
 	if err := Create(archive, "file:"+filepath.Join(sourceDB, "aero.db"), sourceObjects); err != nil {
@@ -344,6 +342,44 @@ func writeSnapshotEntries(t *testing.T, destination string, entries []snapshotTe
 }
 
 // --- helpers ---
+
+func createSQLiteDB(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE records (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create sqlite schema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO records(payload) VALUES ('seed')`); err != nil {
+		t.Fatalf("insert sqlite seed: %v", err)
+	}
+}
+
+func assertSQLiteDB(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open restored sqlite: %v", err)
+	}
+	defer db.Close()
+	var result string
+	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&result); err != nil {
+		t.Fatalf("integrity check: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("integrity_check = %q, want ok", result)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM records`).Scan(&count); err != nil {
+		t.Fatalf("count restored rows: %v", err)
+	}
+	if count < 1 {
+		t.Fatalf("restored row count = %d, want at least one", count)
+	}
+}
 
 func writeFile(t *testing.T, path string, data []byte) {
 	t.Helper()

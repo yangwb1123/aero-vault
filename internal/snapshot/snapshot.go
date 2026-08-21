@@ -7,6 +7,8 @@ package snapshot
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -14,12 +16,13 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	_ "modernc.org/sqlite"
 )
 
-// Create writes a tar.gz to outPath containing:
-//
-//	./db/aero.db (+ -wal, -shm)
-//	./objects/...
+// Create writes a tar.gz to outPath containing a transactionally consistent
+// SQLite image and ./objects/... . The source database may remain open by the
+// server; VACUUM INTO creates a self-contained image without WAL/SHM files.
 //
 // dbPath is the SQLite DSN path (`file:./var/aero.db?...` is parsed).
 // objectsRoot is the local-FS storage root.
@@ -28,17 +31,89 @@ func Create(outPath, dbPath, objectsRoot string) error {
 	if dbFile == "" {
 		return errors.New("snapshot: cannot derive sqlite file from DSN; only sqlite local snapshots are supported")
 	}
+	if _, err := os.Stat(dbFile); err != nil {
+		return fmt.Errorf("snapshot: database file %q not found: %w", dbFile, err)
+	}
+	tempDir, err := os.MkdirTemp("", "aero-snapshot-*")
+	if err != nil {
+		return fmt.Errorf("snapshot: create temporary directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+	tempDB := filepath.Join(tempDir, filepath.Base(dbFile))
+	if err := vacuumInto(dbPath, tempDB); err != nil {
+		return err
+	}
 	f, err := os.Create(outPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	gz := gzip.NewWriter(f)
-	defer gz.Close()
-	tw := tar.NewWriter(gz)
-	defer tw.Close()
+	archiveErr := createArchive(f, tempDB, objectsRoot)
+	closeErr := f.Close()
+	if archiveErr != nil {
+		return archiveErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("snapshot: close archive: %w", closeErr)
+	}
+	return nil
+}
 
-	if err := addDBFiles(tw, dbFile); err != nil {
+func vacuumInto(dbPath, target string) error {
+	dbFile := dbFileFromDSN(dbPath)
+	if dbFile == "" {
+		return errors.New("snapshot: cannot derive sqlite file from DSN")
+	}
+	// mode=rw prevents the SQLite driver from creating a new empty source
+	// database if the file disappears between Create's stat and this open.
+	sourceDSN := "file:" + dbFile + "?mode=rw&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", sourceDSN)
+	if err != nil {
+		return fmt.Errorf("snapshot: open database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("snapshot: ping database: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout = 5000"); err != nil {
+		return fmt.Errorf("snapshot: set busy timeout: %w", err)
+	}
+	// modernc.org/sqlite does not reliably materialize VACUUM INTO's target
+	// when the filename is supplied as a bound parameter. The target is a
+	// private, freshly-created temporary path, so quoting it into the SQL is
+	// safe after escaping SQLite string delimiters.
+	escapedTarget := strings.ReplaceAll(target, "'", "''")
+	statement := "VACUUM INTO '" + escapedTarget + "'"
+	if _, err := db.ExecContext(ctx, statement); err != nil {
+		return fmt.Errorf("snapshot: create consistent database image: %w", err)
+	}
+	return nil
+}
+
+func createArchive(w io.Writer, dbFile, objectsRoot string) (err error) {
+	gz := gzip.NewWriter(w)
+	tw := tar.NewWriter(gz)
+	defer func() {
+		var finalizeErr error
+		if closeErr := tw.Close(); closeErr != nil {
+			finalizeErr = errors.Join(finalizeErr,
+				fmt.Errorf("snapshot: finalize tar archive: %w", closeErr))
+		}
+		if closeErr := gz.Close(); closeErr != nil {
+			finalizeErr = errors.Join(finalizeErr,
+				fmt.Errorf("snapshot: finalize gzip archive: %w", closeErr))
+		}
+		if finalizeErr != nil {
+			if err == nil {
+				err = finalizeErr
+			} else {
+				err = errors.Join(err, finalizeErr)
+			}
+		}
+	}()
+	if err := addDBImage(tw, dbFile); err != nil {
 		return err
 	}
 	if err := addObjectFiles(tw, objectsRoot); err != nil {
@@ -47,23 +122,11 @@ func Create(outPath, dbPath, objectsRoot string) error {
 	return nil
 }
 
-func addDBFiles(tw *tar.Writer, dbFile string) error {
+func addDBImage(tw *tar.Writer, dbFile string) error {
 	if _, err := os.Stat(dbFile); err != nil {
-		return fmt.Errorf("snapshot: database file %q not found: %w", dbFile, err)
+		return fmt.Errorf("snapshot: database image %q not found: %w", dbFile, err)
 	}
-	if err := addFile(tw, dbFile, "db/"+filepath.Base(dbFile)); err != nil {
-		return err
-	}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		path := dbFile + suffix
-		if _, err := os.Stat(path); err != nil {
-			continue
-		}
-		if err := addFile(tw, path, "db/"+filepath.Base(path)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return addFile(tw, dbFile, "db/"+filepath.Base(dbFile))
 }
 
 func addObjectFiles(tw *tar.Writer, objectsRoot string) error {
@@ -259,9 +322,15 @@ func addFile(tw *tar.Writer, fsPath, tarName string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(tw, f)
-	return err
+	_, copyErr := io.Copy(tw, f)
+	if copyErr != nil {
+		_ = f.Close()
+		return copyErr
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		return closeErr
+	}
+	return nil
 }
 
 func writeRootFile(root *os.Root, name string, reader io.Reader) error {

@@ -6,6 +6,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
 // --------------------------------------------------------------------------
@@ -1166,6 +1169,21 @@ func TestCmdUpload_SetsAuthHeaders(t *testing.T) {
 // cmdSnapshot
 // --------------------------------------------------------------------------
 
+func createSnapshotTestDB(t *testing.T, path string) {
+	t.Helper()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open snapshot db: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		_ = repo.Close()
+		t.Fatalf("migrate snapshot db: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close snapshot db: %v", err)
+	}
+}
+
 func TestCmdSnapshot_TooFewArgs_Returns2(t *testing.T) {
 	captureStderr(t, func() {
 		code := cmdSnapshot([]string{})
@@ -1191,7 +1209,7 @@ func TestCmdSnapshot_BadMode_Returns2(t *testing.T) {
 func TestCmdSnapshot_Create_Success(t *testing.T) {
 	tmp := t.TempDir()
 	dbFile := filepath.Join(tmp, "aero.db")
-	os.WriteFile(dbFile, []byte("SQLite"), 0o644)
+	createSnapshotTestDB(t, dbFile)
 	outFile := filepath.Join(tmp, "snap.tgz")
 	objectsDir := filepath.Join(tmp, "objects")
 	os.Mkdir(objectsDir, 0o755)
@@ -1217,7 +1235,7 @@ func TestCmdSnapshot_Create_Success(t *testing.T) {
 func TestCmdSnapshot_Create_ExplicitFlags(t *testing.T) {
 	tmp := t.TempDir()
 	dbFile := filepath.Join(tmp, "aero.db")
-	os.WriteFile(dbFile, []byte("SQLite"), 0o644)
+	createSnapshotTestDB(t, dbFile)
 	outFile := filepath.Join(tmp, "snap.tgz")
 	objectsDir := filepath.Join(tmp, "objects")
 	os.Mkdir(objectsDir, 0o755)
@@ -1239,7 +1257,7 @@ func TestCmdSnapshot_Restore_Success(t *testing.T) {
 	// First create a valid snapshot, then restore it.
 	tmp := t.TempDir()
 	dbFile := filepath.Join(tmp, "aero.db")
-	os.WriteFile(dbFile, []byte("SQLite"), 0o644)
+	createSnapshotTestDB(t, dbFile)
 	objectsDir := filepath.Join(tmp, "objects")
 	os.Mkdir(objectsDir, 0o755)
 	objFile := filepath.Join(objectsDir, "test.obj")
