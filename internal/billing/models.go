@@ -3,8 +3,8 @@ package billing
 import "time"
 
 const (
-	scopeEntitlementRead = "billing:entitlement:read"
-	scopeMeteringWrite   = "metering:write"
+	ScopeEntitlementRead = "billing:entitlement:read"
+	ScopeMeteringWrite   = "metering:write"
 
 	pathEntitlement  = "/api/v1/metering/entitlement"
 	pathUsage        = "/api/v1/metering/usage"

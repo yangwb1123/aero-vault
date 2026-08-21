@@ -39,7 +39,7 @@ func (s *tokenSource) Token(ctx context.Context) (string, error) {
 	if s.token != "" && now.Before(s.expires) {
 		return s.token, nil
 	}
-	response, err := s.client.ClientCredentials(ctx, scopeEntitlementRead, scopeMeteringWrite)
+	response, err := s.client.ClientCredentials(ctx, ScopeEntitlementRead, ScopeMeteringWrite)
 	if err != nil {
 		return "", err
 	}

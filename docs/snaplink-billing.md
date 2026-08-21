@@ -69,7 +69,11 @@ depend on remote availability.
   or expired entitlement rejects capacity-increasing mutations; cleanup can
   still reduce usage.
 - Usage delivery never runs synchronously on a file request. Accepted local
-  mutations remain in the durable outbox and retry indefinitely.
+  mutations remain in the durable outbox. Delivery retries with exponential
+  backoff up to `BILLING_OUTBOX_MAX_ATTEMPTS` (default `10`); permanent HTTP
+  4xx responses, missing tenant bindings, corrupt metadata, and facts that
+  exhaust the cap land in terminal `failed` status with `last_error` set and
+  are never reclaimed.
 - `/healthz` remains a liveness probe. `/readyz` checks the database, storage,
   and initial projection availability without exposing dependency error text.
 - HTTP is time-bounded, redirects are rejected, response bodies are bounded,

@@ -31,6 +31,8 @@ type Runtime struct {
 	batchSize    int
 	claimTTL     time.Duration
 	httpTimeout  time.Duration
+	maxAttempts  int
+	maxLag       time.Duration
 	transport    *http.Transport
 	startOnce    sync.Once
 	closeOnce    sync.Once
@@ -38,6 +40,9 @@ type Runtime struct {
 	closed       bool
 	cancel       context.CancelFunc
 	wait         sync.WaitGroup
+	degradedMu   sync.RWMutex
+	degraded     bool
+	backlogAge   time.Duration
 }
 
 func New(cfg config.BillingConfig, store Store, logger *slog.Logger) (*Runtime, error) {
@@ -70,6 +75,8 @@ func New(cfg config.BillingConfig, store Store, logger *slog.Logger) (*Runtime, 
 		batchSize:    cfg.OutboxBatchSize,
 		claimTTL:     time.Duration(cfg.ClaimTTLSeconds) * time.Second,
 		httpTimeout:  time.Duration(cfg.HTTPTimeoutSeconds) * time.Second,
+		maxAttempts:  cfg.OutboxMaxAttempts,
+		maxLag:       time.Duration(cfg.MaxLagSeconds) * time.Second,
 		transport:    transport,
 	}, nil
 }
@@ -141,7 +148,64 @@ func (r *Runtime) Ready(ctx context.Context) error {
 			return fmt.Errorf("%w: tenant %q", service.ErrEntitlementUnavailable, tenant)
 		}
 	}
+	age, ok, err := r.PendingBacklogAge(ctx)
+	if err != nil {
+		return errors.New("billing usage backlog lookup failed")
+	}
+	if ok && age > r.maxLag {
+		r.logger.Warn("billing usage backlog exceeds maximum lag", "age_seconds", age.Seconds(), "max_lag_seconds", r.maxLag.Seconds())
+		r.recordDegraded(true, age)
+		return nil
+	}
+	r.recordDegraded(false, age)
 	return nil
+}
+
+// PendingBacklogAge returns the current age of the oldest non-terminal fact.
+func (r *Runtime) PendingBacklogAge(ctx context.Context) (time.Duration, bool, error) {
+	oldest, ok, err := r.store.OldestPendingBillingUsage(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		return 0, false, nil
+	}
+	return time.Since(oldest), true, nil
+}
+
+// Degraded reports the last cached backlog probe without touching storage.
+func (r *Runtime) Degraded() bool {
+	r.degradedMu.RLock()
+	defer r.degradedMu.RUnlock()
+	return r.degraded
+}
+
+// BacklogAge returns the last cached backlog age without touching storage.
+func (r *Runtime) BacklogAge() time.Duration {
+	r.degradedMu.RLock()
+	defer r.degradedMu.RUnlock()
+	return r.backlogAge
+}
+
+func (r *Runtime) recordDegraded(degraded bool, age time.Duration) {
+	r.degradedMu.Lock()
+	r.degraded = degraded
+	r.backlogAge = age
+	r.degradedMu.Unlock()
+}
+
+func (r *Runtime) probeAndRecord(ctx context.Context) {
+	age, ok, err := r.PendingBacklogAge(ctx)
+	if err != nil {
+		r.logger.Warn("billing usage readiness probe failed", "err", err)
+		return
+	}
+	if ok && age > r.maxLag {
+		r.logger.Warn("billing usage backlog exceeds maximum lag", "age_seconds", age.Seconds(), "max_lag_seconds", r.maxLag.Seconds())
+		r.recordDegraded(true, age)
+		return
+	}
+	r.recordDegraded(false, age)
 }
 
 func (r *Runtime) CheckQuota(
@@ -153,7 +217,8 @@ func (r *Runtime) CheckQuota(
 	}
 	projection, ok, err := r.store.GetBillingProjection(ctx, tenant)
 	if err != nil {
-		return fmt.Errorf("%w: projection lookup failed", service.ErrEntitlementUnavailable)
+		r.logger.Warn("billing projection lookup failed — degrading to local tenant quota", "tenant", tenant, "err", err)
+		return nil
 	}
 	if !ok {
 		return fmt.Errorf("%w: projection not initialized", service.ErrEntitlementUnavailable)

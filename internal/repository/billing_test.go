@@ -135,3 +135,64 @@ func TestBillingDeletionUsesPositiveReclaimDimensions(t *testing.T) {
 		t.Fatalf("unexpected reclaim facts: %#v", dimensions)
 	}
 }
+
+func TestBillingUsageTerminalFailedExcludedFromClaimAndDueScan(t *testing.T) {
+	ctx := context.Background()
+	_, store := openBillingTestStore(t)
+	seededAt := time.Now().UTC()
+	_, _, err := store.ApplyBillingUsage(ctx, repository.BillingUsageMutation{
+		OperationID: "terminal-1", TenantID: "acme", Kind: "object_write",
+		DeltaBytes: 9, OccurredAt: seededAt,
+	})
+	if err != nil {
+		t.Fatalf("apply usage: %v", err)
+	}
+	oldest, ok, err := store.OldestPendingBillingUsage(ctx)
+	if err != nil || !ok || oldest.Before(seededAt.Add(-time.Second)) {
+		t.Fatalf("oldest pending: oldest=%v ok=%v err=%v", oldest, ok, err)
+	}
+	facts, err := store.ClaimBillingUsage(ctx, "worker", 10, time.Minute)
+	if err != nil || len(facts) != 1 {
+		t.Fatalf("claim usage: len=%d err=%v", len(facts), err)
+	}
+	if _, ok, err := store.OldestPendingBillingUsage(ctx); err != nil || !ok {
+		t.Fatalf("inflight fact excluded from age probe: ok=%v err=%v", ok, err)
+	}
+	if err := store.RetryBillingUsage(ctx, facts[0].ID, facts[0].ClaimOwner,
+		"permanent", time.Now().Add(-time.Minute), facts[0].Attempts); err != nil {
+		t.Fatalf("terminalize billing fact: %v", err)
+	}
+	if _, ok, err := store.OldestPendingBillingUsage(ctx); err != nil || ok {
+		t.Fatalf("terminal fact remained in age probe: ok=%v err=%v", ok, err)
+	}
+	if again, err := store.ClaimBillingUsage(ctx, "worker-2", 10, time.Minute); err != nil || len(again) != 0 {
+		t.Fatalf("terminal billing fact was claimable: facts=%v err=%v", again, err)
+	}
+
+	_, _, err = store.ApplyBillingUsage(ctx, repository.BillingUsageMutation{
+		OperationID: "cap-boundary", TenantID: "acme", Kind: "object_write",
+		DeltaBytes: 7, OccurredAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("apply cap-boundary usage: %v", err)
+	}
+	first, err := store.ClaimBillingUsage(ctx, "worker-3", 10, time.Minute)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first cap-boundary claim: len=%d err=%v", len(first), err)
+	}
+	if err := store.RetryBillingUsage(ctx, first[0].ID, first[0].ClaimOwner,
+		"transient", time.Now().Add(-time.Minute), 2); err != nil {
+		t.Fatalf("retry below cap: %v", err)
+	}
+	second, err := store.ClaimBillingUsage(ctx, "worker-4", 10, time.Minute)
+	if err != nil || len(second) != 1 || second[0].Attempts != 2 {
+		t.Fatalf("second cap-boundary claim: facts=%v err=%v", second, err)
+	}
+	if err := store.RetryBillingUsage(ctx, second[0].ID, second[0].ClaimOwner,
+		"transient", time.Now().Add(-time.Minute), 2); err != nil {
+		t.Fatalf("retry at cap: %v", err)
+	}
+	if final, err := store.ClaimBillingUsage(ctx, "worker-5", 10, time.Minute); err != nil || len(final) != 0 {
+		t.Fatalf("fact at cap remained claimable: facts=%v err=%v", final, err)
+	}
+}

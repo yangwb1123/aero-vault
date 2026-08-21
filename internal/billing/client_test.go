@@ -77,7 +77,7 @@ func TestClientUsesMachineTokenAndServerBoundMeteringBody(t *testing.T) {
 	if credentials.calls != 1 {
 		t.Fatalf("token calls=%d, want cached single call", credentials.calls)
 	}
-	if !slices.Equal(credentials.scopes, []string{scopeEntitlementRead, scopeMeteringWrite}) {
+	if !slices.Equal(credentials.scopes, []string{ScopeEntitlementRead, ScopeMeteringWrite}) {
 		t.Fatalf("token scopes=%v", credentials.scopes)
 	}
 }

@@ -59,6 +59,10 @@ var (
 	mAuditGovRelayDelivered metric.Int64Counter
 	mAuditGovRelayFailed    metric.Int64Counter
 	mAuditGovRelayDead      metric.Int64Counter
+	mBillingRelayAttempted  metric.Int64Counter
+	mBillingRelayDelivered  metric.Int64Counter
+	mBillingRelayFailed     metric.Int64Counter
+	mBillingRelayDead       metric.Int64Counter
 	mThumbnail304           metric.Int64Counter
 )
 
@@ -107,6 +111,10 @@ func initDomain() {
 		mAuditGovRelayDelivered, _ = m.Int64Counter("audit_governance.relay_delivered_total")
 		mAuditGovRelayFailed, _ = m.Int64Counter("audit_governance.relay_failed_total")
 		mAuditGovRelayDead, _ = m.Int64Counter("audit_governance.relay_dead_total")
+		mBillingRelayAttempted, _ = m.Int64Counter("billing.relay_attempted_total")
+		mBillingRelayDelivered, _ = m.Int64Counter("billing.relay_delivered_total")
+		mBillingRelayFailed, _ = m.Int64Counter("billing.relay_failed_total")
+		mBillingRelayDead, _ = m.Int64Counter("billing.relay_dead_total")
 		initThumbnailInstruments(m)
 	})
 }
@@ -365,8 +373,8 @@ func RegisterWebhookQueueDepthGauge(fn func(context.Context) map[string]int64) {
 
 // RegisterAuditGovernanceBacklogAgeGauge registers an observable gauge
 // (audit_governance_backlog_age_seconds) whose value is read from fn on each
-// scrape — the B3-2 degraded-alert source (oldest pending fact age; alert at
-// maxLag×0.5, default 450s).
+// scrape — the B3-2 degraded-alert source (oldest pending fact age; the alert
+// compares it with audit_governance_max_lag_seconds×0.5).
 func RegisterAuditGovernanceBacklogAgeGauge(fn func(context.Context) int64) {
 	m := otel.Meter("aero-vault/domain")
 	_, _ = m.Int64ObservableGauge("audit_governance.backlog_age_seconds", metric.WithInt64Callback(

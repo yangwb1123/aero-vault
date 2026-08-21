@@ -25,6 +25,7 @@ func TestDomainMetrics_SurfaceInScrape(t *testing.T) {
 	RecordReconcileBlobs(ctx, 3, 2)
 	IncIdempotencyReplay(ctx)
 	IncEventDropped(ctx)
+	IncThumbnailCacheBypass(ctx, "sse-c")
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -33,6 +34,9 @@ func TestDomainMetrics_SurfaceInScrape(t *testing.T) {
 		t.Fatalf("scrape returned %d", rec.Code)
 	}
 	body := rec.Body.String()
+	if value, ok := scrapeValueLabel(body, "thumbnail_cache_bypasses_total", "reason", "sse-c"); !ok || value != 1 {
+		t.Fatalf("thumbnail_cache_bypasses_total{reason=\"sse-c\"}: value=%v ok=%v, want 1", value, ok)
+	}
 
 	// OTel counters are exported with a _total suffix and dots → underscores.
 	want := []string{
@@ -46,6 +50,7 @@ func TestDomainMetrics_SurfaceInScrape(t *testing.T) {
 		"reconcile_orphan_blobs",
 		"idempotency_replays",
 		"events_dropped",
+		"thumbnail_cache_bypasses_total",
 	}
 	for _, w := range want {
 		if !strings.Contains(body, w) {
@@ -163,6 +168,57 @@ func TestSearchDegradedMetrics_SurfaceInScrape(t *testing.T) {
 	}
 }
 
+func TestBillingRelayMetrics_SurfaceInScrape(t *testing.T) {
+	if sharedPromHandler == nil {
+		t.Skip("sharedPromHandler not initialized")
+	}
+	ctx := context.Background()
+	IncBillingRelayAttempted(ctx)
+	IncBillingRelayDelivered(ctx)
+	IncBillingRelayFailed(ctx)
+	IncBillingRelayDead(ctx)
+	rec := httptest.NewRecorder()
+	sharedPromHandler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scrape returned %d", rec.Code)
+	}
+	for _, name := range []string{
+		"billing_relay_attempted_total", "billing_relay_delivered_total",
+		"billing_relay_failed_total", "billing_relay_dead_total",
+	} {
+		if value, ok := scrapeValue(rec.Body.String(), name); !ok || value < 1 {
+			t.Errorf("scrape %s: value=%v ok=%v, want positive", name, value, ok)
+		}
+	}
+}
+
+func TestBillingBacklogAgeGaugeSurfaceInScrape(t *testing.T) {
+	if sharedPromHandler == nil {
+		t.Skip("sharedPromHandler not initialized")
+	}
+	age := int64(137)
+	RegisterBillingBacklogAgeGauge(func(context.Context) int64 { return age })
+	scrape := func() float64 {
+		rec := httptest.NewRecorder()
+		sharedPromHandler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("scrape returned %d", rec.Code)
+		}
+		value, ok := scrapeValue(rec.Body.String(), "billing_backlog_age_seconds")
+		if !ok {
+			t.Fatal("billing backlog gauge missing from scrape")
+		}
+		return value
+	}
+	if got := scrape(); got != 137 {
+		t.Fatalf("initial billing backlog gauge=%v, want 137", got)
+	}
+	age = 0
+	if got := scrape(); got != 0 {
+		t.Fatalf("cleared billing backlog gauge=%v, want 0", got)
+	}
+}
+
 // TestAuditGovernanceBacklogAgeGaugeSurfaceInScrape registers the backlog-age
 // gauge exactly once (single-shot registration — OTel rejects a duplicate
 // instrument on the same meter) with a captured callback and pins the exported
@@ -204,6 +260,27 @@ func TestAuditGovernanceDegradedGaugeSurfaceInScrape(t *testing.T) {
 	body = scrapeShared(t)
 	if v, ok := scrapeValue(body, "audit_governance_degraded"); !ok || v != 0 {
 		t.Fatalf("degraded gauge after flip: value=%v ok=%v want 0", v, ok)
+	}
+}
+
+// TestAuditGovernanceMaxLagGaugeSurfaceInScrape pins the configured readiness
+// boundary used by the Prometheus age-arm expression. The value is observable
+// without a store query and follows the runtime configuration callback.
+func TestAuditGovernanceMaxLagGaugeSurfaceInScrape(t *testing.T) {
+	if sharedPromHandler == nil {
+		t.Skip("sharedPromHandler not initialized")
+	}
+	maxLag := int64(900)
+	RegisterAuditGovernanceMaxLagGauge(func(context.Context) int64 { return maxLag })
+
+	body := scrapeShared(t)
+	if v, ok := scrapeValue(body, "audit_governance_max_lag_seconds"); !ok || v != float64(maxLag) {
+		t.Fatalf("max-lag gauge: value=%v ok=%v want %d", v, ok, maxLag)
+	}
+	maxLag = 4
+	body = scrapeShared(t)
+	if v, ok := scrapeValue(body, "audit_governance_max_lag_seconds"); !ok || v != float64(maxLag) {
+		t.Fatalf("max-lag gauge after flip: value=%v ok=%v want %d", v, ok, maxLag)
 	}
 }
 

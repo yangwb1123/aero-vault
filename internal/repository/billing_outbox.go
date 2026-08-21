@@ -23,6 +23,22 @@ func (s *sqlStore) ClaimBillingUsage(
 	return s.claimBillingUsageSQLite(ctx, owner, limit, ttl)
 }
 
+// OldestPendingBillingUsage returns the age anchor for non-terminal facts.
+// The explicit status allowlist keeps future terminal states out of lag.
+func (s *sqlStore) OldestPendingBillingUsage(ctx context.Context) (time.Time, bool, error) {
+	var ns sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT MIN(created_at_ns) FROM billing_usage_outbox WHERE status IN ('pending','inflight')`,
+	).Scan(&ns)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !ns.Valid || ns.Int64 == 0 {
+		return time.Time{}, false, nil
+	}
+	return time.Unix(0, ns.Int64).UTC(), true, nil
+}
+
 func (s *sqlStore) claimBillingUsagePostgres(
 	ctx context.Context, owner string, limit int, ttl time.Duration,
 ) ([]BillingUsageFact, error) {
@@ -31,8 +47,8 @@ func (s *sqlStore) claimBillingUsagePostgres(
 	q := `UPDATE billing_usage_outbox SET status='inflight', attempts=attempts+1,
 claim_owner=$1, claim_until_ns=$2
 WHERE id IN (SELECT id FROM billing_usage_outbox
- WHERE (status='pending' AND next_attempt_at_ns <= $3)
-    OR (status='inflight' AND claim_until_ns <= $4)
+ WHERE ((status='pending' AND next_attempt_at_ns <= $3)
+    OR (status='inflight' AND claim_until_ns <= $4))
  ORDER BY created_at_ns, id LIMIT $5 FOR UPDATE SKIP LOCKED)
 RETURNING ` + billingUsageCols
 	rows, err := s.db.QueryContext(ctx, q, owner, until, now, now, limit)
@@ -52,8 +68,8 @@ func (s *sqlStore) claimBillingUsageSQLite(
 	defer func() { _ = tx.Rollback() }()
 	now := time.Now().UTC().UnixNano()
 	rows, err := tx.QueryContext(ctx, s.rebind(`SELECT id FROM billing_usage_outbox
-WHERE (status='pending' AND next_attempt_at_ns <= $1)
-   OR (status='inflight' AND claim_until_ns <= $2)
+WHERE ((status='pending' AND next_attempt_at_ns <= $1)
+   OR (status='inflight' AND claim_until_ns <= $2))
 ORDER BY created_at_ns, id LIMIT $3`), now, now, limit)
 	if err != nil {
 		return nil, err
@@ -134,16 +150,24 @@ WHERE id=$2 AND status='inflight' AND claim_owner=$3`), now, id, owner)
 }
 
 func (s *sqlStore) RetryBillingUsage(
-	ctx context.Context, id, owner, lastErr string, next time.Time,
+	ctx context.Context, id, owner, lastErr string, next time.Time, maxAttempts int,
 ) error {
 	if len(lastErr) > 512 {
 		lastErr = lastErr[:512]
 	}
 	result, err := s.db.ExecContext(ctx, s.rebind(`UPDATE billing_usage_outbox
-SET status='pending', next_attempt_at_ns=$1, claim_owner='', claim_until_ns=0, last_error=$2
-WHERE id=$3 AND status='inflight' AND claim_owner=$4`),
-		next.UTC().UnixNano(), strings.TrimSpace(lastErr), id, owner)
+	SET status=CASE WHEN attempts >= $1 THEN 'failed' ELSE 'pending' END,
+next_attempt_at_ns=$2, claim_owner='', claim_until_ns=0, last_error=$3
+WHERE id=$4 AND status='inflight' AND claim_owner=$5`),
+		maxAttemptsOrOne(maxAttempts), next.UTC().UnixNano(), strings.TrimSpace(lastErr), id, owner)
 	return requireBillingClaim(result, err)
+}
+
+func maxAttemptsOrOne(maxAttempts int) int {
+	if maxAttempts <= 0 {
+		return 1
+	}
+	return maxAttempts
 }
 
 func requireBillingClaim(result sql.Result, err error) error {

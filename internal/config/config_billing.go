@@ -27,6 +27,8 @@ type BillingConfig struct {
 	OutboxPollMillis      int
 	OutboxBatchSize       int
 	ClaimTTLSeconds       int
+	OutboxMaxAttempts     int
+	MaxLagSeconds         int
 	Bindings              []BillingBinding
 }
 
@@ -42,17 +44,23 @@ type billingBindingsFile struct {
 }
 
 func loadBillingConfig() (BillingConfig, error) {
+	env := &typedEnv{}
 	cfg := BillingConfig{
-		Enabled:               getEnvBool("BILLING_ENABLED", false),
+		Enabled:               env.Bool("BILLING_ENABLED", false),
 		BaseURL:               strings.TrimRight(getEnv("BILLING_BASE_URL", ""), "/"),
 		TokenURL:              getEnv("BILLING_TOKEN_URL", ""),
 		BindingsFile:          getEnv("BILLING_BINDINGS_FILE", ""),
-		AllowInsecureHTTP:     getEnvBool("BILLING_ALLOW_INSECURE_HTTP", false),
-		HTTPTimeoutSeconds:    getEnvInt("BILLING_HTTP_TIMEOUT_SECONDS", 5),
-		ProjectionIntervalSec: getEnvInt("BILLING_PROJECTION_INTERVAL_SECONDS", 60),
-		OutboxPollMillis:      getEnvInt("BILLING_OUTBOX_POLL_MILLISECONDS", 1000),
-		OutboxBatchSize:       getEnvInt("BILLING_OUTBOX_BATCH_SIZE", 32),
-		ClaimTTLSeconds:       getEnvInt("BILLING_OUTBOX_CLAIM_TTL_SECONDS", 30),
+		AllowInsecureHTTP:     env.Bool("BILLING_ALLOW_INSECURE_HTTP", false),
+		HTTPTimeoutSeconds:    env.Int("BILLING_HTTP_TIMEOUT_SECONDS", 5),
+		ProjectionIntervalSec: env.Int("BILLING_PROJECTION_INTERVAL_SECONDS", 60),
+		OutboxPollMillis:      env.Int("BILLING_OUTBOX_POLL_MILLISECONDS", 1000),
+		OutboxBatchSize:       env.Int("BILLING_OUTBOX_BATCH_SIZE", 32),
+		ClaimTTLSeconds:       env.Int("BILLING_OUTBOX_CLAIM_TTL_SECONDS", 30),
+		OutboxMaxAttempts:     env.Int("BILLING_OUTBOX_MAX_ATTEMPTS", 10),
+		MaxLagSeconds:         env.Int("BILLING_MAX_LAG_SECONDS", 900),
+	}
+	if err := env.Err(); err != nil {
+		return BillingConfig{}, err
 	}
 	if !cfg.Enabled {
 		return cfg, nil
@@ -144,6 +152,12 @@ func (c BillingConfig) Validate() error {
 	if c.HTTPTimeoutSeconds > 120 || c.ProjectionIntervalSec > 86_400 ||
 		c.OutboxPollMillis > 60_000 || c.ClaimTTLSeconds > 3_600 {
 		return errors.New("billing timeout or interval exceeds its safe maximum")
+	}
+	if c.OutboxMaxAttempts <= 0 || c.OutboxMaxAttempts > 1000 {
+		return errors.New("BILLING_OUTBOX_MAX_ATTEMPTS must be within 1..1000")
+	}
+	if c.MaxLagSeconds <= c.ClaimTTLSeconds || c.MaxLagSeconds > 604800 {
+		return errors.New("BILLING_MAX_LAG_SECONDS must exceed BILLING_OUTBOX_CLAIM_TTL_SECONDS and be <= 604800")
 	}
 	return validateBillingBindings(c.Bindings)
 }

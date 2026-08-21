@@ -56,9 +56,10 @@ type BillingStore interface {
 	GetBillingProjection(ctx context.Context, tenant string) (BillingProjection, bool, error)
 	ApplyBillingProjection(ctx context.Context, projection BillingProjection) (bool, error)
 	ApplyBillingUsage(ctx context.Context, mutation BillingUsageMutation) (TenantQuota, bool, error)
+	OldestPendingBillingUsage(ctx context.Context) (time.Time, bool, error)
 	ClaimBillingUsage(ctx context.Context, owner string, limit int, ttl time.Duration) ([]BillingUsageFact, error)
 	CompleteBillingUsage(ctx context.Context, id, owner string) error
-	RetryBillingUsage(ctx context.Context, id, owner, lastErr string, next time.Time) error
+	RetryBillingUsage(ctx context.Context, id, owner, lastErr string, next time.Time, maxAttempts int) error
 }
 
 var _ BillingStore = (*sqlStore)(nil)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
 func (r *Runtime) runOutbox(ctx context.Context) {
@@ -21,6 +22,7 @@ func (r *Runtime) runOutbox(ctx context.Context) {
 		case <-timer.C:
 		}
 		r.deliverBatch(ctx)
+		r.probeAndRecord(ctx)
 		timer.Reset(r.pollEvery)
 	}
 }
@@ -48,35 +50,68 @@ func (r *Runtime) deliverBatch(ctx context.Context) {
 }
 
 func (r *Runtime) deliverFact(ctx context.Context, fact repository.BillingUsageFact) {
+	telemetry.IncBillingRelayAttempted(ctx)
 	client, ok := r.bindings[fact.TenantID]
 	if !ok {
-		r.retryFact(ctx, fact, errors.New("billing tenant binding missing"))
+		r.failFact(ctx, fact, errors.New("billing tenant binding missing"))
 		return
 	}
 	metadata := map[string]string{}
 	if err := json.Unmarshal([]byte(fact.MetadataJSON), &metadata); err != nil {
-		r.retryFact(ctx, fact, errors.New("billing usage metadata invalid"))
+		r.failFact(ctx, fact, errors.New("billing usage metadata invalid"))
 		return
 	}
 	err := client.AppendUsage(ctx, fact.ID, fact.Dimension, fact.Quantity, fact.OccurredAt, metadata)
 	if err != nil {
-		r.retryFact(ctx, fact, err)
+		if isPermanentBillingError(err) {
+			r.failFact(ctx, fact, err)
+		} else {
+			r.retryFact(ctx, fact, err)
+		}
 		return
 	}
 	if err := r.store.CompleteBillingUsage(ctx, fact.ID, fact.ClaimOwner); err != nil {
 		r.logger.Warn("billing usage acknowledgement failed", "fact_id", fact.ID, "err", err)
+		return
 	}
+	telemetry.IncBillingRelayDelivered(ctx)
+}
+
+func (r *Runtime) failFact(ctx context.Context, fact repository.BillingUsageFact, cause error) {
+	if err := r.store.RetryBillingUsage(ctx, fact.ID, fact.ClaimOwner, cause.Error(), time.Now().UTC(), fact.Attempts); err != nil {
+		r.logger.Warn("billing usage terminal failure persistence failed", "fact_id", fact.ID, "err", err)
+		return
+	}
+	telemetry.IncBillingRelayDead(ctx)
+	r.logger.Error("billing usage fact rejected permanently", "fact_id", fact.ID, "attempt", fact.Attempts, "err", cause)
 }
 
 func (r *Runtime) retryFact(ctx context.Context, fact repository.BillingUsageFact, cause error) {
 	delay := billingBackoff(fact.Attempts)
 	next := time.Now().UTC().Add(delay)
-	if err := r.store.RetryBillingUsage(ctx, fact.ID, fact.ClaimOwner, cause.Error(), next); err != nil {
+	if err := r.store.RetryBillingUsage(ctx, fact.ID, fact.ClaimOwner, cause.Error(), next, r.maxAttempts); err != nil {
 		r.logger.Warn("billing usage retry persistence failed", "fact_id", fact.ID, "err", err)
 		return
 	}
+	if fact.Attempts >= maxAttemptsOrOne(r.maxAttempts) {
+		telemetry.IncBillingRelayDead(ctx)
+	} else {
+		telemetry.IncBillingRelayFailed(ctx)
+	}
 	r.logger.Warn("billing usage delivery deferred", "fact_id", fact.ID,
 		"attempt", fact.Attempts, "retry_in", delay, "err", cause)
+}
+
+func isPermanentBillingError(err error) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500
+}
+
+func maxAttemptsOrOne(maxAttempts int) int {
+	if maxAttempts < 1 {
+		return 1
+	}
+	return maxAttempts
 }
 
 func billingBackoff(attempt int) time.Duration {
