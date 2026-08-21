@@ -1,0 +1,6 @@
+{"ts": "2026-08-16T21:21:11.021939+00:00", "event": "campaign_done", "module": "", "direction": "Direction(module='internal/thumbnail', title='Per-tenant admission on the global decode-slot semaphore (cross-tenant sta", "status": "PIPELINE_FAILED"}
+{"ts":"2026-08-20T05:46:44-08:00","event":"campaign_done","module":"internal/thumbnail","direction":"Per-tenant admission and cache-effectiveness observability","status":"PASS"}
+{"ts":"2026-08-20T13:01:21-08:00","event":"campaign_done","module":"internal/repository","direction":"Exclude terminal-failed audit-governance rows from binding and disable gates","status":"PASS"}
+{"ts":"2026-08-20T13:17:36-08:00","event":"campaign_done","module":"internal/auditgovernance","direction":"Tombstone permanently rejected origins while preserving transient window recovery","status":"PASS"}
+{"ts":"2026-08-20T13:31:42-08:00","event":"campaign_done","module":"internal/telemetry","direction":"Export configurable audit-governance max-lag threshold for dynamic alert evaluation","status":"PASS"}
+{"ts":"2026-08-20T14:23:42-08:00","event":"campaign_done","module":"internal/billing","direction":"Terminal failed outbox, relay observability, readiness decoupling, and activation e2e","status":"PASS"}
