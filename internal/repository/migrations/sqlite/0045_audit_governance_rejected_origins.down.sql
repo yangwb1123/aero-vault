@@ -1,0 +1,1 @@
+DROP TABLE audit_governance_rejected_origins;

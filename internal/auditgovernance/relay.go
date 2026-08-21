@@ -96,7 +96,7 @@ func (r *Runtime) deliverFact(fact repository.AuditGovernanceFact) {
 		// state. Transient errors fall through to retryFact. Sentinel list
 		// cross-referenced by classifyRelayError below.
 
-		r.failFact(fact, err)
+		r.failFact(fact, err, true)
 		return
 	}
 	if err != nil {
@@ -117,12 +117,19 @@ func (r *Runtime) deliverFact(fact repository.AuditGovernanceFact) {
 // failFact lands a claimed fact in the terminal failed state: no retry is
 // scheduled, no further POST is possible, and the row is retained with
 // last_error until CleanupFailedAuditGovernance prunes it after the retention
-// window (terminal-with-retention). Claim loss on the fail write is warned,
-// never retried in-loop (lease re-claim is the recovery mechanism).
-func (r *Runtime) failFact(fact repository.AuditGovernanceFact, cause error) {
+// window. Permanent failures also retain an origin tombstone; window-terminal
+// failures deliberately remain recoverable by gap reconciliation. Claim loss
+// on the fail write is warned, never retried in-loop (lease re-claim is the
+// recovery mechanism).
+func (r *Runtime) failFact(fact repository.AuditGovernanceFact, cause error, permanent bool) {
 	telemetry.IncAuditGovernanceRelayDead(context.Background())
 	ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
-	err := r.store.FailAuditGovernance(ctx, fact.ID, fact.ClaimOwner, fact.ClaimToken, cause.Error())
+	var err error
+	if permanent {
+		err = r.store.RejectAuditGovernance(ctx, fact.ID, fact.ClaimOwner, fact.ClaimToken, cause.Error())
+	} else {
+		err = r.store.FailAuditGovernance(ctx, fact.ID, fact.ClaimOwner, fact.ClaimToken, cause.Error())
+	}
 	cancel()
 	if err != nil {
 		r.logger.Warn("audit governance terminal failure persistence failed",
@@ -159,7 +166,7 @@ func (r *Runtime) retryFact(fact repository.AuditGovernanceFact, cause error) {
 	// under this worker's fence, so the decision cannot be invalidated by a
 	// concurrent retry/fail write (both are fenced by owner+token+live lease).
 	if cumulativeWindowExceeded(fact.FirstAttemptAt, time.Now().UTC(), r.maxBackoff) {
-		r.failFact(fact, cause)
+		r.failFact(fact, cause, false)
 		return
 	}
 	telemetry.IncAuditGovernanceRelayFailed(context.Background())

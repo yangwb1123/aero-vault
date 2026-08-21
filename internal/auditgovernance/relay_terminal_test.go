@@ -157,6 +157,12 @@ func assertTerminalRetention(t *testing.T, store Store) {
 	if n, err := store.CleanupFailedAuditGovernance(ctx, time.Now().Add(time.Hour), 10); err != nil || n != 1 {
 		t.Fatalf("failed row not pruned after retention window: n=%d err=%v", n, err)
 	}
+	if n, err := store.CleanupFailedAuditGovernance(ctx, time.Now().Add(2*time.Hour), 10); err != nil || n != 0 {
+		t.Fatalf("second terminal cleanup removed another row: n=%d err=%v", n, err)
+	}
+	if gaps, err := store.ListAuditGovernanceGaps(ctx, "acme", 10); err != nil || len(gaps) != 0 {
+		t.Fatalf("permanent origin resurfaced after retention cleanup: gaps=%+v err=%v", gaps, err)
+	}
 }
 
 // terminalSink serves /token and answers fact POSTs per the table row. 409/422

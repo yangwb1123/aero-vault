@@ -99,6 +99,10 @@ type AuditGovernanceStore interface {
 	// (failed_at_ns set): never re-claimed, never re-POSTed, retained until
 	// CleanupFailedAuditGovernance prunes it after the retention window.
 	FailAuditGovernance(context.Context, string, string, string, string) error
+	// RejectAuditGovernance additionally tombstones the immutable origin. This
+	// is reserved for permanent receiver rejections; window-terminal retries
+	// must use FailAuditGovernance so gap reconciliation can recover them.
+	RejectAuditGovernance(context.Context, string, string, string, string) error
 	OldestPendingAuditGovernance(context.Context) (time.Time, bool, error)
 	HasPendingDrainingAuditGovernance(context.Context) (bool, error)
 	CleanupDeliveredAuditGovernance(context.Context, time.Time, int) (int64, error)

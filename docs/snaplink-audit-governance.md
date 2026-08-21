@@ -133,6 +133,12 @@ joins both live outbox rows and tombstones, so cleanup cannot recreate an
 already delivered origin or silently omit a never-delivered origin. Tombstones
 are part of the metadata backup contract.
 
+Permanent receiver rejections follow the same retention lifecycle for their
+diagnostic outbox row, but write a separate rejection tombstone at failure time.
+That tombstone survives failed-row cleanup and keeps gap reconciliation from
+reposting an immutable origin. Window-terminal transient failures deliberately
+have no rejection tombstone and remain eligible for recovery.
+
 `/healthz` remains pure liveness. `/readyz` fails only when the database/storage
 checks fail, Billing has no usable projection, or a `draining` tenant still has
 pending facts. Unbound local history does not pollute readiness. Backlog lag is

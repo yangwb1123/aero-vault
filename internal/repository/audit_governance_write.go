@@ -155,14 +155,17 @@ func (s *sqlStore) insertAuditGovernanceResult(
 request_id,detail_sha256,object_size_bytes,storage_backend,occurred_at_ns,available_at_ns,created_at_ns)
 SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
 WHERE NOT EXISTS (SELECT 1 FROM audit_governance_delivered_origins
-	WHERE origin_kind=$16 AND origin_id=$17)`
+	WHERE origin_kind=$16 AND origin_id=$17)
+AND NOT EXISTS (SELECT 1 FROM audit_governance_rejected_origins
+	WHERE origin_kind=$18 AND origin_id=$19)`
 	if ignoreDuplicate {
 		query += ` ON CONFLICT (origin_kind,origin_id) DO NOTHING`
 	}
 	return exec.ExecContext(ctx, s.rebind(query), fact.ID, fact.TenantID, fact.OriginKind,
 		fact.OriginID, fact.FactKind, fact.ActorDigest, fact.Action, fact.TargetDigest,
 		fact.RequestID, fact.DetailSHA256, fact.ObjectSizeBytes, fact.StorageBackend,
-		fact.OccurredAt.UTC().UnixNano(), now, now, fact.OriginKind, fact.OriginID)
+		fact.OccurredAt.UTC().UnixNano(), now, now, fact.OriginKind, fact.OriginID,
+		fact.OriginKind, fact.OriginID)
 }
 
 func validateAuditGovernanceFact(fact AuditGovernanceFact) error {
@@ -240,7 +243,9 @@ FROM audit_log a LEFT JOIN audit_governance_outbox o
  ON o.origin_kind='admin' AND o.origin_id=a.id
 LEFT JOIN audit_governance_delivered_origins d
  ON d.origin_kind='admin' AND d.origin_id=a.id
-WHERE a.tenant_id=$1 AND o.id IS NULL AND d.origin_id IS NULL
+LEFT JOIN audit_governance_rejected_origins r
+ ON r.origin_kind='admin' AND r.origin_id=a.id
+WHERE a.tenant_id=$1 AND o.id IS NULL AND d.origin_id IS NULL AND r.origin_id IS NULL
 ORDER BY a.id LIMIT $2`), tenant, limit)
 	if err != nil {
 		return nil, err
@@ -269,7 +274,9 @@ FROM object_events e LEFT JOIN audit_governance_outbox o
  ON o.origin_kind='file' AND o.origin_id=e.id
 LEFT JOIN audit_governance_delivered_origins d
  ON d.origin_kind='file' AND d.origin_id=e.id
-WHERE e.tenant_id=$1 AND o.id IS NULL AND d.origin_id IS NULL
+LEFT JOIN audit_governance_rejected_origins r
+ ON r.origin_kind='file' AND r.origin_id=e.id
+WHERE e.tenant_id=$1 AND o.id IS NULL AND d.origin_id IS NULL AND r.origin_id IS NULL
 ORDER BY e.id LIMIT $2`), tenant, limit)
 	if err != nil {
 		return nil, err

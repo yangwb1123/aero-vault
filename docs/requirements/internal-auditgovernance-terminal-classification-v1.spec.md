@@ -58,11 +58,12 @@ go test ./internal/auditgovernance/ ./internal/repository/ \
 
 ### REQ-1 — Permanent delivery classes land terminal within ≤1 attempt
 
-The relay MUST classify exactly `{ErrReceiptConflict, ErrInvalidReceipt, HTTP 409, HTTP 422}` as permanent; a permanent fact MUST be failed (`failed_at_ns>0` via `FailAuditGovernance`), MUST be POSTed exactly once (attempt ≤1), and MUST never be re-claimed or re-POSTed. Wrapped sentinels MUST classify identically (`errors.Is`/`errors.As`).
+The relay MUST classify exactly `{ErrReceiptConflict, ErrInvalidReceipt, HTTP 409, HTTP 422}` as permanent; a permanent fact MUST be failed (`failed_at_ns>0`) and its immutable origin MUST receive a durable rejection tombstone, MUST be POSTed exactly once (attempt ≤1), and MUST never be re-claimed or re-POSTed. Wrapped sentinels MUST classify identically (`errors.Is`/`errors.As`). Window-terminal transient facts remain recoverable by gap reconciliation.
 
 - **AC-1.1 (closed list, both directions).** `TestIsPermanentDeliveryErrorClosedList` (`relay_terminal_test.go:199`): the four permanent errors and their wrapped forms return true; the transient set — `httpStatusError` 400/401/403/404/410/429/500/501/503, `ErrInvalidEvent`, `ErrTokenUnavailable`, bare transport error, `context.DeadlineExceeded` — returns false. *Existing.*
 - **AC-1.2 (e2e terminal table).** `TestRuntimePermanentDeliveryErrorsAreTerminal` (`relay_terminal_test.go:35`): five sink rows — `http409`, `http422`, `tenant-mismatch` (202 + receipt with wrong `tenant_id`), `non-ledgered-status` (202 + `status:"rejected"`), `unparseable-body` (202 + non-JSON) — each asserts: exactly 1 POST within an observe window exceeding the harness max backoff (2s), then after `Close`: `ClaimAuditGovernance` returns 0 rows, `OldestPendingAuditGovernance` reports none (`assertTerminalState` `:126-146`); the 409 case additionally asserts the retention prune (`assertTerminalRetention` `:148-164`). *Existing.*
 - **AC-1.3 (attempt ≤1 at the repository level).** `TestAuditGovernanceFailedFactReadsBackOneAttempt` (`audit_governance_pending_idx_test.go:210`): claim increments `attempts` once, `FailAuditGovernance` is the sole writer of `failed_at_ns`, both land on the same row → `failed_at_ns > 0` AND `attempts == 1` read back. *Existing.*
+- **AC-1.4 (permanent origin is not resurrected).** `TestAuditGovernancePermanentRejectionTombstonesOrigin` (`audit_governance_rejected_origin_test.go`): a permanent rejection remains invisible to gap reconciliation while retained, stays invisible after two cleanup cycles, and a direct re-enqueue is a no-op; the existing deterministic-ID prune test continues to pin recovery for window-terminal transient rows.
 
 ### REQ-2 — Transient classes keep retrying with backoff capped ≤300s
 
@@ -78,7 +79,7 @@ Every error outside REQ-1's closed list MUST be rescheduled via `RetryAuditGover
 A row with `failed_at_ns > 0` MUST be invisible to `ClaimAuditGovernance`, `OldestPendingAuditGovernance`, and `HasPendingDrainingAuditGovernance`; a failed row MUST never reappear in a later claim, and `FailAuditGovernance` MUST be fenced by the claim identity (owner+token+live lease).
 
 - **AC-3.1 (SQL predicate).** All three claim queries and both pending queries carry `failed_at_ns=0` (`audit_governance_claim.go:37,62,88,194,207`). *Verified statically.*
-- **AC-3.2 (repository lock test).** `TestAuditGovernanceConflictFailIsTerminalAndRetentionPruned` (`audit_governance_test.go:419`): after `FailAuditGovernance`, a fresh claim returns 0 rows and `OldestPendingAuditGovernance` reports none; a stale owner/token cannot fail the fact (fencing); the failed row is not pruned before the window and is pruned after; the origin is re-enqueueable post-prune. *Existing.*
+- **AC-3.2 (repository lock test).** `TestAuditGovernanceConflictFailIsTerminalAndRetentionPruned` (`audit_governance_test.go:419`): after window-terminal `FailAuditGovernance`, a fresh claim returns 0 rows and `OldestPendingAuditGovernance` reports none; a stale owner/token cannot fail the fact (fencing); the failed row is not pruned before the window and is pruned after; the origin is re-enqueueable post-prune. Permanent-origin exclusion is pinned separately by AC-1.4. *Existing.*
 - **AC-3.3 (runtime lock).** `assertTerminalState` (`relay_terminal_test.go:126-146`) runs the same two probes through the live store after `Close` for every permanent class. *Existing.*
 
 ### REQ-4 — 0043 migration pair (sqlite + postgres): pending partial index
@@ -91,7 +92,7 @@ Migration 0043 MUST exist in both dialects and MUST add a partial index whose pr
 
 ### REQ-5 — Terminal-with-retention prune bounded by `DeliveredRetentionSeconds`
 
-Failed rows MUST be retained for diagnosis until the retention window and then pruned by `CleanupFailedAuditGovernance`; the window MUST be the delivered-retention window (default 7d).
+Failed rows MUST be retained for diagnosis until the retention window and then pruned by `CleanupFailedAuditGovernance`; the window MUST be the delivered-retention window (default 7d). Permanent rejection tombstones survive that row cleanup; window-terminal transient rows do not create tombstones and may resurface for recovery.
 
 - **AC-5.1 (wiring).** `retention: time.Duration(cfg.DeliveredRetentionSeconds) * time.Second` (`runtime.go:97`); `cleanupDelivered` calls `CleanupFailedAuditGovernance(ctx, now.Add(-r.retention), …)` on the same cadence (`relay.go:150-172`); `CleanupFailedAuditGovernance` deletes `failed_at_ns>0 AND failed_at_ns <= cutoff` (`audit_governance_cleanup.go:113-135`). *Verified statically.*
 - **AC-5.2 (early/late prune).** `assertTerminalRetention` (`relay_terminal_test.go:148-164`, exercised by the `http409` row) and `TestAuditGovernanceConflictFailIsTerminalAndRetentionPruned` (`audit_governance_test.go:419`): cleanup with `now.Add(-1h)` deletes 0 rows; cleanup with `now.Add(+1h)` deletes exactly 1. *Existing.*
@@ -123,5 +124,6 @@ Failed rows MUST be retained for diagnosis until the retention window and then p
 | Classification test: POST 409/422/tenant-mismatch/invalid receipt → terminal within attempt ≤1 (`failed_at_ns` set, never re-claimed) | REQ-1 | AC-1.2 `TestRuntimePermanentDeliveryErrorsAreTerminal` (exactly 1 POST, never re-claimed, absent from lag); AC-1.3 `TestAuditGovernanceFailedFactReadsBackOneAttempt` (`attempts==1`) | ✅ implemented & passing |
 | Transient 5xx/network rows keep retrying with backoff cap ≤300s | REQ-2 | AC-2.1 closed list; AC-2.2 `TestBoundedBackoffIsDeterministicAndCapped`; AC-2.3 500-sink reschedule via `failed` counter; **AC-2.4 `TestRuntimeTransientDeliveryIsRePostedWithGrowingBackoff` (posts ≥ 2 + growing gaps)** | ✅ implemented & passing |
 | Prune path `CleanupFailedAuditGovernance` bounded by `DeliveredRetentionSeconds` | REQ-5 | AC-5.1 wiring; AC-5.2 early/late prune assertions (runtime + repo) | ✅ implemented & passing |
+| Permanent rejection tombstone survives failed-row cleanup and blocks gap re-enqueue | REQ-1/REQ-5 | AC-1.4 `TestAuditGovernancePermanentRejectionTombstonesOrigin` | ✅ implemented & passing |
 
-**Remaining work from the supplied acceptance:** none — AC-2.4 (the one verification gap) is now implemented (`TestRuntimeTransientDeliveryIsRePostedWithGrowingBackoff`) and passing with the full suite. The only prescription intentionally not implemented is `status`/`dead_at` (D1), which is documented in-migration and pinned by test rather than silently dropped.
+**Remaining work from the supplied acceptance:** none — AC-1.4 and AC-2.4 are implemented and passing with the full suite. The only prescription intentionally not implemented is `status`/`dead_at` (D1), which is documented in-migration and pinned by test rather than silently dropped.

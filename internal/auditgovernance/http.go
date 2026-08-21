@@ -189,23 +189,30 @@ func validateReceipt(response *http.Response, fact repository.AuditGovernanceFac
 		return ErrInvalidReceipt
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil || len(body) > maxResponseBytes {
+	if err != nil {
+		// A transport/read failure after the receiver accepted the event is
+		// transient: retrying is what lets an idempotent re-POST receive the
+		// duplicate receipt and complete the fact. Only a complete oversized
+		// body is a deterministic invalid receipt.
+		return err
+	}
+	if len(body) > maxResponseBytes {
 		return ErrInvalidReceipt
 	}
 	var envelope receiptEnvelope
 	if json.Unmarshal(body, &envelope) != nil {
 		return ErrInvalidReceipt
 	}
-	if envelope.Receipt.Conflict {
-		// Contract A: conflict is terminal — the receiver will never ledger
-		// this event, so retrying cannot succeed. Distinct sentinel so the
-		// relay fails the fact with retention instead of bounded-backoff
-		// retrying it forever.
-		return ErrReceiptConflict
-
-	}
 	if !receiptMatches(envelope, fact) {
 		return ErrInvalidReceipt
+	}
+	if envelope.Receipt.Conflict {
+		// Contract A: after the receipt identity matches the posted fact,
+		// conflict is terminal — the receiver will never ledger this event,
+		// so retrying cannot succeed. An identity-mismatched conflict is an
+		// invalid receipt and remains retryable; this prevents a misrouted
+		// receipt from terminally discarding the wrong audit fact.
+		return ErrReceiptConflict
 	}
 	return nil
 }
@@ -214,7 +221,9 @@ func validateReceipt(response *http.Response, fact repository.AuditGovernanceFac
 // (event_id/tenant_id) and commit point (accepted_at) line up with the posted
 // fact. Duplicate is intentionally absent from this predicate (contract A):
 // idempotent re-POSTs arrive as {duplicate:true, conflict:false,
-// status:ledgered} and must complete exactly like a first POST.
+// status:ledgered} and must complete exactly like a first POST. The predicate
+// also gates conflict recognition: only an identity-matched conflict is
+// terminal; a mismatched conflict is an invalid, retryable receipt.
 func receiptMatches(envelope receiptEnvelope, fact repository.AuditGovernanceFact) bool {
 	receipt := envelope.Receipt
 	if receipt.EventID != fact.ID || receipt.TenantID != fact.TenantID ||

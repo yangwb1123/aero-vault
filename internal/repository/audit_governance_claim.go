@@ -196,6 +196,46 @@ AND lease_expires_at_ns > $6`), now, strings.TrimSpace(lastErr),
 	return requireGovernanceClaim(result, err)
 }
 
+// RejectAuditGovernance is the permanent-rejection variant of
+// FailAuditGovernance. It keeps the failed row for normal retention-based
+// diagnosis and atomically records an origin tombstone so pruning cannot make
+// gap reconciliation resurrect the same immutable fact.
+func (s *sqlStore) RejectAuditGovernance(
+	ctx context.Context, id, owner, token, lastErr string,
+) error {
+	if len(lastErr) > 512 {
+		lastErr = lastErr[:512]
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UTC().UnixNano()
+	result, err := tx.ExecContext(ctx, s.rebind(`UPDATE audit_governance_outbox
+SET failed_at_ns=$1,claim_owner='',claim_token='',lease_expires_at_ns=0,last_error=$2
+WHERE id=$3 AND delivered_at_ns=0 AND failed_at_ns=0 AND claim_owner=$4 AND claim_token=$5
+AND lease_expires_at_ns > $6`), now, strings.TrimSpace(lastErr), id, owner, token, now)
+	if err := requireGovernanceClaim(result, err); err != nil {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, s.rebind(`INSERT INTO audit_governance_rejected_origins
+(origin_kind,origin_id,rejected_at_ns)
+SELECT origin_kind,origin_id,$1 FROM audit_governance_outbox WHERE id=$2
+ON CONFLICT (origin_kind,origin_id) DO NOTHING`), now, id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return errors.New("audit governance rejection origin missing")
+	}
+	return tx.Commit()
+}
+
 func requireGovernanceClaim(result sql.Result, err error) error {
 	if err != nil {
 		return err

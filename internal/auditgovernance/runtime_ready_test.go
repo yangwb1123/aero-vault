@@ -151,6 +151,10 @@ func (s *scriptedStore) FailAuditGovernance(ctx context.Context, id, tenant, tok
 	return s.store.FailAuditGovernance(ctx, id, tenant, token, cause)
 }
 
+func (s *scriptedStore) RejectAuditGovernance(ctx context.Context, id, tenant, token, cause string) error {
+	return s.store.RejectAuditGovernance(ctx, id, tenant, token, cause)
+}
+
 func (s *scriptedStore) CleanupDeliveredAuditGovernance(ctx context.Context, before time.Time, limit int) (int64, error) {
 	return s.store.CleanupDeliveredAuditGovernance(ctx, before, limit)
 }

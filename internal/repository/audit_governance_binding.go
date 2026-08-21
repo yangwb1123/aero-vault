@@ -110,7 +110,7 @@ func (s *sqlStore) unboundGovernanceBacklog(
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT o.tenant_id
 FROM audit_governance_outbox o LEFT JOIN audit_governance_bindings b
  ON b.tenant_id=o.tenant_id
-WHERE o.delivered_at_ns=0 AND b.tenant_id IS NULL`)
+WHERE o.delivered_at_ns=0 AND o.failed_at_ns=0 AND b.tenant_id IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +155,7 @@ func (s *sqlStore) AuditGovernanceCanDisable(ctx context.Context) (bool, error) 
 	var safe bool
 	err := s.db.QueryRowContext(ctx, `SELECT
  NOT EXISTS (SELECT 1 FROM audit_governance_bindings) AND
- NOT EXISTS (SELECT 1 FROM audit_governance_outbox WHERE delivered_at_ns=0)`).Scan(&safe)
+ NOT EXISTS (SELECT 1 FROM audit_governance_outbox
+  WHERE delivered_at_ns=0 AND failed_at_ns=0)`).Scan(&safe)
 	return safe, err
 }

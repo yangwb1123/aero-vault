@@ -225,6 +225,13 @@ func (r *Runtime) BacklogAge() time.Duration {
 	return r.backlogAge
 }
 
+// MaxLag returns the configured readiness lag boundary without touching the
+// store. It backs the Prometheus threshold gauge so the alert rule follows
+// operator configuration instead of embedding the shipped default.
+func (r *Runtime) MaxLag() time.Duration {
+	return r.maxLag
+}
+
 // isProbeCtxError distinguishes probe timeout/cancellation (the wedged-store
 // shape — degrades, never fails readiness) from genuine store errors
 // (fail-closed readiness failures, unchanged).

@@ -128,9 +128,13 @@ func TestRuntimeConflictingReceiptIsTerminalWithRetention(t *testing.T) {
 			return
 		}
 		posts.Add(1)
+		var body struct {
+			EventID string `json:"event_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"receipt":{"event_id":"x","tenant_id":"acme","status":"ledgered","accepted_at":"2026-08-04T00:00:00Z","conflict":true}}`))
+		_, _ = fmt.Fprintf(w, `{"receipt":{"event_id":%q,"tenant_id":"acme","status":"ledgered","accepted_at":"2026-08-04T00:00:00Z","conflict":true}}`, body.EventID)
 	}))
 	defer server.Close()
 	ctx := context.Background()
