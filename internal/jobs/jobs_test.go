@@ -116,6 +116,32 @@ func TestDedupeCoalesces(t *testing.T) {
 	}
 }
 
+func TestDedupeFailedJobDoesNotBlockReenqueue(t *testing.T) {
+	repo := testRepo(t)
+	ctx := context.Background()
+
+	id1, deduped, err := repo.EnqueueJob(ctx, repository.Job{
+		Type: "replicate", DedupeKey: "replicate:9",
+	})
+	if err != nil || deduped {
+		t.Fatalf("first enqueue: id=%d deduped=%v err=%v", id1, deduped, err)
+	}
+	job, claimed, err := repo.ClaimJob(ctx, "w0")
+	if err != nil || !claimed || job.ID != id1 {
+		t.Fatalf("claim: job=%+v claimed=%v err=%v", job, claimed, err)
+	}
+	if err := repo.FailJob(ctx, id1, "permanent failure"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	id2, deduped, err := repo.EnqueueJob(ctx, repository.Job{
+		Type: "replicate", DedupeKey: "replicate:9",
+	})
+	if err != nil || deduped || id2 == id1 {
+		t.Fatalf("re-enqueue failed job: id=%d deduped=%v err=%v", id2, deduped, err)
+	}
+}
+
 func TestPoolRetriesThenSucceeds(t *testing.T) {
 	repo := testRepo(t)
 	ctx, cancel := context.WithCancel(context.Background())

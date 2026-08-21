@@ -91,12 +91,7 @@ func (w *Worker) Run(ctx context.Context, sub <-chan repository.Event) {
 			if e.Type != repository.EventCreated || e.ObjectID == nil {
 				continue
 			}
-			job := repository.Job{
-				TenantID:  e.TenantID,
-				Type:      JobReplicate,
-				Payload:   EncodeObjectID(*e.ObjectID),
-				DedupeKey: fmt.Sprintf("%s:%d", JobReplicate, *e.ObjectID),
-			}
+			job := replicateJob(e.TenantID, *e.ObjectID)
 			if _, _, err := w.queue.Enqueue(ctx, job); err != nil {
 				w.logger.Warn("replication: enqueue", "object_id", *e.ObjectID, "err", err)
 			}
@@ -113,7 +108,10 @@ func (w *Worker) ReplicateObjectByID(ctx context.Context, objectID int64) error 
 		return fmt.Errorf("get object %d: %w", objectID, err)
 	}
 	if _, _, ok := service.SSECustomerInfo(obj.Metadata); ok {
-		return errors.New("replication: SSE-C object requires an unavailable customer key")
+		w.recordStatus(ctx, obj, "skipped")
+		w.logger.Info("replication skipped", "tenant", obj.TenantID, "key", obj.Key,
+			"object_id", objectID, "reason", "SSE-C")
+		return nil
 	}
 	rc, info, err := w.primary.Get(ctx, obj.StorageKey)
 	if err != nil {
@@ -133,17 +131,22 @@ func (w *Worker) ReplicateObjectByID(ctx context.Context, objectID int64) error 
 		return fmt.Errorf("replica put %q: %w", obj.StorageKey, err)
 	}
 
-	tags := map[string]string{}
+	w.recordStatus(ctx, obj, "replicated")
+	w.logger.Info("replicated", "tenant", obj.TenantID, "key", obj.Key, "backend", w.replica.Backend())
+	return nil
+}
+
+func (w *Worker) recordStatus(ctx context.Context, obj repository.Object, status string) {
+	tags := make(map[string]string, len(obj.Tags)+1)
 	for k, v := range obj.Tags {
 		tags[k] = v
 	}
-	tags[TagStatus] = "replicated"
+	tags[TagStatus] = status
 	if w.tagger == nil {
-		w.logger.Warn("replication: object tagger unavailable", "object_id", objectID)
-	} else if err := w.tagger.SetObjectTagsByID(ctx, objectID, tags); err != nil {
-		// Replica write already succeeded; a tag failure shouldn't fail the job.
-		w.logger.Warn("replication: tag update", "object_id", objectID, "err", err)
+		w.logger.Warn("replication: object tagger unavailable", "object_id", obj.ID)
+	} else if err := w.tagger.SetObjectTagsByID(ctx, obj.ID, tags); err != nil {
+		// Replica write or a terminal skip already succeeded; a tag failure
+		// should not turn the job into a retry loop.
+		w.logger.Warn("replication: tag update", "object_id", obj.ID, "err", err)
 	}
-	w.logger.Info("replicated", "tenant", obj.TenantID, "key", obj.Key, "backend", w.replica.Backend())
-	return nil
 }
