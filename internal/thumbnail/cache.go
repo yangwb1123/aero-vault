@@ -87,7 +87,8 @@ type entry struct {
 // (default) entries live until LRU byte-budget pressure evicts them,
 // byte-for-byte the pre-TTL behavior. Lazy expiry bounds served retention
 // strictly; SweepExpired additionally bounds physical retention of
-// never-read expired keys.
+// never-read expired keys. cmd/server owns the timer driver and runs this
+// pass whenever TTL is enabled; Cache itself still owns no goroutines/timers.
 //
 // FR-4 (campaign add-ttl-lifecycle-invalidation-to-the-thumbnail) is
 // implemented below: SweepExpired walks the LRU list under c.mu removing
@@ -96,8 +97,9 @@ type entry struct {
 // O(entries) pass, zero allocations), does not bump the LRU eviction
 // counter, and must never be invoked from the request path; the natural
 // driver is an existing timer loop (e.g. the Reconcile ticker, AGENTS.md
-// §2.4), never a goroutine owned by Cache. The runtime wiring is a
-// documented follow-up — the method is inert until a timer driver calls it.
+// §2.4), never a goroutine owned by Cache. cmd/server/thumbnail_sweep.go calls
+// it on its configured cadence; the cache remains a library type with no
+// background lifecycle of its own.
 type Cache struct {
 	mu        sync.Mutex
 	ll        *list.List
@@ -131,6 +133,20 @@ func NewCache(maxBytes int64, ttl time.Duration) *Cache {
 		c.m = make(map[CacheKey]*list.Element)
 	}
 	return c
+}
+
+// Enabled reports whether this cache has a positive byte budget. It lets
+// adapter-level observability distinguish an intentionally disabled cache
+// from an enabled cache that bypassed a structurally uncacheable request.
+func (c *Cache) Enabled() bool {
+	return c != nil && !c.disabled
+}
+
+// PayloadFits reports whether img could be stored under this cache's byte
+// budget. It is a read-only companion to Put for the store-refusal telemetry
+// path; it does not reserve space or inspect the LRU.
+func (c *Cache) PayloadFits(img []byte) bool {
+	return c != nil && !c.disabled && len(img) > 0 && int64(len(img)) <= c.maxBytes
 }
 
 // Get returns the cached payload for k classified by GetOutcome. On a hit

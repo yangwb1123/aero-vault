@@ -20,6 +20,7 @@ var (
 	mThumbnailCacheSweepRuns       metric.Int64Counter
 	mThumbnailCacheSweepLastRun    metric.Int64Gauge
 	mThumbnailCacheSweepInterv     metric.Int64Gauge
+	mThumbnailCacheBypasses        metric.Int64Counter
 	mThumbnailGenerationSuccess    metric.Int64Counter
 	mThumbnailGenerationRejections metric.Int64Counter
 )
@@ -67,6 +68,18 @@ func IncThumbnailCacheExpired(ctx context.Context) {
 func IncThumbnailCacheEviction(ctx context.Context, n int64) {
 	initDomain()
 	mThumbnailCacheEvictions.Add(ctx, n)
+}
+
+// IncThumbnailCacheBypass counts traffic that cannot use the output cache.
+// The reason vocabulary is intentionally closed so object metadata and ETag
+// values cannot create unbounded metric cardinality.
+func IncThumbnailCacheBypass(ctx context.Context, reason string) {
+	if reason != "non-content-md5" && reason != "sse-c" &&
+		reason != "sse-kms" && reason != "store-refused" {
+		reason = "unknown"
+	}
+	initDomain()
+	mThumbnailCacheBypasses.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
 
 // IncThumbnailCacheSwept counts n entries physically purged from the
@@ -118,6 +131,7 @@ func initThumbnailInstruments(m metric.Meter) {
 	mThumbnailCacheSweepRuns, _ = m.Int64Counter("thumbnail.cache.sweep_runs_total")
 	mThumbnailCacheSweepLastRun, _ = m.Int64Gauge("thumbnail.cache.sweep_last_run_seconds")
 	mThumbnailCacheSweepInterv, _ = m.Int64Gauge("thumbnail.cache.sweep_interval_seconds")
+	mThumbnailCacheBypasses, _ = m.Int64Counter("thumbnail.cache.bypasses_total")
 	mThumbnail304, _ = m.Int64Counter("thumbnail.304_total")
 	mThumbnailGenerationSuccess, _ = m.Int64Counter("thumbnail.generation.success_total")
 	mThumbnailGenerationRejections, _ = m.Int64Counter("thumbnail.generation.rejections_total")

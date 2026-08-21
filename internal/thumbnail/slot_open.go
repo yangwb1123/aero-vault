@@ -157,10 +157,17 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 // object's ETag is returned alongside the bytes so the cached entry point can
 // verify content identity before storing.
 func generateContextWithOpener3(ctx context.Context, maxW, maxH int, open open3) ([]byte, string, error) {
-	if err := acquireDecodeSlotContext(ctx); err != nil {
+	return generateContextWithAdmission(ctx, maxW, maxH, nil, "", open)
+}
+
+func generateContextWithAdmission(
+	ctx context.Context, maxW, maxH int, admission *DecodeAdmission, tenant string, open open3,
+) ([]byte, string, error) {
+	release, err := admission.Acquire(ctx, tenant)
+	if err != nil {
 		return nil, "", err // no slot consumed, no stream opened
 	}
-	defer releaseDecodeSlot() // registered first → runs LAST
+	defer release() // registered first → runs LAST
 	rc, etag, err := open()
 	if err != nil {
 		// Defensive close: an opener may return a non-nil stream together

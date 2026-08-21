@@ -42,6 +42,32 @@ func GenerateContextWithOpenerCached(
 	maxW, maxH int,
 	open open3,
 ) (img []byte, fromCache bool, err error) {
+	return generateContextWithOpenerCached(ctx, cache, nil, tenant, sourceETag, maxW, maxH, open)
+}
+
+// GenerateContextWithOpenerCachedWithAdmission is the REST-serving variant
+// that adds an optional per-tenant decode ceiling. Cache hits still bypass
+// admission entirely; misses acquire the tenant slot before the global slot,
+// then keep both through open, decode, encode, and stream close.
+func GenerateContextWithOpenerCachedWithAdmission(
+	ctx context.Context,
+	cache *Cache,
+	admission *DecodeAdmission,
+	tenant, sourceETag string,
+	maxW, maxH int,
+	open open3,
+) (img []byte, fromCache bool, err error) {
+	return generateContextWithOpenerCached(ctx, cache, admission, tenant, sourceETag, maxW, maxH, open)
+}
+
+func generateContextWithOpenerCached(
+	ctx context.Context,
+	cache *Cache,
+	admission *DecodeAdmission,
+	tenant, sourceETag string,
+	maxW, maxH int,
+	open open3,
+) (img []byte, fromCache bool, err error) {
 	if open == nil {
 		return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: nil opener")
 	}
@@ -65,7 +91,10 @@ func GenerateContextWithOpenerCached(
 	// return — no lookup, no store, zero telemetry, byte-identical to
 	// GenerateContextWithOpener with a nil cache.
 	if !ContentMD5ETag(sourceETag) {
-		img, _, err := generateContextWithOpener3(ctx, maxW, maxH, open)
+		if cache != nil && cache.Enabled() {
+			telemetry.IncThumbnailCacheBypass(ctx, "non-content-md5")
+		}
+		img, _, err := generateContextWithAdmission(ctx, maxW, maxH, admission, tenant, open)
 		if err != nil {
 			return nil, false, err
 		}
@@ -93,7 +122,7 @@ func GenerateContextWithOpenerCached(
 
 	// Miss path: the exact shared body of GenerateContextWithOpener (slot →
 	// open → *OpenError wrap → close → generateLocked), byte-identical.
-	img, openedETag, err := generateContextWithOpener3(ctx, maxW, maxH, open)
+	img, openedETag, err := generateContextWithAdmission(ctx, maxW, maxH, admission, tenant, open)
 	if err != nil {
 		// Errors are never cached; the sentinel/classification surface is
 		// preserved byte-for-byte.
@@ -147,6 +176,9 @@ func lookupCached(ctx context.Context, cache *Cache, key CacheKey) (img []byte, 
 func storeCached(ctx context.Context, cache *Cache, key CacheKey, sourceETag, openedETag string, img []byte) {
 	if cache == nil || cache.disabled || openedETag == "" || openedETag != sourceETag {
 		return
+	}
+	if !cache.PayloadFits(img) {
+		telemetry.IncThumbnailCacheBypass(ctx, "store-refused")
 	}
 	if n := cache.Put(key, img); n > 0 {
 		telemetry.IncThumbnailCacheEviction(ctx, int64(n))

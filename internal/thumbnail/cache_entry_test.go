@@ -171,12 +171,13 @@ func TestCacheGenerateSpyOpenerSingleInvocation(t *testing.T) {
 // semaphore is fully recovered afterwards.
 func TestCacheGenerateHitBypassesDecodeSlot(t *testing.T) {
 	c := NewCache(1<<20, 0)
+	admission := NewDecodeAdmission(1)
 	data := makePNG(t, 64, 64)
 	var opens atomic.Int64
 	ctx := context.Background()
 
 	// Warm the cache (miss; acquires and releases one slot).
-	if _, fromCache, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens)); err != nil || fromCache {
+	if _, fromCache, err := GenerateContextWithOpenerCachedWithAdmission(ctx, c, admission, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens)); err != nil || fromCache {
 		t.Fatalf("warm-up: err=%v fromCache=%v", err, fromCache)
 	}
 
@@ -190,7 +191,7 @@ func TestCacheGenerateHitBypassesDecodeSlot(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		img, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+		img, from, err := GenerateContextWithOpenerCachedWithAdmission(ctx, c, admission, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
 		done <- struct {
 			img  []byte
 			from bool
@@ -538,6 +539,48 @@ func TestCacheETagShapeGateDeadCtxAndStats(t *testing.T) {
 				t.Fatal("bypass must still produce the thumbnail bytes")
 			}
 		})
+	}
+}
+
+func TestGenerateCacheEvictionsForwarded(t *testing.T) {
+	fixture := makePNG(t, 128, 128)
+	probe := NewCache(1<<20, 0)
+	first, _, err := GenerateContextWithOpenerCached(context.Background(), probe, "t1", etagA, 64, 64,
+		countingOpener3(fixture, etagA, new(atomic.Int64)))
+	if err != nil {
+		t.Fatalf("probe generation: %v", err)
+	}
+	if len(first) == 0 {
+		t.Fatal("probe generation returned empty bytes")
+	}
+	c := NewCache(int64(len(first)), 0)
+	if _, _, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", etagA, 64, 64,
+		countingOpener3(fixture, etagA, new(atomic.Int64))); err != nil {
+		t.Fatalf("first cached generation: %v", err)
+	}
+	if _, _, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", etagB, 64, 64,
+		countingOpener3(fixture, etagB, new(atomic.Int64))); err != nil {
+		t.Fatalf("overflow cached generation: %v", err)
+	}
+	_, _, evictions, _ := c.Stats()
+	if evictions < 1 || c.Len() != 1 {
+		t.Fatalf("cache stats after overflow: evictions=%d len=%d, want at least one eviction and one entry", evictions, c.Len())
+	}
+}
+
+func TestGenerateCacheStoreRefusalIsNotAnEviction(t *testing.T) {
+	c := NewCache(1, 0)
+	img, from, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", etagA, 64, 64,
+		countingOpener3(makePNG(t, 128, 128), etagA, new(atomic.Int64)))
+	if err != nil {
+		t.Fatalf("oversized cache generation: %v", err)
+	}
+	if from || len(img) == 0 {
+		t.Fatalf("oversized cache generation: from=%v len=%d", from, len(img))
+	}
+	_, _, evictions, _ := c.Stats()
+	if c.Len() != 0 || evictions != 0 {
+		t.Fatalf("store refusal changed cache: len=%d evictions=%d", c.Len(), evictions)
 	}
 }
 
