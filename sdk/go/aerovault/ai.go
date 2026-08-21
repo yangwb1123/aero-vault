@@ -88,7 +88,11 @@ func streamError(data string) error {
 		if payload.Code == "" {
 			payload.Code = "StreamError"
 		}
-		return &Error{Status: http.StatusOK, Code: payload.Code, Message: payload.Message}
+		status := http.StatusOK
+		if payload.Code == "BudgetExceeded" {
+			status = http.StatusPaymentRequired
+		}
+		return &Error{Status: status, Code: payload.Code, Message: payload.Message}
 	}
 	return &Error{Status: http.StatusOK, Code: "StreamError", Message: unquote(data)}
 }

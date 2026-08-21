@@ -229,6 +229,19 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(toks, ["Hello", " world"])
         self.assertEqual(done["answer"], "Hello world")
 
+    def test_chat_stream_decodes_structured_error_frame(self):
+        lines = [
+            b"event: error\n",
+            b'data: {"code":"BudgetExceeded","message":"tenant AI budget exceeded"}\n',
+            b"\n",
+        ]
+        c = StubClient(FakeResp(lines=lines))
+        with self.assertRaises(av.AeroVaultError) as raised:
+            list(c.chat_stream("q"))
+        self.assertEqual(raised.exception.status, 402)
+        self.assertEqual(raised.exception.code, "BudgetExceeded")
+        self.assertEqual(raised.exception.message, "tenant AI budget exceeded")
+
     def test_key_escaping(self):
         self.assertEqual(av._escape_key("/a/b c.txt"), "a/b%20c.txt")
 

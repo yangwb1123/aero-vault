@@ -238,12 +238,18 @@ export class Client {
     }
     let resp;
     try {
-      resp = await this._fetch(this._url(path, params), {
+      /** @type {RequestInit & {duplex?: "half"}} */
+      const init = {
         method,
         headers: this._headers(headers),
         body: body ?? null,
         signal: usedSignal,
-      });
+      };
+      // Node's undici requires this opt-in for a Web ReadableStream request
+      // body. Keep it off for ordinary bodies so browser fetches remain
+      // maximally portable.
+      if (isReadableStreamBody(body)) init.duplex = "half";
+      resp = await this._fetch(this._url(path, params), init);
     } catch (e) {
       if (timer) clearTimeout(timer);
       // Surface aborts/timeouts and network errors consistently.
@@ -560,7 +566,7 @@ export class Client {
    */
   async lock(key, seconds) {
     return this._requestJSON("POST", "/v1/files/" + escapeKey(key) + "/lock", {
-      body: { seconds },
+      json: { seconds },
     });
   }
 
@@ -716,7 +722,7 @@ export class Client {
         // Each token frame is a JSON-encoded string.
         yield /** @type {string} */ (JSON.parse(payload));
       } else if (event === "error") {
-        throw new AeroVaultError(502, "StreamError", maybeUnquote(payload));
+        throw parseStreamError(payload);
       } else if (event === "done") {
         if (opts.onDone) {
           try {
@@ -1018,6 +1024,16 @@ export function coerceBody(data) {
 }
 
 /**
+ * Detect a Web ReadableStream without relying on a realm-specific
+ * `instanceof` check (streams can come from an iframe or another runtime).
+ * @param {unknown} body
+ * @returns {boolean}
+ */
+function isReadableStreamBody(body) {
+  return body != null && typeof body === "object" && typeof body.getReader === "function";
+}
+
+/**
  * Assemble the JSON body for chat/chatStream, omitting undefined options.
  * @param {string} query
  * @param {Record<string, any>} opts
@@ -1052,6 +1068,34 @@ function maybeUnquote(s) {
     }
   }
   return t;
+}
+
+/**
+ * Decode the structured `event: error` payload emitted by ChatStream.
+ * Keep accepting the old JSON-string payload for compatibility with older
+ * servers and test fixtures.
+ * @param {string} payload
+ * @returns {AeroVaultError}
+ */
+function parseStreamError(payload) {
+  const fallback = maybeUnquote(payload);
+  let code = "StreamError";
+  let message = fallback;
+  let status = 502;
+  try {
+    const parsed = JSON.parse(payload);
+    if (typeof parsed === "string") {
+      message = parsed;
+    } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (typeof parsed.code === "string" && parsed.code) code = parsed.code;
+      if (typeof parsed.message === "string") message = parsed.message;
+      if (Number.isInteger(parsed.status) && parsed.status >= 400) status = parsed.status;
+    }
+  } catch {
+    // Preserve the trimmed raw payload for malformed/legacy frames.
+  }
+  if (code === "BudgetExceeded" && status === 502) status = 402;
+  return new AeroVaultError(status, code, message);
 }
 
 /**

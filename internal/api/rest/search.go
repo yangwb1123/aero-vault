@@ -1,12 +1,14 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -113,16 +115,29 @@ func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 
-	resp, err := h.chat.AnswerStream(r.Context(), ai.ChatReq{
+	streamCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	var writeFailed atomic.Bool
+	resp, err := h.chat.AnswerStream(streamCtx, ai.ChatReq{
 		Tenant: mw.TenantFrom(r.Context()), Bucket: req.Bucket,
 		Query: req.Query, K: req.K, Mode: req.Mode,
 		Caller: "rest:chat-stream", ReqID: mw.RequestIDFrom(r.Context()),
 	}, func(chunk string) {
+		if writeFailed.Load() || streamCtx.Err() != nil {
+			return
+		}
 		// each token chunk is a JSON-encoded string so newlines stay safe.
 		b, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "event: token\ndata: %s\n\n", string(b))
+		if _, writeErr := fmt.Fprintf(w, "event: token\ndata: %s\n\n", string(b)); writeErr != nil {
+			writeFailed.Store(true)
+			cancel()
+			return
+		}
 		flusher.Flush()
 	})
+	if writeFailed.Load() || streamCtx.Err() != nil {
+		return
+	}
 	if err != nil {
 		if errors.Is(err, ai.ErrBudgetExceeded) {
 			writeSSEError(w, flusher, "BudgetExceeded", "tenant AI budget exceeded")
@@ -133,7 +148,9 @@ func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	// Final frame: full answer + citations as JSON
 	final, _ := json.Marshal(resp)
-	fmt.Fprintf(w, "event: done\ndata: %s\n\n", string(final))
+	if _, err := fmt.Fprintf(w, "event: done\ndata: %s\n\n", string(final)); err != nil {
+		return
+	}
 	flusher.Flush()
 }
 

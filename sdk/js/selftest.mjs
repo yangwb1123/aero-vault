@@ -145,6 +145,12 @@ await test("upload accepts ArrayBuffer and ArrayBufferView bodies", async () => 
   assert.ok(fetch.calls[0].init.body instanceof Uint8Array);
 });
 
+await test("upload enables Node duplex for ReadableStream bodies", async () => {
+  const { client, fetch } = newClient(() => ({ body: "{}" }));
+  await client.upload("stream.bin", streamOf([new Uint8Array([1, 2, 3])]));
+  assert.equal(fetch.calls[0].init.duplex, "half");
+});
+
 // ---- get / getText / stat ----------------------------------------------
 
 await test("get returns a Uint8Array of the body bytes", async () => {
@@ -254,6 +260,15 @@ await test("putTags PUTs the tag map as JSON", async () => {
   const c = fetch.calls[0];
   assert.equal(c.init.method, "PUT");
   assert.deepEqual(JSON.parse(c.init.body), { team: "research" });
+});
+
+await test("lock POSTs seconds as a JSON body", async () => {
+  const { client, fetch } = newClient(() => ({ body: "{}" }));
+  await client.lock("a.txt", 60);
+  const c = fetch.calls[0];
+  assert.equal(c.init.method, "POST");
+  assert.equal(c.headers["Content-Type"], "application/json");
+  assert.deepEqual(JSON.parse(c.init.body), { seconds: 60 });
 });
 
 // ---- search / chat ------------------------------------------------------
@@ -427,7 +442,7 @@ await test("chatStream yields decoded token strings and fires onDone", async () 
 });
 
 await test("chatStream raises AeroVaultError on an error frame", async () => {
-  const sse = 'event: error\ndata: "model exploded"\n\n';
+  const sse = 'event: error\ndata: {"code":"BudgetExceeded","message":"tenant AI budget exceeded"}\n\n';
   const fetch = stubFetch(() => new Response(streamOf([sse]), { status: 200 }));
   const client = new Client("http://test", { fetch });
   await assert.rejects(
@@ -439,10 +454,25 @@ await test("chatStream raises AeroVaultError on an error frame", async () => {
     })(),
     (e) => {
       assert.ok(e instanceof AeroVaultError);
-      assert.equal(e.code, "StreamError");
-      assert.equal(e.message, "model exploded");
+      assert.equal(e.status, 402);
+      assert.equal(e.code, "BudgetExceeded");
+      assert.equal(e.message, "tenant AI budget exceeded");
       return true;
     }
+  );
+});
+
+await test("chatStream accepts legacy quoted error payloads", async () => {
+  const sse = 'event: error\ndata: "model exploded"\n\n';
+  const fetch = stubFetch(() => new Response(streamOf([sse]), { status: 200 }));
+  const client = new Client("http://test", { fetch });
+  await assert.rejects(
+    (async () => {
+      for await (const _ of client.chatStream("q")) {
+        /* drain */
+      }
+    })(),
+    (e) => e instanceof AeroVaultError && e.code === "StreamError" && e.message === "model exploded"
   );
 });
 
@@ -471,10 +501,11 @@ await test("multipart init/part/complete hit the right routes", async () => {
   const client = new Client("http://test", { fetch });
   const mp = await client.createMultipartUpload("big.bin");
   assert.equal(mp.upload_id, "U1");
-  await client.uploadPart("U1", 1, new Uint8Array([1, 2, 3]));
+  await client.uploadPart("U1", 1, streamOf([new Uint8Array([1, 2, 3])]));
   await client.completeMultipartUpload("U1");
   assert.equal(fetch.calls[0].url, "http://test/v1/multipart");
   assert.equal(fetch.calls[1].init.method, "PUT");
+  assert.equal(fetch.calls[1].init.duplex, "half");
   assert.equal(fetch.calls[1].url, "http://test/v1/multipart/U1/parts/1");
   assert.equal(fetch.calls[2].url, "http://test/v1/multipart/U1/complete");
 });

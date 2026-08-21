@@ -502,7 +502,7 @@ class Client:
                 if event == "token":
                     yield json.loads(payload)  # token is a JSON-encoded string
                 elif event == "error":
-                    raise AeroVaultError(502, "StreamError", _maybe_unquote(payload))
+                    raise _parse_stream_error(payload)
                 elif event == "done":
                     if on_done:
                         try:
@@ -734,6 +734,30 @@ def _maybe_unquote(s: str) -> str:
         except Exception:  # noqa: BLE001
             return s[1:-1]
     return s
+
+
+def _parse_stream_error(payload: str) -> AeroVaultError:
+    """Decode structured ChatStream errors, retaining legacy string support."""
+    fallback = _maybe_unquote(payload)
+    code = "StreamError"
+    message = fallback
+    status = 502
+    try:
+        parsed = json.loads(payload)
+        if isinstance(parsed, str):
+            message = parsed
+        elif isinstance(parsed, dict):
+            if isinstance(parsed.get("code"), str) and parsed["code"]:
+                code = parsed["code"]
+            if isinstance(parsed.get("message"), str):
+                message = parsed["message"]
+            if isinstance(parsed.get("status"), int) and parsed["status"] >= 400:
+                status = parsed["status"]
+    except (TypeError, ValueError):
+        pass
+    if code == "BudgetExceeded" and status == 502:
+        status = 402
+    return AeroVaultError(status, code, message)
 
 
 def _iter_sse(resp: t.Iterable[bytes]) -> t.Iterator[t.Tuple[str, str]]:

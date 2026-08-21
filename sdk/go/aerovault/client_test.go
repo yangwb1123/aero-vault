@@ -853,11 +853,10 @@ func TestChatStream(t *testing.T) {
 }
 
 func TestChatStreamErrorFrame(t *testing.T) {
-	// The server writes the error frame with %q, i.e. a JSON-quoted string.
 	const stream = "event: token\n" +
 		"data: \"partial\"\n\n" +
 		"event: error\n" +
-		"data: \"backend exploded\"\n\n"
+		"data: {\"code\":\"BudgetExceeded\",\"message\":\"tenant budget exceeded\"}\n\n"
 
 	c, _ := newStub(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -872,8 +871,26 @@ func TestChatStreamErrorFrame(t *testing.T) {
 	if !AsError(err, &ae) {
 		t.Fatalf("err type = %T, want *Error", err)
 	}
-	if ae.Code != "StreamError" || ae.Message != "backend exploded" {
+	if ae.Status != http.StatusPaymentRequired || ae.Code != "BudgetExceeded" ||
+		ae.Message != "tenant budget exceeded" {
 		t.Errorf("error = %+v", ae)
+	}
+}
+
+func TestChatStreamLegacyQuotedErrorFrame(t *testing.T) {
+	const stream = "event: error\n" + "data: \"backend exploded\"\n\n"
+	c, _ := newStub(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, stream)
+	})
+	_, err := c.ChatStream(context.Background(), ChatRequest{Query: "hi"}, nil)
+	if err == nil {
+		t.Fatal("expected error from legacy error frame")
+	}
+	var ae *Error
+	if !AsError(err, &ae) || ae.Code != "StreamError" || ae.Message != "backend exploded" {
+		t.Errorf("legacy error = %+v", err)
 	}
 }
 
