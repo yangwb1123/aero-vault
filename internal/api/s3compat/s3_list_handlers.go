@@ -7,7 +7,6 @@ import (
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
-	"github.com/aero-vault/aero-vault/internal/service"
 )
 
 func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -21,6 +20,7 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request, bucket str
 func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
 	q := r.URL.Query()
 	prefix := q.Get("prefix")
+	delimiter := q.Get("delimiter")
 	rawToken := q.Get("continuation-token")
 	marker := ""
 	if rawToken != "" {
@@ -37,15 +37,13 @@ func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket s
 	ctx := r.Context()
 	tenant := mw.TenantFrom(ctx)
 
-	var page repository.ListPage
-	var err error
-	if maxKeys > 0 {
+	fetch := func(cursor string, limit int) (repository.ListPage, error) {
 		if tagKey != "" {
-			page, err = h.svc.ListByTag(ctx, tenant, bucket, prefix, marker, maxKeys, tagKey, tagValue)
-		} else {
-			page, err = h.svc.List(ctx, tenant, bucket, prefix, marker, maxKeys)
+			return h.svc.ListByTag(ctx, tenant, bucket, prefix, cursor, limit, tagKey, tagValue)
 		}
+		return h.svc.List(ctx, tenant, bucket, prefix, cursor, limit)
 	}
+	page, err := loadObjectListPage(prefix, delimiter, marker, maxKeys, fetch)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
@@ -54,23 +52,17 @@ func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket s
 		Xmlns:             s3Namespace,
 		Name:              bucket,
 		Prefix:            prefix,
-		KeyCount:          len(page.Objects),
+		KeyCount:          page.keyCount(),
 		MaxKeys:           maxKeys,
+		Delimiter:         delimiter,
 		IsTruncated:       page.HasMore,
 		ContinuationToken: rawToken,
 		StartAfter:        q.Get("start-after"),
+		Contents:          listContents(page.Objects),
+		CommonPrefixes:    page.CommonPrefixes,
 	}
 	if page.HasMore {
 		out.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(page.NextMarker))
-	}
-	for _, o := range page.Objects {
-		out.Contents = append(out.Contents, listContent{
-			Key:          o.Key,
-			LastModified: o.UpdatedAt.UTC(),
-			ETag:         `"` + o.ETag + `"`,
-			Size:         o.Size,
-			StorageClass: service.StorageClassOrDefault(o.StorageClass),
-		})
 	}
 	writeListResult(w, out)
 }
@@ -78,38 +70,32 @@ func (h *Handler) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket s
 func (h *Handler) listObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
 	q := r.URL.Query()
 	prefix := q.Get("prefix")
+	delimiter := q.Get("delimiter")
 	marker := q.Get("marker")
 	maxKeys := s3PageLimit(q.Get("max-keys"), 1000)
-	page := repository.ListPage{}
-	var err error
-	if maxKeys > 0 {
-		page, err = h.svc.List(
-			r.Context(), mw.TenantFrom(r.Context()), bucket, prefix, marker, maxKeys,
-		)
+	ctx := r.Context()
+	tenant := mw.TenantFrom(ctx)
+	fetch := func(cursor string, limit int) (repository.ListPage, error) {
+		return h.svc.List(ctx, tenant, bucket, prefix, cursor, limit)
 	}
+	page, err := loadObjectListPage(prefix, delimiter, marker, maxKeys, fetch)
 	if err != nil {
 		writeS3Error(w, r, err)
 		return
 	}
 	out := listBucketResultV1{
-		Xmlns:       s3Namespace,
-		Name:        bucket,
-		Prefix:      prefix,
-		Marker:      marker,
-		MaxKeys:     maxKeys,
-		IsTruncated: page.HasMore,
+		Xmlns:          s3Namespace,
+		Name:           bucket,
+		Prefix:         prefix,
+		Marker:         marker,
+		MaxKeys:        maxKeys,
+		Delimiter:      delimiter,
+		IsTruncated:    page.HasMore,
+		Contents:       listContents(page.Objects),
+		CommonPrefixes: page.CommonPrefixes,
 	}
 	if page.HasMore {
 		out.NextMarker = page.NextMarker
-	}
-	for _, o := range page.Objects {
-		out.Contents = append(out.Contents, listContent{
-			Key:          o.Key,
-			LastModified: o.UpdatedAt.UTC(),
-			ETag:         `"` + o.ETag + `"`,
-			Size:         o.Size,
-			StorageClass: service.StorageClassOrDefault(o.StorageClass),
-		})
 	}
 	writeListResult(w, out)
 }

@@ -636,7 +636,7 @@ S3 and REST see the same objects.
 | HeadObject | `HEAD /{bucket}/{key}` | ✅ | |
 | DeleteObject | `DELETE /{bucket}/{key}` | ✅ | Creates a delete marker when versioning is enabled; otherwise deletes the object. `versionId` deletes an exact version. |
 | CopyObject | `PUT` + `x-amz-copy-source` | ✅ | `x-amz-metadata-directive: COPY` (default) or `REPLACE`. |
-| ListObjectsV2 | `GET /{bucket}?list-type=2` | ✅ | `prefix`, `continuation-token`, `max-keys`, `start-after`. |
+| ListObjectsV2 | `GET /{bucket}?list-type=2` | ✅ | `prefix`, `delimiter`, `continuation-token`, `max-keys`, `start-after`; grouped keys are returned as `CommonPrefixes` and count toward `KeyCount`/`max-keys`. |
 | HeadBucket | `HEAD /{bucket}` | ✅ | |
 | CreateBucket | `PUT /{bucket}` | ✅ | Registers the bucket; canned ACL via `x-amz-acl`. |
 | DeleteObjects (batch) | `POST /{bucket}?delete` | ✅ | XML body; supports quiet mode. |
@@ -651,7 +651,7 @@ S3 and REST see the same objects.
 | AbortMultipartUpload | `DELETE /{bucket}/{key}?uploadId=` | ✅ | |
 | ListParts | `GET /{bucket}/{key}?uploadId=` | ✅ | |
 | ListMultipartUploads | `GET /{bucket}?uploads` | ✅ | |
-| ListObjects (v1) | `GET /{bucket}` (no `list-type=2`) | ✅ | `prefix`, `marker`, `max-keys`; `NextMarker` when truncated. |
+| ListObjects (v1) | `GET /{bucket}` (no `list-type=2`) | ✅ | `prefix`, `delimiter`, `marker`, `max-keys`; grouped keys are returned as `CommonPrefixes`, with `NextMarker` when truncated. |
 | Versioning / lock / lifecycle sub-resources | `GET`/`PUT /{bucket}?versioning`, `?object-lock`, `?lifecycle` | ✅ | XML config round-trips; `GET ?lifecycle` is `404 NoSuchLifecycleConfiguration` when unset. |
 | DeleteBucketLifecycle | `DELETE /{bucket}?lifecycle` | ✅ | Clears the expiry policy; `204 No Content`. |
 | GetBucketAcl / PutBucketAcl | `GET`/`PUT /{bucket}?acl` | ✅ | Canned ACL ↔ `AccessControlPolicy`; PUT via `x-amz-acl` header or policy body. |

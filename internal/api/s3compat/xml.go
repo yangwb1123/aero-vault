@@ -8,32 +8,40 @@ import (
 const s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 type listBucketResult struct {
-	XMLName               xml.Name      `xml:"ListBucketResult"`
-	Xmlns                 string        `xml:"xmlns,attr"`
-	Name                  string        `xml:"Name"`
-	Prefix                string        `xml:"Prefix"`
-	KeyCount              int           `xml:"KeyCount"`
-	MaxKeys               int           `xml:"MaxKeys"`
-	IsTruncated           bool          `xml:"IsTruncated"`
-	ContinuationToken     string        `xml:"ContinuationToken,omitempty"`
-	NextContinuationToken string        `xml:"NextContinuationToken,omitempty"`
-	StartAfter            string        `xml:"StartAfter,omitempty"`
-	Contents              []listContent `xml:"Contents"`
+	XMLName               xml.Name       `xml:"ListBucketResult"`
+	Xmlns                 string         `xml:"xmlns,attr"`
+	Name                  string         `xml:"Name"`
+	Prefix                string         `xml:"Prefix"`
+	KeyCount              int            `xml:"KeyCount"`
+	MaxKeys               int            `xml:"MaxKeys"`
+	Delimiter             string         `xml:"Delimiter,omitempty"`
+	IsTruncated           bool           `xml:"IsTruncated"`
+	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
+	StartAfter            string         `xml:"StartAfter,omitempty"`
+	Contents              []listContent  `xml:"Contents"`
+	CommonPrefixes        []commonPrefix `xml:"CommonPrefixes"`
 }
 
 // listBucketResultV1 is the ListObjects (v1) response: it echoes the request
 // Marker and emits NextMarker when truncated, and never carries the v2-only
 // KeyCount / ContinuationToken / NextContinuationToken fields.
 type listBucketResultV1 struct {
-	XMLName     xml.Name      `xml:"ListBucketResult"`
-	Xmlns       string        `xml:"xmlns,attr"`
-	Name        string        `xml:"Name"`
-	Prefix      string        `xml:"Prefix"`
-	Marker      string        `xml:"Marker"`
-	NextMarker  string        `xml:"NextMarker,omitempty"`
-	MaxKeys     int           `xml:"MaxKeys"`
-	IsTruncated bool          `xml:"IsTruncated"`
-	Contents    []listContent `xml:"Contents"`
+	XMLName        xml.Name       `xml:"ListBucketResult"`
+	Xmlns          string         `xml:"xmlns,attr"`
+	Name           string         `xml:"Name"`
+	Prefix         string         `xml:"Prefix"`
+	Marker         string         `xml:"Marker"`
+	NextMarker     string         `xml:"NextMarker,omitempty"`
+	MaxKeys        int            `xml:"MaxKeys"`
+	Delimiter      string         `xml:"Delimiter,omitempty"`
+	IsTruncated    bool           `xml:"IsTruncated"`
+	Contents       []listContent  `xml:"Contents"`
+	CommonPrefixes []commonPrefix `xml:"CommonPrefixes"`
+}
+
+type commonPrefix struct {
+	Prefix string `xml:"Prefix"`
 }
 
 type listContent struct {
