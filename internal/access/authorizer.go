@@ -28,7 +28,7 @@ func (m *Manager) Authorize(
 		// Fail-closed for deletes (FR-2): a disabled PDP must not grant
 		// delete capability unless the operator explicitly opts out via
 		// DeleteFailOpen. Read/write actions keep the legacy allow.
-		if action == ActionDelete && !m.cfg.DeleteFailOpen {
+		if isDeleteAction(action) && !m.cfg.DeleteFailOpen {
 			return denied("access_control_disabled"), nil
 		}
 		return Decision{Allowed: true, Reason: "access_control_disabled"}, nil
@@ -48,6 +48,25 @@ func (m *Manager) Authorize(
 		return denied("directory_store_error"), err
 	}
 	matching := matchingEntries(entries, principal, departments, action)
+	if action == ActionAdminDelete {
+		if hasEffect(matching, EffectDeny) {
+			return denied("explicit_deny"), nil
+		}
+		if capabilityAllows(principal.Capability, resource, action) ||
+			hasExplicitAdminDeleteGrant(principal, matching) || isAdministrator(principal) {
+			return Decision{Allowed: true, Reason: "explicit_delete_grant"}, nil
+		}
+		return denied("delete_permission_required"), nil
+	}
+	if action == ActionDelete {
+		if hasEffect(matching, EffectDeny) {
+			return denied("explicit_deny"), nil
+		}
+		if hasExplicitDeleteGrant(principal, matching) {
+			return Decision{Allowed: true, Reason: "explicit_delete_grant"}, nil
+		}
+		return denied("default_deny"), nil
+	}
 	if hasEffect(matching, EffectDeny) {
 		return denied("explicit_deny"), nil
 	}
@@ -72,6 +91,33 @@ func (m *Manager) Authorize(
 	return denied("default_deny"), nil
 }
 
+func hasExplicitDeleteGrant(principal Principal, entries []ACLEntry) bool {
+	if slices.Contains(principal.Scopes, string(PermissionVaultFileDelete)) ||
+		slices.Contains(principal.Roles, string(PermissionVaultFileDelete)) {
+		return true
+	}
+	// Keep the existing ACL grant surface useful while preventing broad
+	// ActionAll/owner/admin grants from silently becoming delete permission.
+	return slices.ContainsFunc(entries, func(entry ACLEntry) bool {
+		return entry.Effect == EffectAllow && entry.Action == ActionDelete
+	})
+}
+
+func hasExplicitAdminDeleteGrant(principal Principal, entries []ACLEntry) bool {
+	if slices.Contains(principal.Scopes, string(PermissionVaultFileDelete)) ||
+		slices.Contains(principal.Roles, string(PermissionVaultFileDelete)) {
+		return true
+	}
+	return slices.ContainsFunc(entries, func(entry ACLEntry) bool {
+		return entry.Effect == EffectAllow &&
+			(entry.Action == ActionAdminDelete || entry.Action == ActionDelete)
+	})
+}
+
+func isDeleteAction(action Action) bool {
+	return action == ActionDelete || action == ActionAdminDelete
+}
+
 func denied(reason string) Decision { return Decision{Allowed: false, Reason: reason} }
 
 func tenantMatches(p Principal, r Resource) bool {
@@ -90,6 +136,9 @@ func matchingEntries(entries []ACLEntry, p Principal, departments []string, acti
 
 func actionMatches(granted, wanted Action) bool {
 	if granted == ActionAll || granted == wanted {
+		return true
+	}
+	if wanted == ActionAdminDelete && granted == ActionDelete {
 		return true
 	}
 	if wanted == ActionPreview || wanted == ActionDownload {

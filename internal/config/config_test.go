@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -37,16 +38,17 @@ func TestGetEnvBool(t *testing.T) {
 		val  string
 		def  bool
 		want bool
+		err  bool
 	}{
-		{"unset uses default true", false, "", true, true},
-		{"unset uses default false", false, "", false, false},
-		{"empty uses default", true, "", true, true},
-		{"true literal", true, "true", false, true},
-		{"1 is true", true, "1", false, true},
-		{"false literal", true, "false", true, false},
-		{"0 is false", true, "0", true, false},
-		{"unparseable uses default", true, "notabool", true, true},
-		{"unparseable uses default false", true, "yepnope", false, false},
+		{"unset uses default true", false, "", true, true, false},
+		{"unset uses default false", false, "", false, false, false},
+		{"empty uses default", true, "", true, true, false},
+		{"true literal", true, "true", false, true, false},
+		{"1 is true", true, "1", false, true, false},
+		{"false literal", true, "false", true, false, false},
+		{"0 is false", true, "0", true, false, false},
+		{"unparseable returns error", true, "notabool", true, true, true},
+		{"unparseable false returns error", true, "yepnope", false, false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -57,7 +59,11 @@ func TestGetEnvBool(t *testing.T) {
 			if !c.set {
 				key = "AERO_TEST_BOOL_UNSET"
 			}
-			if got := getEnvBool(key, c.def); got != c.want {
+			got, err := getEnvBool(key, c.def)
+			if (err != nil) != c.err {
+				t.Fatalf("getEnvBool(%q=%q) error = %v, want error=%v", key, c.val, err, c.err)
+			}
+			if got != c.want {
 				t.Fatalf("getEnvBool(%q=%q, def=%v) = %v, want %v", key, c.val, c.def, got, c.want)
 			}
 		})
@@ -71,13 +77,14 @@ func TestGetEnvInt(t *testing.T) {
 		val  string
 		def  int
 		want int
+		err  bool
 	}{
-		{"unset uses default", false, "", 7, 7},
-		{"empty uses default", true, "", 7, 7},
-		{"parses positive", true, "42", 0, 42},
-		{"parses negative", true, "-3", 0, -3},
-		{"unparseable uses default", true, "12.5", 9, 9},
-		{"garbage uses default", true, "abc", 9, 9},
+		{"unset uses default", false, "", 7, 7, false},
+		{"empty uses default", true, "", 7, 7, false},
+		{"parses positive", true, "42", 0, 42, false},
+		{"parses negative", true, "-3", 0, -3, false},
+		{"unparseable returns error", true, "12.5", 9, 9, true},
+		{"garbage returns error", true, "abc", 9, 9, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -87,7 +94,11 @@ func TestGetEnvInt(t *testing.T) {
 			} else {
 				key = "AERO_TEST_INT_UNSET"
 			}
-			if got := getEnvInt(key, c.def); got != c.want {
+			got, err := getEnvInt(key, c.def)
+			if (err != nil) != c.err {
+				t.Fatalf("getEnvInt(%q=%q) error = %v, want error=%v", key, c.val, err, c.err)
+			}
+			if got != c.want {
 				t.Fatalf("getEnvInt(%q=%q, def=%d) = %d, want %d", key, c.val, c.def, got, c.want)
 			}
 		})
@@ -101,12 +112,13 @@ func TestGetEnvFloat(t *testing.T) {
 		val  string
 		def  float64
 		want float64
+		err  bool
 	}{
-		{"unset uses default", false, "", 1.5, 1.5},
-		{"empty uses default", true, "", 1.5, 1.5},
-		{"parses float", true, "3.25", 0, 3.25},
-		{"parses integer-like", true, "10", 0, 10},
-		{"unparseable uses default", true, "x", 2.0, 2.0},
+		{"unset uses default", false, "", 1.5, 1.5, false},
+		{"empty uses default", true, "", 1.5, 1.5, false},
+		{"parses float", true, "3.25", 0, 3.25, false},
+		{"parses integer-like", true, "10", 0, 10, false},
+		{"unparseable returns error", true, "x", 2.0, 2.0, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -116,7 +128,11 @@ func TestGetEnvFloat(t *testing.T) {
 			} else {
 				key = "AERO_TEST_FLOAT_UNSET"
 			}
-			if got := getEnvFloat(key, c.def); got != c.want {
+			got, err := getEnvFloat(key, c.def)
+			if (err != nil) != c.err {
+				t.Fatalf("getEnvFloat(%q=%q) error = %v, want error=%v", key, c.val, err, c.err)
+			}
+			if got != c.want {
 				t.Fatalf("getEnvFloat(%q=%q, def=%v) = %v, want %v", key, c.val, c.def, got, c.want)
 			}
 		})
@@ -264,6 +280,29 @@ func TestValidateThumbnailCacheTTL(t *testing.T) {
 	}
 	if loaded.App.ThumbnailCacheTTL != 0 {
 		t.Fatalf("wired ThumbnailCacheTTL = %d, want 0 (default) when unset/empty", loaded.App.ThumbnailCacheTTL)
+	}
+}
+
+func TestValidateThumbnailPerTenantDecodeSlots(t *testing.T) {
+	c := baseValid()
+	if c.App.ThumbnailPerTenantDecodeSlots != 0 {
+		t.Fatalf("default ThumbnailPerTenantDecodeSlots = %d, want 0", c.App.ThumbnailPerTenantDecodeSlots)
+	}
+	c.App.ThumbnailPerTenantDecodeSlots = 2
+	if err := c.Validate(); err != nil {
+		t.Fatalf("positive per-tenant decode slots rejected: %v", err)
+	}
+	c.App.ThumbnailPerTenantDecodeSlots = -1
+	if err := c.Validate(); err == nil {
+		t.Fatal("negative per-tenant decode slots must be rejected")
+	}
+	t.Setenv("THUMBNAIL_PER_TENANT_DECODE_SLOTS", "3")
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load with per-tenant decode slots: %v", err)
+	}
+	if loaded.App.ThumbnailPerTenantDecodeSlots != 3 {
+		t.Fatalf("loaded per-tenant decode slots = %d, want 3", loaded.App.ThumbnailPerTenantDecodeSlots)
 	}
 }
 
@@ -433,6 +472,7 @@ func clearEnv(t *testing.T) {
 		"CORS_ALLOWED_ORIGINS", "CORS_ALLOWED_METHODS",
 		"RATE_LIMIT_RPS", "RATE_LIMIT_BURST",
 		"RECONCILE_INTERVAL_MINUTES", "JOBS_WORKERS",
+		"REPLICATION_ENABLED", "REPLICATION_RESYNC_INTERVAL_MINUTES",
 		"WEBUI_ENABLED", "WEBDAV_PREFIX",
 		"PROMETHEUS_ENABLED",
 	} {
@@ -469,6 +509,10 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.Jobs.Workers != 4 {
 		t.Errorf("default Jobs.Workers = %d, want 4", cfg.Jobs.Workers)
+	}
+	if cfg.Replication.ResyncIntervalMinutes != 0 {
+		t.Errorf("default Replication.ResyncIntervalMinutes = %d, want 0",
+			cfg.Replication.ResyncIntervalMinutes)
 	}
 	if cfg.AI.Dim != 256 {
 		t.Errorf("default AI.Dim = %d, want 256", cfg.AI.Dim)
@@ -535,6 +579,7 @@ func TestLoad_OverridesAndLowercasing(t *testing.T) {
 	t.Setenv("RATE_LIMIT_RPS", "10.5")
 	t.Setenv("RATE_LIMIT_BURST", "20")
 	t.Setenv("JOBS_WORKERS", "8")
+	t.Setenv("REPLICATION_RESYNC_INTERVAL_MINUTES", "30")
 	t.Setenv("CORS_ALLOWED_ORIGINS", "https://a.com, https://b.com")
 	t.Setenv("WEBUI_ENABLED", "false")
 
@@ -560,6 +605,9 @@ func TestLoad_OverridesAndLowercasing(t *testing.T) {
 	if cfg.Jobs.Workers != 8 {
 		t.Errorf("Workers = %d", cfg.Jobs.Workers)
 	}
+	if cfg.Replication.ResyncIntervalMinutes != 30 {
+		t.Errorf("Replication resync interval = %d, want 30", cfg.Replication.ResyncIntervalMinutes)
+	}
 	if want := []string{"https://a.com", "https://b.com"}; !reflect.DeepEqual(cfg.CORS.AllowedOrigins, want) {
 		t.Errorf("CORS origins = %#v, want %#v", cfg.CORS.AllowedOrigins, want)
 	}
@@ -573,6 +621,30 @@ func TestLoad_InvalidLogLevel(t *testing.T) {
 	t.Setenv("APP_LOG_LEVEL", "loud")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected Load() to fail on invalid log level")
+	}
+}
+
+func TestLoad_InvalidTypedEnvFailsFast(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"bool", "APP_TLS_ENABLED", "yes"},
+		{"int", "APP_MAX_BODY_SIZE", "30m"},
+		{"float", "AI_TENANT_DAILY_BUDGET_USD", "100USD"},
+		{"billing bool", "BILLING_ENABLED", "tru"},
+		{"audit governance int", "AUDIT_GOVERNANCE_MAX_LAG_SECONDS", "900s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil ||
+				!strings.Contains(err.Error(), tc.key) ||
+				!strings.Contains(err.Error(), tc.value) {
+				t.Fatalf("Load() error = %v, want %s and %q", err, tc.key, tc.value)
+			}
+		})
 	}
 }
 

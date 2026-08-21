@@ -66,8 +66,9 @@ type AntivirusCfg struct {
 // ReplicationCfg configures asynchronous replication to a secondary storage
 // backend (a different region/provider). Storage holds the replica target.
 type ReplicationCfg struct {
-	Enabled bool
-	Storage StorageConfig
+	Enabled               bool
+	Storage               StorageConfig
+	ResyncIntervalMinutes int
 }
 
 type WebDAVCfg struct {

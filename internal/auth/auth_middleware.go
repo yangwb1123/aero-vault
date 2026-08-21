@@ -202,6 +202,10 @@ func (r *Registry) Require(s Scope) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, req)
 				return
 			}
+			if s == ScopeRead && IsAnonymous(req.Context()) && isObjectReadPath(req.Method, req.URL.Path) {
+				next.ServeHTTP(w, req)
+				return
+			}
 			k, ok := FromContext(req.Context())
 			if !ok {
 				unauthorized(w, "not authenticated")

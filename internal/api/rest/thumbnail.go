@@ -356,8 +356,14 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	// For a pinned request all gates evaluate the PINNED version's metadata
 	// and ETag (the lookup key carries its ETag; no CacheKeyVersion bump).
 	cache := h.thumbnailCache
-	if !thumbnailCacheAdmissible(obj) {
-		cache = nil
+	if reason := thumbnailCacheBypassReason(obj); reason != "" {
+		recordThumbnailCacheBypass(r.Context(), cache, reason)
+		// Non-MD5 ETags remain on the module path so it can classify the
+		// bypass; encryption-key-derived bytes are excluded before the cache
+		// entry point and never enter its lookup/store logic.
+		if reason == "sse-c" || reason == "sse-kms" {
+			cache = nil
+		}
 	}
 	// The 200-path validator must describe the bytes actually decoded, so
 	// the opened object is captured here and read after the pipeline
@@ -370,8 +376,8 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	// is immutable, so the rule is trivially satisfied and remains the
 	// residual guard).
 	var opened *repository.Object
-	img, fromCache, err := thumbnail.GenerateContextWithOpenerCached(
-		r.Context(), cache, tenant, obj.ETag, maxW, maxH,
+	img, fromCache, err := thumbnail.GenerateContextWithOpenerCachedWithAdmission(
+		r.Context(), cache, h.thumbnailAdmission, tenant, obj.ETag, maxW, maxH,
 		func() (io.ReadCloser, string, error) {
 			// Version-aware opener: GetVersion for pins (the pinned stream —
 			// sniff-replay and close-forwarding apply unchanged), Get for the

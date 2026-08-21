@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/auditgovernance"
@@ -15,12 +16,13 @@ import (
 func buildAuditGovernanceRuntime(
 	cfg *config.Config, repo repository.Repository, logger *slog.Logger,
 ) (*auditgovernance.Runtime, error) {
-	if !cfg.AuditGovernance.Enabled {
+	legacy, enabled := selectedAuditGovernance(cfg)
+	if !enabled {
 		store, ok := repo.(auditgovernance.Store)
 		if !ok {
 			return nil, fmt.Errorf("repository does not support Audit Governance persistence")
 		}
-		timeout := time.Duration(cfg.AuditGovernance.HTTPTimeoutSeconds) * time.Second
+		timeout := time.Duration(legacy.HTTPTimeoutSeconds) * time.Second
 		if timeout <= 0 {
 			timeout = 5 * time.Second
 		}
@@ -39,7 +41,7 @@ func buildAuditGovernanceRuntime(
 	if !ok {
 		return nil, fmt.Errorf("repository does not support Audit Governance persistence")
 	}
-	runtime, err := auditgovernance.New(cfg.AuditGovernance, store, logger)
+	runtime, err := auditgovernance.New(legacy, store, logger)
 	if err != nil {
 		return nil, fmt.Errorf("configure Snaplink Audit Governance: %w", err)
 	}
@@ -51,14 +53,30 @@ func buildAuditGovernanceRuntime(
 		// fingerprint — the only trace that survives the forensically
 		// destructive DELETE-all beside the control-row revision watermark.
 		logger.Warn("Snaplink Audit Governance relay enabled — drain mode",
-			"flag", "AUDIT_GOVERNANCE_DRAIN", "tenants", len(cfg.AuditGovernance.Bindings),
-			"revision", cfg.AuditGovernance.Revision,
+			"flag", "AUDIT_GOVERNANCE_DRAIN", "tenants", len(legacy.Bindings),
+			"revision", legacy.Revision,
 			"digest", digestFingerprint(runtime.AppliedDigest()))
 		return runtime, nil
 	}
 	logger.Info("Snaplink Audit Governance relay enabled",
-		"tenants", len(cfg.AuditGovernance.Bindings), "revision", cfg.AuditGovernance.Revision)
+		"tenants", len(legacy.Bindings), "revision", legacy.Revision)
 	return runtime, nil
+}
+
+func selectedAuditGovernance(cfg *config.Config) (config.AuditGovernanceConfig, bool) {
+	legacy := cfg.AuditSink.Legacy
+	if !legacy.Enabled && cfg.AuditGovernance.Enabled {
+		legacy = cfg.AuditGovernance
+	}
+	kind := strings.ToUpper(strings.TrimSpace(cfg.AuditSink.Kind))
+	if kind == "" {
+		if legacy.Enabled {
+			kind = config.AuditSinkKindL2
+		} else {
+			kind = config.AuditSinkKindL0
+		}
+	}
+	return legacy, kind == config.AuditSinkKindL2 && legacy.Enabled
 }
 
 // digestFingerprint shortens the persisted desired-manifest digest

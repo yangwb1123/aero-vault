@@ -23,19 +23,32 @@ import (
 
 // Handler binds REST routes to the FileService.
 type Handler struct {
-	svc              *service.FileService
-	logger           *slog.Logger
-	corsProvider     mw.BucketCORSProvider
-	putPresigner     *auth.PutPresigner
-	access           *access.Manager
-	publicBaseURL    string
-	thumbnailTimeout time.Duration    // REQUEST_TIMEOUT_SECONDS; 0 = disabled
-	thumbnailCache   *thumbnail.Cache // THUMBNAIL_CACHE_BYTES; nil/0-budget = disabled
+	svc                *service.FileService
+	logger             *slog.Logger
+	corsProvider       mw.BucketCORSProvider
+	putPresigner       *auth.PutPresigner
+	access             *access.Manager
+	publicBaseURL      string
+	thumbnailTimeout   time.Duration    // REQUEST_TIMEOUT_SECONDS; 0 = disabled
+	thumbnailCache     *thumbnail.Cache // THUMBNAIL_CACHE_BYTES; nil/0-budget = disabled
+	thumbnailAdmission *thumbnail.DecodeAdmission
+	adminAuthz         AuthorizationProvider
+	adminAuthzSet      bool
 }
 
 func (h *Handler) WithAccessManager(manager *access.Manager, publicBaseURL string) *Handler {
 	h.access = manager
 	h.publicBaseURL = strings.TrimRight(publicBaseURL, "/")
+	return h
+}
+
+// WithAdminAuthorizationProvider injects the provider governing the
+// administrative vault.file.delete boundary. A deliberately nil provider is
+// retained as an explicit fail-closed configuration for tests and deployments
+// that require an external PDP to be present.
+func (h *Handler) WithAdminAuthorizationProvider(provider AuthorizationProvider) *Handler {
+	h.adminAuthz = provider
+	h.adminAuthzSet = true
 	return h
 }
 
@@ -64,6 +77,13 @@ func (h *Handler) WithCORSProvider(p mw.BucketCORSProvider) *Handler {
 // behavior (THUMBNAIL_CACHE_BYTES=0). Returns the handler for fluent wiring.
 func (h *Handler) WithThumbnailCache(c *thumbnail.Cache) *Handler {
 	h.thumbnailCache = c
+	return h
+}
+
+// WithThumbnailDecodeAdmission attaches the optional per-tenant decode gate.
+// A nil admission preserves the package-global semaphore behavior.
+func (h *Handler) WithThumbnailDecodeAdmission(a *thumbnail.DecodeAdmission) *Handler {
+	h.thumbnailAdmission = a
 	return h
 }
 

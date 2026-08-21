@@ -41,7 +41,7 @@ type adminDeleteEnv struct {
 // behind the auth + tenant middleware chain. authKeys "" disables the registry
 // (baseline CI shape); a non-empty value enables it (requireAdmin becomes
 // real). manager, when non-nil, is installed as the svc authorizer (F2/F4).
-func newAdminDeleteEnv(t *testing.T, authKeys string, manager *access.Manager, store storage.Storage) *adminDeleteEnv {
+func newAdminDeleteEnv(t *testing.T, authKeys string, manager *access.Manager, store storage.Storage, providers ...AuthorizationProvider) *adminDeleteEnv {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -74,7 +74,12 @@ func newAdminDeleteEnv(t *testing.T, authKeys string, manager *access.Manager, s
 	if err != nil {
 		t.Fatal(err)
 	}
-	v1 := NewRouter(svc, repo, nil, nil, nil, nil, reg, logger, false, nil, nil, 0, false)
+	adminAuthz := AuthorizationProvider(allowAllProvider{})
+	if len(providers) > 0 {
+		adminAuthz = providers[0]
+	}
+	v1 := NewRouter(svc, repo, nil, nil, nil, nil, reg, logger, false, nil, nil, 0, false,
+		func(h *Handler) { h.WithAdminAuthorizationProvider(adminAuthz) })
 	root := chi.NewRouter()
 	root.Use(reg.Middleware())
 	root.Use(mw.Tenant)
@@ -210,8 +215,8 @@ func TestAdminDeleteFile_RouteAndPassthrough(t *testing.T) {
 		if _, err := env.store.Stat(context.Background(), obj.StorageKey); err == nil {
 			t.Error("storage blob still present after hard delete")
 		}
-		if rows := env.auditDeleteRows(t); len(rows) != 1 || rows[0].Detail != "hard" {
-			t.Errorf("audit rows = %+v, want exactly 1 hard", rows)
+		if rows := env.auditDeleteRows(t); len(rows) != 1 || rows[0].Detail != "hard;permission=vault.file.delete" {
+			t.Errorf("audit rows = %+v, want annotated hard delete", rows)
 		}
 	})
 
@@ -236,8 +241,8 @@ func TestAdminDeleteFile_RouteAndPassthrough(t *testing.T) {
 		if _, err := env.store.Stat(context.Background(), obj.StorageKey); err != nil {
 			t.Errorf("storage blob must survive soft delete: %v", err)
 		}
-		if rows := env.auditDeleteRows(t); len(rows) != 1 || rows[0].Detail != "soft" {
-			t.Errorf("audit rows = %+v, want exactly 1 soft", rows)
+		if rows := env.auditDeleteRows(t); len(rows) != 1 || rows[0].Detail != "soft;permission=vault.file.delete" {
+			t.Errorf("audit rows = %+v, want annotated soft delete", rows)
 		}
 	})
 

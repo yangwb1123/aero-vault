@@ -67,25 +67,32 @@ type Resource struct {
 type Action string
 
 const (
-	ActionList      Action = "object:list"
-	ActionRead      Action = "object:read"
-	ActionPreview   Action = "object:preview"
-	ActionDownload  Action = "object:download"
-	ActionCreate    Action = "object:create"
-	ActionWrite     Action = "object:write"
-	ActionDelete    Action = "object:delete"
-	ActionRestore   Action = "object:restore"
-	ActionShare     Action = "object:share"
-	ActionManageACL Action = "object:manage_acl"
-	ActionPublish   Action = "asset:publish"
-	ActionExport    Action = "object:export"
-	ActionAll       Action = "*"
+	ActionList     Action = "object:list"
+	ActionRead     Action = "object:read"
+	ActionPreview  Action = "object:preview"
+	ActionDownload Action = "object:download"
+	ActionCreate   Action = "object:create"
+	ActionWrite    Action = "object:write"
+	ActionDelete   Action = "object:delete"
+	// ActionAdminDelete is the privileged delete action used by administrative
+	// and WebDAV hard-delete paths. It deliberately remains distinct from the
+	// ordinary object:delete action.
+	ActionAdminDelete Action = "vault.file.delete"
+	// ActionVaultFileDelete is the descriptive alias used by provider-facing
+	// callers; both names resolve to the same canonical action.
+	ActionVaultFileDelete        = ActionAdminDelete
+	ActionRestore         Action = "object:restore"
+	ActionShare           Action = "object:share"
+	ActionManageACL       Action = "object:manage_acl"
+	ActionPublish         Action = "asset:publish"
+	ActionExport          Action = "object:export"
+	ActionAll             Action = "*"
 )
 
 func ValidAction(action Action) bool {
 	switch action {
 	case ActionList, ActionRead, ActionPreview, ActionDownload, ActionCreate,
-		ActionWrite, ActionDelete, ActionRestore, ActionShare, ActionManageACL,
+		ActionWrite, ActionDelete, ActionAdminDelete, ActionRestore, ActionShare, ActionManageACL,
 		ActionPublish, ActionExport, ActionAll:
 		return true
 	default:

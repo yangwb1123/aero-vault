@@ -27,10 +27,9 @@ func TestActionForPermission(t *testing.T) {
 	}
 }
 
-// T-8 (FR-3 companion): the system delete exemption predicate is exact — only
-// the antivirus actor pinned to the exact resource tenant passes. Any other
-// system shape (different subject, wildcard tenant, mismatched tenant) fails
-// closed.
+// T-8 (FR-3 companion): the system delete exemption predicate is tenant exact.
+// Both the generic internal system context and the antivirus context are
+// trusted; wildcard or mismatched tenants still fail closed.
 func TestIsSystemDeleteExempt(t *testing.T) {
 	av := Principal{Kind: PrincipalSystem, SubjectID: SystemActorAntivirus, TenantID: "acme"}
 	allow := []struct {
@@ -39,6 +38,7 @@ func TestIsSystemDeleteExempt(t *testing.T) {
 		tenant    string
 	}{
 		{"antivirus exact tenant", av, "acme"},
+		{"generic system exact tenant", Principal{Kind: PrincipalSystem, SubjectID: "aero-vault-system", TenantID: "acme"}, "acme"},
 	}
 	for _, c := range allow {
 		if !IsSystemDeleteExempt(c.principal, c.tenant) {
@@ -53,7 +53,6 @@ func TestIsSystemDeleteExempt(t *testing.T) {
 		{"antivirus wrong tenant", av, "other"},
 		{"antivirus empty tenant principal", Principal{Kind: PrincipalSystem, SubjectID: SystemActorAntivirus}, "acme"},
 		{"antivirus wildcard tenant", Principal{Kind: PrincipalSystem, SubjectID: SystemActorAntivirus, TenantID: "*"}, "acme"},
-		{"generic system actor (MCP stdio shape)", Principal{Kind: PrincipalSystem, SubjectID: "aero-vault-system", TenantID: "acme"}, "acme"},
 		{"anonymous", Principal{Kind: PrincipalAnonymous, SubjectID: "anon", TenantID: "acme"}, "acme"},
 		{"zero-value principal", Principal{}, "acme"},
 	}

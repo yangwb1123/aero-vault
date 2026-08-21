@@ -23,17 +23,22 @@ type EventOutboxConfig struct {
 	FailedRetentionHours    int // EVENT_OUTBOX_FAILED_RETENTION_HOURS
 }
 
-func loadEventOutboxConfig() EventOutboxConfig {
-	return EventOutboxConfig{
-		Enabled:                 getEnvBool("EVENT_OUTBOX_ENABLED", true),
-		PollMilliseconds:        getEnvInt("EVENT_OUTBOX_POLL_INTERVAL_MILLIS", 1000),
-		BatchSize:               getEnvInt("EVENT_OUTBOX_BATCH_SIZE", 32),
-		ClaimTTLSeconds:         getEnvInt("EVENT_OUTBOX_CLAIM_TTL_SECONDS", 30),
-		HTTPTimeoutSeconds:      getEnvInt("EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS", 5),
-		MaxAttempts:             getEnvInt("EVENT_OUTBOX_MAX_ATTEMPTS", 10),
-		DeliveredRetentionHours: getEnvInt("EVENT_OUTBOX_DELIVERED_RETENTION_HOURS", 24),
-		FailedRetentionHours:    getEnvInt("EVENT_OUTBOX_FAILED_RETENTION_HOURS", 168),
+func loadEventOutboxConfig() (EventOutboxConfig, error) {
+	env := &typedEnv{}
+	cfg := EventOutboxConfig{
+		Enabled:                 env.Bool("EVENT_OUTBOX_ENABLED", true),
+		PollMilliseconds:        env.Int("EVENT_OUTBOX_POLL_INTERVAL_MILLIS", 1000),
+		BatchSize:               env.Int("EVENT_OUTBOX_BATCH_SIZE", 32),
+		ClaimTTLSeconds:         env.Int("EVENT_OUTBOX_CLAIM_TTL_SECONDS", 30),
+		HTTPTimeoutSeconds:      env.Int("EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS", 5),
+		MaxAttempts:             env.Int("EVENT_OUTBOX_MAX_ATTEMPTS", 10),
+		DeliveredRetentionHours: env.Int("EVENT_OUTBOX_DELIVERED_RETENTION_HOURS", 24),
+		FailedRetentionHours:    env.Int("EVENT_OUTBOX_FAILED_RETENTION_HOURS", 168),
 	}
+	if err := env.Err(); err != nil {
+		return EventOutboxConfig{}, err
+	}
+	return cfg, nil
 }
 
 // withDefaults fills zero numeric fields with the billing-mirrored defaults,

@@ -1235,7 +1235,7 @@ func newThumbnailAccessHarness(t *testing.T) (*httptest.Server, string, reposito
 	svc := service.NewFileService(store, repo, nil).
 		WithAuthorizer(manager).
 		WithTenantStatusEnforcement()
-	reg, err := auth.Parse("alice:default:read+write,operator:*:admin")
+	reg, err := auth.Parse("alice:default:read+write+vault.file.delete,operator:*:admin")
 	if err != nil {
 		t.Fatalf("parse auth: %v", err)
 	}

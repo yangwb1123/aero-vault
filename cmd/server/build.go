@@ -10,6 +10,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/antivirus"
 	"github.com/aero-vault/aero-vault/internal/auditgovernance"
+	"github.com/aero-vault/aero-vault/internal/billing"
 	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
@@ -117,6 +118,15 @@ func auditGovernanceDegradedGaugeFn(rt *auditgovernance.Runtime) func(context.Co
 	}
 }
 
+// auditGovernanceMaxLagGaugeFn exposes the runtime's configured readiness
+// boundary. The alert rule derives its age threshold from this gauge, keeping
+// deploy-time configuration and Prometheus evaluation in sync.
+func auditGovernanceMaxLagGaugeFn(rt *auditgovernance.Runtime) func(context.Context) int64 {
+	return func(context.Context) int64 {
+		return int64(rt.MaxLag().Seconds())
+	}
+}
+
 // auditGovernanceDrainGaugesFn returns the drain-mode gauge pair callback
 // (bound tenants, draining 0/1) fed by zero-I/O Runtime accessors — the only
 // positive signal of the drained-but-enabled state (AuditGovernanceEnabledUnbound
@@ -132,6 +142,10 @@ func auditGovernanceDrainGaugesFn(rt *auditgovernance.Runtime) func(context.Cont
 	}
 }
 
+func billingBacklogAgeGaugeFn(rt *billing.Runtime) func(context.Context) int64 {
+	return func(context.Context) int64 { return int64(rt.BacklogAge().Seconds()) }
+}
+
 func buildPrometheus(cfg *config.Config, logger *slog.Logger) http.Handler {
 	if !cfg.Telemetry.PrometheusEnabled {
 		return nil
@@ -145,7 +159,9 @@ func buildPrometheus(cfg *config.Config, logger *slog.Logger) http.Handler {
 	return h
 }
 
-func registerGauges(repo repository.Repository, auditRuntime *auditgovernance.Runtime) {
+func registerGauges(
+	repo repository.Repository, auditRuntime *auditgovernance.Runtime, billingRuntime *billing.Runtime,
+) {
 	telemetry.RegisterQueueDepthGauge(func(ctx context.Context) int64 {
 		n, _ := repo.CountJobsByStatus(ctx, "pending")
 		return int64(n)
@@ -153,7 +169,11 @@ func registerGauges(repo repository.Repository, auditRuntime *auditgovernance.Ru
 	if auditRuntime != nil {
 		telemetry.RegisterAuditGovernanceBacklogAgeGauge(auditGovernanceBacklogAgeGaugeFn(auditRuntime))
 		telemetry.RegisterAuditGovernanceDegradedGauge(auditGovernanceDegradedGaugeFn(auditRuntime))
+		telemetry.RegisterAuditGovernanceMaxLagGauge(auditGovernanceMaxLagGaugeFn(auditRuntime))
 		telemetry.RegisterAuditGovernanceDrainGauges(auditGovernanceDrainGaugesFn(auditRuntime))
+	}
+	if billingRuntime != nil {
+		telemetry.RegisterBillingBacklogAgeGauge(billingBacklogAgeGaugeFn(billingRuntime))
 	}
 	telemetry.RegisterStorageGauges(func(ctx context.Context) []telemetry.TenantStorage {
 		qs, _ := repo.ListTenantQuotas(ctx)

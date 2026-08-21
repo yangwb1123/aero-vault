@@ -364,11 +364,10 @@ func TestReadyzDeadLetteredBacklog200AndGaugeZero(t *testing.T) {
 }
 
 // TestAlertsYMLAuditGovernanceExprParity pins the B3-2 degraded alert to the
-// gauge the seam reports: expr name == exported gauge name (dots→underscores,
-// telemetry/metrics.go), threshold == the SHIPPED AUDIT_GOVERNANCE_MAX_LAG_SECONDS
-// default × 0.5 — DERIVED via config.Load() (the same loader main.go uses)
-// with the env neutralized, so an operator override can never shift what the
-// static alerts.yml is compared against — severity warning, the
+// gauge the seam reports: expr names == exported gauge names (dots→underscores,
+// telemetry/metrics.go), with the age arm derived from the exported
+// audit_governance_max_lag_seconds gauge × 0.5 rather than a static default —
+// severity warning, the
 // "/readyz stays 200" contract in the rule description, and the F11/F16
 // OR-arm (v3 amendment): `for: 10m`, `OR audit_governance_degraded == 1`,
 // and exactly two `expr: audit_governance_` exprs file-wide (this rule and
@@ -382,12 +381,8 @@ func TestReadyzDeadLetteredBacklog200AndGaugeZero(t *testing.T) {
 func TestAlertsYMLAuditGovernanceExprParity(t *testing.T) {
 	t.Setenv("AUDIT_GOVERNANCE_ENABLED", "false")    // skip the bindings-file requirement
 	t.Setenv("AUDIT_GOVERNANCE_MAX_LAG_SECONDS", "") // empty → getEnvInt falls back to the shipped default
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantExpr := "expr: audit_governance_backlog_age_seconds > " +
-		strconv.Itoa(cfg.AuditGovernance.BacklogAlertThresholdSeconds())
+		"(audit_governance_max_lag_seconds * 0.5)"
 
 	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "prometheus", "alerts.yml"))
 	if err != nil {

@@ -35,6 +35,20 @@ func TestParse_AcceptsScopedRecord(t *testing.T) {
 	}
 }
 
+func TestParse_AcceptsFileDeletePermission(t *testing.T) {
+	reg, err := Parse("tok:acme:write+vault.file.delete")
+	if err != nil {
+		t.Fatalf("Parse with vault.file.delete: %v", err)
+	}
+	k, ok := reg.Lookup(context.Background(), "tok")
+	if !ok || !k.Scopes[ScopeFileDelete] || !k.Scopes[ScopeWrite] {
+		t.Fatalf("file-delete permission missing after parse: %+v ok=%v", k, ok)
+	}
+	if _, err := Parse("tok:acme:write+vault.file.delete.extra"); err == nil {
+		t.Fatal("unknown file-delete permission suffix must fail closed")
+	}
+}
+
 // A persisted key whose ExpiresAt is not valid RFC3339 must fail closed: an
 // unparseable expiry was previously ignored, treating the key as non-expiring.
 func TestPersistedKey_MalformedExpiryFailsClosed(t *testing.T) {

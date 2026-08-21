@@ -551,6 +551,8 @@ All `/v1/admin/*` routes require the `admin` scope (when auth is enabled).
 | `GET` | `/v1/admin/webhook-failures` | List undelivered webhooks. |
 | `GET` | `/v1/admin/jobs` | List background jobs + status histogram. |
 | `POST` | `/v1/admin/jobs/{id}/retry` | Requeue a job. |
+| `DELETE` | `/v1/admin/files/{tenant}/{key}` | Soft-delete an object in the default bucket; add `?hard=1` for physical deletion. Requires the `vault.file.delete` admin boundary. |
+| `DELETE` | `/v1/admin/files/{tenant}/{bucket}/{key}` | Same operation with an explicit bucket. |
 
 ```bash
 # Self-serve usage (any authenticated tenant sees its own row)
@@ -608,7 +610,7 @@ curl -s -X PUT -d '{"daily_budget_usd":5.00}' "$BASE/v1/admin/tenants/acme/budge
 
 ### Audit log
 
-Admin and security actions are recorded automatically: key add/revoke, tenant create/delete/status, quota/budget set.
+Admin and security actions are recorded automatically: key add/revoke, tenant create/delete/status, quota/budget set, and administrative file deletion. Admin file-delete rows retain `action="file.delete"`; their `detail` is `hard;permission=vault.file.delete` or `soft;permission=vault.file.delete`.
 
 ```bash
 # Most recent 50 entries (default 100)

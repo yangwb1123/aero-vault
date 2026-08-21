@@ -17,7 +17,10 @@ func TestEventOutboxDefaults(t *testing.T) {
 	} {
 		t.Setenv(k, "")
 	}
-	c := loadEventOutboxConfig()
+	c, err := loadEventOutboxConfig()
+	if err != nil {
+		t.Fatalf("loadEventOutboxConfig(): %v", err)
+	}
 	if !c.Enabled {
 		t.Error("default Enabled = false, want true (always-on shipped behavior)")
 	}
@@ -280,18 +283,14 @@ func TestEventOutboxValidate_PreservesExplicitDisabled(t *testing.T) {
 	}
 }
 
-// ── AC-1: unparseable env falls back to the default (F2 / F11) ──────────────
+// ── typed env parse errors fail startup ─────────────────────────────────────
 
-func TestEventOutboxLoad_UnparseableEnvFallsBackToDefault(t *testing.T) {
-	t.Run("enabled parse error falls back to default true", func(t *testing.T) {
+func TestEventOutboxLoad_UnparseableEnvFailsFast(t *testing.T) {
+	t.Run("enabled parse error names the variable", func(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("EVENT_OUTBOX_ENABLED", "tru") // genuine parse error ("1" parses true)
-		cfg, err := Load()
-		if err != nil {
-			t.Fatalf("Load(): %v", err)
-		}
-		if !cfg.EventOutbox.Enabled {
-			t.Fatal("unparseable EVENT_OUTBOX_ENABLED must fall back to default true")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "EVENT_OUTBOX_ENABLED") {
+			t.Fatalf("Load() error = %v, want error naming EVENT_OUTBOX_ENABLED", err)
 		}
 	})
 	t.Run("parseable 0 disables", func(t *testing.T) {
@@ -305,15 +304,11 @@ func TestEventOutboxLoad_UnparseableEnvFallsBackToDefault(t *testing.T) {
 			t.Fatal("EVENT_OUTBOX_ENABLED=0 must disable the relay")
 		}
 	})
-	t.Run("non-numeric retention falls back to the default", func(t *testing.T) {
+	t.Run("non-numeric retention names the variable", func(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("EVENT_OUTBOX_DELIVERED_RETENTION_HOURS", "abc")
-		cfg, err := Load()
-		if err != nil {
-			t.Fatalf("Load(): %v", err)
-		}
-		if cfg.EventOutbox.DeliveredRetentionHours != 24 {
-			t.Fatalf("DeliveredRetentionHours = %d, want default 24 (silent fallback, F11)", cfg.EventOutbox.DeliveredRetentionHours)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "EVENT_OUTBOX_DELIVERED_RETENTION_HOURS") {
+			t.Fatalf("Load() error = %v, want error naming EVENT_OUTBOX_DELIVERED_RETENTION_HOURS", err)
 		}
 	})
 }

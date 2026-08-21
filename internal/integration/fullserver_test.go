@@ -56,6 +56,13 @@ type fullServerHarness struct {
 	dsn  string
 }
 
+// serviceShape lets composition tests model the production access-off
+// wiring without accidentally installing an allow-all authorizer.
+type serviceShape struct {
+	authorizer     access.Authorizer
+	deleteFailOpen bool
+}
+
 // startFullServer builds a production-shaped server with SQLite + local storage,
 // no auth (MVP mode), no AI, all protocols mounted, and the event-outbox relay
 // running with default options (always-on, production shape).
@@ -93,6 +100,26 @@ func startFullServerOpts(t *testing.T, relayOpts *events.EventOutboxRelayOptions
 // server.ApplyMiddleware, so fail fast in the test.
 
 func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string, cfg *config.Config) *fullServerHarness {
+	return startFullServerWithConfigAndProviders(t, relayOpts, authKeys, cfg,
+		allowAllProvider{}, serviceShape{authorizer: allowAllProvider{}})
+}
+
+// startFullServerNamed resolves the administrative delete provider through a
+// test-local name registry, mirroring the production composition root. An
+// explicit nil entry is a real fail-closed provider configuration.
+func startFullServerNamed(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string, providers map[string]rest.AuthorizationProvider, name string, shapes ...serviceShape) *fullServerHarness {
+	provider, ok := providers[name]
+	if !ok {
+		t.Fatalf("unknown admin delete provider %q", name)
+	}
+	shape := serviceShape{authorizer: allowAllProvider{}}
+	if len(shapes) > 0 {
+		shape = shapes[0]
+	}
+	return startFullServerWithConfigAndProviders(t, relayOpts, authKeys, &config.Config{}, provider, shape)
+}
+
+func startFullServerWithConfigAndProviders(t *testing.T, relayOpts *events.EventOutboxRelayOptions, authKeys string, cfg *config.Config, adminAuthz rest.AuthorizationProvider, shape serviceShape) *fullServerHarness {
 	t.Helper()
 	if cfg == nil {
 		t.Fatal("cfg required")
@@ -115,7 +142,10 @@ func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayO
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.NewFileService(store, repo, logger).WithAuthorizer(allowAllProvider{}).WithTenantStatusEnforcement()
+	svc := service.NewFileService(store, repo, logger).WithTenantStatusEnforcement().WithDeleteFailOpen(shape.deleteFailOpen)
+	if shape.authorizer != nil {
+		svc.WithAuthorizer(shape.authorizer)
+	}
 	// Production bus shape (mirrors cmd/server/main.go:215 + workers.go:141-147):
 	// the service sinks lifecycle events into the Bus and the Notifier delivers
 	// them per bucket notification rules. Existing tests are unaffected — with
@@ -154,7 +184,8 @@ func startFullServerWithConfig(t *testing.T, relayOpts *events.EventOutboxRelayO
 	})
 	r.Get("/openapi.json", rest.OpenAPISpecHandler())
 	r.Get("/docs", rest.SwaggerUIHandler())
-	r.Mount("/v1", rest.NewRouter(svc, repo, nil, nil, nil, nil, authReg, logger, false, aiRL, nil, 0, false))
+	r.Mount("/v1", rest.NewRouter(svc, repo, nil, nil, nil, nil, authReg, logger, false, aiRL, nil, 0, false,
+		func(h *rest.Handler) { h.WithAdminAuthorizationProvider(adminAuthz) }))
 	r.Mount("/s3", s3compat.NewRouter(svc, logger, allowAllProvider{}))
 
 	mcpServer := mcp.NewServer(svc, repo, nil, "default", logger)

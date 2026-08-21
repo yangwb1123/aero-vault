@@ -40,12 +40,10 @@ type AuditGovernanceConfig struct {
 }
 
 // BacklogAlertThresholdSeconds returns the age-arm threshold of the
-// AuditGovernanceBacklogDegraded alert: maxLag×0.5, floored — the shipped
-// default 900s → 450s (deploy/prometheus/alerts.yml expr). The alert's
-// degraded==1 arm remains the config-true signal for any non-default
-// maxLag; this accessor is what the alerts.yml parity pin derives from,
-// so an operator override of AUDIT_GOVERNANCE_MAX_LAG_SECONDS stays
-// coupled to the alert threshold. Value receiver; zero I/O.
+// AuditGovernanceBacklogDegraded alert's age arm: maxLag×0.5, floored. The
+// deployed rule now derives this from audit_governance_max_lag_seconds, while
+// this accessor remains the config-side arithmetic contract used by tests and
+// documentation. Value receiver; zero I/O.
 func (c AuditGovernanceConfig) BacklogAlertThresholdSeconds() int {
 	return c.MaxLagSeconds / 2
 }
@@ -98,6 +96,7 @@ func loadAuditGovernanceConfig() (AuditGovernanceConfig, error) {
 	if err != nil {
 		return AuditGovernanceConfig{}, err
 	}
+	env := &typedEnv{}
 	cfg := AuditGovernanceConfig{
 		Enabled:                   enabled,
 		Drain:                     drain,
@@ -105,17 +104,20 @@ func loadAuditGovernanceConfig() (AuditGovernanceConfig, error) {
 		TokenURL:                  getEnv("AUDIT_GOVERNANCE_TOKEN_URL", ""),
 		BindingsFile:              getEnv("AUDIT_GOVERNANCE_BINDINGS_FILE", ""),
 		HMACKey:                   getEnv("AUDIT_GOVERNANCE_HMAC_KEY", ""),
-		HTTPTimeoutSeconds:        getEnvInt("AUDIT_GOVERNANCE_HTTP_TIMEOUT_SECONDS", 5),
-		PollMilliseconds:          getEnvInt("AUDIT_GOVERNANCE_POLL_MILLISECONDS", 1000),
-		BatchSize:                 getEnvInt("AUDIT_GOVERNANCE_BATCH_SIZE", 32),
-		ClaimTTLSeconds:           getEnvInt("AUDIT_GOVERNANCE_CLAIM_TTL_SECONDS", 30),
-		InitialBackoffSeconds:     getEnvInt("AUDIT_GOVERNANCE_INITIAL_BACKOFF_SECONDS", 1),
-		MaxBackoffSeconds:         getEnvInt("AUDIT_GOVERNANCE_MAX_BACKOFF_SECONDS", 300),
-		MaxLagSeconds:             getEnvInt("AUDIT_GOVERNANCE_MAX_LAG_SECONDS", 900),
-		ReconcileBatchSize:        getEnvInt("AUDIT_GOVERNANCE_RECONCILE_BATCH_SIZE", 100),
-		DeliveredRetentionSeconds: getEnvInt("AUDIT_GOVERNANCE_DELIVERED_RETENTION_SECONDS", 604800),
-		CleanupIntervalSeconds:    getEnvInt("AUDIT_GOVERNANCE_CLEANUP_INTERVAL_SECONDS", 3600),
-		CleanupBatchSize:          getEnvInt("AUDIT_GOVERNANCE_CLEANUP_BATCH_SIZE", 100),
+		HTTPTimeoutSeconds:        env.Int("AUDIT_GOVERNANCE_HTTP_TIMEOUT_SECONDS", 5),
+		PollMilliseconds:          env.Int("AUDIT_GOVERNANCE_POLL_MILLISECONDS", 1000),
+		BatchSize:                 env.Int("AUDIT_GOVERNANCE_BATCH_SIZE", 32),
+		ClaimTTLSeconds:           env.Int("AUDIT_GOVERNANCE_CLAIM_TTL_SECONDS", 30),
+		InitialBackoffSeconds:     env.Int("AUDIT_GOVERNANCE_INITIAL_BACKOFF_SECONDS", 1),
+		MaxBackoffSeconds:         env.Int("AUDIT_GOVERNANCE_MAX_BACKOFF_SECONDS", 300),
+		MaxLagSeconds:             env.Int("AUDIT_GOVERNANCE_MAX_LAG_SECONDS", 900),
+		ReconcileBatchSize:        env.Int("AUDIT_GOVERNANCE_RECONCILE_BATCH_SIZE", 100),
+		DeliveredRetentionSeconds: env.Int("AUDIT_GOVERNANCE_DELIVERED_RETENTION_SECONDS", 604800),
+		CleanupIntervalSeconds:    env.Int("AUDIT_GOVERNANCE_CLEANUP_INTERVAL_SECONDS", 3600),
+		CleanupBatchSize:          env.Int("AUDIT_GOVERNANCE_CLEANUP_BATCH_SIZE", 100),
+	}
+	if err := env.Err(); err != nil {
+		return AuditGovernanceConfig{}, err
 	}
 	if !cfg.Enabled {
 		return cfg, nil

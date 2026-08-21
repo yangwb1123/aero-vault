@@ -28,9 +28,10 @@ import (
 type Scope string
 
 const (
-	ScopeRead  Scope = "read"
-	ScopeWrite Scope = "write"
-	ScopeAdmin Scope = "admin"
+	ScopeRead       Scope = "read"
+	ScopeWrite      Scope = "write"
+	ScopeAdmin      Scope = "admin"
+	ScopeFileDelete Scope = "vault.file.delete"
 )
 
 // Key is a parsed API-key record.
@@ -137,7 +138,8 @@ func failClosedRegistry(err error) (*Registry, error) {
 }
 
 func knownScope(scope Scope) bool {
-	return scope == ScopeRead || scope == ScopeWrite || scope == ScopeAdmin
+	return scope == ScopeRead || scope == ScopeWrite || scope == ScopeAdmin ||
+		scope == ScopeFileDelete
 }
 
 func (r *Registry) Enabled() bool {
@@ -345,11 +347,9 @@ func isObjectReadPath(method, path string) bool {
 	if !strings.HasPrefix(path, prefix) || len(path) <= len(prefix) {
 		return false
 	}
-	if method == http.MethodGet {
-		for _, suffix := range []string{"/tags", "/versions", "/acl", "/metadata"} {
-			if strings.HasSuffix(path, suffix) {
-				return false
-			}
+	for _, suffix := range []string{"/tags", "/versions", "/acl", "/metadata"} {
+		if strings.HasSuffix(path, suffix) {
+			return false
 		}
 	}
 	return true

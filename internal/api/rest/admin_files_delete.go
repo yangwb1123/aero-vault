@@ -1,27 +1,43 @@
 package rest
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/service"
 )
 
-// DELETE /v1/admin/files/{tenant}/* — operator-facing file deletion in any
-// tenant (metadata + object state). The optional `?hard=1` flag drives the
-// existing FileService.Delete hard path (storage blob + metadata + audit +
-// outbox facts); without it the object is soft-deleted. The tenant comes from
-// the path (the admin surface is cross-tenant by design, operator-equivalence
-// model, C3); the key is extracted from the chi catch-all segment. This route
-// intentionally bypasses the REST bucket-policy guard (F12): admin is the
-// operator trust surface, matching every existing admin route. Placed in its
-// own file so admin.go stays under the 500-line gate.
+// DELETE /v1/admin/files/{tenant}/* — administrative file deletion (metadata
+// plus object state). The optional `?hard=1` flag drives the existing
+// FileService.Delete hard path (storage blob + metadata + audit + outbox
+// facts); without it the object is soft-deleted. A tenant-scoped admin key is
+// confined to its own path tenant; tenant="*" is the cross-tenant operator
+// form. This route intentionally bypasses the REST bucket-policy guard (F12)
+// because it is an administrative trust surface. Placed in its own file so
+// admin.go stays under the 500-line gate.
 func (h *AdminHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	tenant := chiURLParam(r, "tenant")
+	h.deleteFile(w, r, tenant, service.DefaultBucket, "")
+}
+
+// DeleteFileInBucket is the explicit bucket form used by the privileged
+// vault.file.delete surface. DeleteFile remains as a compatibility route for
+// the original default-bucket admin CLI endpoint.
+func (h *AdminHandler) DeleteFileInBucket(w http.ResponseWriter, r *http.Request) {
+	bucket := chiURLParam(r, "bucket")
+	key := keyFromPath(r)
+	legacyKey := strings.TrimPrefix(bucket+"/"+key, "/")
+	h.deleteFile(w, r, chiURLParam(r, "tenant"), bucket, legacyKey)
+}
+
+func (h *AdminHandler) deleteFile(w http.ResponseWriter, r *http.Request, tenant, bucket, legacyKey string) {
+	if !h.requireAdminForTenant(w, r, tenant) {
 		return
 	}
-	tenant := chiURLParam(r, "tenant")
 	if tenant == "" {
 		// Reject explicitly: svc.Delete would normalize "" to the default
 		// tenant and silently delete from it (F13, non-fail-closed).
@@ -29,8 +45,22 @@ func (h *AdminHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := keyFromPath(r)
+	if !h.authorizeFileDelete(w, r, tenant, bucket, key) {
+		return
+	}
 	hard := r.URL.Query().Get("hard") == "1"
-	if err := h.svc.Delete(r.Context(), tenant, service.DefaultBucket, key, hard); err != nil {
+	ctx := service.WithDeletePermission(r.Context(), access.PermissionVaultFileDelete)
+	err := h.svc.AdminDelete(ctx, tenant, bucket, key, hard)
+	if errors.Is(err, service.ErrNotFound) && legacyKey != "" {
+		// The compatibility fallback is a different authorization resource.
+		// Re-check it before attempting the delete so a key-aware provider
+		// cannot be bypassed by a missing explicit-bucket object.
+		if !h.authorizeFileDelete(w, r, tenant, service.DefaultBucket, legacyKey) {
+			return
+		}
+		err = h.svc.AdminDelete(ctx, tenant, service.DefaultBucket, legacyKey, hard)
+	}
+	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}

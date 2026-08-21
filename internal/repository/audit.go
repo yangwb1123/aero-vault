@@ -9,7 +9,8 @@ const auditCols = `id, created_at, actor, action, target, tenant_id, detail`
 
 // AuditActionFileDelete is the audit_log action written inside the delete
 // transaction (FR-1). One literal for both delete modes; Detail carries
-// "hard"/"soft" (the action vocabulary stays flat).
+// "hard"/"soft" and may include an enforcing permission annotation (the
+// action vocabulary stays flat).
 const AuditActionFileDelete = "file.delete"
 
 // RecordAudit appends one audit-log entry. id is assigned by the database; if

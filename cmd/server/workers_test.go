@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -57,6 +59,28 @@ func TestStartEventOutboxRelay_DisabledSkipsL2Build(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "L2 audit sink enabled") {
 		t.Error("disabled relay built the L2 audit sink")
+	}
+}
+
+func TestAuditSinkForEventOutboxFollowsKind(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, kind := range []string{config.AuditSinkKindL0, config.AuditSinkKindL1} {
+		sink, err := auditSinkForEventOutbox(&config.Config{AuditSink: config.AuditSinkConfig{Kind: kind}}, time.Second, logger)
+		if err != nil || sink != nil {
+			t.Fatalf("kind %s selected sink=%v err=%v, want no sink", kind, sink, err)
+		}
+	}
+	sink, err := auditSinkForEventOutbox(&config.Config{AuditSink: config.AuditSinkConfig{
+		Kind: config.AuditSinkKindL2, Endpoint: "https://audit.example.test",
+	}}, time.Second, logger)
+	if err != nil || sink == nil {
+		t.Fatalf("bearer L2 selected sink=%v err=%v, want sink", sink, err)
+	}
+	_, err = auditSinkForEventOutbox(&config.Config{AuditSink: config.AuditSinkConfig{
+		Kind: config.AuditSinkKindL2, Endpoint: "not-a-url",
+	}}, time.Second, logger)
+	if err == nil {
+		t.Fatal("malformed bearer endpoint was accepted by the assembly seam")
 	}
 }
 

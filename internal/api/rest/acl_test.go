@@ -39,6 +39,7 @@ func newAuthRESTTest(t *testing.T) (*httptest.Server, string) {
 
 	r := chi.NewRouter()
 	r.Use(reg.Middleware())
+	r.Use(requireRESTScope(reg))
 	r.Put("/v1/files/*", h.putKey)
 	r.Get("/v1/files/*", h.getKey)
 	r.Head("/v1/files/*", h.Head)

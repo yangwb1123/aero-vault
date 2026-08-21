@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/access"
@@ -84,6 +85,23 @@ func (s *FileService) preparePresignPut(
 		return "", "", err
 	}
 	if _, err := s.preparePutAccess(ctx, tenant, bucket, key, nil); err != nil {
+		return "", "", err
+	}
+	bcfg, err := s.repo.GetBucketConfig(ctx, tenant, bucket)
+	if err != nil {
+		return "", "", fmt.Errorf("get bucket config: %w", err)
+	}
+	usage, err := s.objectWriteUsage(ctx, tenant, bucket, key, bcfg.Versioning)
+	if err != nil {
+		return "", "", err
+	}
+	// Direct uploads do not expose their final size at presign time. Preflight a
+	// one-byte minimum so a full quota cannot be bypassed by issuing a URL.
+	deltaBytes, deltaObjects := usage.deltas(1)
+	if err := s.preflightQuota(ctx, tenant, deltaBytes, deltaObjects); err != nil {
+		return "", "", err
+	}
+	if err := s.preflightBucketQuota(ctx, tenant, bucket, deltaBytes, deltaObjects); err != nil {
 		return "", "", err
 	}
 	s.recordPresign(ctx, "PUT", tenant, bucket, key, expiry)

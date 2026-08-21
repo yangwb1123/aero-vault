@@ -546,11 +546,13 @@ func TestConcurrencyLimiter_WeightedCost(t *testing.T) {
 func TestConcurrencyLimiter_ReturnsErrorBody(t *testing.T) {
 	cl2 := NewConcurrencyLimiter(1)
 	block := make(chan struct{})
+	entered := make(chan struct{})
 	h := cl2.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
 		<-block
 	}))
 	go h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
-	runtime.Gosched()
+	<-entered
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))

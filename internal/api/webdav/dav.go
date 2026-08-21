@@ -16,6 +16,7 @@ import (
 
 	xwebdav "golang.org/x/net/webdav"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/service"
 )
@@ -41,6 +42,13 @@ func Handler(prefix string, svc *service.FileService, logger *slog.Logger) http.
 	// Pre-set the stored Content-Type so ServeContent honours it instead of
 	// sniffing; PROPFIND already reads ContentTyper directly.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			name := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, prefix), "/")
+			if err := fsys.svc.AuthorizeDelete(r.Context(), fsys.tenant(r.Context()), service.DefaultBucket, name, true); err != nil && errors.Is(err, service.ErrForbidden) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			if name, ok := strings.CutPrefix(r.URL.Path, prefix); ok {
 				if ct := fsys.storedContentType(r.Context(), name); ct != "" {
@@ -140,7 +148,7 @@ func (f *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fil
 
 func (f *davFS) RemoveAll(ctx context.Context, name string) error {
 	name = strings.TrimPrefix(name, "/")
-	err := f.svc.Delete(ctx, f.tenant(ctx), service.DefaultBucket, name, true)
+	err := f.svc.DeleteWithAction(ctx, f.tenant(ctx), service.DefaultBucket, name, true, access.ActionAdminDelete)
 	if errors.Is(err, service.ErrNotFound) {
 		return os.ErrNotExist
 	}
@@ -151,6 +159,9 @@ func (f *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	// WebDAV-required for drag-and-drop renames in Finder. Implement via
 	// copy-then-delete (atomic enough for MVP).
 	tenant := f.tenant(ctx)
+	if err := f.svc.AuthorizeDelete(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"), true); err != nil {
+		return err
+	}
 	rc, src, err := f.svc.Get(ctx, tenant, service.DefaultBucket, strings.TrimPrefix(oldName, "/"))
 	if err != nil {
 		return err
@@ -195,7 +206,7 @@ func (f *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	// copy-then-delete: if the delete of the source fails after the destination
 	// is written, both names would otherwise exist (a duplicate). Roll back by
 	// removing the just-written destination before surfacing the error.
-	if err := f.svc.Delete(ctx, tenant, service.DefaultBucket, src2, true); err != nil {
+	if err := f.svc.DeleteWithAction(ctx, tenant, service.DefaultBucket, src2, true, access.ActionAdminDelete); err != nil {
 		if delErr := f.svc.Delete(ctx, tenant, service.DefaultBucket, dst, true); delErr != nil {
 			f.logger.Warn("webdav rename rollback failed", "dst", dst, "err", delErr)
 		}

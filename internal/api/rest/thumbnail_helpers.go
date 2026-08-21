@@ -9,6 +9,7 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/telemetry"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
 
@@ -85,13 +86,26 @@ func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (
 // requests are identical here: both arms pass the statPinned row, so the
 // gate evaluates the pinned version's metadata and ETag for a pinned read.
 func thumbnailCacheAdmissible(obj repository.Object) bool {
+	return thumbnailCacheBypassReason(obj) == ""
+}
+
+func thumbnailCacheBypassReason(obj repository.Object) string {
 	if _, _, ssec := service.SSECustomerInfo(obj.Metadata); ssec {
-		return false
+		return "sse-c"
 	}
 	if algo, _, ok := service.ServerSideEncryptionInfo(obj.Metadata); ok && algo == "aws:kms" {
-		return false
+		return "sse-kms"
 	}
-	return thumbnail.ContentMD5ETag(obj.ETag)
+	if !thumbnail.ContentMD5ETag(obj.ETag) {
+		return "non-content-md5"
+	}
+	return ""
+}
+
+func recordThumbnailCacheBypass(ctx context.Context, cache *thumbnail.Cache, reason string) {
+	if cache != nil && cache.Enabled() && (reason == "sse-c" || reason == "sse-kms") {
+		telemetry.IncThumbnailCacheBypass(ctx, reason)
+	}
 }
 
 // bucketVersioning reports whether the default bucket has versioning enabled.

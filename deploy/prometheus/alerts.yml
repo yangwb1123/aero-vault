@@ -176,21 +176,21 @@ groups:
     # B3-2 (D1): a stalled audit relay degrades instead of failing /readyz.
     # Two signals feed the alert: the backlog-age gauge
     # (audit_governance_backlog_age_seconds, oldest pending non-terminal fact;
-    # 450s = maxLag default 900 × 0.5 early warning) and the degraded flag
+    # (audit_governance_max_lag_seconds × 0.5 early warning) and the degraded flag
     # (audit_governance_degraded, cache-fed 0/1: lag > configured maxLag or
     # relay-store probe timeout — age unknown → 0). The OR is deliberate: a
     # probe timeout records age 0, so the age arm alone would reset `for: 10m`
     # on every timeout sample; the degraded arm keeps accumulation true until a
-    # genuinely healthy probe (age ≤ 450 AND degraded=0) — no starvation reset.
+    # genuinely healthy probe (age ≤ maxLag×0.5 AND degraded=0) — no starvation reset.
     rules:
       - alert: AuditGovernanceBacklogDegraded
-        expr: audit_governance_backlog_age_seconds > 450 OR audit_governance_degraded == 1
+        expr: audit_governance_backlog_age_seconds > (audit_governance_max_lag_seconds * 0.5) OR audit_governance_degraded == 1
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Audit governance relay backlog degraded"
-          description: "Oldest pending audit fact exceeded the 450s early warning (maxLag default 900 × 0.5), or the relay store probe degraded (degraded=1: lag > configured maxLag, or store probe timeout — age unknown). /readyz stays 200 (degraded); check relay_attempted/failed counters and the sink."
+          description: "Oldest pending audit fact exceeded maxLag×0.5 (900s default → 450s), or the relay store probe degraded (degraded=1: lag > configured maxLag, or store probe timeout — age unknown). /readyz stays 200 (degraded); check relay_attempted/failed counters and the sink."
 
       # Fail-closed activation gate companion: an enabled relay with zero
       # bound tenants is never a healthy steady state — the empty-manifest
@@ -207,6 +207,17 @@ groups:
         annotations:
           summary: "Audit governance relay enabled with zero bound tenants"
           description: "An enabled audit governance relay reports no bound tenants for 10m. audit_governance_draining==1: in-progress drain transition (disable flow step 2 — complete with ENABLED=false and clear AUDIT_GOVERNANCE_DRAIN + the empty manifest). audit_governance_draining==0: stale AUDIT_GOVERNANCE_DRAIN with an empty manifest replay — clear the flag and remove the manifest, or restore bindings at a higher revision."
+
+  - name: aero-vault-billing
+    rules:
+      - alert: BillingBacklogDegraded
+        expr: billing_backlog_age_seconds > 450
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Billing relay backlog degraded"
+          description: "Oldest pending billing usage fact exceeded the 450s early warning (maxLag default 900 × 0.5). /readyz stays 200 (degraded); check billing_relay_attempted/failed counters and the sink."
 
   - name: aero-vault-thumbnail-cache
     rules:

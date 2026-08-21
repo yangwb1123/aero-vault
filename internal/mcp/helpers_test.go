@@ -37,6 +37,29 @@ func newTestServer(t *testing.T, search *ai.Search) (*Server, *service.FileServi
 	return srv, svc, repo
 }
 
+// newTestServerNoAuthorizer builds the fail-closed baseline used by the MCP
+// delete-gate test. Keep this separate from newTestServer so the general MCP
+// tests retain their explicit allow-all authorizer.
+func newTestServerNoAuthorizer(t *testing.T, search *ai.Search) (*Server, *service.FileService, repository.Repository) {
+	t.Helper()
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repo.Close() })
+	if err := repo.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := service.NewFileService(store, repo, nil)
+	srv := NewServer(svc, repo, search, "default", nil)
+	return srv, svc, repo
+}
+
 // allowAllProvider is the CI-baseline test double injected into the mcp test
 // helper: it preserves the pre-fail-closed baseline (all actions allowed) for
 // tests exercising MCP behavior other than the delete gate. The default-config

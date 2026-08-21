@@ -25,16 +25,6 @@ import (
 //
 // All /v1/admin/* routes require the admin scope; the auth middleware sees
 // these on PUT/POST/DELETE/GET and enforces accordingly.
-type AdminHandler struct {
-	svc  *service.FileService
-	repo repository.Repository
-	reg  *auth.Registry
-}
-
-func NewAdminHandler(svc *service.FileService, repo repository.Repository, reg *auth.Registry) *AdminHandler {
-	return &AdminHandler{svc: svc, repo: repo, reg: reg}
-}
-
 // GET /v1/usage — any authenticated tenant sees its own row.
 func (h *AdminHandler) Usage(w http.ResponseWriter, r *http.Request) {
 	q, err := h.svc.Usage(r.Context(), mw.TenantFrom(r.Context()))
@@ -54,10 +44,10 @@ func (h *AdminHandler) Usage(w http.ResponseWriter, r *http.Request) {
 
 // PUT /v1/admin/tenants/{t}/quota
 func (h *AdminHandler) SetQuota(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	tenant := chiURLParam(r, "tenant")
+	if !h.requireAdminForTenant(w, r, tenant) {
 		return
 	}
-	tenant := chiURLParam(r, "tenant")
 	var body struct {
 		MaxBytes   int64 `json:"max_bytes"`
 		MaxObjects int64 `json:"max_objects"`
@@ -67,6 +57,10 @@ func (h *AdminHandler) SetQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.SetQuota(r.Context(), tenant, body.MaxBytes, body.MaxObjects); err != nil {
+		if errors.Is(err, service.ErrInvalidArgs) {
+			h.writeError(w, r, err)
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}
@@ -77,10 +71,10 @@ func (h *AdminHandler) SetQuota(w http.ResponseWriter, r *http.Request) {
 // PUT /v1/admin/tenants/{t}/budget — body {"daily_budget_usd": <float>}; 0 clears
 // the override so the global AI_TENANT_DAILY_BUDGET_USD default applies again.
 func (h *AdminHandler) SetBudget(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	tenant := chiURLParam(r, "tenant")
+	if !h.requireAdminForTenant(w, r, tenant) {
 		return
 	}
-	tenant := chiURLParam(r, "tenant")
 	var body struct {
 		DailyBudgetUSD float64 `json:"daily_budget_usd"`
 	}
@@ -106,13 +100,21 @@ func (h *AdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(w, r) {
 		return
 	}
-	out := h.reg.ListKeys(r.Context())
+	if h.reg == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"keys": []auth.Key{}})
+		return
+	}
+	out := filterAdminKeys(r, h.reg.ListKeys(r.Context()))
 	writeJSON(w, http.StatusOK, map[string]any{"keys": out})
 }
 
 // POST /v1/admin/keys
 func (h *AdminHandler) AddKey(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(w, r) {
+		return
+	}
+	if h.reg == nil {
+		writeAdminUnavailable(w)
 		return
 	}
 	var body struct {
@@ -128,6 +130,9 @@ func (h *AdminHandler) AddKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Token == "" || body.Tenant == "" || len(body.Scopes) == 0 {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: "token, tenant, scopes required"}})
+		return
+	}
+	if !h.requireTenantBoundary(w, r, body.Tenant) {
 		return
 	}
 	k := auth.Key{Token: body.Token, Tenant: body.Tenant, Scopes: map[auth.Scope]bool{}}
@@ -147,10 +152,17 @@ func (h *AdminHandler) RevokeKey(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(w, r) {
 		return
 	}
+	if h.reg == nil {
+		writeAdminUnavailable(w)
+		return
+	}
 	tok := chiURLParam(r, "token")
-	tenant, _, err := h.reg.TenantForKey(r.Context(), tok)
+	tenant, found, err := h.reg.TenantForKey(r.Context(), tok)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		return
+	}
+	if found && !h.requireTenantBoundary(w, r, tenant) {
 		return
 	}
 	revoked, err := h.reg.RevokeKey(r.Context(), tok)
@@ -171,6 +183,10 @@ func (h *AdminHandler) IssueJWT(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(w, r) {
 		return
 	}
+	if h.reg == nil {
+		writeAdminUnavailable(w)
+		return
+	}
 	if h.reg.JWT() == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: errorPayload{Code: "Unavailable", Message: "JWT not configured"}})
 		return
@@ -189,6 +205,9 @@ func (h *AdminHandler) IssueJWT(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Tenant == "" || len(body.Scopes) == 0 {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: "tenant + scopes required"}})
+		return
+	}
+	if !h.requireTenantBoundary(w, r, body.Tenant) {
 		return
 	}
 	tok, err := h.reg.JWT().SignWithPrincipal(auth.JWTSignClaims{
@@ -229,6 +248,10 @@ func (h *AdminHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Request
 		NoncurrentTransitionStorageClass: req.NoncurrentTransClass,
 	}
 	if err := h.svc.SetBucketLifecycleFull(r.Context(), mw.TenantFrom(r.Context()), bucket, lc); err != nil {
+		if errors.Is(err, service.ErrInvalidArgs) {
+			h.writeError(w, r, err)
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}
@@ -237,10 +260,11 @@ func (h *AdminHandler) PutBucketLifecycle(w http.ResponseWriter, r *http.Request
 
 // PUT /v1/admin/buckets/{bucket}/quota  {"max_bytes":N,"max_objects":N}
 func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	bucket := chiURLParam(r, "bucket")
+	tenant := mw.TenantFrom(r.Context())
+	if !h.requireAdminForTenant(w, r, tenant) {
 		return
 	}
-	bucket := chiURLParam(r, "bucket")
 	var req struct {
 		MaxBytes   int64 `json:"max_bytes"`
 		MaxObjects int64 `json:"max_objects"`
@@ -249,8 +273,11 @@ func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: err.Error()}})
 		return
 	}
-	tenant := mw.TenantFrom(r.Context())
 	if err := h.svc.SetBucketQuota(r.Context(), tenant, bucket, req.MaxBytes, req.MaxObjects); err != nil {
+		if errors.Is(err, service.ErrInvalidArgs) {
+			h.writeError(w, r, err)
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
 		return
 	}
@@ -261,7 +288,7 @@ func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/admin/webhook-failures
 func (h *AdminHandler) ListWebhookFailures(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -276,7 +303,7 @@ func (h *AdminHandler) ListWebhookFailures(w http.ResponseWriter, r *http.Reques
 // POST /v1/admin/tenants — body {tenant_id, display_name}; creates or updates a
 // tenant record (status defaults to 'active'). 201 with the stored record.
 func (h *AdminHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	var body struct {
@@ -307,7 +334,7 @@ func (h *AdminHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/admin/tenants — 200 {"tenants":[...]}.
 func (h *AdminHandler) ListTenants(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	recs, err := h.repo.ListTenants(r.Context())
@@ -324,7 +351,7 @@ func (h *AdminHandler) ListTenants(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /v1/admin/tenants/{tenant} — 204; 404 if not found.
 func (h *AdminHandler) DeleteTenant(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	tenant := chiURLParam(r, "tenant")
@@ -359,7 +386,7 @@ func (h *AdminHandler) DeleteTenant(w http.ResponseWriter, r *http.Request) {
 
 // PUT /v1/admin/tenants/{tenant}/status — body {status:"active"|"disabled"}; 200.
 func (h *AdminHandler) SetTenantStatus(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	tenant := chiURLParam(r, "tenant")
@@ -431,7 +458,7 @@ func (h *AdminHandler) auditForTenant(
 //
 //	GET /v1/admin/audit?limit=N
 func (h *AdminHandler) ListAudit(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -441,38 +468,4 @@ func (h *AdminHandler) ListAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"audit": rows})
-}
-
-// redactToken masks a raw API-key token for audit-log storage, keeping a short
-// suffix so an operator can correlate it without persisting the secret.
-func redactToken(tok string) string {
-	if len(tok) <= 4 {
-		return "****"
-	}
-	return "****" + tok[len(tok)-4:]
-}
-
-// requireAdmin gates admin routes when auth is enabled. Without auth, the
-// caller is implicitly admin (mirrors the no-auth MVP behaviour).
-func (h *AdminHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
-	if !h.reg.Enabled() {
-		return true
-	}
-	k, ok := auth.FromContext(r.Context())
-	if !ok || !k.Has(auth.ScopeAdmin) {
-		writeJSON(w, http.StatusForbidden, errorBody{Error: errorPayload{Code: "Forbidden", Message: "admin scope required"}})
-		return false
-	}
-	return true
-}
-
-// GetConfig returns a read-only snapshot of the server configuration,
-// excluding sensitive fields (keys, secrets, tokens).
-func (h *AdminHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"version": 1,
-	})
 }

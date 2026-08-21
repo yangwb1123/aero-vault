@@ -36,8 +36,8 @@ type readinessChecker interface {
 // degradedChecker is the additive readiness-degradation surface: a checker
 // that also reports a degraded condition (with the recorded backlog age)
 // lets /readyz answer 200 with a degraded marker instead of 503 — the D1
-// "degrade, never evict" contract. billing.Runtime (no Degraded) does not
-// implement it and contributes false/0 through the group.
+// "degrade, never evict" contract. Billing and audit-governance runtimes
+// contribute their cached degraded state and backlog age through this seam.
 type degradedChecker interface {
 	Degraded() bool
 	BacklogAge() time.Duration
@@ -155,6 +155,11 @@ func mcpScopeGate(authReg *auth.Registry) func(http.Handler) http.Handler {
 
 func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, thumbCache *thumbnail.Cache, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider, extraReady readinessChecker) http.Handler {
 	r := chi.NewRouter()
+	adminAuthz := configuredAdminDeleteProvider()
+	thumbnailAdmission := thumbnail.NewDecodeAdmission(cfg.App.ThumbnailPerTenantDecodeSlots)
+	if adminAuthz == nil {
+		logger.Error("admin delete authorization provider is not configured", "name", defaultAdminDeleteProviderName)
+	}
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -175,10 +180,11 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 		r.Get("/auth/oidc/callback", oidc.Callback)
 		r.Get("/auth/oidc/logout", oidc.Logout)
 	}
-	r.Mount("/v1", rest.NewRouter(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode,
+	r.Mount("/v1", rest.NewRouterWithAdminAuthorizationProvider(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode, adminAuthz,
 		func(h *rest.Handler) {
 			h.WithCORSProvider(corsProvider)
 			h.WithThumbnailCache(thumbCache)
+			h.WithThumbnailDecodeAdmission(thumbnailAdmission)
 			if cfg.App.ThumbnailCacheBytes > 0 && cfg.App.ThumbnailCacheTTL == 0 {
 				// Compliance F2 (privacy-by-default posture): the cache is enabled
 				// without a retention bound — derived bytes of deleted/overwritten

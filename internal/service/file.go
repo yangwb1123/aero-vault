@@ -74,6 +74,13 @@ type ChunkCleaner interface {
 	DeleteObjectChunks(ctx context.Context, objectID int64) error
 }
 
+// ShareLister is the read-only capability lookup used to enrich privileged
+// delete facts. It is deliberately narrower than access.Store so wrappers and
+// test doubles can provide only the required repository operation.
+type ShareLister interface {
+	ListShares(ctx context.Context, tenant, bucket, key string) ([]access.Share, error)
+}
+
 type noopSink struct{}
 
 func (noopSink) Publish(context.Context, repository.Event) {}
@@ -97,6 +104,7 @@ type FileService struct {
 	logger          *slog.Logger
 	sink            EventSink
 	chunkCleaner    ChunkCleaner
+	shareLister     ShareLister
 	readVerify      ReadVerificationConfig
 	authorizer      access.Authorizer
 	deleteFailOpen  bool
@@ -105,7 +113,8 @@ type FileService struct {
 }
 
 // WithAuthorizer enables resource-level authorization at the FileService
-// boundary. A nil authorizer preserves the CI/MVP baseline.
+// boundary. A nil authorizer preserves non-delete compatibility paths; object
+// deletion remains fail-closed unless explicitly opted out.
 func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService {
 	// nil 防御：接口持有的 (*Manager)(nil) 会让 `authorizer != nil` 误判为
 	// true，随后 authorize() 调用 nil 方法 panic（真实事故：PUT /v1/files 500，
@@ -127,8 +136,8 @@ func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService 
 // WithDeleteFailOpen opts out of the fail-closed delete gate (FR-1): when
 // optOut is true and no authorizer is configured, deletes are allowed again
 // (legacy baseline). The zero value (not called) is fail-closed: ActionDelete
-// with a nil authorizer returns ErrForbidden. Only the antivirus system actor
-// remains exempt (AV quarantine, access.IsSystemDeleteExempt).
+// with a nil authorizer returns ErrForbidden. Trusted system contexts remain
+// exempt for internal maintenance paths (access.IsSystemDeleteExempt).
 func (s *FileService) WithDeleteFailOpen(optOut bool) *FileService {
 	s.deleteFailOpen = optOut
 	return s
@@ -174,6 +183,13 @@ func (s *FileService) WithChunkCleaner(cc ChunkCleaner) *FileService {
 	} else {
 		s.chunkCleaner = cc
 	}
+	return s
+}
+
+// WithShareLister attaches the optional capability reader used by AdminDelete
+// to capture active share IDs before the transactional cascade.
+func (s *FileService) WithShareLister(lister ShareLister) *FileService {
+	s.shareLister = lister
 	return s
 }
 

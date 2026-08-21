@@ -35,32 +35,89 @@ func (c *Config) Validate() error {
 	if err := validateAccess(c.Access, c.Auth); err != nil {
 		return err
 	}
-	if err := validateCommercialIntegrations(c.Billing, c.AuditGovernance); err != nil {
+	sink := c.effectiveAuditSink()
+	if err := validateCommercialIntegrations(c.Billing, sink); err != nil {
 		return err
 	}
 	c.EventOutbox = c.EventOutbox.withDefaults()
 	if err := c.EventOutbox.Validate(); err != nil {
 		return err
 	}
-	if err := c.AuditSinkL2.Validate(); err != nil {
+	if err := sink.Validate(); err != nil {
 		return err
 	}
 	return c.validateRateLimits()
 }
 
 func validateCommercialIntegrations(
-	billing BillingConfig, governance AuditGovernanceConfig,
+	billing BillingConfig, sink AuditSinkConfig,
 ) error {
 	if err := billing.Validate(); err != nil {
 		return err
 	}
-	if err := governance.Validate(); err != nil {
+	if err := sink.Legacy.Validate(); err != nil {
 		return err
 	}
-	return validateCommercialCredentialSeparation(billing, governance)
+	return validateCommercialCredentialSeparation(billing, sink)
 }
 
-func validateCommercialCredentialSeparation(
+// effectiveAuditSink keeps direct Config construction backwards compatible
+// while making the selector the single validation/runtime surface. Load
+// already fills AuditSink; older tests and embedders may still fill only the
+// legacy fields on Config.
+func (c *Config) effectiveAuditSink() AuditSinkConfig {
+	sink := c.AuditSink
+	if !sink.Legacy.Enabled && c.AuditGovernance.Enabled {
+		sink.Legacy = c.AuditGovernance
+	}
+	if sink.Endpoint == "" && c.AuditSinkL2.Endpoint != "" {
+		sink.Endpoint = c.AuditSinkL2.Endpoint
+	}
+	if sink.BindingsFile == "" && c.AuditSinkL2.BindingsFile != "" {
+		sink.BindingsFile = c.AuditSinkL2.BindingsFile
+	}
+	if len(sink.Bindings) == 0 && len(c.AuditSinkL2.Bindings) > 0 {
+		sink.Bindings = c.AuditSinkL2.Bindings
+	}
+	if sink.Kind == "" {
+		switch {
+		case sink.Legacy.Enabled, sink.Endpoint != "", sink.BindingsFile != "", len(sink.Bindings) > 0:
+			sink.Kind = AuditSinkKindL2
+		default:
+			sink.Kind = AuditSinkKindL0
+		}
+	}
+	return sink
+}
+
+// validateCommercialCredentialSeparation accepts the legacy type as well as
+// AuditSinkConfig so existing package-local callers retain their old seam
+// while the configuration validator covers bearer L2 credentials too.
+func validateCommercialCredentialSeparation(billing BillingConfig, credentials any) error {
+	switch value := credentials.(type) {
+	case AuditGovernanceConfig:
+		return validateLegacyCredentialSeparation(billing, value)
+	case AuditSinkConfig:
+		if err := validateLegacyCredentialSeparation(billing, value.Legacy); err != nil {
+			return err
+		}
+		if !billing.Enabled || normalizeAuditSinkKind(value.Kind) != AuditSinkKindL2 || value.Legacy.Enabled {
+			return nil
+		}
+		for _, auditBinding := range value.Bindings {
+			for _, billingBinding := range billing.Bindings {
+				if auditBinding.Token == billingBinding.ClientSecret {
+					return errors.New("audit sink bearer token and billing credentials must be distinct")
+				}
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported audit credential configuration %T", credentials)
+	}
+}
+
+func validateLegacyCredentialSeparation(
 	billing BillingConfig, governance AuditGovernanceConfig,
 ) error {
 	if !billing.Enabled || !governance.Enabled {
@@ -161,6 +218,9 @@ func (c *Config) validateTimeouts() error {
 	}
 	if c.App.ThumbnailCacheTTL < 0 {
 		return errors.New("THUMBNAIL_CACHE_TTL must be >= 0 (0 = disabled)")
+	}
+	if c.App.ThumbnailPerTenantDecodeSlots < 0 {
+		return errors.New("THUMBNAIL_PER_TENANT_DECODE_SLOTS must be >= 0 (0 = disabled)")
 	}
 	// Upper bound: values beyond one year would overflow time.Duration's
 	// nanosecond range at the wiring site (cmd/server/http.go), silently

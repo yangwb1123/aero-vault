@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +53,12 @@ func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slo
 		})
 		rwSub, _ := bus.Subscribe()
 		go rw.Run(ctx, rwSub)
+		if cfg.Replication.ResyncIntervalMinutes > 0 {
+			go replication.NewResyncer(repo, jobQueue,
+				time.Duration(cfg.Replication.ResyncIntervalMinutes)*time.Minute, logger).Run(ctx)
+			logger.Info("replication resync enabled",
+				"interval_minutes", cfg.Replication.ResyncIntervalMinutes)
+		}
 		logger.Info("replication enabled", "replica_backend", replica.Backend())
 	}
 	if jobReg != nil {
@@ -166,7 +173,8 @@ func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog
 	// while disabled (read-only, nil-repo-safe, never blocks startup — D6).
 	if !cfg.EventOutbox.Enabled {
 		logger.Info("event outbox relay disabled",
-			"backlog", eventOutboxBacklog(ctx, repo))
+			"backlog", eventOutboxBacklog(ctx, repo),
+			"audit_sink_kind", auditSinkKind(cfg))
 
 		return nil
 	}
@@ -179,20 +187,26 @@ func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog
 		DeliveredRetain: time.Duration(cfg.EventOutbox.DeliveredRetentionHours) * time.Hour,
 		FailedRetain:    time.Duration(cfg.EventOutbox.FailedRetentionHours) * time.Hour,
 	}
-	if cfg.AuditSinkL2.Endpoint != "" {
-		sink, err := events.NewAuditSinkL2(cfg.AuditSinkL2.Endpoint,
-			auditSinkL2Bindings(cfg.AuditSinkL2.Bindings),
-			events.NewAuditSinkL2Client(opts.HTTPTimeout), logger)
-		if err != nil {
-			return fmt.Errorf("build audit sink L2: %w", err)
-		}
-		opts.AuditSink = sink
-		logger.Info("event outbox relay L2 audit sink enabled", "endpoint", cfg.AuditSinkL2.Endpoint,
-			"bindings", len(cfg.AuditSinkL2.Bindings))
+	kind := auditSinkKind(cfg)
+	sink, err := auditSinkForEventOutbox(cfg, opts.HTTPTimeout, logger)
+	if err != nil {
+		return err
 	}
+	if sink != nil {
+		opts.AuditSink = sink
+		endpoint, bindings := auditSinkBearerConfig(cfg)
+		logger.Info("event outbox relay L2 audit sink enabled", "endpoint", endpoint,
+			"bindings", len(bindings), "kind", kind)
+	}
+	variant := "none"
+	if sink != nil {
+		variant = "bearer"
+	}
+	logger.Info("event outbox relay audit sink", "kind", kind, "variant", variant)
 	relay := events.NewEventOutboxRelay(repo, logger, opts)
 	go relay.Run(ctx)
 	logger.Info("event outbox relay started",
+		"audit_sink_kind", kind,
 		"poll_ms", cfg.EventOutbox.PollMilliseconds,
 		"batch", cfg.EventOutbox.BatchSize,
 		"claim_ttl_s", cfg.EventOutbox.ClaimTTLSeconds,
@@ -203,6 +217,51 @@ func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog
 		"backlog", eventOutboxBacklog(ctx, repo))
 
 	return nil
+}
+
+func auditSinkKind(cfg *config.Config) string {
+	kind := strings.ToUpper(strings.TrimSpace(cfg.AuditSink.Kind))
+	if kind != "" {
+		return kind
+	}
+	if cfg.AuditSink.Legacy.Enabled || cfg.AuditGovernance.Enabled ||
+		cfg.AuditSink.Endpoint != "" || cfg.AuditSink.BindingsFile != "" || len(cfg.AuditSink.Bindings) > 0 ||
+		cfg.AuditSinkL2.Endpoint != "" || cfg.AuditSinkL2.BindingsFile != "" || len(cfg.AuditSinkL2.Bindings) > 0 {
+		return config.AuditSinkKindL2
+	}
+	return config.AuditSinkKindL0
+}
+
+func auditSinkBearerConfig(cfg *config.Config) (string, []config.AuditSinkL2Binding) {
+	if cfg.AuditSink.Endpoint != "" || cfg.AuditSink.BindingsFile != "" || len(cfg.AuditSink.Bindings) > 0 {
+		return cfg.AuditSink.Endpoint, cfg.AuditSink.Bindings
+	}
+	endpoint := cfg.AuditSinkL2.Endpoint
+	bindings := cfg.AuditSinkL2.Bindings
+	if endpoint == "" {
+		endpoint = cfg.AuditSink.Endpoint
+		bindings = cfg.AuditSink.Bindings
+	}
+	return endpoint, bindings
+}
+
+func auditSinkForEventOutbox(
+	cfg *config.Config, timeout time.Duration, logger *slog.Logger,
+) (events.AuditSink, error) {
+	if auditSinkKind(cfg) != config.AuditSinkKindL2 ||
+		cfg.AuditSink.Legacy.Enabled || cfg.AuditGovernance.Enabled {
+		return nil, nil
+	}
+	endpoint, bindings := auditSinkBearerConfig(cfg)
+	if endpoint == "" {
+		return nil, nil
+	}
+	sink, err := events.NewAuditSinkL2(endpoint, auditSinkL2Bindings(bindings),
+		events.NewAuditSinkL2Client(timeout), logger)
+	if err != nil {
+		return nil, fmt.Errorf("build audit sink L2: %w", err)
+	}
+	return sink, nil
 }
 
 // eventOutboxBacklog returns the event_outbox depth for the startup log

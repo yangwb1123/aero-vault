@@ -60,6 +60,10 @@ func run() error {
 		return err
 	}
 	defer repo.Close()
+	var shareLister service.ShareLister
+	if lister, ok := repo.(service.ShareLister); ok {
+		shareLister = lister
+	}
 	accessManager, err := buildAccessManager(cfg, repo)
 	if err != nil {
 		return fmt.Errorf("configure enterprise access: %w", err)
@@ -93,7 +97,6 @@ func run() error {
 
 	svc := service.NewFileService(store, repo, logger).
 		WithEventSink(bus).
-		WithAuthorizer(accessManager).
 		WithDeleteFailOpen(!cfg.Access.DeleteFailClosed).
 		WithTenantStatusEnforcement().
 		WithReadVerification(service.ReadVerificationConfig{
@@ -101,6 +104,12 @@ func run() error {
 			MaxSize: cfg.Storage.VerifyMaxSize,
 			Sample:  cfg.Storage.VerifySample,
 		})
+	if accessManager != nil {
+		svc.WithAuthorizer(accessManager)
+	}
+	if shareLister != nil {
+		svc.WithShareLister(shareLister)
+	}
 	if billingRuntime != nil {
 		svc.WithUsageAccountant(billingRuntime)
 	}
@@ -160,7 +169,7 @@ func run() error {
 	adminRL.Start(ctx)
 
 	promHandler := buildPrometheus(cfg, logger)
-	registerGauges(repo, auditRuntime)
+	registerGauges(repo, auditRuntime, billingRuntime)
 
 	aiTimeout := time.Duration(cfg.App.RequestTimeoutSec) * time.Second
 	dispatcher := buildRouter(svc, repo, svc.Storage(), search, chat, agent, bus, authReg, accessManager, oidcHandler, promHandler, thumbCache, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider, runtimeReadiness(billingRuntime, auditRuntime))
@@ -198,6 +207,10 @@ func runMCP() error {
 	if err := repo.Migrate(ctx); err != nil {
 		return err
 	}
+	var shareLister service.ShareLister
+	if lister, ok := repo.(service.ShareLister); ok {
+		shareLister = lister
+	}
 	accessManager, err := buildAccessManager(cfg, repo)
 	if err != nil {
 		return fmt.Errorf("configure enterprise access: %w", err)
@@ -223,7 +236,13 @@ func runMCP() error {
 	ctx = access.SystemContext(ctx, "default")
 	bus := events.NewWithBuffer(repo, logger, cfg.Events.SubBufferSize)
 	defer bus.Close()
-	svc := service.NewFileService(store, repo, logger).WithAuthorizer(accessManager).WithEventSink(bus)
+	svc := service.NewFileService(store, repo, logger).WithEventSink(bus)
+	if accessManager != nil {
+		svc.WithAuthorizer(accessManager)
+	}
+	if shareLister != nil {
+		svc.WithShareLister(shareLister)
+	}
 	if !cfg.Access.DeleteFailClosed {
 		svc.WithDeleteFailOpen(true)
 	}

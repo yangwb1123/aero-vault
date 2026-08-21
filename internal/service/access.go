@@ -89,12 +89,14 @@ func (s *FileService) authorize(
 		return err
 	}
 	if s.authorizer == nil {
+		if action == access.ActionAdminDelete {
+			return fmt.Errorf("%w: no authorization provider configured", ErrForbidden)
+		}
 		if action == access.ActionDelete && !s.deleteFailOpen {
 			// Fail-closed (FR-1): with no provider configured, delete is
 			// denied unless the operator explicitly opted out. The only
-			// exemption is the antivirus quarantine actor pinned to the
-			// exact resource tenant (access.IsSystemDeleteExempt); every
-			// other principal — including other system actors — is denied.
+			// exemption is a trusted system context pinned to the exact
+			// resource tenant (access.IsSystemDeleteExempt).
 			if principal, ok := access.PrincipalFrom(ctx); ok && access.IsSystemDeleteExempt(principal, resource.TenantID) {
 				return nil
 			}

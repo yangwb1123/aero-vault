@@ -149,6 +149,9 @@ func (s *FileService) SetBucketQuota(ctx context.Context, tenant, bucket string,
 	if err := s.authorizeBucket(ctx, access.ActionManageACL, tenant, bucket); err != nil {
 		return err
 	}
+	if err := validateQuotaLimits(maxBytes, maxObjects); err != nil {
+		return err
+	}
 	return s.repo.SetBucketQuota(ctx, tenant, bucket, maxBytes, maxObjects)
 }
 

@@ -22,6 +22,9 @@ func (s *FileService) Usage(ctx context.Context, tenant string) (repository.Tena
 // SetQuota updates the caps for a tenant.
 func (s *FileService) SetQuota(ctx context.Context, tenant string, maxBytes, maxObjects int64) error {
 	tenant, _ = defaults(tenant, "")
+	if err := validateQuotaLimits(maxBytes, maxObjects); err != nil {
+		return err
+	}
 	return s.repo.SetTenantQuota(ctx, tenant, maxBytes, maxObjects)
 }
 
@@ -122,6 +125,9 @@ func (s *FileService) SetBucketObjectLock(ctx context.Context, tenant, bucket st
 func (s *FileService) SetBucketLifecycle(ctx context.Context, tenant, bucket string, days int, action string) error {
 	tenant, bucket = defaults(tenant, bucket)
 	if err := s.authorizeBucket(ctx, access.ActionManageACL, tenant, bucket); err != nil {
+		return err
+	}
+	if err := validateLifecycleDays("days", days); err != nil {
 		return err
 	}
 	return s.repo.SetBucketLifecycle(ctx, tenant, bucket, days, action)

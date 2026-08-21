@@ -153,7 +153,7 @@ func TestAC2_AdminDelete_EventTypeFilteredState(t *testing.T) {
 	if n := deliveredTotal(t, h.dsn); n != 0 {
 		t.Errorf("event_outbox_delivered rows = %d, want 0 (no relay)", n)
 	}
-	assertAuditRowFor(t, h.repo, "acme", "hard")
+	assertAuditRowFor(t, h.repo, "acme", "hard;permission=vault.file.delete")
 	if _, err := h.repo.GetObject(ctx, "acme", "default", "docs/a.txt"); err == nil {
 		t.Error("object still readable after admin hard delete")
 	}
@@ -343,7 +343,7 @@ func TestComposition_AdminFilesDeleteEndToEnd(t *testing.T) {
 				Detail   string `json:"detail"`
 			}
 			_ = json.Unmarshal(raw, &row)
-			if row.Action == "file.delete" && row.TenantID == "acme" && row.Detail == "hard" {
+			if row.Action == "file.delete" && row.TenantID == "acme" && row.Detail == "hard;permission=vault.file.delete" {
 				found = true
 			}
 		}

@@ -6,9 +6,9 @@ package access
 // deletion, resolved to the PDP action ActionDelete.
 const PermissionVaultFileDelete = "vault.file.delete"
 
-// SystemActorAntivirus is the one internal system principal allowed to delete
-// without an authorizer (AV quarantine). Any other system actor fails closed
-// under the fail-closed delete gate — see IsSystemDeleteExempt.
+// SystemActorAntivirus identifies the actor used by the AV quarantine path.
+// It remains part of the public context vocabulary for compatibility; all
+// trusted system contexts are exempt from the delete gate below.
 const SystemActorAntivirus = "system:antivirus"
 
 // ActionForPermission resolves an external permission name to its PDP action.
@@ -21,13 +21,10 @@ func ActionForPermission(permission string) (Action, bool) {
 	return "", false
 }
 
-// IsSystemDeleteExempt reports whether the principal is the one internal
-// system actor allowed to delete while no authorizer is configured (the AV
-// quarantine path). The match requires exact tenant equality (no "*"
-// wildcard): the antivirus worker always pins obj.TenantID, so a wildcard
-// would grant any system actor with a "*" tenant delete rights everywhere.
+// IsSystemDeleteExempt reports whether an internal system principal may delete
+// while no authorizer is configured. The match requires exact tenant equality
+// (no "*" wildcard), so a system context cannot cross tenant boundaries.
 func IsSystemDeleteExempt(principal Principal, tenant string) bool {
 	return principal.Kind == PrincipalSystem &&
-		principal.SubjectID == SystemActorAntivirus &&
 		principal.TenantID != "" && principal.TenantID == tenant
 }

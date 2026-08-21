@@ -50,7 +50,7 @@ func nonZeroTime(t time.Time) *time.Time {
 // GET /v1/admin/jobs?status=&type=&limit=
 // Returns recent jobs plus a status histogram for the dashboard.
 func (h *AdminHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	q := r.URL.Query()
@@ -74,7 +74,7 @@ func (h *AdminHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/admin/jobs/{id}/retry — requeue a job (e.g. after permanent failure).
 func (h *AdminHandler) RetryJob(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) {
 		return
 	}
 	id, err := strconv.ParseInt(chiURLParam(r, "id"), 10, 64)

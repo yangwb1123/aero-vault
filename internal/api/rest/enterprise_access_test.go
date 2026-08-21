@@ -52,7 +52,7 @@ func newEnterpriseRESTTest(t *testing.T) (*httptest.Server, string, string, repo
 	svc := service.NewFileService(store, repo, nil).WithDeleteFailOpen(true).
 		WithAuthorizer(manager).
 		WithTenantStatusEnforcement()
-	reg, err := auth.Parse("alice:default:read+write,operator:*:admin")
+	reg, err := auth.Parse("alice:default:read+write+vault.file.delete,operator:*:admin")
 	if err != nil {
 		t.Fatal(err)
 	}

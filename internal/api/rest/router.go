@@ -211,6 +211,7 @@ func init() {
 		{Method: "GET", Path: "/v1/admin/webhook-failures", Summary: "List webhook failures", Tag: "admin", AdminOnly: true, Status: 200},
 		{Method: "GET", Path: "/v1/admin/audit", Summary: "List audit log", Tag: "admin", AdminOnly: true, Status: 200},
 		{Method: "DELETE", Path: "/v1/admin/files/{tenant}/{key}", Summary: "Delete a file in any tenant (admin)", Tag: "admin", AdminOnly: true, Status: 204},
+		{Method: "DELETE", Path: "/v1/admin/files/{tenant}/{bucket}/{key}", Summary: "Delete a file in any tenant and bucket (vault.file.delete)", Tag: "admin", AdminOnly: true, Status: 204},
 		{Method: "POST", Path: "/v1/admin/departments", Summary: "Create a department", Tag: "admin", AdminOnly: true, Body: `{"name":"engineering","parent_id":""}`, Status: 201},
 		{Method: "GET", Path: "/v1/admin/departments", Summary: "List departments", Tag: "admin", AdminOnly: true, Status: 200},
 		{Method: "GET", Path: "/v1/admin/departments/{id}", Summary: "Get department and members", Tag: "admin", AdminOnly: true, Status: 200},
@@ -222,17 +223,36 @@ func init() {
 
 // NewRouter returns a sub-router mounted at /v1.
 func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger, idemHashBody bool, aiRL, adminRL *mw.RateLimiter, aiTimeout time.Duration, aiDegraded bool, opts ...func(*Handler)) chi.Router {
+	return newRouter(svc, repo, search, chat, agent, bus, reg, logger, idemHashBody, aiRL, adminRL, aiTimeout, aiDegraded, nil, true, opts...)
+}
+
+// NewRouterWithAdminAuthorizationProvider is the explicit composition entry
+// point for the administrative delete provider. A nil provider is retained as
+// an intentional fail-closed setting.
+func NewRouterWithAdminAuthorizationProvider(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger, idemHashBody bool, aiRL, adminRL *mw.RateLimiter, aiTimeout time.Duration, aiDegraded bool, adminAuthz AuthorizationProvider, opts ...func(*Handler)) chi.Router {
+	return newRouter(svc, repo, search, chat, agent, bus, reg, logger, idemHashBody, aiRL, adminRL, aiTimeout, aiDegraded, adminAuthz, true, opts...)
+}
+
+func newRouter(svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, reg *auth.Registry, logger *slog.Logger, idemHashBody bool, aiRL, adminRL *mw.RateLimiter, aiTimeout time.Duration, aiDegraded bool, adminAuthz AuthorizationProvider, adminAuthzSet bool, opts ...func(*Handler)) chi.Router {
 	h := NewHandler(svc, logger)
 	h.thumbnailTimeout = aiTimeout // REQUEST_TIMEOUT_SECONDS; 0 = disabled
 	if reg != nil {
 		h.WithPutPresigner(reg.PutPresigner())
+	}
+	if adminAuthzSet {
+		h.WithAdminAuthorizationProvider(adminAuthz)
 	}
 	for _, opt := range opts {
 		opt(h)
 	}
 	aih := NewAIHandler(repo, search, chat, agent, logger, aiDegraded)
 	sse := NewSSEHandler(bus, repo, logger)
-	adm := NewAdminHandler(svc, repo, reg)
+	var adm *AdminHandler
+	if h.adminAuthzSet {
+		adm = NewAdminHandler(svc, repo, reg, h.adminAuthz)
+	} else {
+		adm = NewAdminHandler(svc, repo, reg)
+	}
 	r := chi.NewRouter()
 	if reg != nil {
 		r.Use(requireRESTScope(reg))
@@ -360,6 +380,7 @@ func NewRouter(svc *service.FileService, repo repository.Repository, search *ai.
 		r.Put("/admin/tenants/{tenant}/status", adm.SetTenantStatus)
 		r.Get("/admin/audit", adm.ListAudit)
 		r.Get("/admin/config", adm.GetConfig)
+		r.Delete("/admin/files/{tenant}/{bucket}/*", adm.DeleteFileInBucket)
 		r.Delete("/admin/files/{tenant}/*", adm.DeleteFile)
 		if h.access != nil {
 			r.Post("/admin/departments", h.CreateDepartment)

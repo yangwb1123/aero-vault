@@ -64,7 +64,7 @@ func newBucketQuotaAuthTestServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatalf("new local storage: %v", err)
 	}
-	reg, err := auth.Parse("writer:default:write,operator:acme:admin")
+	reg, err := auth.Parse("writer:default:write,operator:*:admin")
 	if err != nil {
 		t.Fatalf("parse auth: %v", err)
 	}
@@ -155,6 +155,10 @@ func TestBucketConfig(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PUT lifecycle: status=%d want 200, body=%s", resp.StatusCode, body)
 	}
+	resp, body = req(t, "PUT", base+"/lifecycle", []byte(`{"days":-1,"action":"soft_delete"}`), nil)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "days") {
+		t.Fatalf("negative lifecycle: status=%d want 400, body=%s", resp.StatusCode, body)
+	}
 
 	// 9. GET config → expire_after_days is 30
 	_, body = req(t, "GET", base+"/config", nil, nil)
@@ -193,6 +197,10 @@ func TestAdminBucketQuotaRequiresAdmin(t *testing.T) {
 	resp, got = req(t, http.MethodPut, url, body, operatorHeaders)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin key: status=%d want 200, body=%s", resp.StatusCode, got)
+	}
+	resp, got = req(t, http.MethodPut, url, []byte(`{"max_objects":-1}`), operatorHeaders)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(got), "max_objects") {
+		t.Fatalf("negative bucket quota: status=%d want 400, body=%s", resp.StatusCode, got)
 	}
 
 	resp, got = req(t, http.MethodGet, srv.URL+"/v1/admin/audit", nil, operatorHeaders)

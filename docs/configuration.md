@@ -10,7 +10,8 @@ Notes that apply throughout:
 - **Empty-string handling:** an environment variable that is set but empty is
   treated as *unset* (the default applies).
 - **Booleans** accept Go `strconv.ParseBool` values: `true`/`false`, `1`/`0`,
-  `t`/`f`, etc. An unparseable value falls back to the default.
+  `t`/`f`, etc. A non-empty unparseable value fails startup with an error
+  naming the variable. Integer and float values follow the same fail-fast rule.
 - **Defaults** below are the in-code defaults from `internal/config/config.go`.
 - Variables marked *(config.go only)* are honored by the loader but are **not**
   listed in `.env.example`.
@@ -18,7 +19,9 @@ Notes that apply throughout:
 Validation (fails fast on startup): the storage backend must be one of
 `local|s3|oss|cos` and its required fields must be present; `DB_DRIVER` must be
 `sqlite|postgres` and `DB_DSN` non-empty; if `AI_INDEX_ENABLED=true` and
-`AI_EMBED_PROVIDER=http`, then `AI_EMBED_ENDPOINT` is required.
+`AI_EMBED_PROVIDER=http`, then `AI_EMBED_ENDPOINT` is required. Any non-empty
+boolean, integer, or float environment value that cannot be parsed also aborts
+startup; the error names the affected variable and value.
 
 ---
 
@@ -37,6 +40,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `REQUEST_TIMEOUT_SECONDS` | `120` | Per-request context deadline applied to all AI endpoints (`/search`, `/chat`, `/chat/stream`, `/agent`, `/lineage`) **and the `/thumbnail` route** (bounding the decode-slot wait, see "Thumbnail decode budget"). Set to `0` to disable. |
 | `THUMBNAIL_CACHE_BYTES` | `0` | Server-side thumbnail output cache budget in bytes (see "Thumbnail decode budget"); `0` disables the cache (default, zero allocation, byte-identical behavior). |
 | `THUMBNAIL_CACHE_TTL` | `0` | Thumbnail cache entry retention in seconds; `0` disables expiry (unbounded — the pre-TTL behavior, byte-for-byte). When `> 0` every cached thumbnail expires this long after it was last generated (fixed TTL from the last store; hits do not extend it). Negative values and values `> 31536000` (1 year) are rejected at startup (the latter fails fast on `time.Duration` overflow). A positive TTL with `THUMBNAIL_CACHE_BYTES=0` is a harmless no-op (cache is a pass-through). |
+| `THUMBNAIL_PER_TENANT_DECODE_SLOTS` | `0` | Optional per-tenant ceiling inside the thumbnail decode semaphore; `0` disables the extra gate. Positive values are clamped to the global four-slot capacity. The tenant slot is acquired before the global slot, so one noisy tenant cannot occupy every decode slot while another tenant is admitted. |
 | `MAX_INFLIGHT_REQUESTS` | `0` | Global weighted in-flight request limit (reads cost 1, writes cost 2); `0` disables. |
 | `PER_TENANT_CONCURRENCY_MAX` | `0` | Optional per-tenant in-flight limit used alongside the global cap; `0` disables per-tenant partitioning. |
 | `EVENTS_SUB_BUFFER` | `64` | Per-subscriber in-process event channel buffer depth. Increase if subscribers fall behind under high event throughput. Set to `0` to use the default. |
@@ -177,7 +181,7 @@ Validation (fails fast on startup): the storage backend must be one of
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = operator (any tenant). Empty disables API-key auth (MVP/open mode). **Deployment caveat — the `admin` scope is operator-grade on its own:** `requireAdmin` checks scope only (never the caller's tenant) and the admin API takes the target tenant from the request body/path, so a tenant-scoped admin key (e.g. `ops:acme:admin`) is operator-equivalent: it can mint keys/JWTs for any tenant, delete files in any tenant, and set quotas. Never issue tenant-scoped admin keys unless operator equivalence is intended. |
+| `AUTH_KEYS` | _(empty = open)_ | Comma-separated API keys as `token:tenant:scope+scope` (e.g. `prod-rw:acme:read+write,ops:*:admin`). Tenant `*` = cross-tenant operator. Empty disables API-key auth (MVP/open mode). An `admin` key scoped to a tenant is confined to that tenant for quota/budget, delegated keys/JWTs, key revocation, bucket quota, and admin file deletion; global tenant/job/audit/config views require `tenant=*`. |
 | `AUTH_JWT_SECRET` | _(empty)_ | Secret enabling HS256 JWT verification and issuance (`POST /v1/admin/jwt`). |
 | `AUTH_JWKS_ENDPOINT` | _(empty)_ | Snaplink JWKS URL. Setting it activates `interfaces/ssoclient/rs`; Aero does not implement external JWT cryptography. |
 | `AUTH_JWKS_KEY_TTL` | `3600` | Snaplink SDK background JWKS refresh interval in seconds; unknown keys also trigger the SDK's bounded refresh path. |
@@ -193,7 +197,7 @@ Validation (fails fast on startup): the storage backend must be one of
 | `AUTH_OIDC_TOKEN_ENDPOINT` | `<issuer>/token` | Authorization-code token endpoint. |
 | `AUTH_OIDC_SCOPES` | `openid,profile,email` | Comma-separated scopes requested during login. |
 | `AUTH_PRESIGN_SECRET` | _(empty = process-random)_ | HMAC key for REST presigned GET/PUT capability URLs. Configured values must be at least 32 bytes. Set the same value on every replica so URLs survive restarts and load-balancer routing; an empty value is suitable only for single-process development because issued URLs become invalid after restart. GET capabilities still traverse Aero Vault, so tenant suspension, bucket policy, ACL explicit deny, and object deletion take effect immediately. |
-| `AUTH_ANONYMOUS_PUBLIC_READ` | `false` | Parse-only (no effect through the production chain): intended to allow unauthenticated `GET`/`HEAD` of public-read objects with the handler ACL gate enforcing object ACLs. The auth ring does admit anonymous object reads (`internal/auth`), but the REST router's `requireRESTScope` scope gate then rejects them with `401 not authenticated` before the handler's ACL check runs (`requireRESTScope` → `Require(read)` has no anonymous carve-out); the S3 gateway has no anonymous admission at all. The flag therefore currently serves no path — do not rely on it until the 12-ring fix lands (recorded as defect S1 in `docs/requirements/internal-cli-activation-gate-scope-matrix-e2e-v1.design.md` §2.5, with a 12-ring integration test as the acceptance vehicle). |
+| `AUTH_ANONYMOUS_PUBLIC_READ` | `false` | When an auth source is enabled, allows unauthenticated REST `GET`/`HEAD` object requests to reach the ACL gate; only objects with `public-read` ACL are served. Object subresources, listings, writes, and the S3 gateway still require credentials. With all auth sources empty, the documented open-MVP pass-through remains in effect. |
 | `AUTH_PERSIST_KEYS` | `false` | Back runtime API keys with the DB (`api_keys` table, tokens sha256-hashed). Keys survive restart and are shared across replicas. Also acts as an implicit auth switch: setting this without `AUTH_KEYS` still enables auth. |
 | `AUTH_KEY_CACHE_TTL_SECONDS` | `0` | `>0` adds a bounded TTL'd read-through cache in front of the DB key lookup, reducing per-request DB hits. Revokes are bounded by this TTL — keep short (e.g. 30). When `EVENTS_TRANSPORT_DSN` is set, add/revoke also broadcasts immediately via a dedicated Postgres LISTEN/NOTIFY channel (`aero_key_invalidate`) so other replicas drop the cache entry without waiting for TTL expiry. |
 | `S3_SIGV4_CREDENTIALS` | _(empty)_ | AWS SigV4 credentials for the S3 endpoint: `accessKey:secretKey:tenant[:scope+scope]`, comma-separated (e.g. `AKIA...:secret...:acme:read+write`). |
@@ -206,11 +210,10 @@ authentication source (API key, JWT/JWKS, SigV4, or persistent API-key store).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ACCESS_CONTROL_ENABLED` | `false` | Enable normalized principals, ownership, department/resource ACL enforcement, protected shares, and public assets. |
-| `ACCESS_DELETE_FAIL_CLOSED` | `true` | Fail-closed delete gate: with access control disabled (`ACCESS_CONTROL_ENABLED=false`), object deletes (REST/WebDAV/admin/MCP/quarantine via the service gate) are denied unless this is explicitly `false` (restores the legacy allow). **The S3 gateway is unaffected** — it always denies deletes without access control, and this flag does not re-enable it; only `ACCESS_CONTROL_ENABLED=true` does. See breaking-change notes. |
+| `ACCESS_DELETE_FAIL_CLOSED` | `true` | Fail-closed delete gate: with access control disabled (`ACCESS_CONTROL_ENABLED=false`), object deletes (REST/WebDAV/MCP/quarantine via the service gate) are denied unless this is explicitly `false` (restores the legacy allow). The S3 gateway always denies deletes without access control. The admin-delete boundary (`DELETE /v1/admin/files/...`) additionally requires an attributable authenticated admin principal, so it remains 403 when the auth registry is disabled regardless of this flag. |
 | `ACCESS_DEFAULT_POLICY` | `deny` | `deny` requires ownership/ACL/admin access. `tenant` allows the existing `read`/`write` scope fallback only when no resource ACL applies; useful for gradual migration. |
 | `ACCESS_SHARE_SECRET` | _(empty)_ | Required when enabled; at least 32 bytes and identical on every replica. HMAC-protects share passwords. |
 | `ACCESS_PUBLIC_BASE_URL` | _(empty)_ | Canonical external base URL placed in returned share/asset URLs, e.g. `https://source.ywbsd.site`. Empty derives it from the request. |
-| `ACCESS_DELETE_FAIL_CLOSED` | `true` | `false` restores the legacy nil-authorizer → allow delete baseline (`WithDeleteFailOpen`); default denies deletes without an authorizer (the antivirus system actor stays exempt). |
 
 For Snaplink, configure a tenant-bound `aero-vault` OAuth client, pin issuer and
 audience, and map that trusted client to the Aero tenant. State/cookie handling,
@@ -249,12 +252,28 @@ contain a client secret because the decoder rejects unknown fields.
 | `BILLING_OUTBOX_POLL_MILLISECONDS` | `1000` | Durable usage outbox polling interval. |
 | `BILLING_OUTBOX_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
 | `BILLING_OUTBOX_CLAIM_TTL_SECONDS` | `30` | Multi-replica delivery lease; must exceed the HTTP timeout. |
+| `BILLING_OUTBOX_MAX_ATTEMPTS` | `10` | Per-fact delivery cap (`1..1000`); a fact failing past the cap becomes terminal `failed` and is never reclaimed. |
+| `BILLING_MAX_LAG_SECONDS` | `900` | Backlog age above this value marks billing degraded while `/readyz` remains 200; must exceed the claim TTL and be at most 604800. |
 
 See [Snaplink billing integration](snaplink-billing.md) for binding format,
 central source-binding requirements, quota semantics, failure behavior, and a
 Helm mounting example.
 
-## Snaplink Audit Governance relay
+## Audit sink selection
+
+`AUDIT_SINK_KIND` is the single selector for the audit adapter. It is
+case-insensitive; when empty it derives `L2` from either legacy governance or
+bearer L2 settings, and otherwise defaults to `L0`. `L1` uses the existing
+event/protocol surface and needs no governance credentials. `L0` and `L1`
+reject L2 credentials; `L2` requires exactly one configured endpoint variant.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUDIT_SINK_KIND` | `L0` | `L0` = local `audit_log`, `L1` = existing event/protocol surface, `L2` = external governance sink. Explicit `L0`/`L1` cannot be combined with legacy or bearer L2 credentials. |
+| `AUDIT_SINK_L2_ENDPOINT` | _(empty)_ | Bearer L2 endpoint. HTTPS is required except for loopback HTTP; it is required when `AUDIT_SINK_KIND=L2` selects the bearer variant. |
+| `AUDIT_SINK_L2_BINDINGS_FILE` | _(empty)_ | Owner-only JSON tenant-to-bearer-token bindings for the bearer L2 variant. |
+
+## Snaplink Audit Governance relay (legacy L2 mapping)
 
 This optional, default-off runtime forwards only redacted admin, security, and
 file lifecycle facts. It is independent from browser OIDC and from Billing;
@@ -275,7 +294,7 @@ secret values.
 | `AUDIT_GOVERNANCE_CLAIM_TTL_SECONDS` | `30` | Fenced delivery lease (`1..60`); must exceed twice the HTTP timeout so publish plus acknowledgement/retry remain fenced. |
 | `AUDIT_GOVERNANCE_INITIAL_BACKOFF_SECONDS` | `1` | Initial retry delay before deterministic jitter. |
 | `AUDIT_GOVERNANCE_MAX_BACKOFF_SECONDS` | `300` | Retry cap (`2..86400`): the per-attempt delay **and** the cumulative transient-retry window. A fact failing with transient-only errors (e.g. a receiver answering 500) is re-POSTed with bounded backoff until `now − first attempt` strictly exceeds this value, then dead-letters with the same terminal-with-retention semantics as permanent classes (`failed_at_ns` set, never re-claimed, pruned after the delivered retention). The window anchor (`first_attempt_at_ns`) is set once on the row's first claim and survives lease/ack-lost re-claims. |
-| `AUDIT_GOVERNANCE_MAX_LAG_SECONDS` | `900` | Oldest undelivered outbox age after which the relay reports degraded (`degraded=1`; `/readyz` stays `200` with `degraded:true`). The `AuditGovernanceBacklogDegraded` alert fires earlier at half this value (450s at default) as early warning, or immediately when degraded. |
+| `AUDIT_GOVERNANCE_MAX_LAG_SECONDS` | `900` | Oldest undelivered outbox age after which the relay reports degraded (`degraded=1`; `/readyz` stays `200` with `degraded:true`). The `AuditGovernanceBacklogDegraded` alert evaluates the age arm at half this value through the `audit_governance_max_lag_seconds` metric (450s at default), or immediately when degraded. |
 | `AUDIT_GOVERNANCE_RECONCILE_BATCH_SIZE` | `100` | Historical local facts reconciled per tenant and poll (`2..500`); batches alternate admin/security and file origins. |
 | `AUDIT_GOVERNANCE_DELIVERED_RETENTION_SECONDS` | `604800` | Retain delivered outbox bodies before replacing them with permanent origin tombstones (`3600..31536000`). |
 | `AUDIT_GOVERNANCE_CLEANUP_INTERVAL_SECONDS` | `3600` | Delivered-row cleanup interval (`60..86400`, no greater than retention). Full batches continue at the poll interval. |
@@ -337,6 +356,7 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 | `REPLICATION_S3_ACCESS_KEY` | _(empty)_ | Replica S3 access key. |
 | `REPLICATION_S3_SECRET_KEY` | _(empty)_ | Replica S3 secret key. |
 | `REPLICATION_S3_FORCE_PATH_STYLE` | `true` | Path-style addressing for the replica S3 endpoint. *(config.go only)* |
+| `REPLICATION_RESYNC_INTERVAL_MINUTES` | `0` | Periodic sweep re-enqueuing replication for active objects without `repl_status=replicated`; `0` disables. |
 
 > The replica reuses the same `StorageConfig` shape; OSS/COS replica targets are
 > constructed from the corresponding `STORAGE_OSS_*` / `STORAGE_COS_*` values
@@ -356,17 +376,14 @@ Async replication to a secondary backend; requires `JOBS_WORKERS>0`.
 File delete (`FileService.Delete`, hard and soft) commits the metadata delete and two versioned event facts (`vault.file.deleted@1.1` / `vault.file.notify@1.1`) in **one transaction**; the always-on relay — unless `EVENT_OUTBOX_ENABLED=false` — drains them (claim → deliver → complete). `notify@1.1` facts are POSTed byte-exact to matching bucket-notification targets; `deleted@1.1` facts are durable lifecycle records that are completed without local re-broadcast. Delivery is exactly-once only after `complete`; the deliver→complete window is at-least-once (S3-equivalent) — receivers must be idempotent. |
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EVENT_OUTBOX_ENABLED` | `true` | Kill-switch for the relay loop (claim → deliver → complete → prune). Enqueue of the two delete facts is **never** gated — rows keep accumulating while disabled and drain (FIFO) once re-enabled. Unparseable values fall back to the default (`true`). |
+| `EVENT_OUTBOX_ENABLED` | `true` | Kill-switch for the relay loop (claim → deliver → complete → prune). Enqueue of the two delete facts is **never** gated — rows keep accumulating while disabled and drain (FIFO) once re-enabled. Non-empty unparseable values fail startup. |
 | `EVENT_OUTBOX_POLL_INTERVAL_MILLIS` | `1000` | Relay claim poll interval (`1..60000`). |
 | `EVENT_OUTBOX_BATCH_SIZE` | `32` | Facts claimed per poll (`1..500`). |
-| `EVENT_OUTBOX_ENABLED` | `true` | Gates the relay loop entirely; `false` logs a nil-repo-safe disabled line and skips the L2 sink build. |
-| `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` | `24` | Delivered rows are pruned after this many hours (`1..8760`). |
-| `EVENT_OUTBOX_FAILED_RETENTION_HOURS` | `168` | Terminal-failed rows are pruned after this many hours (`1..8760`). |
 | `EVENT_OUTBOX_CLAIM_TTL_SECONDS` | `30` | Fenced delivery lease; must exceed twice `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` so a slow target plus lease expiry cannot cause concurrent duplicate POSTs without any crash (`1..600`). Worst-case in-flight time per fact is `targets×timeout` — raise the TTL when a rule targets more than 3 endpoints at the default timeout. |
 | `EVENT_OUTBOX_HTTP_TIMEOUT_SECONDS` | `5` | Per-target HTTP POST timeout (`1..29`). |
 | `EVENT_OUTBOX_MAX_ATTEMPTS` | `10` | Delivery attempts before a fact becomes terminal `failed` (`1..1000`); prune cutoffs are configurable — defaults 24h for delivered, 7 days for failed, see `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` / `EVENT_OUTBOX_FAILED_RETENTION_HOURS`. |
-| `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` | `24` | Delivered rows are pruned after this many hours (`1..8760`). Non-numeric values silently fall back to the default (`24`). Prune runs once per 60 relay rounds — a 60s–60min cadence across the poll bounds — so effective retention is the horizon plus up to one prune interval (≈2× the horizon at the extremes, e.g. poll 60s + retention 1h ⇒ 1–2h). With replicas sharing one `event_outbox` table, effective retention is the **minimum across running nodes** — the most aggressive prune wins fleet-wide; configure identically on every replica. |
-| `EVENT_OUTBOX_FAILED_RETENTION_HOURS` | `168` | Terminal `failed` rows are pruned after this many hours (`1..8760`; default 168 = 7 days, matching the shipped behavior). Non-numeric values silently fall back to the default (`168`). Same prune cadence and fleet-min property as `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS`. |
+| `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS` | `24` | Delivered rows are pruned after this many hours (`1..8760`). Non-empty non-numeric values fail startup. Prune runs once per 60 relay rounds — a 60s–60min cadence across the poll bounds — so effective retention is the horizon plus up to one prune interval (≈2× the horizon at the extremes, e.g. poll 60s + retention 1h ⇒ 1–2h). With replicas sharing one `event_outbox` table, effective retention is the **minimum across running nodes** — the most aggressive prune wins fleet-wide; configure identically on every replica. |
+| `EVENT_OUTBOX_FAILED_RETENTION_HOURS` | `168` | Terminal `failed` rows are pruned after this many hours (`1..8760`; default 168 = 7 days, matching the shipped behavior). Non-empty non-numeric values fail startup. Same prune cadence and fleet-min property as `EVENT_OUTBOX_DELIVERED_RETENTION_HOURS`. |
 | `AUDIT_SINK_L2_ENDPOINT` | _(empty = L2 off)_ | Optional L2 audit sink: the relay POSTs each `vault.file.deleted@1.1` fact to this URL with the tenant's bearer token. Must be an absolute URL without credentials/query/fragment; scheme must be `https`, or `http` only to a loopback host (`localhost` / loopback IP). Enforced twice at startup (config validation + relay construction) — an invalid value aborts boot. Empty disables L2: facts are still completed without delivery and the L0 `audit_log` stays authoritative. |
 | `AUDIT_SINK_L2_BINDINGS_FILE` | _(empty)_ | JSON file `{"bindings":[{"tenant":"…","token":"…"\|"token_env":"…"}]}` mapping tenant → bearer token. Must be a regular file with mode 0600 (owner-only) and ≤1 MiB; unknown fields and trailing JSON are rejected — any violation fails startup. `token` values must be ≥16 characters with no surrounding whitespace; prefer the `token_env` indirection (env var must start with `AUDIT_SINK_L2_TOKEN_` and resolve) to keep secrets out of the filesystem. Duplicate tenants or tokens are rejected. The wildcard tenant `"*"` is accepted as an operator-grade mapping (same trust class as the auth operator key). Without this file every tenant is unbound: deleted facts complete without delivery — the startup log line `event outbox relay L2 audit sink enabled … bindings: 0` is the only signal. |
 
@@ -430,6 +447,15 @@ Per-request worst-case decode allocation: ≈ 268 MiB (PNG RGBA at `MaxSourceDim
 ≈ 275 MiB (progressive JPEG, capped at `MaxProgressiveSourceDim`). Aggregate
 ceilings: ≈ 1.1 GiB (PNG RGBA) / ≈ 1.1 GiB (progressive JPEG) across all
 concurrent decodes.
+
+**Cross-tenant admission:** `THUMBNAIL_PER_TENANT_DECODE_SLOTS` is an opt-in
+ceiling applied only to cache misses that enter the decode pipeline. A cache
+hit still performs no admission or decode. The tenant reservation is taken
+before the global semaphore and is released after the object stream closes;
+waiting requests hold neither a stream nor a global slot. With the default
+`0`, this layer is absent and the package retains the original global-only
+semaphore behavior. Values above `4` are clamped to the global capacity, and
+request cancellation releases both reservations.
 
 **Decode-slot wait contract:** on the REST derivation path the decode slot is
 acquired **before** the object stream opens (`thumbnail.GenerateContextWithOpener`
@@ -498,7 +524,8 @@ On the REST path the cache is consulted only after bucket-policy and
 anonymous-read authorization and after the 304 fast path; the tenant
 component of the key isolates tenants. Observability: `thumbnail.cache.hits_total`
 / `misses_total` / `evictions_total` / `expired_total` (TTL-expired reads;
-excluded from the hit-ratio miss class) / `swept_total` (sweep removals) at
+excluded from the hit-ratio miss class) / `swept_total` (sweep removals) /
+`bypasses_total{reason=non-content-md5|sse-c|sse-kms|store-refused}` at
 `/metrics` (`PROMETHEUS_ENABLED=true`).
 
 **Compliance & retention notes (what an auditor can cite):** the cache holds

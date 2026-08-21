@@ -52,5 +52,8 @@ func (s *FileService) SetBucketLifecycleFull(
 	if err := s.authorizeBucket(ctx, access.ActionManageACL, tenant, bucket); err != nil {
 		return err
 	}
+	if err := validateLifecycleConfig(config); err != nil {
+		return err
+	}
 	return s.repo.SetBucketLifecycleFull(ctx, tenant, bucket, config)
 }

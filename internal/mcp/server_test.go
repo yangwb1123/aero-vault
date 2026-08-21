@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/aero-vault/aero-vault/internal/ai"
+	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
@@ -18,8 +21,12 @@ import (
 
 // handle sends a single JSON-RPC message and decodes the response envelope.
 func handle(t *testing.T, srv *Server, body string) rpcResponse {
+	return handleCtx(t, srv, context.Background(), body)
+}
+
+func handleCtx(t *testing.T, srv *Server, ctx context.Context, body string) rpcResponse {
 	t.Helper()
-	raw := srv.Handle(context.Background(), []byte(body))
+	raw := srv.Handle(ctx, []byte(body))
 	if raw == nil {
 		t.Fatal("Handle returned nil for non-notification request")
 	}
@@ -28,6 +35,21 @@ func handle(t *testing.T, srv *Server, body string) rpcResponse {
 		t.Fatalf("unmarshal response: %v\n  raw: %s", err, raw)
 	}
 	return resp
+}
+
+func tenantContext(t *testing.T, tenant string) context.Context {
+	t.Helper()
+	var ctx context.Context
+	handler := mw.Tenant(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		ctx = r.Context()
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	request.Header.Set(mw.TenantHeader, tenant)
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+	if ctx == nil {
+		t.Fatal("tenant middleware did not capture a context")
+	}
+	return ctx
 }
 
 // handleResult calls handle and returns the Result as a re-marshalled []byte.
@@ -438,6 +460,43 @@ func TestCallTool_DeleteFile_NotFound(t *testing.T) {
 	}
 }
 
+func TestCallTool_DeleteFile_FailClosed(t *testing.T) {
+	srv, svc, _ := newTestServerNoAuthorizer(t, nil)
+	seedObject(t, svc, "default", "default", "keep.txt", "must survive")
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_file","arguments":{"key":"keep.txt"}}}`
+	resp := handle(t, srv, req)
+	if resp.Error != nil {
+		t.Fatalf("unexpected JSON-RPC error: %+v", resp.Error)
+	}
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var result toolResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode tool result: %v", err)
+	}
+	if !result.IsError || len(result.Content) == 0 {
+		t.Fatalf("expected fail-closed delete result, got %+v", result)
+	}
+	message := result.Content[0].Text
+	if !strings.Contains(message, "forbidden") ||
+		!strings.Contains(message, "no authorization provider configured") {
+		t.Fatalf("unexpected denial message: %q", message)
+	}
+
+	readReq := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"key":"keep.txt"}}}`
+	readRaw := handleResult(t, srv, readReq)
+	var readResult toolResult
+	if err := json.Unmarshal(readRaw, &readResult); err != nil {
+		t.Fatalf("decode read result: %v", err)
+	}
+	if readResult.IsError || len(readResult.Content) == 0 ||
+		!strings.Contains(readResult.Content[0].Text, "must survive") {
+		t.Fatalf("delete had a side effect: %+v", readResult)
+	}
+}
+
 // ---- tools/call: unknown tool ----
 
 func TestCallTool_UnknownTool(t *testing.T) {
@@ -642,6 +701,49 @@ func TestReadResource_InvalidParams(t *testing.T) {
 	resp := handle(t, srv, req)
 	if resp.Error == nil || resp.Error.Code != -32602 {
 		t.Errorf("want -32602 invalid params, got %+v", resp.Error)
+	}
+}
+
+func TestReadResource_TenantMismatch(t *testing.T) {
+	srv, _, _ := newTestServer(t, nil)
+	ctx := tenantContext(t, "default")
+	req := `{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"aero-vault://other/default/secret.txt"}}`
+	resp := handleCtx(t, srv, ctx, req)
+	if resp.Error == nil || resp.Error.Code != -32000 ||
+		!strings.Contains(resp.Error.Message, "tenant mismatch") {
+		t.Fatalf("expected tenant mismatch error, got %+v", resp.Error)
+	}
+}
+
+func TestReadResource_TenantScoped(t *testing.T) {
+	srv, svc, _ := newTestServer(t, nil)
+	seedObject(t, svc, "acme", "default", "doc.txt", "acme content")
+	ctx := tenantContext(t, "acme")
+	uri := "aero-vault://acme/default/doc.txt"
+	req := `{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"` + uri + `"}}`
+	resp := handleCtx(t, srv, ctx, req)
+	if resp.Error != nil {
+		t.Fatalf("scoped read failed: %+v", resp.Error)
+	}
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal read result: %v", err)
+	}
+	var result readResourceResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode read result: %v", err)
+	}
+	if len(result.Contents) != 1 || result.Contents[0].URI != uri ||
+		result.Contents[0].Text != "acme content" {
+		t.Fatalf("unexpected scoped content: %+v", result)
+	}
+
+	defaultURI := "aero-vault://default/default/doc.txt"
+	req = `{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"` + defaultURI + `"}}`
+	resp = handleCtx(t, srv, ctx, req)
+	if resp.Error == nil || resp.Error.Code != -32000 ||
+		!strings.Contains(resp.Error.Message, "tenant mismatch") {
+		t.Fatalf("expected default URI rejection, got %+v", resp.Error)
 	}
 }
 

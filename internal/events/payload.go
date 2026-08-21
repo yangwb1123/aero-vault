@@ -31,18 +31,21 @@ var newSequencer = func() string {
 // object_id is the objects row id at delete time (informational; the payload
 // as a whole is the receiver-visible identity — C1/G5).
 type deletedFact struct {
-	SchemaVersion string `json:"schema_version"`
-	EventType     string `json:"event_type"`
-	Tenant        string `json:"tenant"`
-	Bucket        string `json:"bucket"`
-	Key           string `json:"key"`
-	ObjectID      int64  `json:"object_id"`
-	VersionID     string `json:"version_id"`
-	Size          int64  `json:"size"`
-	ETag          string `json:"etag"`
-	Backend       string `json:"backend"`
-	RequestID     string `json:"request_id"`
-	Actor         string `json:"actor"`
+	SchemaVersion string   `json:"schema_version"`
+	EventType     string   `json:"event_type"`
+	Tenant        string   `json:"tenant"`
+	Bucket        string   `json:"bucket"`
+	Key           string   `json:"key"`
+	ObjectID      int64    `json:"object_id"`
+	VersionID     string   `json:"version_id"`
+	Size          int64    `json:"size"`
+	ETag          string   `json:"etag"`
+	Backend       string   `json:"backend"`
+	RequestID     string   `json:"request_id"`
+	Actor         string   `json:"actor"`
+	ShareIDs      []string `json:"share_ids,omitempty"`
+	VersionCount  int      `json:"version_count,omitempty"`
+	ChunkCount    int      `json:"chunk_count,omitempty"`
 	// Reason is the deletion reason vocabulary (quarantine uses
 	// "av_infected"). omitempty keeps REST-path goldens byte-identical.
 	Reason string `json:"reason,omitempty"`
@@ -107,6 +110,23 @@ type notifyObject struct {
 // pipeline is introduced). reason is optional and appended only when non-empty
 // (additive schema: REST-path goldens stay byte-identical).
 func BuildDeletedFact(obj repository.Object, actor, requestID, tenant string, reason ...string) []byte {
+	return buildDeletedFact(obj, actor, requestID, tenant, nil, 0, 0, reason...)
+}
+
+// BuildDeletedFactWithRefs adds best-effort pre-delete capability and index
+// reference counts to the privileged delete fact. Zero-valued fields remain
+// omitted so ordinary delete payloads retain their byte-stable shape.
+func BuildDeletedFactWithRefs(
+	obj repository.Object, actor, requestID, tenant string, shareIDs []string,
+	versionCount, chunkCount int, reason ...string,
+) []byte {
+	return buildDeletedFact(obj, actor, requestID, tenant, shareIDs, versionCount, chunkCount, reason...)
+}
+
+func buildDeletedFact(
+	obj repository.Object, actor, requestID, tenant string, shareIDs []string,
+	versionCount, chunkCount int, reason ...string,
+) []byte {
 	reasonValue := ""
 	if len(reason) > 0 {
 		reasonValue = reason[0]
@@ -124,6 +144,9 @@ func BuildDeletedFact(obj repository.Object, actor, requestID, tenant string, re
 		Backend:       obj.Backend,
 		RequestID:     requestID,
 		Actor:         actor,
+		ShareIDs:      shareIDs,
+		VersionCount:  versionCount,
+		ChunkCount:    chunkCount,
 		Reason:        reasonValue,
 	})
 	return payload
