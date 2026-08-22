@@ -1,6 +1,6 @@
-// Package webui serves a single-page HTML console at /ui. It depends on
-// nothing — pure HTML + vanilla JS calling the existing REST API. Tenant is
-// chosen via a text input; the page persists it in localStorage.
+// Package webui serves the dependency-free console at /ui and the incremental
+// Iris UI replacement under /ui/app/. The legacy alias makes migrations and
+// bookmarks explicit while the new application reaches feature parity.
 package webui
 
 import (
@@ -18,16 +18,28 @@ func Favicon(w http.ResponseWriter, r *http.Request) {
 	http.ServeFileFS(w, r, staticFS, "static/favicon.svg")
 }
 
-// Handler returns an http.Handler that serves the static UI under /ui/* and
-// redirects /ui → /ui/.
+// Handler returns an http.Handler that serves the static UI under /ui/*.
 func Handler() http.Handler {
 	sub, _ := fs.Sub(staticFS, "static")
 	files := http.FileServer(http.FS(sub))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// strip the prefix /ui before delegating to the file server
 		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
+			w.Header().Set("Cache-Control", "no-store")
 			http.ServeFileFS(w, r, sub, "index.html")
 			return
+		}
+		if r.URL.Path == "/ui/app" || r.URL.Path == "/ui/app/" {
+			w.Header().Set("Cache-Control", "no-store")
+			http.ServeFileFS(w, r, sub, "app/index.html")
+			return
+		}
+		if r.URL.Path == "/ui/legacy" || r.URL.Path == "/ui/legacy/" {
+			w.Header().Set("Cache-Control", "no-store")
+			http.ServeFileFS(w, r, sub, "index.html")
+			return
+		}
+		if r.URL.Path == "/ui/app/runtime-config.js" {
+			w.Header().Set("Cache-Control", "no-store")
 		}
 		http.StripPrefix("/ui", files).ServeHTTP(w, r)
 	})

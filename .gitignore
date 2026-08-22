@@ -13,6 +13,11 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 
+# Iris UI web workspace
+/web/node_modules/
+/web/coverage/
+/web/.vite/
+
 # ai-batch-runner runtime artifacts
 .pi-batch/
 .pi-batch.lock

@@ -108,12 +108,24 @@ curl -s -X PUT --data-binary "hello world" \
   localhost:8080/v1/files/hello.txt
 curl -s localhost:8080/v1/files/hello.txt          # -> hello world
 open http://localhost:8080/docs                     # Swagger UI
-open http://localhost:8080/ui                        # static web UI
+open http://localhost:8080/ui/app/                   # Iris UI web console
 ```
 
 With the defaults the server starts with **no authentication** (MVP mode), the
 `local` storage backend writing under `./var/objects`, and an embedded SQLite
 database at `./var/aero.db`.
+
+The Iris UI React source lives in [`web/`](web/README.md). It uses the
+server-side Snaplink Authorization Code + PKCE flow and builds into the Go
+embedded assets. With a sibling `~/iris-ui` checkout:
+
+```bash
+make web-install
+make web-check
+```
+
+The dependency-free console remains the `/ui/` default and is also available
+at `/ui/legacy/` until the Iris application reaches feature parity.
 
 ### One-command RAG demo
 
@@ -204,7 +216,7 @@ The most common knobs:
 | `PROMETHEUS_ENABLED` | `false` | Expose `/metrics`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | OTLP/HTTP endpoint, e.g. `http://localhost:4318`. |
 | `WEBDAV_PREFIX` | _(disabled)_ | e.g. `/webdav`. |
-| `WEBUI_ENABLED` | `true` | Static UI at `/ui`. |
+| `WEBUI_ENABLED` | `true` | Existing console at `/ui`; incremental Iris UI application at `/ui/app/`. |
 
 This is an abridged set. See [`docs/configuration.md`](docs/configuration.md) for
 the **exhaustive** reference (every variable, grouped by subsystem, with

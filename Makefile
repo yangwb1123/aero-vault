@@ -3,7 +3,7 @@ BIN   := bin/aero-vault
 PKG   := ./cmd/server
 GOBIN := $(shell go env GOPATH)/bin
 
-.PHONY: build run test cover test-integration test-integration-qdrant tidy clean check fmt lint vet vet-integration complexity-lines coverage docker compose-up compose-down
+.PHONY: build run test cover test-integration test-integration-qdrant tidy clean check fmt lint vet vet-integration complexity-lines coverage docker compose-up compose-down web-install web-test web-build web-check
 
 AERO_PG_DSN ?= postgres://aero:aero@localhost:55432/aero?sslmode=disable
 
@@ -13,6 +13,20 @@ build:
 
 run:
 	go run $(PKG)
+
+# Iris UI is developed as a separate workspace and embedded into the Go
+# binary from internal/webui/static/app. It remains outside the zero-network
+# Go `make check` gate; release builds should run `make web-check` first.
+web-install:
+	cd web && pnpm install --frozen-lockfile
+
+web-test:
+	cd web && pnpm test
+
+web-build:
+	cd web && pnpm build
+
+web-check: web-test web-build
 
 test:
 	go test ./...
