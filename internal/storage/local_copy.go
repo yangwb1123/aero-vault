@@ -95,7 +95,10 @@ func (s *LocalStorage) Copy(ctx context.Context, srcKey, dstKey string, opts Cop
 	// Build destination metadata: copy source, then apply REPLACE overrides.
 	dstMeta := meta
 	dstMeta.Key = dstKey
-	dstMeta.Size = plaintextSize(written, s.enc != nil)
+	// The copied blob and its sidecar envelope come from the source.  The
+	// destination instance may have a different SSE configuration, so its
+	// encrypter is not authoritative for the number of plaintext bytes.
+	dstMeta.Size = plaintextSize(written, meta.Envelope != "")
 	if opts.MetadataDirective == "REPLACE" {
 		if opts.Metadata != nil {
 			dstMeta.Metadata = cloneMap(opts.Metadata)
