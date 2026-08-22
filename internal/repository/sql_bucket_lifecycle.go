@@ -65,10 +65,8 @@ WHERE tenant_id=$8 AND name=$9`),
 // and whose age qualifies for a storage-class change. Returns objects whose
 // updated_at is older than at least one transition rule's days threshold.
 func (s *sqlStore) ListTransitionable(ctx context.Context, limit int) ([]Object, error) {
-	if limit <= 0 {
-		limit = 200
-	}
-	rows, err := s.db.QueryContext(ctx, s.rebind(`
+	limit, batch := lifecycleScanLimits(limit)
+	return s.scanLifecycleBatches(ctx, limit, batch, `
 SELECT o.id, o.tenant_id, o.bucket, o.key, o.version_id, o.backend, o.storage_key,
        o.size, o.etag, o.content_type, o.metadata, o.tags, o.storage_class,
        o.created_at, o.updated_at, o.deleted_at, o.locked_until,
@@ -78,13 +76,9 @@ JOIN buckets b ON o.tenant_id = b.tenant_id AND o.bucket = b.name
 WHERE o.deleted_at IS NULL
   AND b.transition_rules != ''
   AND b.transition_rules IS NOT NULL
-LIMIT $1`), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Object
-	for rows.Next() {
+  AND o.id > $1
+ORDER BY o.id ASC
+LIMIT $2`, nil, func(rows lifecycleRows) (Object, bool, error) {
 		var (
 			obj      Object
 			metaRaw  []byte
@@ -98,7 +92,7 @@ LIMIT $1`), limit)
 		if err := rows.Scan(&obj.ID, &obj.TenantID, &obj.Bucket, &obj.Key, &obj.VersionID, &obj.Backend, &obj.StorageKey,
 			&obj.Size, &obj.ETag, &obj.ContentType, &metaRaw, &tagRaw, &obj.StorageClass,
 			&created, &updated, &deleted, &locked, &transRaw); err != nil {
-			return nil, err
+			return Object{}, false, err
 		}
 		obj.CreatedAt = created.Time
 		obj.UpdatedAt = updated.Time
@@ -119,14 +113,13 @@ LIMIT $1`), limit)
 							obj.Metadata = map[string]string{}
 						}
 						obj.Metadata["__transition_to"] = rule.StorageClass
-						out = append(out, obj)
-						break
+						return obj, true, nil
 					}
 				}
 			}
 		}
-	}
-	return out, rows.Err()
+		return obj, false, nil
+	})
 }
 
 func (s *sqlStore) SetBucketNoncurrentVersionLifecycle(ctx context.Context, tenant, bucket string, noncurrentDays, noncurrentCount int) error {
@@ -142,23 +135,16 @@ func (s *sqlStore) SetBucketNoncurrentVersionLifecycle(ctx context.Context, tena
 // ListExpired finds active objects whose bucket has expire_after_days > 0 and
 // whose updated_at is older than that window.
 func (s *sqlStore) ListExpired(ctx context.Context, limit int) ([]Object, error) {
-	if limit <= 0 {
-		limit = 200
-	}
-	rows, err := s.db.QueryContext(ctx, s.rebind(`
+	limit, batch := lifecycleScanLimits(limit)
+	now := time.Now()
+	return s.scanLifecycleBatches(ctx, limit, batch, `
 SELECT o.id, o.tenant_id, o.bucket, o.key, o.version_id, o.backend, o.storage_key, o.size, o.etag, o.content_type,
        o.metadata, o.tags, o.storage_class, o.created_at, o.updated_at, o.deleted_at, o.locked_until,
        b.expire_after_days, b.expire_action
 FROM objects o JOIN buckets b ON o.tenant_id = b.tenant_id AND o.bucket = b.name
-WHERE o.deleted_at IS NULL AND b.expire_after_days > 0
-LIMIT $1`), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Object
-	now := time.Now()
-	for rows.Next() {
+WHERE o.deleted_at IS NULL AND b.expire_after_days > 0 AND o.id > $1
+ORDER BY o.id ASC
+LIMIT $2`, nil, func(rows lifecycleRows) (Object, bool, error) {
 		var (
 			obj     Object
 			metaRaw []byte
@@ -173,7 +159,7 @@ LIMIT $1`), limit)
 		if err := rows.Scan(&obj.ID, &obj.TenantID, &obj.Bucket, &obj.Key, &obj.VersionID, &obj.Backend, &obj.StorageKey,
 			&obj.Size, &obj.ETag, &obj.ContentType, &metaRaw, &tagRaw, &obj.StorageClass, &created, &updated, &deleted, &locked,
 			&days, &action); err != nil {
-			return nil, err
+			return Object{}, false, err
 		}
 		obj.CreatedAt = created.Time
 		obj.UpdatedAt = updated.Time
@@ -190,10 +176,10 @@ LIMIT $1`), limit)
 				}
 				obj.Metadata["__expire_action"] = action
 			}
-			out = append(out, obj)
+			return obj, true, nil
 		}
-	}
-	return out, rows.Err()
+		return obj, false, nil
+	})
 }
 
 // ListSoftDeletedBefore finds objects soft-deleted before a timestamp.
@@ -229,24 +215,21 @@ func (s *sqlStore) ListExpiredNonCurrentVersions(ctx context.Context, limit int)
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.db.QueryContext(ctx, s.rebind(`
+	_, batch := lifecycleScanLimits(limit)
+	now := time.Now()
+	return s.scanLifecycleBatches(ctx, limit, batch, `
 SELECT o.id, o.tenant_id, o.bucket, o.key, o.version_id, o.backend, o.storage_key,
        o.size, o.etag, o.content_type, o.metadata, o.tags, o.storage_class,
        o.created_at, o.updated_at, o.deleted_at, o.locked_until, o.version_tombstone,
        b.noncurrent_days
 FROM objects o
 JOIN buckets b ON o.tenant_id = b.tenant_id AND o.bucket = b.name
-WHERE o.version_tombstone = $1
+WHERE o.id > $1
+  AND o.version_tombstone = $2
   AND b.noncurrent_days > 0
   AND NOT EXISTS (SELECT 1 FROM legal_holds lh WHERE lh.object_id = o.id)
-LIMIT $2`), true, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Object
-	now := time.Now()
-	for rows.Next() {
+	ORDER BY o.id ASC
+LIMIT $3`, []any{true}, func(rows lifecycleRows) (Object, bool, error) {
 		var (
 			obj            Object
 			metaRaw        []byte
@@ -264,7 +247,7 @@ LIMIT $2`), true, limit)
 			&created, &updated, &deleted, &locked, &tombstone,
 			&noncurrentDays,
 		); err != nil {
-			return nil, err
+			return Object{}, false, err
 		}
 		obj.VersionTombstone = tombstone
 		obj.Metadata, _ = unmarshalKV(metaRaw)
@@ -278,8 +261,8 @@ LIMIT $2`), true, limit)
 		if deleted.Valid && deleted.Time.Add(time.Duration(noncurrentDays)*24*time.Hour).Before(now) {
 			t := deleted.Time
 			obj.DeletedAt = &t
-			out = append(out, obj)
+			return obj, true, nil
 		}
-	}
-	return out, rows.Err()
+		return obj, false, nil
+	})
 }
