@@ -176,6 +176,28 @@ func (cb *circuitBreaker) beforeRequest() error {
 	}
 }
 
+// isBackendFailure distinguishes provider failures from expected storage
+// outcomes. Client input and object-state errors must not be able to open a
+// breaker for an otherwise healthy backend.
+func isBackendFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case errors.Is(err, ErrNotFound),
+		errors.Is(err, ErrAlreadyExists),
+		errors.Is(err, ErrInvalidKey),
+		errors.Is(err, ErrUnsupported),
+		errors.Is(err, ErrSSECustomerKeyRequired),
+		errors.Is(err, ErrInvalidSSECustomerKey),
+		errors.Is(err, ErrBackendUnavailable),
+		errors.Is(err, context.Canceled):
+		return false
+	default:
+		return true
+	}
+}
+
 // recordOutcome records a success or failure after a request completes.
 func (cb *circuitBreaker) recordOutcome(err error) {
 	cb.mu.Lock()
@@ -200,6 +222,16 @@ func (cb *circuitBreaker) recordOutcome(err error) {
 			cb.stateChanged = now
 		case CBClosed:
 			cb.failures = 0
+		}
+		return
+	}
+
+	if !isBackendFailure(err) {
+		// A half-open probe that fails for a client/object-state reason did not
+		// provide a backend health signal. Return its slot so a real probe can
+		// still decide whether to close the circuit.
+		if cb.state == CBHalfOpen && cb.halfAllowed < cb.cfg.HalfOpenMaxRequests {
+			cb.halfAllowed++
 		}
 		return
 	}

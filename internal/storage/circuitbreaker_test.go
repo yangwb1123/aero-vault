@@ -15,6 +15,15 @@ type failStorage struct {
 	threshold int // fail when count < threshold
 }
 
+type staticErrorStorage struct {
+	Storage
+	err error
+}
+
+func (s *staticErrorStorage) Stat(context.Context, string) (ObjectInfo, error) {
+	return ObjectInfo{}, s.err
+}
+
 func (f *failStorage) fail() bool {
 	f.count++
 	return f.count <= f.threshold
@@ -120,5 +129,71 @@ func TestCircuitBreaker_Recovers(t *testing.T) {
 	}
 	if s := cbState(t, cb); s != CBClosed {
 		t.Fatalf("expected closed, got %v", s)
+	}
+}
+
+func TestCircuitBreaker_IgnoresExpectedErrors(t *testing.T) {
+	expected := []error{
+		ErrNotFound,
+		ErrAlreadyExists,
+		ErrInvalidKey,
+		ErrUnsupported,
+		ErrSSECustomerKeyRequired,
+		ErrInvalidSSECustomerKey,
+		ErrBackendUnavailable,
+		context.Canceled,
+	}
+	for _, want := range expected {
+		t.Run(want.Error(), func(t *testing.T) {
+			inner := &staticErrorStorage{Storage: newLocal(t), err: want}
+			cb := NewCircuitBreaker(inner, CBConfig{
+				Enabled: true, FailureThreshold: 1, RecoveryTimeout: time.Hour,
+			})
+			for i := 0; i < 3; i++ {
+				_, err := cb.Stat(context.Background(), "k")
+				if !errors.Is(err, want) {
+					t.Fatalf("error #%d = %v, want %v", i+1, err, want)
+				}
+			}
+			if s := cbState(t, cb); s != CBClosed {
+				t.Fatalf("expected closed, got %v", s)
+			}
+			_, failures, total := cb.(*circuitBreaker).Stats()
+			if failures != 0 {
+				t.Fatalf("failures=%d, want 0", failures)
+			}
+			if total != 3 {
+				t.Fatalf("total=%d, want 3", total)
+			}
+		})
+	}
+}
+
+func TestCircuitBreaker_ExpectedErrorDoesNotConsumeHalfOpenProbe(t *testing.T) {
+	inner := newLocal(t)
+	fs := &failStorage{Storage: inner, threshold: 1}
+	cb := NewCircuitBreaker(fs, CBConfig{
+		Enabled: true, FailureThreshold: 1, RecoveryTimeout: 10 * time.Millisecond,
+	})
+	ctx := context.Background()
+
+	_, _, err := cb.Get(ctx, "missing")
+	if err == nil {
+		t.Fatal("expected injected failure")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if s := cbState(t, cb); s != CBHalfOpen {
+		t.Fatalf("expected half-open, got %v", s)
+	}
+
+	_, _, err = cb.Get(ctx, "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound probe result, got %v", err)
+	}
+	if _, err = cb.Put(ctx, "healthy", strings.NewReader("ok"), 2, PutOptions{}); err != nil {
+		t.Fatalf("expected next probe to proceed: %v", err)
+	}
+	if s := cbState(t, cb); s != CBClosed {
+		t.Fatalf("expected closed after successful probe, got %v", s)
 	}
 }
