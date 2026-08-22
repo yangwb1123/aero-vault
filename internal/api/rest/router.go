@@ -133,6 +133,7 @@ func init() {
 		},
 
 		// Usage
+		{Method: "GET", Path: "/v1/session", Summary: "Get the normalized current session", Tag: "auth", Status: 200, Response: `{"authenticated":true,"subject_id":"user-7","tenant_id":"acme","principal_kind":"user","roles":["vault.user"],"groups":["engineering"],"scopes":["read"]}`},
 		{Method: "GET", Path: "/v1/usage", Summary: "Get tenant usage", Tag: "admin", Status: 200, Response: `{"used_bytes":1000,"max_bytes":1000000}`},
 
 		// Batch
@@ -329,6 +330,7 @@ func newRouter(svc *service.FileService, repo repository.Repository, search *ai.
 	r.Get("/buckets/{bucket}/versions", h.ListBucketVersions)
 
 	// Self-serve usage
+	r.Get("/session", h.Session)
 	r.Get("/usage", adm.Usage)
 	if h.access != nil {
 		r.Get("/access/acl", h.ListResourceACL)
