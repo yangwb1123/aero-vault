@@ -390,7 +390,7 @@ bucket lifecycle, bucket location, object lock, and SigV4 auth
 | `GET/PUT ?policy` (bucket policies) | ❌ Missing | Primary S3 auth mechanism; customers migrating from S3 expect it |
 | `GET/PUT ?notification` | ❌ Missing | Hook S3 events to external systems (webhook equivalent) |
 | `GET/PUT ?cors` (per-bucket CORS) | ❌ Missing | Currently only global CORS middleware — tenants can't self-serve |
-| `GET/PUT ?logging` (server access logs) | ❌ Missing | PCI/SOC2 requirement: must log every read |
+| `GET/PUT ?logging` (server access logs) | ✅ Implemented | Best-effort S3 access-log objects plus durable request rows |
 | `POST ?select` (S3 Select) | ❌ Missing | Query CSV/JSON/Parquet objects server-side |
 | `POST ?restore` (Glacier restore) | ❌ Missing | Needed when #9 adds cold storage tier |
 | ListObjectsV2 with `?tag-key` | ❌ Missing | Filter listing by tags |
@@ -411,8 +411,9 @@ order:
    bucket config; evaluate at auth time (extends `internal/auth`).
 2. **Bucket CORS** (`?cors`) — per-bucket CORS rules evaluated by a middleware
    before the global CORS; revert to global as fallback.
-3. **Server access logging** (`?logging`) — record every GET/HEAD to a target
-   bucket/prefix via the existing job queue.
+3. **Server access logging** (`?logging`) — record every S3 request after the
+   response completes, writing a best-effort log object to the configured
+   target bucket/prefix and a durable request row for audit/reconciliation.
 4. **Bucket notifications** (`?notification`) — map S3 event types to the
    existing webhook infrastructure (`internal/events/webhook.go`).
 5. **S3 Select** — SQL expression evaluated via `encoding/csv` + `encoding/json`

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"time"
 )
 
 // ── CORS ────────────────────────────────────────────────────────────────────
@@ -84,14 +85,14 @@ func (s *sqlStore) DeleteBucketLogging(ctx context.Context, tenant, bucket strin
 }
 
 func (s *sqlStore) WriteAccessLog(ctx context.Context, tenant, sourceBucket, method, key, status, latencyMs, userAgent string) error {
-	_ = tenant
-	_ = sourceBucket
-	_ = method
-	_ = key
-	_ = status
-	_ = latencyMs
-	_ = userAgent
-	return nil
+	tenant = defaultTenant(tenant)
+	_, err := s.db.ExecContext(ctx, s.rebind(`
+		INSERT INTO bucket_access_logs
+		  (created_at, tenant_id, source_bucket, method, object_key, status, latency_ms, user_agent)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
+		time.Now().UTC().Format(time.RFC3339Nano), tenant, sourceBucket,
+		method, key, status, latencyMs, userAgent)
+	return err
 }
 
 // ── Notifications ───────────────────────────────────────────────────────────

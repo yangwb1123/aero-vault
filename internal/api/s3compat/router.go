@@ -14,6 +14,7 @@ import (
 func NewRouter(svc *service.FileService, logger *slog.Logger, authz AuthorizationProvider) chi.Router {
 	h := NewHandler(svc, logger, authz)
 	r := chi.NewRouter()
+	r.Use(h.accessLogMiddleware)
 
 	// Bucket-only paths: with or without trailing slash.
 	r.HandleFunc("/{bucket}", h.BucketDispatch)

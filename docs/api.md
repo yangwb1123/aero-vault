@@ -657,7 +657,17 @@ S3 and REST see the same objects.
 | GetBucketAcl / PutBucketAcl | `GET`/`PUT /{bucket}?acl` | ✅ | Canned ACL ↔ `AccessControlPolicy`; PUT via `x-amz-acl` header or policy body. |
 | GetBucketLocation | `GET /{bucket}?location` | ✅ | Empty `LocationConstraint` (us-east-1); `404 NoSuchBucket` if absent. |
 | ListObjectVersions | `GET /{bucket}?versions` | ✅ | Returns `<Version>` and `<DeleteMarker>` entries. Combined-count pagination supports `prefix`, `max-keys`, `key-marker`, and `version-id-marker`, including continuation within one key. |
+| Bucket access logging | `GET`/`PUT`/`DELETE /{bucket}?logging` | ✅ | Configures `TargetBucket`/`TargetPrefix`; completed S3 requests write timestamped `.log` objects under that target. Logging is best-effort and never changes the original response. |
 | Presigned URLs | — | ✅ (REST) | Use `POST /v1/files/{key}/presign`. |
+
+When bucket logging is enabled, the S3 router records the response status,
+latency, request key, user agent, request ID, and remote address. A log object is
+written under `<TargetPrefix>/<source-bucket>/YYYY/MM/DD/HH/` using a unique key;
+the object body is line-oriented and safely quotes request-controlled fields.
+Writes use an internal system principal so a destination bucket's ACL does not
+make an already-completed source request fail. A destination equal to the source
+bucket is skipped to avoid self-referential logging. The repository also stores a
+durable `bucket_access_logs` row for each successfully materialized object.
 
 ## SigV4 usage
 
