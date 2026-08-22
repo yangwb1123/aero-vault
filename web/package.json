@@ -11,8 +11,8 @@
     "clean": "rm -rf ../internal/webui/static/app coverage"
   },
   "dependencies": {
-    "@iris-ui-kit/plugin-locale-zh": "link:../../iris-ui/packages/plugin-locale-zh",
-    "@iris-ui-kit/react": "link:../../iris-ui/packages/react",
+    "@iris-ui-kit/plugin-locale-zh": "0.1.0",
+    "@iris-ui-kit/react": "0.2.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

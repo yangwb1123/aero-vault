@@ -14,9 +14,9 @@ build:
 run:
 	go run $(PKG)
 
-# Iris UI is developed as a separate workspace and embedded into the Go
-# binary from internal/webui/static/app. It remains outside the zero-network
-# Go `make check` gate; release builds should run `make web-check` first.
+# Iris UI is consumed from its published npm packages and embedded into the Go
+# binary from internal/webui/static/app. It remains outside the zero-network Go
+# `make check` gate; release builds should run `make web-check` first.
 web-install:
 	cd web && pnpm install --frozen-lockfile
 

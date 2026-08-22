@@ -4,14 +4,12 @@
 `internal/webui/static/app/`，由 Go 二进制嵌入并在 `/ui/app/` 提供。达到旧版能力齐平前，
 正式入口 `/ui/` 保持不变，`/ui/legacy/` 是它的显式别名。
 
-## 本地依赖
+## 安装与运行
 
-Iris UI 尚未发布到 npm，本仓库按约定从相邻的 `~/iris-ui` 链接：
-
-```text
-~/aero-vault
-~/iris-ui
-```
+应用只消费 npm Registry 已发布的 `@iris-ui-kit/react@0.2.2` 与
+`@iris-ui-kit/plugin-locale-zh@0.1.0`，不依赖相邻源码仓库或 pnpm workspace link。
+`@iris-ui-kit/react@0.2.3` 的 registry 元数据仍含 `workspace:*`，独立消费端无法安装；
+Iris UI 发布修复版本后再通过正常依赖升级接入。
 
 首次运行：
 

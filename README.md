@@ -116,8 +116,8 @@ With the defaults the server starts with **no authentication** (MVP mode), the
 database at `./var/aero.db`.
 
 The Iris UI React source lives in [`web/`](web/README.md). It uses the
-server-side Snaplink Authorization Code + PKCE flow and builds into the Go
-embedded assets. With a sibling `~/iris-ui` checkout:
+server-side Snaplink Authorization Code + PKCE flow, consumes the published
+Iris UI npm packages, and builds into the Go embedded assets:
 
 ```bash
 make web-install

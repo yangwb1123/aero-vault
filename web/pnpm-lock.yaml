@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@iris-ui-kit/plugin-locale-zh':
-        specifier: link:../../iris-ui/packages/plugin-locale-zh
-        version: link:../../iris-ui/packages/plugin-locale-zh
+        specifier: 0.1.0
+        version: 0.1.0
       '@iris-ui-kit/react':
-        specifier: link:../../iris-ui/packages/react
-        version: link:../../iris-ui/packages/react
+        specifier: 0.2.2
+        version: 0.2.2(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -314,6 +314,39 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@floating-ui/core@1.8.0':
+    resolution: {integrity: sha512-0CIZ5itps/8x7BG8dEIhs53BvCUH2PCoogtakwRTut+Arm58sJooJ0AuZhLw2HJYIR5cMLNPBSS728sPho2khQ==}
+
+  '@floating-ui/dom@1.8.0':
+    resolution: {integrity: sha512-yXSrzeHZBTZadLOlfyhCkJHNeLJnHRnRInwdZ40L7ZiaAtrBwoYlsDrX3v5zB1Utk7CLfzcOVnVVWoXEky7Ceg==}
+
+  '@floating-ui/utils@0.2.12':
+    resolution: {integrity: sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww==}
+
+  '@iris-ui-kit/core@0.2.0':
+    resolution: {integrity: sha512-aIi/1cbzcaI3cz1RpNYtTDmgqMPI4QVxigUSZ+q8xrzfs2E24796hlFTjlWW0TBVNzSED95URXO3OqbIAOqXWA==}
+
+  '@iris-ui-kit/icons@0.2.0':
+    resolution: {integrity: sha512-1N7I1I/lYFuvuStUFI2z3bghB4HjhN6oP0TbOCZSZVMfXGSUYygxF+1yeZuw7m68ybwL+HGs9vRLc+5KZ/8gKQ==}
+
+  '@iris-ui-kit/plugin-locale-zh@0.1.0':
+    resolution: {integrity: sha512-m3U0co5k54b7FkiCB16Q8CSSssjln9+7x3o0fGd0CNloGlZhp0ATMuzSchEUl1+A7Blxb10s8n9n/BoYCBxKHg==}
+
+  '@iris-ui-kit/react@0.2.2':
+    resolution: {integrity: sha512-Pqj6JXM1IlvCXt5xebaEKaoyyKZJDXOjZuYgDnP+VDV06UH7CDosdLntMlVII4ZXBjmwK8CdqQ6vzJBp8cKc4w==}
+    peerDependencies:
+      react: ^18.0.0 || ^19.0.0
+      react-dom: ^18.0.0 || ^19.0.0
+
+  '@iris-ui-kit/skins@0.1.1':
+    resolution: {integrity: sha512-DECBzK5i4Th1/kQK9n+sgnha/P2XmRmSefRLlsbpqB/2ha3VPoPkoJhdkUxWalWMn1FOOr/KcC27wnkVzMLQHQ==}
+
+  '@iris-ui-kit/theme@0.3.0':
+    resolution: {integrity: sha512-qxecNbGFzA9ZIKK2pYOjPLTKZNrL3urWvbRDLAuVHsELofOxcqJAuulijSO4r3J5kh4zl7zO8mLFrzKiyCMo2w==}
+
+  '@iris-ui-kit/tokens@0.3.0':
+    resolution: {integrity: sha512-a76IYcfPUamvyuGzkxM7iZopGEOLXAuLE1ZoWshYR6ct896aohELptlQYyz56v99JZdMF6qf+rJPSdNlqJnNKA==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -1195,6 +1228,49 @@ snapshots:
 
   '@esbuild/win32-x64@0.25.12':
     optional: true
+
+  '@floating-ui/core@1.8.0':
+    dependencies:
+      '@floating-ui/utils': 0.2.12
+
+  '@floating-ui/dom@1.8.0':
+    dependencies:
+      '@floating-ui/core': 1.8.0
+      '@floating-ui/utils': 0.2.12
+
+  '@floating-ui/utils@0.2.12': {}
+
+  '@iris-ui-kit/core@0.2.0': {}
+
+  '@iris-ui-kit/icons@0.2.0': {}
+
+  '@iris-ui-kit/plugin-locale-zh@0.1.0':
+    dependencies:
+      '@iris-ui-kit/core': 0.2.0
+
+  '@iris-ui-kit/react@0.2.2(react-dom@18.3.1(react@18.3.1))(react@18.3.1)':
+    dependencies:
+      '@floating-ui/dom': 1.8.0
+      '@iris-ui-kit/core': 0.2.0
+      '@iris-ui-kit/icons': 0.2.0
+      '@iris-ui-kit/skins': 0.1.1
+      '@iris-ui-kit/theme': 0.3.0
+      '@iris-ui-kit/tokens': 0.3.0
+      react: 18.3.1
+      react-dom: 18.3.1(react@18.3.1)
+
+  '@iris-ui-kit/skins@0.1.1':
+    dependencies:
+      '@iris-ui-kit/core': 0.2.0
+      '@iris-ui-kit/theme': 0.3.0
+      '@iris-ui-kit/tokens': 0.3.0
+
+  '@iris-ui-kit/theme@0.3.0':
+    dependencies:
+      '@iris-ui-kit/core': 0.2.0
+      '@iris-ui-kit/tokens': 0.3.0
+
+  '@iris-ui-kit/tokens@0.3.0': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
