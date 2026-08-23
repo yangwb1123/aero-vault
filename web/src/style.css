@@ -149,6 +149,105 @@ a {
   flex: 1;
 }
 
+.knowledge-form,
+.chat-form,
+.hit-list,
+.citation-list {
+  display: grid;
+  gap: var(--iris-space-md, 16px);
+}
+
+.knowledge-form {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: end;
+  margin-block-end: var(--iris-space-md, 16px);
+}
+
+.chat-form {
+  margin-block-end: var(--iris-space-md, 16px);
+}
+
+.chat-actions,
+.lineage-form,
+.hit-header {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--iris-space-sm, 12px);
+}
+
+.chat-actions,
+.hit-header {
+  justify-content: space-between;
+}
+
+.lineage-form {
+  margin-block-end: var(--iris-space-md, 16px);
+}
+
+.lineage-form label {
+  display: grid;
+  flex: 1;
+  gap: 6px;
+}
+
+.mode-field {
+  display: grid;
+  min-width: 170px;
+  gap: 6px;
+  color: var(--iris-muted);
+  font-size: 13px;
+}
+
+.mode-field select {
+  min-height: 34px;
+  padding-inline: 10px;
+  color: var(--iris-foreground);
+  background: var(--iris-background);
+  border: 1px solid var(--iris-border);
+  border-radius: var(--iris-radius-md, 8px);
+  font: inherit;
+}
+
+.hit-list,
+.citation-list {
+  margin-block-start: var(--iris-space-md, 16px);
+}
+
+.hit-header {
+  align-items: flex-start;
+}
+
+.hit-source {
+  color: var(--iris-muted);
+  font-size: 12px;
+}
+
+.hit-content,
+.chat-answer {
+  white-space: pre-wrap;
+  line-height: 1.7;
+}
+
+.chat-answer {
+  min-height: 80px;
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 0.55em;
+  height: 1.1em;
+  margin-inline-start: 2px;
+  vertical-align: text-bottom;
+  background: var(--iris-primary);
+  animation: vault-cursor 0.9s steps(2, jump-none) infinite;
+}
+
+@keyframes vault-cursor {
+  50% {
+    opacity: 0;
+  }
+}
+
 .file-picker {
   display: inline-flex;
   align-items: center;
@@ -203,8 +302,19 @@ a {
 @media (max-width: 720px) {
   .page-header,
   .status-row,
-  .filter-bar {
+  .filter-bar,
+  .chat-actions,
+  .lineage-form {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .knowledge-form {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .mode-field {
+    min-width: 0;
   }
 }

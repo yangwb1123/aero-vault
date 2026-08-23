@@ -4,6 +4,10 @@
 `internal/webui/static/app/`，由 Go 二进制嵌入并在 `/ui/app/` 提供。达到旧版能力齐平前，
 正式入口 `/ui/` 保持不变，`/ui/legacy/` 是它的显式别名。
 
+当前 Iris UI 应用已接入 Snaplink 登录、服务概览、文件管理，以及 AI 搜索、SSE 流式对话和
+对象使用血缘查询。AI 页面遵循后端 opt-in 开关；能力未启用时会直接展示 API 返回的降级或
+不可用信息。
+
 ## 安装与运行
 
 应用只消费 npm Registry 已发布的 `@iris-ui-kit/react@0.2.2` 与

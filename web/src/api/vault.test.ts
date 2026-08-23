@@ -28,4 +28,26 @@ describe('VaultClient', () => {
       new VaultApiError(403, 'Forbidden', 'denied', 'r1'),
     )
   })
+
+  it('consumes token and done frames from streaming chat', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('event: token\ndata: "Hel'))
+        controller.enqueue(new TextEncoder().encode('lo"\n\nevent: done\ndata: {"answer":"Hello","model":"m","citations":[]}\n\n'))
+        controller.close()
+      },
+    })
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(body, { status: 200 }),
+    )
+    const client = new VaultClient('/v1', () => 'token', fetcher as typeof fetch)
+    const tokens: string[] = []
+
+    await expect(client.streamChat('hello', 'hybrid', (token) => tokens.push(token))).resolves.toEqual({
+      answer: 'Hello', model: 'm', citations: [],
+    })
+    expect(tokens).toEqual(['Hello'])
+    const headers = new Headers(fetcher.mock.calls[0][1]?.headers)
+    expect(headers.get('Accept')).toBe('text/event-stream')
+  })
 })

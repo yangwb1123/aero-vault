@@ -1,3 +1,45 @@
+import { SSEDecoder, type SSEFrame } from './sse'
+
+export type SearchMode = 'vector' | 'bm25' | 'hybrid'
+
+export interface SearchHit {
+  score: number
+  chunk: string
+  chunk_id: number
+  object_id: number
+  bucket: string
+  object_key: string
+  seq: number
+  embed_model: string
+}
+
+export interface ChatResponse {
+  answer: string
+  model: string
+  citations: SearchHit[]
+}
+
+export interface LineageEntry {
+  usage_id: number
+  caller: string
+  query?: string
+  chunk_ids: number[]
+  object_ids: number[]
+  request_id?: string
+  created_at: string
+  model?: string
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  latency_ms?: number
+  cost_micros?: number
+}
+
+export interface LineageResponse {
+  object_id: number
+  entries: LineageEntry[]
+}
+
 export interface VaultSession {
   authenticated: boolean
   subject_id?: string
@@ -96,6 +138,48 @@ export class VaultClient {
     return response.blob()
   }
 
+  async search(query: string, mode: SearchMode): Promise<SearchHit[]> {
+    const result = await this.json<{ hits?: SearchHit[] }>('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, mode, k: 8 }),
+    })
+    return result.hits ?? []
+  }
+
+  getLineage(objectId: number): Promise<LineageResponse> {
+    return this.json<LineageResponse>(`/lineage/objects/${encodeURIComponent(objectId)}?limit=100`)
+  }
+
+  async streamChat(
+    query: string,
+    mode: SearchMode,
+    onToken: (token: string) => void,
+    signal?: AbortSignal,
+  ): Promise<ChatResponse> {
+    const response = await this.request('/chat/stream', {
+      method: 'POST',
+      headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, mode, k: 5 }),
+      signal,
+    })
+    if (!response.body) throw new VaultApiError(502, 'StreamError', 'Chat 响应没有数据流')
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    const frames = new SSEDecoder()
+    let completed: ChatResponse | undefined
+    for (;;) {
+      const part = await reader.read()
+      const text = decoder.decode(part.value, { stream: !part.done })
+      for (const frame of frames.push(text, part.done)) {
+        completed = handleChatFrame(frame, onToken) ?? completed
+      }
+      if (part.done) break
+    }
+    if (!completed) throw new VaultApiError(502, 'StreamError', 'Chat 数据流未返回完成事件')
+    return completed
+  }
+
   private async json<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await this.request(path, init)
     return (await response.json()) as T
@@ -103,7 +187,7 @@ export class VaultClient {
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers)
-    headers.set('Accept', 'application/json')
+    if (!headers.has('Accept')) headers.set('Accept', 'application/json')
     const token = this.token()
     if (token) headers.set('Authorization', `Bearer ${token}`)
     const response = await this.fetcher(`${this.base}${path}`, {
@@ -126,4 +210,25 @@ export class VaultClient {
       error?.request_id,
     )
   }
+}
+
+function handleChatFrame(frame: SSEFrame, onToken: (token: string) => void): ChatResponse | undefined {
+  if (frame.event === 'token') {
+    const token = JSON.parse(frame.data) as unknown
+    onToken(typeof token === 'string' ? token : String(token))
+    return undefined
+  }
+  if (frame.event === 'error') {
+    const error = JSON.parse(frame.data) as { code?: string; message?: string }
+    throw new VaultApiError(200, error.code ?? 'StreamError', error.message ?? 'Chat 流处理失败')
+  }
+  if (frame.event === 'done') {
+    const result = JSON.parse(frame.data) as Partial<ChatResponse>
+    return {
+      answer: result.answer ?? '',
+      model: result.model ?? '',
+      citations: result.citations ?? [],
+    }
+  }
+  return undefined
 }
