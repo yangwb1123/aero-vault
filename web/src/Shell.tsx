@@ -12,6 +12,7 @@ import { VaultClient } from './api/vault'
 import { useAuth } from './auth/AuthProvider'
 import type { WebConfig } from './config'
 import { ActivityPage } from './pages/ActivityPage'
+import { AgentPage } from './pages/AgentPage'
 import { FilesPage } from './pages/FilesPage'
 import { AccessPage } from './pages/access/AccessPage'
 import { ChatPage } from './pages/ChatPage'
@@ -34,6 +35,7 @@ const menus: NavNode[] = [
   { key: 'departments', title: '部门与成员', icon: 'users' },
   { key: 'search', title: '知识检索', icon: 'search' },
   { key: 'chat', title: '知识 Chat', icon: 'link' },
+  { key: 'agent', title: '知识 Agent', icon: 'grid' },
   { key: 'lineage', title: '对象血缘', icon: 'clock' },
   { key: 'operations', title: '运行运维', icon: 'settings' },
   { key: 'services', title: '平台服务', icon: 'grid' },
@@ -60,6 +62,7 @@ function PageHost({
   if (route === 'departments') return <DepartmentsPage client={client} />
   if (route === 'search') return <SearchPage client={client} />
   if (route === 'chat') return <ChatPage client={client} />
+  if (route === 'agent') return <AgentPage client={client} />
   if (route === 'lineage') return <LineagePage client={client} />
   if (route === 'operations') return <OperationsPage client={client} />
   if (route === 'services') return <ServicesPage config={config} />

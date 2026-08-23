@@ -22,6 +22,7 @@ import {
 } from './admin'
 import type { BucketConfig, BucketLifecycleInput, BucketStats } from './buckets'
 import type { BatchDeleteResult, BatchTagResult, FolderListing } from './files'
+import { normalizeAgentResponse, type AgentResponse } from './agent'
 import { VaultApiError, VaultTransport } from './transport'
 
 export { VaultApiError } from './transport'
@@ -407,6 +408,14 @@ export class VaultClient extends VaultTransport {
       body: JSON.stringify({ query, mode, k: 8 }),
     })
     return result.hits ?? []
+  }
+
+  async runAgent(query: string, signal?: AbortSignal): Promise<AgentResponse> {
+    const result = await this.json<Parameters<typeof normalizeAgentResponse>[0]>('/agent', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }), signal,
+    })
+    return normalizeAgentResponse(result)
   }
 
   getLineage(objectId: number): Promise<LineageResponse> {

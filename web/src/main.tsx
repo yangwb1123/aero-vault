@@ -7,6 +7,7 @@ import './operations.css'
 import './buckets.css'
 import './files.css'
 import './activity.css'
+import './agent.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

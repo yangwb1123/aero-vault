@@ -1,0 +1,58 @@
+.agent-form,
+.agent-result {
+  display: grid;
+  gap: var(--iris-space-md, 16px);
+}
+
+.agent-actions,
+.agent-trace-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--iris-space-md, 16px);
+}
+
+.agent-result {
+  margin-block-start: var(--iris-space-md, 16px);
+}
+
+.agent-trace-heading h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.agent-step-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+  gap: var(--iris-space-md, 16px);
+}
+
+.agent-step-grid pre {
+  max-height: 280px;
+  margin: 6px 0 0;
+  padding: var(--iris-space-sm, 12px);
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--iris-foreground);
+  background: color-mix(in srgb, var(--iris-muted) 9%, transparent);
+  border: 1px solid var(--iris-border);
+  border-radius: var(--iris-radius-md, 8px);
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.agent-step-label {
+  color: var(--iris-muted);
+  font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .agent-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .agent-step-grid {
+    grid-template-columns: 1fr;
+  }
+}
