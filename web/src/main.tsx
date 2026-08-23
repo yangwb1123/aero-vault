@@ -4,6 +4,7 @@ import { App } from './App'
 import './style.css'
 import './object.css'
 import './operations.css'
+import './buckets.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

@@ -93,6 +93,7 @@ func init() {
 
 		// Buckets
 		{Method: "GET", Path: "/v1/buckets", Summary: "List buckets", Tag: "buckets", Status: 200, Response: `{"buckets":["default"]}`},
+		{Method: "PUT", Path: "/v1/buckets/{bucket}", Summary: "Create a bucket", Tag: "buckets", Status: 201, Response: `{"bucket":"project"}`},
 		{Method: "GET", Path: "/v1/buckets/{bucket}/config", Summary: "Get bucket config", Tag: "buckets", Status: 200, Response: `{"name":"default","versioning":false}`},
 		{Method: "PUT", Path: "/v1/buckets/{bucket}/versioning", Summary: "Set bucket versioning", Tag: "buckets", Body: `{"enabled":true}`, Status: 200},
 		{Method: "PUT", Path: "/v1/buckets/{bucket}/object-lock", Summary: "Set object lock config", Tag: "buckets", Status: 200},
@@ -298,6 +299,7 @@ func newRouter(svc *service.FileService, repo repository.Repository, search *ai.
 
 	// Bucket policies
 	r.Get("/buckets", h.ListBuckets)
+	r.Put("/buckets/{bucket}", h.CreateBucket)
 	r.Get("/buckets/{bucket}/config", h.GetBucketConfig)
 	r.Put("/buckets/{bucket}/versioning", h.PutBucketVersioning)
 	r.Put("/buckets/{bucket}/object-lock", h.PutBucketLock)

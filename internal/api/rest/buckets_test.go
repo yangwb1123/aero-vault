@@ -39,6 +39,9 @@ func newBucketTestServer(t *testing.T) *httptest.Server {
 	adm := NewAdminHandler(svc, repo, reg)
 
 	r := chi.NewRouter()
+	r.Put("/v1/buckets/{bucket}", h.CreateBucket)
+	r.Get("/v1/buckets", h.ListBuckets)
+	r.Delete("/v1/buckets/{bucket}", h.DeleteBucket)
 	r.Get("/v1/buckets/{bucket}/config", h.GetBucketConfig)
 	r.Put("/v1/buckets/{bucket}/versioning", h.PutBucketVersioning)
 	r.Put("/v1/buckets/{bucket}/object-lock", h.PutBucketLock)
@@ -77,6 +80,30 @@ func newBucketQuotaAuthTestServer(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
 	return srv
+}
+
+func TestBucketCRUD(t *testing.T) {
+	srv := newBucketTestServer(t)
+	bucketURL := srv.URL + "/v1/buckets/project"
+
+	for range 2 {
+		resp, body := req(t, http.MethodPut, bucketURL, nil, nil)
+		if resp.StatusCode != http.StatusCreated || !strings.Contains(string(body), `"bucket":"project"`) {
+			t.Fatalf("create bucket: status=%d body=%s", resp.StatusCode, body)
+		}
+	}
+	resp, body := req(t, http.MethodGet, srv.URL+"/v1/buckets", nil, nil)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"project"`) {
+		t.Fatalf("list buckets: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp, body = req(t, http.MethodDelete, bucketURL, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete bucket: status=%d body=%s", resp.StatusCode, body)
+	}
+	_, body = req(t, http.MethodGet, srv.URL+"/v1/buckets", nil, nil)
+	if strings.Contains(string(body), `"project"`) {
+		t.Fatalf("deleted bucket still listed: %s", body)
+	}
 }
 
 func TestBucketConfig(t *testing.T) {

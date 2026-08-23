@@ -208,6 +208,16 @@ func (h *Handler) DeleteBucketWebsite(w http.ResponseWriter, r *http.Request) {
 
 // ── Bucket CRUD ────────────────────────────────────────────────────────────────
 
+// PUT /v1/buckets/{bucket} — idempotently create a bucket for the current tenant.
+func (h *Handler) CreateBucket(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	if err := h.svc.CreateBucket(r.Context(), mw.TenantFrom(r.Context()), bucket); err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"bucket": bucket})
+}
+
 // GET /v1/buckets — list all buckets for the current tenant.
 func (h *Handler) ListBuckets(w http.ResponseWriter, r *http.Request) {
 	buckets, err := h.svc.ListBuckets(r.Context(), mw.TenantFrom(r.Context()))

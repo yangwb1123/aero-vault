@@ -20,6 +20,8 @@ import {
   type AdminTenant,
   type AdminWebhookFailure,
 } from './admin'
+import type { BucketConfig, BucketLifecycleInput, BucketStats } from './buckets'
+import { requestHeaders } from './headers'
 
 export type SearchMode = 'vector' | 'bm25' | 'hybrid'
 
@@ -134,6 +136,34 @@ export class VaultClient {
   async listBuckets(): Promise<string[]> {
     const result = await this.json<{ buckets?: string[] }>('/buckets')
     return result.buckets ?? []
+  }
+
+  async createBucket(bucket: string): Promise<void> {
+    await this.json(`/buckets/${encodeURIComponent(bucket)}`, { method: 'PUT' })
+  }
+
+  async deleteBucket(bucket: string): Promise<void> {
+    await this.request(`/buckets/${encodeURIComponent(bucket)}`, { method: 'DELETE' })
+  }
+
+  getBucketConfig(bucket: string): Promise<BucketConfig> {
+    return this.json<BucketConfig>(`/buckets/${encodeURIComponent(bucket)}/config`)
+  }
+
+  getBucketStats(bucket: string): Promise<BucketStats> {
+    return this.json<BucketStats>(`/buckets/${encodeURIComponent(bucket)}/stats`)
+  }
+
+  async setBucketVersioning(bucket: string, enabled: boolean): Promise<void> {
+    await this.putBucketJSON(bucket, 'versioning', { enabled })
+  }
+
+  async setBucketObjectLock(bucket: string, seconds: number): Promise<void> {
+    await this.putBucketJSON(bucket, 'object-lock', { seconds })
+  }
+
+  async setBucketLifecycle(bucket: string, input: BucketLifecycleInput): Promise<void> {
+    await this.putBucketJSON(bucket, 'lifecycle', input)
   }
 
   listFiles(prefix = '', deleted = false): Promise<FilePage> {
@@ -408,6 +438,14 @@ export class VaultClient {
     return (await response.json()) as T
   }
 
+  private async putBucketJSON(bucket: string, setting: string, body: unknown): Promise<void> {
+    await this.json(`/buckets/${encodeURIComponent(bucket)}/${setting}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  }
+
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
     const headers = requestHeaders(init.headers, this.token())
     const response = await this.fetcher(`${this.base}${path}`, {
@@ -430,21 +468,6 @@ export class VaultClient {
       error?.request_id,
     )
   }
-}
-
-function requestHeaders(source: HeadersInit | undefined, token: string): Record<string, string> {
-  const headers: Record<string, string> = {}
-  if (source instanceof Headers) {
-    source.forEach((value, key) => { headers[key] = value })
-  } else if (Array.isArray(source)) {
-    for (const [key, value] of source) headers[key] = value
-  } else if (source) {
-    Object.assign(headers, source)
-  }
-  const names = new Set(Object.keys(headers).map((name) => name.toLowerCase()))
-  if (!names.has('accept')) headers.Accept = 'application/json'
-  if (token) headers.Authorization = `Bearer ${token}`
-  return headers
 }
 
 function handleChatFrame(frame: SSEFrame, onToken: (token: string) => void): ChatResponse | undefined {
