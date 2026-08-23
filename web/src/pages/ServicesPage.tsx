@@ -34,7 +34,7 @@ export function ServicesPage({ config }: { config: WebConfig }): React.ReactElem
           header="旧版 Aero Vault 控制台"
           footer={<IrisButton asChild variant="outline"><a href="/ui/legacy/">打开旧版</a></IrisButton>}
         >
-          搜索、Chat、血缘、分享、公开资产和部门 ACL 等能力在迁移完成前继续保留。
+          仅用于紧急回退和兼容旧书签；日常操作请使用当前 Iris UI。
         </IrisCard>
       </div>
     </section>

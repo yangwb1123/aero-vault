@@ -37,6 +37,36 @@ describe('VaultClient object management APIs', () => {
     expect(String(fetcher.mock.calls[1][0])).toBe('/v1/files/docs/a.txt?version=v%2F1')
   })
 
+  it('requests only the first 4 KiB for a safe object preview', async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>
+      expect(headers.Range).toBe('bytes=0-4095')
+      expect(headers.Accept).toBe('*/*')
+      return new Response('preview', { status: 206, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })
+    })
+    const client = new VaultClient('/v1', () => 'token', fetcher as typeof fetch)
+
+    await expect(client.previewObject('docs/a.txt')).resolves.toMatchObject({
+      contentType: 'text/plain', partial: true,
+    })
+    expect(String(fetcher.mock.calls[0][0])).toBe('/v1/files/docs/a.txt')
+  })
+
+  it('uses the bounded thumbnail endpoint for JPEG previews', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/thumbnail?')) {
+        return new Response('thumbnail', { status: 200, headers: { 'Content-Type': 'image/jpeg' } })
+      }
+      return new Response('jpeg header', { status: 206, headers: { 'Content-Type': 'image/jpeg' } })
+    })
+    const client = new VaultClient('/v1', () => 'token', fetcher as typeof fetch)
+
+    await expect(client.previewObject('images/hero.jpg')).resolves.toMatchObject({
+      contentType: 'image/jpeg', partial: false,
+    })
+    expect(String(fetcher.mock.calls[1][0])).toBe('/v1/files/images/hero.jpg/thumbnail?w=1280&h=960')
+  })
+
   it('manages restore, presign, and legal hold operations', async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)

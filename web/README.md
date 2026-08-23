@@ -1,11 +1,12 @@
 # Aero Vault Web
 
 `web/` 是 Aero Vault 的 Iris UI React 前端源码。生产构建输出到
-`internal/webui/static/app/`，由 Go 二进制嵌入并在 `/ui/app/` 提供。达到旧版能力齐平前，
-正式入口 `/ui/` 保持不变，`/ui/legacy/` 是它的显式别名。
+`internal/webui/static/app/`，由 Go 二进制嵌入并在 `/ui/` 提供；`/ui/app/` 是兼容别名，
+依赖无关的旧控制台保留在 `/ui/legacy/` 作为回退入口。
 
-当前 Iris UI 应用已接入 Snaplink 登录、服务概览、文件与回收站、对象标签/元数据/版本/Legal Hold、
-对象分享、公开图片、资源 ACL、部门与 aero-id 成员映射、可移植备份，以及 AI 搜索、SSE 流式对话和对象使用血缘查询。
+当前 Iris UI 应用已接入 Snaplink 登录、服务概览、拖拽批量上传、文件与回收站、受限内容预览、
+对象标签/元数据/版本/Legal Hold、对象分享、公开图片、资源 ACL、部门与 aero-id 成员映射、
+可移植备份，以及 AI 搜索、SSE 流式对话和对象使用血缘查询。
 AI 与企业访问页面遵循后端 opt-in 开关；能力未启用时会直接展示 API 返回的降级或不可用信息。
 
 ## 安装与运行

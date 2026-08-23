@@ -23,7 +23,7 @@ func TestFavicon(t *testing.T) {
 
 func TestConsoleIncludesEnterpriseAccessControls(t *testing.T) {
 	rec := httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ui/", nil))
+	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ui/legacy/", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d want %d", rec.Code, http.StatusOK)
 	}
@@ -45,17 +45,19 @@ func TestConsoleIncludesEnterpriseAccessControls(t *testing.T) {
 }
 
 func TestConsoleServesIrisApplication(t *testing.T) {
-	rec := httptest.NewRecorder()
-	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ui/app/", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want %d", rec.Code, http.StatusOK)
-	}
-	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("Cache-Control=%q want no-store", got)
-	}
-	for _, want := range []string{"<title>Aero Vault</title>", "/ui/app/runtime-config.js", "/ui/app/assets/"} {
-		if !strings.Contains(rec.Body.String(), want) {
-			t.Errorf("Iris application shell missing %q", want)
+	for _, path := range []string{"/ui/", "/ui/app/"} {
+		rec := httptest.NewRecorder()
+		Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status=%d want %d", path, rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("%s Cache-Control=%q want no-store", path, got)
+		}
+		for _, want := range []string{"<title>Aero Vault</title>", "/ui/app/runtime-config.js", "/ui/app/assets/"} {
+			if !strings.Contains(rec.Body.String(), want) {
+				t.Errorf("%s Iris application shell missing %q", path, want)
+			}
 		}
 	}
 }

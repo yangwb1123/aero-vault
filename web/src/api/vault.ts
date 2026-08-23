@@ -12,7 +12,7 @@ import type {
   ResourceKind,
   Share,
 } from './access'
-import type { LegalHold, ObjectVersion, PresignedLink } from './objects'
+import type { LegalHold, ObjectPreview, ObjectVersion, PresignedLink } from './objects'
 
 export type SearchMode = 'vector' | 'bm25' | 'hybrid'
 
@@ -151,6 +151,24 @@ export class VaultClient {
   async download(key: string): Promise<Blob> {
     const response = await this.request(`/files/${encodeKey(key)}`)
     return response.blob()
+  }
+
+  async previewObject(key: string): Promise<ObjectPreview> {
+    const response = await this.request(`/files/${encodeKey(key)}`, {
+      headers: { Accept: '*/*', Range: 'bytes=0-4095' },
+    })
+    const contentType = response.headers.get('Content-Type')?.split(';')[0] ?? ''
+    if (contentType === 'image/jpeg') {
+      const thumbnail = await this.request(`/files/${encodeKey(key)}/thumbnail?w=1280&h=960`, {
+        headers: { Accept: 'image/jpeg' },
+      })
+      return { body: await thumbnail.blob(), contentType: 'image/jpeg', partial: false }
+    }
+    return {
+      body: await response.blob(),
+      contentType,
+      partial: response.status === 206,
+    }
   }
 
   async getTags(key: string): Promise<Record<string, string>> {
@@ -363,10 +381,7 @@ export class VaultClient {
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
-    const headers = new Headers(init.headers)
-    if (!headers.has('Accept')) headers.set('Accept', 'application/json')
-    const token = this.token()
-    if (token) headers.set('Authorization', `Bearer ${token}`)
+    const headers = requestHeaders(init.headers, this.token())
     const response = await this.fetcher(`${this.base}${path}`, {
       ...init,
       headers,
@@ -387,6 +402,21 @@ export class VaultClient {
       error?.request_id,
     )
   }
+}
+
+function requestHeaders(source: HeadersInit | undefined, token: string): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (source instanceof Headers) {
+    source.forEach((value, key) => { headers[key] = value })
+  } else if (Array.isArray(source)) {
+    for (const [key, value] of source) headers[key] = value
+  } else if (source) {
+    Object.assign(headers, source)
+  }
+  const names = new Set(Object.keys(headers).map((name) => name.toLowerCase()))
+  if (!names.has('accept')) headers.Accept = 'application/json'
+  if (token) headers.Authorization = `Bearer ${token}`
+  return headers
 }
 
 function handleChatFrame(frame: SSEFrame, onToken: (token: string) => void): ChatResponse | undefined {

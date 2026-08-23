@@ -343,27 +343,6 @@ a {
   }
 }
 
-.file-picker {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 34px;
-  padding-inline: 14px;
-  border-radius: var(--iris-radius-md, 8px);
-  color: var(--iris-primary-foreground);
-  background: var(--iris-primary);
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 650;
-}
-
-.file-picker input {
-  position: absolute;
-  inline-size: 1px;
-  block-size: 1px;
-  opacity: 0;
-}
-
 .table-scroll {
   overflow-x: auto;
 }

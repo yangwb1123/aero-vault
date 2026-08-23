@@ -20,3 +20,9 @@ export interface LegalHold {
   created_by: string
   created_at: string
 }
+
+export interface ObjectPreview {
+  body: Blob
+  contentType: string
+  partial: boolean
+}

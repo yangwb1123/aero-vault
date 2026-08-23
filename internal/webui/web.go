@@ -1,6 +1,5 @@
-// Package webui serves the dependency-free console at /ui and the incremental
-// Iris UI replacement under /ui/app/. The legacy alias makes migrations and
-// bookmarks explicit while the new application reaches feature parity.
+// Package webui serves the Iris UI application at /ui and /ui/app. The
+// dependency-free console remains available under /ui/legacy for rollback.
 package webui
 
 import (
@@ -25,7 +24,7 @@ func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
 			w.Header().Set("Cache-Control", "no-store")
-			http.ServeFileFS(w, r, sub, "index.html")
+			http.ServeFileFS(w, r, sub, "app/index.html")
 			return
 		}
 		if r.URL.Path == "/ui/app" || r.URL.Path == "/ui/app/" {

@@ -4,6 +4,7 @@ import type { VaultClient, VaultObject } from '../api/vault'
 import { PageError, PageHeader, PageLoading } from '../components/Page'
 import { downloadBlob } from '../download'
 import { useResource } from '../hooks/useResource'
+import { UploadPanel } from './files/UploadPanel'
 
 const formatBytes = (value: number): string =>
   new Intl.NumberFormat('zh-CN', { notation: 'compact', style: 'unit', unit: 'byte' }).format(value)
@@ -34,9 +35,6 @@ export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpe
     }
   }
 
-  const upload = (file: File | undefined) => {
-    if (file) void run(`upload:${file.name}`, () => client.upload(file.name, file))
-  }
   const download = (item: VaultObject) =>
     run(`download:${item.key}`, async () => downloadBlob(await client.download(item.key), item.key.split('/').pop() || 'download'))
 
@@ -45,13 +43,8 @@ export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpe
       <PageHeader
         title="文件"
         description="浏览、上传、下载、管理和恢复默认存储桶中的对象。"
-        actions={!deleted ? (
-          <label className="file-picker">
-            <span>{busy.startsWith('upload:') ? '上传中…' : '上传文件'}</span>
-            <input type="file" disabled={Boolean(busy)} onChange={(event) => upload(event.target.files?.[0])} />
-          </label>
-        ) : undefined}
       />
+      {!deleted ? <div className="files-upload"><UploadPanel key={activePrefix} client={client} initialPrefix={activePrefix} onUploaded={resource.reload} /></div> : null}
       <form
         className="filter-bar"
         onSubmit={(event) => {

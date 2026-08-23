@@ -108,7 +108,7 @@ curl -s -X PUT --data-binary "hello world" \
   localhost:8080/v1/files/hello.txt
 curl -s localhost:8080/v1/files/hello.txt          # -> hello world
 open http://localhost:8080/docs                     # Swagger UI
-open http://localhost:8080/ui/app/                   # Iris UI web console
+open http://localhost:8080/ui/                       # Iris UI web console
 ```
 
 With the defaults the server starts with **no authentication** (MVP mode), the
@@ -124,8 +124,9 @@ make web-install
 make web-check
 ```
 
-The dependency-free console remains the `/ui/` default and is also available
-at `/ui/legacy/` until the Iris application reaches feature parity.
+The Iris application is the `/ui/` default and remains available at
+`/ui/app/` as a compatibility alias. The dependency-free console is retained
+at `/ui/legacy/` for rollback.
 
 ### One-command RAG demo
 
@@ -216,7 +217,7 @@ The most common knobs:
 | `PROMETHEUS_ENABLED` | `false` | Expose `/metrics`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | OTLP/HTTP endpoint, e.g. `http://localhost:4318`. |
 | `WEBDAV_PREFIX` | _(disabled)_ | e.g. `/webdav`. |
-| `WEBUI_ENABLED` | `true` | Existing console at `/ui`; incremental Iris UI application at `/ui/app/`. |
+| `WEBUI_ENABLED` | `true` | Iris UI at `/ui` (`/ui/app` alias); fallback console at `/ui/legacy`. |
 
 This is an abridged set. See [`docs/configuration.md`](docs/configuration.md) for
 the **exhaustive** reference (every variable, grouped by subsystem, with
