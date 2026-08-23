@@ -26,6 +26,10 @@ func openJobsTestRepo(t *testing.T) repository.Repository {
 // jobStatus returns the current status of the job with the given id, failing the
 // test if it is missing.
 func jobStatus(t *testing.T, repo repository.Repository, id int64) string {
+	return jobRecord(t, repo, id).Status
+}
+
+func jobRecord(t *testing.T, repo repository.Repository, id int64) repository.Job {
 	t.Helper()
 	ctx := context.Background()
 	jobs, err := repo.ListJobs(ctx, "", "", 500)
@@ -34,11 +38,11 @@ func jobStatus(t *testing.T, repo repository.Repository, id int64) string {
 	}
 	for _, j := range jobs {
 		if j.ID == id {
-			return j.Status
+			return j
 		}
 	}
 	t.Fatalf("job %d not found", id)
-	return ""
+	return repository.Job{}
 }
 
 // enqueueAndClaim enqueues a single job and immediately claims it, returning the
@@ -136,6 +140,27 @@ func TestRetryJobOnlyTransitionsRunning(t *testing.T) {
 	}
 	if got := jobStatus(t, repo, j.ID); got != repository.JobPending {
 		t.Fatalf("after retry: status=%q, want %q", got, repository.JobPending)
+	}
+}
+
+func TestRetryJobRequeuesFailedWithFreshAttemptBudget(t *testing.T) {
+	ctx := context.Background()
+	repo := openJobsTestRepo(t)
+
+	j := enqueueAndClaim(t, repo)
+	if err := repo.FailJob(ctx, j.ID, "permanent"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	if err := repo.RetryJob(ctx, j.ID, "manual retry", time.Now()); err != nil {
+		t.Fatalf("manual retry: %v", err)
+	}
+	requeued := jobRecord(t, repo, j.ID)
+	if requeued.Status != repository.JobPending || requeued.Attempts != 0 {
+		t.Fatalf("requeued job: status=%q attempts=%d, want pending/0", requeued.Status, requeued.Attempts)
+	}
+	claimed, ok, err := repo.ClaimJob(ctx, "worker-B")
+	if err != nil || !ok || claimed.ID != j.ID || claimed.Attempts != 1 {
+		t.Fatalf("claim manual retry: job=%+v ok=%v err=%v", claimed, ok, err)
 	}
 }
 

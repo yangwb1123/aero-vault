@@ -152,12 +152,16 @@ func (s *sqlStore) CompleteJob(ctx context.Context, id int64, result string) err
 	return err
 }
 
-// RetryJob returns a job to the pending queue with a delayed run_after and the
-// error that triggered the retry. Attempts were already bumped at claim time.
+// RetryJob returns a running or permanently failed job to the pending queue.
+// Worker retries retain their attempt count; manual retries of failed jobs get
+// a fresh attempt budget so the admin endpoint can actually re-run them.
 func (s *sqlStore) RetryJob(ctx context.Context, id int64, lastErr string, runAfter time.Time) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, s.rebind(
-		`UPDATE jobs SET status='pending', last_error=$1, run_after=$2, worker='', updated_at=$3 WHERE id=$4 AND status='running'`),
+		`UPDATE jobs SET status='pending', last_error=$1, run_after=$2, worker='',
+		 attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,
+		 started_at=NULL, finished_at=NULL, updated_at=$3
+		 WHERE id=$4 AND status IN ('running','failed')`),
 		lastErr, runAfter.UTC().Format(time.RFC3339Nano), now, id)
 	return err
 }

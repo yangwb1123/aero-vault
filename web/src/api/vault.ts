@@ -13,6 +13,13 @@ import type {
   Share,
 } from './access'
 import type { LegalHold, ObjectPreview, ObjectVersion, PresignedLink } from './objects'
+import {
+  normalizeWebhookFailure,
+  type AdminJobsResponse,
+  type AdminJobStatus,
+  type AdminTenant,
+  type AdminWebhookFailure,
+} from './admin'
 
 export type SearchMode = 'vector' | 'bm25' | 'hybrid'
 
@@ -331,6 +338,27 @@ export class VaultClient {
     await this.request(`/admin/departments/${encodeURIComponent(id)}/members/${encodeURIComponent(subject)}`, {
       method: 'DELETE',
     })
+  }
+
+  listAdminJobs(status: AdminJobStatus | '' = '', type = ''): Promise<AdminJobsResponse> {
+    const query = new URLSearchParams({ limit: '100' })
+    if (status) query.set('status', status)
+    if (type.trim()) query.set('type', type.trim())
+    return this.json<AdminJobsResponse>(`/admin/jobs?${query}`)
+  }
+
+  async retryAdminJob(id: number): Promise<void> {
+    await this.json(`/admin/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' })
+  }
+
+  async listAdminTenants(): Promise<AdminTenant[]> {
+    const result = await this.json<{ tenants?: AdminTenant[] }>('/admin/tenants')
+    return result.tenants ?? []
+  }
+
+  async listAdminWebhookFailures(): Promise<AdminWebhookFailure[]> {
+    const result = await this.json<{ failures?: unknown[] }>('/admin/webhook-failures?limit=100')
+    return (result.failures ?? []).map(normalizeWebhookFailure)
   }
 
   async search(query: string, mode: SearchMode): Promise<SearchHit[]> {

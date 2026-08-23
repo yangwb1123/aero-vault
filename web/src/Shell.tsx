@@ -18,6 +18,7 @@ import { DepartmentsPage } from './pages/departments/DepartmentsPage'
 import { LineagePage } from './pages/LineagePage'
 import { OverviewPage } from './pages/OverviewPage'
 import { ObjectPage } from './pages/object/ObjectPage'
+import { OperationsPage } from './pages/operations/OperationsPage'
 import { SearchPage } from './pages/SearchPage'
 import { ServicesPage } from './pages/ServicesPage'
 import { objectRoute, parseObjectRoute, useHashRoute } from './router'
@@ -30,6 +31,7 @@ const menus: NavNode[] = [
   { key: 'search', title: '知识检索', icon: 'search' },
   { key: 'chat', title: '知识 Chat', icon: 'link' },
   { key: 'lineage', title: '对象血缘', icon: 'clock' },
+  { key: 'operations', title: '运行运维', icon: 'settings' },
   { key: 'services', title: '平台服务', icon: 'grid' },
 ]
 const routeKeys = new Set(menus.map((item) => item.key))
@@ -53,6 +55,7 @@ function PageHost({
   if (route === 'search') return <SearchPage client={client} />
   if (route === 'chat') return <ChatPage client={client} />
   if (route === 'lineage') return <LineagePage client={client} />
+  if (route === 'operations') return <OperationsPage client={client} />
   if (route === 'services') return <ServicesPage config={config} />
   return <OverviewPage client={client} />
 }
