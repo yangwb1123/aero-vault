@@ -21,7 +21,10 @@ import {
   type AdminWebhookFailure,
 } from './admin'
 import type { BucketConfig, BucketLifecycleInput, BucketStats } from './buckets'
-import { requestHeaders } from './headers'
+import type { BatchDeleteResult, BatchTagResult, FolderListing } from './files'
+import { VaultApiError, VaultTransport } from './transport'
+
+export { VaultApiError } from './transport'
 
 export type SearchMode = 'vector' | 'bm25' | 'hybrid'
 
@@ -100,31 +103,9 @@ export interface FilePage {
   has_more: boolean
 }
 
-interface ErrorEnvelope {
-  error?: { code?: string; message?: string; request_id?: string } | string
-}
-
-export class VaultApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-    readonly requestId = '',
-  ) {
-    super(message)
-    this.name = 'VaultApiError'
-  }
-}
-
 const encodeKey = (key: string): string => key.split('/').map(encodeURIComponent).join('/')
 
-export class VaultClient {
-  constructor(
-    private readonly base: string,
-    private readonly token: () => string,
-    private readonly fetcher: typeof fetch = window.fetch.bind(window),
-  ) {}
-
+export class VaultClient extends VaultTransport {
   getSession(): Promise<VaultSession> {
     return this.json<VaultSession>('/session')
   }
@@ -183,6 +164,34 @@ export class VaultClient {
 
   async deleteFile(key: string): Promise<void> {
     await this.request(`/files/${encodeKey(key)}`, { method: 'DELETE' })
+  }
+
+  listFolder(path = ''): Promise<FolderListing> {
+    const query = new URLSearchParams()
+    if (path) query.set('path', path)
+    const suffix = query.size ? `?${query}` : ''
+    return this.json<FolderListing>(`/folders${suffix}`)
+  }
+
+  async createFolder(path: string): Promise<void> {
+    await this.json(`/folders/${encodeKey(path)}`, { method: 'POST' })
+  }
+
+  async deleteFolder(path: string): Promise<void> {
+    const result = await this.json<{ deleted: number; failed: number }>(`/folders/${encodeKey(path)}`, { method: 'DELETE' })
+    if (result.failed > 0) {
+      throw new VaultApiError(409, 'PartialFailure', `目录中有 ${result.failed} 个对象未能删除`)
+    }
+  }
+
+  async batchDeleteFiles(keys: string[]): Promise<BatchDeleteResult[]> {
+    const result = await this.postBatch<BatchDeleteResult>('delete', { keys })
+    return result.results
+  }
+
+  async batchTagFiles(keys: string[], tags: Record<string, string>): Promise<BatchTagResult[]> {
+    const result = await this.postBatch<BatchTagResult>('tag', { keys, tags })
+    return result.results
   }
 
   async download(key: string): Promise<Blob> {
@@ -433,11 +442,6 @@ export class VaultClient {
     return completed
   }
 
-  private async json<T>(path: string, init?: RequestInit): Promise<T> {
-    const response = await this.request(path, init)
-    return (await response.json()) as T
-  }
-
   private async putBucketJSON(bucket: string, setting: string, body: unknown): Promise<void> {
     await this.json(`/buckets/${encodeURIComponent(bucket)}/${setting}`, {
       method: 'PUT',
@@ -446,28 +450,14 @@ export class VaultClient {
     })
   }
 
-  private async request(path: string, init: RequestInit = {}): Promise<Response> {
-    const headers = requestHeaders(init.headers, this.token())
-    const response = await this.fetcher(`${this.base}${path}`, {
-      ...init,
-      headers,
-      credentials: 'same-origin',
+  private postBatch<T>(operation: string, body: unknown): Promise<{ results: T[] }> {
+    return this.json<{ results: T[] }>(`/batch/${operation}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     })
-    if (response.ok) return response
-    let envelope: ErrorEnvelope = {}
-    try {
-      envelope = (await response.json()) as ErrorEnvelope
-    } catch {
-      // Non-JSON reverse proxies still become a bounded status error.
-    }
-    const error = typeof envelope.error === 'object' ? envelope.error : undefined
-    throw new VaultApiError(
-      response.status,
-      error?.code ?? 'HTTPError',
-      error?.message ?? `Aero Vault 请求失败（HTTP ${response.status}）`,
-      error?.request_id,
-    )
   }
+
 }
 
 function handleChatFrame(frame: SSEFrame, onToken: (token: string) => void): ChatResponse | undefined {

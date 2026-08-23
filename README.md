@@ -117,9 +117,9 @@ database at `./var/aero.db`.
 
 The Iris UI React source lives in [`web/`](web/README.md). It uses the
 server-side Snaplink Authorization Code + PKCE flow, consumes the published
-Iris UI npm packages, and includes object/access workflows, bucket protection
-settings, plus an operator-only job, tenant, and webhook operations view. It
-builds into the Go embedded assets:
+Iris UI npm packages, and includes directory navigation, batch object actions,
+access workflows, bucket protection settings, plus an operator-only job, tenant,
+and webhook operations view. It builds into the Go embedded assets:
 
 ```bash
 make web-install

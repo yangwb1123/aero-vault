@@ -1,0 +1,107 @@
+.files-stack {
+  display: grid;
+  gap: var(--iris-space-md, 16px);
+}
+
+.folder-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-block-end: var(--iris-space-md, 16px);
+  color: var(--iris-muted);
+  font-size: 13px;
+}
+
+.folder-crumbs button,
+.folder-open {
+  padding: 0;
+  color: var(--iris-foreground);
+  font: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.folder-crumbs button:hover,
+.folder-open:hover strong {
+  color: var(--iris-primary);
+}
+
+.folder-create,
+.batch-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--iris-space-sm, 12px);
+}
+
+.folder-create {
+  margin-block-end: var(--iris-space-md, 16px);
+}
+
+.folder-create [data-iris-input] {
+  flex: 1;
+}
+
+.folder-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: var(--iris-space-sm, 12px);
+}
+
+.folder-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 11px 12px;
+  background: color-mix(in srgb, var(--iris-primary) 5%, transparent);
+  border: 1px solid var(--iris-border);
+  border-radius: var(--iris-radius-md, 8px);
+}
+
+.folder-open {
+  display: grid;
+  min-width: 0;
+  text-align: start;
+}
+
+.folder-open strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.folder-open span {
+  color: var(--iris-muted);
+  font-size: 12px;
+}
+
+.batch-toolbar {
+  flex-wrap: wrap;
+}
+
+.batch-toolbar [data-iris-input] {
+  min-width: 140px;
+  flex: 1;
+}
+
+.selection-cell {
+  width: 44px;
+  min-width: 44px;
+  text-align: center !important;
+}
+
+@media (max-width: 720px) {
+  .folder-create,
+  .batch-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .folder-create [data-iris-button],
+  .batch-toolbar [data-iris-button] {
+    width: 100%;
+    justify-content: center;
+  }
+}

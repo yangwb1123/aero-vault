@@ -149,7 +149,7 @@ func init() {
 		// Folders
 		{Method: "GET", Path: "/v1/folders", Summary: "List folders", Tag: "files", Status: 200, Response: `{"folders":["docs/","images/"]}`},
 		{Method: "POST", Path: "/v1/folders/{key}", Summary: "Create folder", Tag: "files", Status: 201},
-		{Method: "DELETE", Path: "/v1/folders/{key}", Summary: "Delete folder", Tag: "files", Status: 204},
+		{Method: "DELETE", Path: "/v1/folders/{key}", Summary: "Delete folder recursively", Tag: "files", Status: 200, Response: `{"deleted":3,"failed":0}`},
 
 		// Enterprise access, sharing, publishing, and portable export
 		{

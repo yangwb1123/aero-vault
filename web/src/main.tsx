@@ -5,6 +5,7 @@ import './style.css'
 import './object.css'
 import './operations.css'
 import './buckets.css'
+import './files.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
