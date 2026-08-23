@@ -71,3 +71,27 @@ export interface PutACLInput {
   effect: AccessEffect
   inherit: boolean
 }
+
+export interface Department {
+  id: string
+  tenant_id: string
+  parent_id?: string
+  name: string
+  created_at: string
+  updated_at: string
+}
+
+export type DepartmentRole = 'member' | 'manager'
+
+export interface DepartmentMember {
+  tenant_id: string
+  department_id: string
+  subject_id: string
+  role: DepartmentRole
+  created_at: string
+}
+
+export interface DepartmentDetail {
+  department: Department
+  members: DepartmentMember[]
+}

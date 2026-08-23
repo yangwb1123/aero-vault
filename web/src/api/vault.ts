@@ -3,6 +3,9 @@ import type {
   ACLEntry,
   CreatedShare,
   CreateShareInput,
+  Department,
+  DepartmentDetail,
+  DepartmentRole,
   PublicAsset,
   PublishedAsset,
   PutACLInput,
@@ -208,6 +211,41 @@ export class VaultClient {
       headers: { Accept: 'application/gzip' },
     })
     return response.blob()
+  }
+
+  async listDepartments(): Promise<Department[]> {
+    const result = await this.json<{ departments?: Department[] }>('/admin/departments')
+    return result.departments ?? []
+  }
+
+  createDepartment(name: string, parentId = ''): Promise<Department> {
+    return this.json<Department>('/admin/departments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, parent_id: parentId }),
+    })
+  }
+
+  getDepartment(id: string): Promise<DepartmentDetail> {
+    return this.json<DepartmentDetail>(`/admin/departments/${encodeURIComponent(id)}`)
+  }
+
+  async deleteDepartment(id: string): Promise<void> {
+    await this.request(`/admin/departments/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  async putDepartmentMember(id: string, subject: string, role: DepartmentRole): Promise<void> {
+    await this.json(`/admin/departments/${encodeURIComponent(id)}/members/${encodeURIComponent(subject)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role }),
+    })
+  }
+
+  async deleteDepartmentMember(id: string, subject: string): Promise<void> {
+    await this.request(`/admin/departments/${encodeURIComponent(id)}/members/${encodeURIComponent(subject)}`, {
+      method: 'DELETE',
+    })
   }
 
   async search(query: string, mode: SearchMode): Promise<SearchHit[]> {

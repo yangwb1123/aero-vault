@@ -315,6 +315,28 @@ a {
   color: var(--iris-danger);
 }
 
+.department-create,
+.member-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  align-items: end;
+  gap: var(--iris-space-md, 16px);
+}
+
+.department-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.7fr) minmax(0, 1.8fr);
+  align-items: start;
+  gap: var(--iris-space-md, 16px);
+}
+
+.department-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--iris-space-md, 16px);
+}
+
 @keyframes vault-cursor {
   50% {
     opacity: 0;
@@ -403,6 +425,17 @@ a {
   .access-link,
   .backup-form {
     align-items: stretch;
+    flex-direction: column;
+  }
+
+  .department-create,
+  .member-form,
+  .department-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .department-heading {
+    align-items: flex-start;
     flex-direction: column;
   }
 }

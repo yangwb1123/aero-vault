@@ -14,6 +14,7 @@ import type { WebConfig } from './config'
 import { FilesPage } from './pages/FilesPage'
 import { AccessPage } from './pages/access/AccessPage'
 import { ChatPage } from './pages/ChatPage'
+import { DepartmentsPage } from './pages/departments/DepartmentsPage'
 import { LineagePage } from './pages/LineagePage'
 import { OverviewPage } from './pages/OverviewPage'
 import { SearchPage } from './pages/SearchPage'
@@ -24,6 +25,7 @@ const menus: NavNode[] = [
   { key: 'overview', title: '空间概览', icon: 'home' },
   { key: 'files', title: '文件', icon: 'folder' },
   { key: 'access', title: '访问与发布', icon: 'lock' },
+  { key: 'departments', title: '部门与成员', icon: 'users' },
   { key: 'search', title: '知识检索', icon: 'search' },
   { key: 'chat', title: '知识 Chat', icon: 'link' },
   { key: 'lineage', title: '对象血缘', icon: 'clock' },
@@ -42,6 +44,7 @@ function PageHost({
 }): React.ReactElement {
   if (route === 'files') return <FilesPage client={client} />
   if (route === 'access') return <AccessPage client={client} />
+  if (route === 'departments') return <DepartmentsPage client={client} />
   if (route === 'search') return <SearchPage client={client} />
   if (route === 'chat') return <ChatPage client={client} />
   if (route === 'lineage') return <LineagePage client={client} />
