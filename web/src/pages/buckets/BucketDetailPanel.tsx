@@ -4,6 +4,7 @@ import type { BucketConfig } from '../../api/buckets'
 import type { VaultClient } from '../../api/vault'
 import { PageError, PageLoading } from '../../components/Page'
 import { useResource } from '../../hooks/useResource'
+import { BucketSecurityPanel } from './BucketSecurityPanel'
 
 export function BucketDetailPanel({ client, bucket, onDeleted }: { client: VaultClient; bucket: string; onDeleted(): void }): React.ReactElement {
   const load = React.useCallback(async () => {
@@ -22,6 +23,7 @@ export function BucketDetailPanel({ client, bucket, onDeleted }: { client: Vault
         <IrisCard variant="outline" header="占用空间"><div className="metric-value">{formatBytes(stats.total_size_bytes)}</div></IrisCard>
       </div>
       <BucketSettings client={client} bucket={bucket} config={config} onSaved={resource.reload} />
+      <BucketSecurityPanel client={client} bucket={bucket} />
       <DangerZone client={client} bucket={bucket} onDeleted={onDeleted} />
     </div>
   )

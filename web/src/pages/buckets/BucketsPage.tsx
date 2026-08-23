@@ -41,7 +41,7 @@ export function BucketsPage({ client }: { client: VaultClient }): React.ReactEle
 
   return (
     <section>
-      <PageHeader title="存储桶" description="创建和管理当前租户的版本控制、默认对象锁与生命周期策略。" />
+      <PageHeader title="存储桶" description="管理当前租户的数据保护、访问策略、跨域规则与服务端加密。" />
       <div className="bucket-stack">
         <IrisCard variant="outline" header="创建存储桶">
           <form className="bucket-create" onSubmit={(event) => { event.preventDefault(); void create() }}>

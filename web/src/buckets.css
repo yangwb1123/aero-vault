@@ -1,7 +1,53 @@
 .bucket-stack,
-.bucket-detail {
+.bucket-detail,
+.bucket-security-stack {
   display: grid;
   gap: var(--iris-space-md, 16px);
+}
+
+.bucket-security-tabs {
+  margin-block-end: var(--iris-space-md, 16px);
+}
+
+.bucket-security-form,
+.bucket-encryption-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.75fr) minmax(240px, 1fr) auto;
+  align-items: end;
+  gap: var(--iris-space-md, 16px);
+}
+
+.bucket-security-form label,
+.bucket-encryption-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--iris-muted);
+  font-size: 13px;
+}
+
+.bucket-security-form p {
+  margin: 0;
+  color: var(--iris-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.bucket-security-form select,
+.bucket-encryption-form select {
+  min-height: 34px;
+  padding-inline: 10px;
+  color: var(--iris-foreground);
+  background: var(--iris-background);
+  border: 1px solid var(--iris-border);
+  border-radius: var(--iris-radius-md, 8px);
+  font: inherit;
+}
+
+.bucket-security-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--iris-space-sm, 12px);
+  margin-block-start: var(--iris-space-md, 16px);
 }
 
 .bucket-create {
@@ -123,7 +169,9 @@
 @media (max-width: 820px) {
   .bucket-layout,
   .bucket-settings form,
-  .bucket-settings .bucket-lifecycle {
+  .bucket-settings .bucket-lifecycle,
+  .bucket-security-form,
+  .bucket-encryption-form {
     grid-template-columns: 1fr;
   }
 

@@ -21,6 +21,7 @@ import {
   type AdminWebhookFailure,
 } from './admin'
 import type { BucketConfig, BucketLifecycleInput, BucketStats } from './buckets'
+import { BucketSecurityClient } from './bucketSecurity'
 import type { BatchDeleteResult, BatchTagResult, FolderListing } from './files'
 import { normalizeAgentResponse, type AgentResponse } from './agent'
 import { VaultApiError, VaultTransport } from './transport'
@@ -107,6 +108,8 @@ export interface FilePage {
 const encodeKey = (key: string): string => key.split('/').map(encodeURIComponent).join('/')
 
 export class VaultClient extends VaultTransport {
+  readonly bucketSecurity = new BucketSecurityClient(this.base, this.token, this.fetcher)
+
   getSession(): Promise<VaultSession> {
     return this.json<VaultSession>('/session')
   }
