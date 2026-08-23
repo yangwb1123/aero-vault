@@ -12,6 +12,7 @@ import { VaultClient } from './api/vault'
 import { useAuth } from './auth/AuthProvider'
 import type { WebConfig } from './config'
 import { FilesPage } from './pages/FilesPage'
+import { AccessPage } from './pages/access/AccessPage'
 import { ChatPage } from './pages/ChatPage'
 import { LineagePage } from './pages/LineagePage'
 import { OverviewPage } from './pages/OverviewPage'
@@ -22,6 +23,7 @@ import { useHashRoute } from './router'
 const menus: NavNode[] = [
   { key: 'overview', title: '空间概览', icon: 'home' },
   { key: 'files', title: '文件', icon: 'folder' },
+  { key: 'access', title: '访问与发布', icon: 'lock' },
   { key: 'search', title: '知识检索', icon: 'search' },
   { key: 'chat', title: '知识 Chat', icon: 'link' },
   { key: 'lineage', title: '对象血缘', icon: 'clock' },
@@ -39,6 +41,7 @@ function PageHost({
   config: WebConfig
 }): React.ReactElement {
   if (route === 'files') return <FilesPage client={client} />
+  if (route === 'access') return <AccessPage client={client} />
   if (route === 'search') return <SearchPage client={client} />
   if (route === 'chat') return <ChatPage client={client} />
   if (route === 'lineage') return <LineagePage client={client} />

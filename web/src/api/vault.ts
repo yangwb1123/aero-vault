@@ -1,4 +1,14 @@
 import { SSEDecoder, type SSEFrame } from './sse'
+import type {
+  ACLEntry,
+  CreatedShare,
+  CreateShareInput,
+  PublicAsset,
+  PublishedAsset,
+  PutACLInput,
+  ResourceKind,
+  Share,
+} from './access'
 
 export type SearchMode = 'vector' | 'bm25' | 'hybrid'
 
@@ -135,6 +145,68 @@ export class VaultClient {
 
   async download(key: string): Promise<Blob> {
     const response = await this.request(`/files/${encodeKey(key)}`)
+    return response.blob()
+  }
+
+  async createShare(input: CreateShareInput): Promise<CreatedShare> {
+    return this.json<CreatedShare>('/shares', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+  }
+
+  async listShares(key: string): Promise<Share[]> {
+    const query = new URLSearchParams({ bucket: 'default', key })
+    const result = await this.json<{ shares?: Share[] }>(`/shares?${query}`)
+    return result.shares ?? []
+  }
+
+  async revokeShare(id: string): Promise<void> {
+    await this.request(`/shares/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  async publishAsset(key: string, slug: string): Promise<PublishedAsset> {
+    return this.json<PublishedAsset>('/assets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, slug, cache_control: 'public, max-age=86400' }),
+    })
+  }
+
+  async listAssets(): Promise<PublicAsset[]> {
+    const result = await this.json<{ assets?: PublicAsset[] }>('/assets')
+    return result.assets ?? []
+  }
+
+  async unpublishAsset(slug: string): Promise<void> {
+    await this.request(`/assets/${encodeKey(slug)}`, { method: 'DELETE' })
+  }
+
+  async listACL(key: string, kind: ResourceKind): Promise<ACLEntry[]> {
+    const query = new URLSearchParams({ bucket: 'default', key, kind })
+    const result = await this.json<{ entries?: ACLEntry[] }>(`/access/acl?${query}`)
+    return result.entries ?? []
+  }
+
+  async putACL(input: PutACLInput): Promise<ACLEntry[]> {
+    const result = await this.json<{ entries?: ACLEntry[] }>('/access/acl', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    return result.entries ?? []
+  }
+
+  async deleteACL(id: string): Promise<void> {
+    await this.request(`/access/acl/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  async exportArchive(prefix: string): Promise<Blob> {
+    const query = new URLSearchParams({ bucket: 'default', prefix })
+    const response = await this.request(`/exports/archive?${query}`, {
+      headers: { Accept: 'application/gzip' },
+    })
     return response.blob()
   }
 

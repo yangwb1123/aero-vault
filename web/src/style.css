@@ -242,6 +242,79 @@ a {
   animation: vault-cursor 0.9s steps(2, jump-none) infinite;
 }
 
+.access-tabs {
+  margin-block-end: var(--iris-space-md, 16px);
+}
+
+.access-panel,
+.access-stack {
+  display: grid;
+  gap: var(--iris-space-md, 16px);
+}
+
+.access-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--iris-space-md, 16px);
+}
+
+.access-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--iris-muted);
+  font-size: 13px;
+}
+
+.access-field select {
+  min-height: 34px;
+  padding-inline: 10px;
+  color: var(--iris-foreground);
+  background: var(--iris-background);
+  border: 1px solid var(--iris-border);
+  border-radius: var(--iris-radius-md, 8px);
+  font: inherit;
+}
+
+.access-wide {
+  grid-column: 1 / -1;
+}
+
+.access-options,
+.access-actions,
+.access-link,
+.backup-form {
+  display: flex;
+  align-items: center;
+  gap: var(--iris-space-sm, 12px);
+}
+
+.access-options {
+  flex-wrap: wrap;
+}
+
+.access-actions,
+.backup-form {
+  justify-content: flex-end;
+}
+
+.access-link {
+  justify-content: space-between;
+}
+
+.access-link a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.backup-form .access-field {
+  flex: 1;
+}
+
+.text-danger {
+  color: var(--iris-danger);
+}
+
 @keyframes vault-cursor {
   50% {
     opacity: 0;
@@ -316,5 +389,20 @@ a {
 
   .mode-field {
     min-width: 0;
+  }
+
+  .access-form {
+    grid-template-columns: 1fr;
+  }
+
+  .access-wide {
+    grid-column: auto;
+  }
+
+  .access-actions,
+  .access-link,
+  .backup-form {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
