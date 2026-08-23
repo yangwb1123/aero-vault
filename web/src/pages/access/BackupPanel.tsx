@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { IrisAlert, IrisButton, IrisCard, IrisInput } from '@iris-ui-kit/react'
 import type { VaultClient } from '../../api/vault'
+import { downloadBlob } from '../../download'
 
 export function BackupPanel({ client }: { client: VaultClient }): React.ReactElement {
   const [prefix, setPrefix] = React.useState('')
@@ -12,7 +13,7 @@ export function BackupPanel({ client }: { client: VaultClient }): React.ReactEle
     setError(undefined)
     try {
       const archive = await client.exportArchive(prefix.trim())
-      saveArchive(archive)
+      downloadBlob(archive, `aero-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '备份导出失败')
     } finally {
@@ -32,13 +33,4 @@ export function BackupPanel({ client }: { client: VaultClient }): React.ReactEle
       {error ? <IrisAlert tone="danger">{error}</IrisAlert> : null}
     </div>
   )
-}
-
-function saveArchive(blob: Blob): void {
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = `aero-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`
-  anchor.click()
-  URL.revokeObjectURL(url)
 }

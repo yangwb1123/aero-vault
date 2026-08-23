@@ -12,6 +12,7 @@ import type {
   ResourceKind,
   Share,
 } from './access'
+import type { LegalHold, ObjectVersion, PresignedLink } from './objects'
 
 export type SearchMode = 'vector' | 'bm25' | 'hybrid'
 
@@ -128,9 +129,10 @@ export class VaultClient {
     return result.buckets ?? []
   }
 
-  listFiles(prefix = ''): Promise<FilePage> {
+  listFiles(prefix = '', deleted = false): Promise<FilePage> {
     const query = new URLSearchParams({ limit: '200' })
     if (prefix) query.set('prefix', prefix)
+    if (deleted) query.set('deleted', 'true')
     return this.json<FilePage>(`/files?${query}`)
   }
 
@@ -149,6 +151,71 @@ export class VaultClient {
   async download(key: string): Promise<Blob> {
     const response = await this.request(`/files/${encodeKey(key)}`)
     return response.blob()
+  }
+
+  async getTags(key: string): Promise<Record<string, string>> {
+    const result = await this.json<{ tags?: Record<string, string> }>(`/files/${encodeKey(key)}/tags`)
+    return result.tags ?? {}
+  }
+
+  async putTags(key: string, tags: Record<string, string>): Promise<void> {
+    await this.json(`/files/${encodeKey(key)}/tags`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(tags),
+    })
+  }
+
+  getMetadata(key: string): Promise<Record<string, string>> {
+    return this.json<Record<string, string>>(`/files/${encodeKey(key)}/metadata`)
+  }
+
+  async putMetadata(key: string, metadata: Record<string, string>): Promise<void> {
+    await this.json(`/files/${encodeKey(key)}/metadata`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(metadata),
+    })
+  }
+
+  async listVersions(key: string): Promise<ObjectVersion[]> {
+    const result = await this.json<{ versions?: ObjectVersion[] }>(`/files/${encodeKey(key)}/versions`)
+    return result.versions ?? []
+  }
+
+  async downloadVersion(key: string, versionID: string): Promise<Blob> {
+    const query = new URLSearchParams({ version: versionID })
+    const response = await this.request(`/files/${encodeKey(key)}?${query}`)
+    return response.blob()
+  }
+
+  async restoreObject(key: string): Promise<void> {
+    await this.json(`/files/${encodeKey(key)}/restore`, { method: 'POST' })
+  }
+
+  presignObject(key: string, operation: 'get' | 'put', expires: number): Promise<PresignedLink> {
+    const query = new URLSearchParams({ op: operation, expires: String(expires) })
+    return this.json<PresignedLink>(`/files/${encodeKey(key)}/presign?${query}`, { method: 'POST' })
+  }
+
+  async getLegalHold(key: string, versionID = ''): Promise<LegalHold | undefined> {
+    const query = new URLSearchParams({ key })
+    if (versionID) query.set('versionId', versionID)
+    try {
+      return await this.json<LegalHold>(`/legal-hold?${query}`)
+    } catch (reason) {
+      if (reason instanceof VaultApiError && reason.status === 404) return undefined
+      throw reason
+    }
+  }
+
+  async putLegalHold(key: string, reason: string, versionID = ''): Promise<void> {
+    await this.json('/legal-hold', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, reason, ...(versionID ? { version_id: versionID } : {}) }),
+    })
+  }
+
+  async removeLegalHold(key: string, versionID = ''): Promise<void> {
+    const query = new URLSearchParams({ key })
+    if (versionID) query.set('versionId', versionID)
+    await this.request(`/legal-hold?${query}`, { method: 'DELETE' })
   }
 
   async createShare(input: CreateShareInput): Promise<CreatedShare> {

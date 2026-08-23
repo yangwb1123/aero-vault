@@ -17,9 +17,10 @@ import { ChatPage } from './pages/ChatPage'
 import { DepartmentsPage } from './pages/departments/DepartmentsPage'
 import { LineagePage } from './pages/LineagePage'
 import { OverviewPage } from './pages/OverviewPage'
+import { ObjectPage } from './pages/object/ObjectPage'
 import { SearchPage } from './pages/SearchPage'
 import { ServicesPage } from './pages/ServicesPage'
-import { useHashRoute } from './router'
+import { objectRoute, parseObjectRoute, useHashRoute } from './router'
 
 const menus: NavNode[] = [
   { key: 'overview', title: '空间概览', icon: 'home' },
@@ -37,12 +38,16 @@ function PageHost({
   route,
   client,
   config,
+  navigate,
 }: {
   route: string
   client: VaultClient
   config: WebConfig
+  navigate(route: string): void
 }): React.ReactElement {
-  if (route === 'files') return <FilesPage client={client} />
+  const object = parseObjectRoute(route)
+  if (object) return <ObjectPage key={`${object.deleted}:${object.key}`} client={client} objectKey={object.key} deleted={object.deleted} onBack={() => navigate('files')} onRestored={() => navigate(objectRoute(object.key))} />
+  if (route === 'files') return <FilesPage client={client} onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted))} />
   if (route === 'access') return <AccessPage client={client} />
   if (route === 'departments') return <DepartmentsPage client={client} />
   if (route === 'search') return <SearchPage client={client} />
@@ -56,7 +61,9 @@ export function Shell({ config }: { config: WebConfig }): React.ReactElement {
   const auth = useAuth()
   const { skin, setMode, setSkin } = useSkin()
   const [route, navigate] = useHashRoute('overview')
-  const activeRoute = routeKeys.has(route) ? route : 'overview'
+  const object = parseObjectRoute(route)
+  const pageRoute = routeKeys.has(route) || object ? route : 'overview'
+  const activeRoute = object ? 'files' : pageRoute
   const token = auth.session?.accessToken ?? ''
   const client = React.useMemo(
     () => new VaultClient(config.apiBase, () => token),
@@ -97,7 +104,7 @@ export function Shell({ config }: { config: WebConfig }): React.ReactElement {
       }
       footer={<div className="shell-footer">文件由 Aero Vault 管理 · 身份由 Snaplink 验证 · UI 由 Iris UI 构建</div>}
     >
-      <PageHost route={activeRoute} client={client} config={config} />
+      <PageHost route={pageRoute} client={client} config={config} navigate={navigate} />
     </IrisAdminLayout>
   )
 }

@@ -1,27 +1,20 @@
 import * as React from 'react'
-import { IrisAlert, IrisButton, IrisCard, IrisInput } from '@iris-ui-kit/react'
+import { IrisAlert, IrisButton, IrisCard, IrisInput, IrisSwitch } from '@iris-ui-kit/react'
 import type { VaultClient, VaultObject } from '../api/vault'
 import { PageError, PageHeader, PageLoading } from '../components/Page'
+import { downloadBlob } from '../download'
 import { useResource } from '../hooks/useResource'
 
 const formatBytes = (value: number): string =>
   new Intl.NumberFormat('zh-CN', { notation: 'compact', style: 'unit', unit: 'byte' }).format(value)
 
-function saveBlob(blob: Blob, key: string): void {
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = key.split('/').pop() || 'download'
-  anchor.click()
-  URL.revokeObjectURL(url)
-}
-
-export function FilesPage({ client }: { client: VaultClient }): React.ReactElement {
+export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpenObject(key: string, deleted: boolean): void }): React.ReactElement {
   const [prefix, setPrefix] = React.useState('')
   const [activePrefix, setActivePrefix] = React.useState('')
+  const [deleted, setDeleted] = React.useState(false)
   const [busy, setBusy] = React.useState('')
   const [message, setMessage] = React.useState<{ tone: 'success' | 'danger'; text: string }>()
-  const load = React.useCallback(() => client.listFiles(activePrefix), [activePrefix, client])
+  const load = React.useCallback(() => client.listFiles(activePrefix, deleted), [activePrefix, client, deleted])
   const resource = useResource(load)
 
   const run = async (label: string, action: () => Promise<void>) => {
@@ -45,19 +38,19 @@ export function FilesPage({ client }: { client: VaultClient }): React.ReactEleme
     if (file) void run(`upload:${file.name}`, () => client.upload(file.name, file))
   }
   const download = (item: VaultObject) =>
-    run(`download:${item.key}`, async () => saveBlob(await client.download(item.key), item.key))
+    run(`download:${item.key}`, async () => downloadBlob(await client.download(item.key), item.key.split('/').pop() || 'download'))
 
   return (
     <section>
       <PageHeader
         title="文件"
-        description="浏览、上传、下载和软删除默认存储桶中的对象。"
-        actions={
+        description="浏览、上传、下载、管理和恢复默认存储桶中的对象。"
+        actions={!deleted ? (
           <label className="file-picker">
             <span>{busy.startsWith('upload:') ? '上传中…' : '上传文件'}</span>
             <input type="file" disabled={Boolean(busy)} onChange={(event) => upload(event.target.files?.[0])} />
           </label>
-        }
+        ) : undefined}
       />
       <form
         className="filter-bar"
@@ -67,6 +60,7 @@ export function FilesPage({ client }: { client: VaultClient }): React.ReactEleme
         }}
       >
         <IrisInput value={prefix} placeholder="按 key 前缀筛选" onChange={(event) => setPrefix(event.target.value)} />
+        <label className="deleted-toggle"><IrisSwitch checked={deleted} onChange={setDeleted} /><span>回收站</span></label>
         <IrisButton type="submit" variant="outline">筛选</IrisButton>
       </form>
       {message ? <IrisAlert tone={message.tone}>{message.text}</IrisAlert> : null}
@@ -85,17 +79,17 @@ export function FilesPage({ client }: { client: VaultClient }): React.ReactEleme
                     <td>{item.content_type || 'application/octet-stream'}</td>
                     <td>{new Date(item.updated_at).toLocaleString('zh-CN')}</td>
                     <td className="row-actions">
-                      <IrisButton size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => void download(item)}>下载</IrisButton>
-                      <IrisButton
-                        size="sm"
-                        variant="ghost"
-                        disabled={Boolean(busy)}
-                        onClick={() => {
-                          if (window.confirm(`软删除 ${item.key}？`)) {
-                            void run(`delete:${item.key}`, () => client.deleteFile(item.key))
-                          }
-                        }}
-                      >删除</IrisButton>
+                      <IrisButton size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => onOpenObject(item.key, deleted)}>详情</IrisButton>
+                      {deleted ? (
+                        <IrisButton size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => void run(`restore:${item.key}`, () => client.restoreObject(item.key))}>恢复</IrisButton>
+                      ) : (
+                        <>
+                          <IrisButton size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => void download(item)}>下载</IrisButton>
+                          <IrisButton size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => {
+                            if (window.confirm(`软删除 ${item.key}？`)) void run(`delete:${item.key}`, () => client.deleteFile(item.key))
+                          }}>删除</IrisButton>
+                        </>
+                      )}
                     </td>
                   </tr>
                 ))}
