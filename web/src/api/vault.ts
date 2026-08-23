@@ -413,6 +413,12 @@ export class VaultClient extends VaultTransport {
     return this.json<LineageResponse>(`/lineage/objects/${encodeURIComponent(objectId)}?limit=100`)
   }
 
+  openEventStream(lastEventID: number, signal?: AbortSignal): Promise<Response> {
+    const headers: Record<string, string> = { Accept: 'text/event-stream' }
+    if (lastEventID > 0) headers['Last-Event-ID'] = String(lastEventID)
+    return this.request('/events/stream', { headers, signal })
+  }
+
   async streamChat(
     query: string,
     mode: SearchMode,

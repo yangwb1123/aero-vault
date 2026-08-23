@@ -17,4 +17,11 @@ describe('SSEDecoder', () => {
       { event: 'error', data: 'first\nsecond' },
     ])
   })
+
+  it('preserves the SSE event id for reconnect replay', () => {
+    const decoder = new SSEDecoder()
+    expect(decoder.push('id: 42\nevent: created\ndata: {"id":42}\n\n')).toEqual([
+      { id: '42', event: 'created', data: '{"id":42}' },
+    ])
+  })
 })

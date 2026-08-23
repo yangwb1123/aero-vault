@@ -1,0 +1,24 @@
+.activity-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--iris-space-md, 16px);
+}
+
+.activity-filters {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.45fr) minmax(220px, 1fr);
+  gap: var(--iris-space-md, 16px);
+  margin-block-end: var(--iris-space-md, 16px);
+}
+
+@media (max-width: 640px) {
+  .activity-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .activity-filters {
+    grid-template-columns: 1fr;
+  }
+}

@@ -11,6 +11,7 @@ import {
 import { VaultClient } from './api/vault'
 import { useAuth } from './auth/AuthProvider'
 import type { WebConfig } from './config'
+import { ActivityPage } from './pages/ActivityPage'
 import { FilesPage } from './pages/FilesPage'
 import { AccessPage } from './pages/access/AccessPage'
 import { ChatPage } from './pages/ChatPage'
@@ -27,6 +28,7 @@ import { objectRoute, parseObjectRoute, useHashRoute } from './router'
 const menus: NavNode[] = [
   { key: 'overview', title: '空间概览', icon: 'home' },
   { key: 'files', title: '文件', icon: 'folder' },
+  { key: 'activity', title: '对象动态', icon: 'clock' },
   { key: 'buckets', title: '存储桶', icon: 'archive' },
   { key: 'access', title: '访问与发布', icon: 'lock' },
   { key: 'departments', title: '部门与成员', icon: 'users' },
@@ -52,6 +54,7 @@ function PageHost({
   const object = parseObjectRoute(route)
   if (object) return <ObjectPage key={`${object.deleted}:${object.key}`} client={client} objectKey={object.key} deleted={object.deleted} onBack={() => navigate('files')} onRestored={() => navigate(objectRoute(object.key))} />
   if (route === 'files') return <FilesPage client={client} onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted))} />
+  if (route === 'activity') return <ActivityPage client={client} onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted))} />
   if (route === 'buckets') return <BucketsPage client={client} />
   if (route === 'access') return <AccessPage client={client} />
   if (route === 'departments') return <DepartmentsPage client={client} />

@@ -1,4 +1,5 @@
 export interface SSEFrame {
+  id?: string
   event: string
   data: string
 }
@@ -27,6 +28,7 @@ export class SSEDecoder {
 }
 
 function parseFrame(raw: string): SSEFrame | undefined {
+  let id: string | undefined
   let event = 'message'
   const data: string[] = []
   for (const line of raw.split('\n')) {
@@ -36,7 +38,8 @@ function parseFrame(raw: string): SSEFrame | undefined {
     let value = colon >= 0 ? line.slice(colon + 1) : ''
     if (value.startsWith(' ')) value = value.slice(1)
     if (field === 'event') event = value
+    if (field === 'id') id = value
     if (field === 'data') data.push(value)
   }
-  return data.length > 0 ? { event, data: data.join('\n') } : undefined
+  return data.length > 0 ? { ...(id ? { id } : {}), event, data: data.join('\n') } : undefined
 }
