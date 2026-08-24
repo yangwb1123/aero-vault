@@ -157,6 +157,8 @@ func readPreconditionFailed(r *http.Request, obj repository.Object) bool {
 
 func readPreconditionFailedForETag(r *http.Request, obj repository.Object, etag string) bool {
 	if match := r.Header.Get("If-Match"); match != "" {
+		// RFC 9110 evaluates If-Match before If-Unmodified-Since; a
+		// successful If-Match therefore suppresses the date condition.
 		return !etagListMatchesStrong(match, etag)
 	}
 	if unmodified := r.Header.Get("If-Unmodified-Since"); unmodified != "" {

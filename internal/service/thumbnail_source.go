@@ -11,7 +11,8 @@ import (
 
 // ThumbnailSource is the result of opening one authoritative object for
 // thumbnail generation. Bound is true only when the storage backend proved
-// that the returned descriptor belongs to obj's storage generation.
+// that the returned descriptor belongs to the returned object's generation;
+// the caller separately compares that object with its pre-open observation.
 type ThumbnailSource struct {
 	Reader io.ReadCloser
 	Object repository.Object
@@ -49,7 +50,12 @@ func (s *FileService) OpenThumbnailSource(ctx context.Context, obj repository.Ob
 		if err == nil && rc != nil && thumbnailStorageProofMatches(proof, expected) {
 			s.emit(ctx, openedObj, repository.EventAccessed)
 			rc = s.wrapReadVerification(openedObj, rc)
-			return ThumbnailSource{Reader: rc, Object: openedObj, Bound: !unbound}, nil
+			// The backend proof binds these bytes to openedObj. Whether
+			// openedObj is still the object observed by the caller's initial
+			// Stat is a separate cache-key comparison performed by the
+			// thumbnail package; keep Bound about the storage proof itself so
+			// the response can use the freshly opened object's validator.
+			return ThumbnailSource{Reader: rc, Object: openedObj, Bound: true}, nil
 		}
 		if rc != nil {
 			_ = rc.Close()

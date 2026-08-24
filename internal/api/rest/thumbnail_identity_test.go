@@ -196,7 +196,7 @@ func TestThumbnailCacheEqualETagReplacementUsesVersionID(t *testing.T) {
 	}
 }
 
-func TestThumbnailUnsupportedBackendKeepsCompleteValidator(t *testing.T) {
+func TestThumbnailUnsupportedBackendOmitsUnprovenValidator(t *testing.T) {
 	dir := t.TempDir()
 	real, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
 	if err != nil {
@@ -210,16 +210,19 @@ func TestThumbnailUnsupportedBackendKeepsCompleteValidator(t *testing.T) {
 	}
 	thumb := base + "/thumbnail?w=32&h=32"
 	first, body := req(t, http.MethodGet, thumb, nil, nil)
-	validator := first.Header.Get("ETag")
-	if first.StatusCode != http.StatusOK || len(body) == 0 || validator == "" {
-		t.Fatalf("uncached thumbnail: status=%d bytes=%d etag=%q", first.StatusCode, len(body), validator)
+	if first.StatusCode != http.StatusOK || len(body) == 0 || first.Header.Get("ETag") != "" {
+		t.Fatalf("unbound thumbnail: status=%d bytes=%d etag=%q", first.StatusCode, len(body), first.Header.Get("ETag"))
 	}
-	second, secondBody := req(t, http.MethodGet, thumb, nil, map[string]string{"If-None-Match": validator})
-	if second.StatusCode != http.StatusNotModified || len(secondBody) != 0 {
-		t.Fatalf("uncached validator revalidation: status=%d body=%d", second.StatusCode, len(secondBody))
+	if first.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("unbound Cache-Control=%q, want no-store", first.Header.Get("Cache-Control"))
 	}
-	if counting.gets.Load() != 1 {
-		t.Fatalf("uncached 304 opened storage: gets=%d, want 1", counting.gets.Load())
+	before := counting.gets.Load()
+	second, secondBody := req(t, http.MethodGet, thumb, nil, map[string]string{"If-None-Match": `"stale"`})
+	if second.StatusCode != http.StatusOK || len(secondBody) == 0 {
+		t.Fatalf("unbound conditional request: status=%d body=%d", second.StatusCode, len(secondBody))
+	}
+	if counting.gets.Load() != before+1 {
+		t.Fatalf("unbound source should reopen after every request: gets=%d before=%d", counting.gets.Load(), before)
 	}
 }
 

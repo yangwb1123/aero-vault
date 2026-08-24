@@ -214,10 +214,12 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	identity := thumbnailSourceIdentity(obj)
 	sourceBound := identity.Complete() && h.svc.ThumbnailSourceCacheBound(obj)
 	statETag := ""
-	if identity.Complete() {
-		// Cache admission additionally requires a generation proof, but the
-		// derived representation still needs a safe identity-bound validator
-		// for uncached and wrapper-backed sources.
+	if sourceBound {
+		// A reusable strong validator requires both complete repository
+		// identity and a backend proof that the opened descriptor belongs to
+		// that generation. Unsupported or legacy backends still generate a
+		// response, but must not certify a repository identity that was never
+		// bound to the returned bytes.
 		statETag = thumbValidatorETag(thumbnail.CacheKeyVersion, identity, obj.ETag, effW, effH)
 	}
 	// Strong read preconditions run before cache lookup, slot acquisition, open,
@@ -267,10 +269,10 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		}
 		freshIdentity := thumbnailSourceIdentity(fresh)
 		freshETag := ""
-		// Generation proof gates cache admission, not the safe opaque
-		// validator. Keep 304 support for complete identities even when an
-		// unsupported backend forces this request down the uncached path.
-		if freshIdentity.Complete() {
+		// Generation proof gates both reusable caching and validators. An
+		// unsupported backend cannot safely certify a 304 because its bytes
+		// are not bound to the repository generation.
+		if sourceBound && freshIdentity.Complete() && h.svc.ThumbnailSourceCacheBound(fresh) {
 			freshETag = thumbValidatorETag(thumbnail.CacheKeyVersion, freshIdentity, fresh.ETag, effW, effH)
 		}
 		if readPreconditionFailedForETag(r, fresh, freshETag) {
@@ -429,8 +431,15 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		etag = ""
 		lastModified = opened.Object.UpdatedAt.UTC().Format(http.TimeFormat)
 		versionID = opened.Object.VersionID
-		if openedIdentity.Complete() {
+		if opened.Bound && openedIdentity.Complete() {
 			etag = thumbValidatorETag(thumbnail.CacheKeyVersion, openedIdentity, opened.Object.ETag, effW, effH)
+		} else if !opened.Bound || !openedIdentity.Complete() {
+			// The source was read without a complete, reusable identity or
+			// through an unbound fallback. Do not let an intermediary retain
+			// bytes whose repository generation was not proven, and do not
+			// emit a reusable validator or version claim for them.
+			cacheControl = "no-store"
+			versionID = ""
 		}
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
