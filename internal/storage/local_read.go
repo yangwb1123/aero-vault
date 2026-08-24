@@ -29,6 +29,84 @@ func (s *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, Obje
 	return s.GetWithOptions(ctx, key, GetOptions{})
 }
 
+func (s *LocalStorage) GetGenerationBound(ctx context.Context, key string, expected ObjectInfo) (io.ReadCloser, ObjectInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	path, err := s.objectPath(key)
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	beforePath, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ObjectInfo{}, ErrNotFound
+		}
+		return nil, ObjectInfo{}, err
+	}
+	before, err := s.statObject(key, nil)
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	if !boundInfoMatches(before, expected) {
+		return nil, before, generationProofError(before, expected)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ObjectInfo{}, ErrNotFound
+		}
+		return nil, ObjectInfo{}, err
+	}
+	openedPath, statErr := f.Stat()
+	afterPath, pathErr := os.Stat(path)
+	after, metaErr := s.statObject(key, nil)
+	if statErr != nil || pathErr != nil || metaErr != nil ||
+		!os.SameFile(beforePath, openedPath) || !os.SameFile(openedPath, afterPath) ||
+		!boundInfoMatches(after, expected) {
+		_ = f.Close()
+		if errors.Is(metaErr, os.ErrNotExist) || errors.Is(pathErr, os.ErrNotExist) {
+			return nil, ObjectInfo{}, ErrNotFound
+		}
+		if metaErr != nil {
+			return nil, ObjectInfo{}, metaErr
+		}
+		return nil, after, ErrGenerationMismatch
+	}
+	meta, err := readMeta(s.metaPath(path))
+	if err != nil {
+		_ = f.Close()
+		return nil, ObjectInfo{}, err
+	}
+	if meta.Envelope == "" {
+		return f, after, nil
+	}
+	enc, err := s.readEncrypter(meta.Envelope, GetOptions{})
+	if err != nil {
+		_ = f.Close()
+		return nil, ObjectInfo{}, err
+	}
+	rc, err := decryptReader(f, meta.Envelope, enc)
+	_ = f.Close()
+	if err != nil {
+		return nil, ObjectInfo{}, fmt.Errorf("sse decrypt: %w", err)
+	}
+	return rc, after, nil
+}
+
+func boundInfoMatches(got, expected ObjectInfo) bool {
+	generation := expected.Metadata[GenerationMetadataKey]
+	return generation != "" && got.Key == expected.Key && got.ETag == expected.ETag &&
+		got.Size == expected.Size && got.Metadata[GenerationMetadataKey] == generation
+}
+
+func generationProofError(got, expected ObjectInfo) error {
+	if expected.Metadata[GenerationMetadataKey] == "" || got.Metadata[GenerationMetadataKey] == "" {
+		return ErrUnsupported
+	}
+	return ErrGenerationMismatch
+}
+
 func (s *LocalStorage) GetWithOptions(ctx context.Context, key string, opts GetOptions) (io.ReadCloser, ObjectInfo, error) {
 	ctx, span := storeTracer.Start(ctx, "LocalStorage.Get",
 		trace.WithAttributes(attribute.String("key", key)),

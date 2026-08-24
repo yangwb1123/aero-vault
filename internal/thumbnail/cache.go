@@ -6,16 +6,10 @@ import (
 	"time"
 )
 
-// CacheKeyVersion is the cache-key schema version: bump it whenever the
-// generated thumbnail bytes can change for the same source ETag + effective
-// dims (pipeline output changes — quality, composite, rotation, format
-// defaults). The REST thumbnail wire validator (rest.thumbValidatorETag)
-// embeds the same version, so a bump also invalidates every client-held
-// validator in lockstep — server cache key and client validator move
-// together, and the const-derived endpoint pins keep that coupling honest.
-// Stale entries under an old version are never looked up; the bounded LRU
-// evicts them naturally.
-const CacheKeyVersion = 1
+// CacheKeyVersion is the cache-key schema version. Version 2 binds entries to
+// the complete authoritative source identity as well as source ETag and
+// effective dimensions; old entries are never looked up.
+const CacheKeyVersion = 2
 
 // GetOutcome classifies one Cache.Get result. GetHit: stored bytes served,
 // LRU recency refreshed (expiry deadline NOT extended — fixed from the last
@@ -32,20 +26,11 @@ const (
 	GetExpired                   // entry existed but now.After(expiresAt); removed here, not served
 )
 
-// CacheKey identifies one cacheable thumbnail output: the tenant (cross-tenant
-// isolation), the source object's content ETag, and the EFFECTIVE bounds
-// EffectiveDims applies inside generateLocked, plus the key schema version.
-// GenerateContextWithOpenerCached enforces the 32-lowercase-hex content-MD5
-// precondition on SourceETag for every stored entry (a non-content-derived
-// ETag bypasses the cache entirely); the REST handler's admission gate
-// additionally excludes SSE-C/SSE-KMS metadata classes the module cannot
-// see. Bucket and object key are
-// deliberately excluded: the output is a pure function of source bytes +
-// effective dims, so two objects with identical bytes share one correct
-// entry; the tenant component prevents one tenant's bytes ever being served
-// to another tenant's requests.
+// CacheKey identifies one cacheable thumbnail output. Identity fields remain
+// separate so tenant, bucket, key, and generation cannot alias at delimiters.
+// An incomplete identity is never looked up or stored.
 type CacheKey struct {
-	Tenant     string
+	Identity   SourceIdentity
 	SourceETag string
 	EffW, EffH int
 	Version    uint8
@@ -161,7 +146,7 @@ func (c *Cache) PayloadFits(img []byte) bool {
 // not a miss, not an LRU eviction); on a genuine miss or a disabled cache it
 // returns GetMiss with nil bytes.
 func (c *Cache) Get(k CacheKey) ([]byte, GetOutcome) {
-	if c.disabled {
+	if c == nil || c.disabled || !k.Identity.Complete() {
 		return nil, GetMiss // counted by nothing; lookupCached's own guard makes this unreachable in production
 	}
 	c.mu.Lock()
@@ -201,7 +186,7 @@ func (c *Cache) Get(k CacheKey) ([]byte, GetOutcome) {
 // on this path. On overflow, least-recently-used entries are evicted from
 // the tail until bytes <= maxBytes.
 func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
-	if c.disabled || len(img) == 0 {
+	if c == nil || c.disabled || !k.Identity.Complete() || len(img) == 0 {
 		return 0
 	}
 	if int64(len(img)) > c.maxBytes {

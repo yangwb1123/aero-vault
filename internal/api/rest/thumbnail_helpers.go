@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
@@ -73,6 +75,37 @@ func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (
 	return h.svc.StatVersionWithOptions(ctx, tenant, service.DefaultBucket, key, version, service.ReadOptions{})
 }
 
+func thumbnailSourceIdentity(obj repository.Object) thumbnail.SourceIdentity {
+	return thumbnail.SourceIdentity{
+		TenantID:  obj.TenantID,
+		Bucket:    obj.Bucket,
+		Key:       obj.Key,
+		VersionID: obj.VersionID,
+	}
+}
+
+func addThumbnailVary(w http.ResponseWriter) {
+	want := []string{"Authorization", "X-Aero-Tenant", "X-Api-Key"}
+	seen := make(map[string]bool)
+	var values []string
+	for _, raw := range w.Header().Values("Vary") {
+		for _, token := range strings.Split(raw, ",") {
+			token = strings.TrimSpace(token)
+			if token != "" && !seen[strings.ToLower(token)] {
+				seen[strings.ToLower(token)] = true
+				values = append(values, token)
+			}
+		}
+	}
+	for _, token := range want {
+		if !seen[strings.ToLower(token)] {
+			seen[strings.ToLower(token)] = true
+			values = append(values, token)
+		}
+	}
+	w.Header().Set("Vary", strings.Join(values, ", "))
+}
+
 // thumbnailCacheAdmissible reports whether the source object may seed the
 // server-side thumbnail cache — the handler's admission gate. An object is
 // admissible only when its ETag is provably a whole-object content MD5
@@ -103,7 +136,7 @@ func thumbnailCacheBypassReason(obj repository.Object) string {
 }
 
 func recordThumbnailCacheBypass(ctx context.Context, cache *thumbnail.Cache, reason string) {
-	if cache != nil && cache.Enabled() && (reason == "sse-c" || reason == "sse-kms") {
+	if cache != nil && cache.Enabled() && (reason == "sse-c" || reason == "sse-kms" || reason == "storage-generation") {
 		telemetry.IncThumbnailCacheBypass(ctx, reason)
 	}
 }

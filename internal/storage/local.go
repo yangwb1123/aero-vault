@@ -56,6 +56,8 @@ type localMeta struct {
 	Envelope     string            `json:"envelope,omitempty"` // SSE: AES-GCM envelope JSON
 }
 
+var _ GenerationBoundStorage = (*LocalStorage)(nil)
+
 // NewLocal returns a filesystem-backed Storage rooted at cfg.Root.
 func NewLocal(cfg LocalConfig) (*LocalStorage, error) {
 	if cfg.Root == "" {

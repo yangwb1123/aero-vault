@@ -75,7 +75,8 @@ func IncThumbnailCacheEviction(ctx context.Context, n int64) {
 // values cannot create unbounded metric cardinality.
 func IncThumbnailCacheBypass(ctx context.Context, reason string) {
 	if reason != "non-content-md5" && reason != "sse-c" &&
-		reason != "sse-kms" && reason != "store-refused" {
+		reason != "sse-kms" && reason != "storage-generation" &&
+		reason != "store-refused" {
 		reason = "unknown"
 	}
 	initDomain()

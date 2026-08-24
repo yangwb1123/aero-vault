@@ -32,10 +32,18 @@ const (
 // countingOpener3 is the 3-value (ETag-reporting) spy opener: records every
 // invocation and serves data on a fresh NopCloser each time, reporting the
 // given source ETag.
-func countingOpener3(data []byte, etag string, opens *atomic.Int64) open3 {
-	return func() (io.ReadCloser, string, error) {
+func testIdentity(tenant string) SourceIdentity {
+	return SourceIdentity{TenantID: tenant, Bucket: "bucket", Key: "image", VersionID: "version"}
+}
+
+func countingOpener3(data []byte, etag string, opens *atomic.Int64, ids ...SourceIdentity) Opener {
+	identity := testIdentity("t1")
+	if len(ids) > 0 {
+		identity = ids[0]
+	}
+	return func() (io.ReadCloser, OpenedSource, error) {
 		opens.Add(1)
-		return io.NopCloser(bytes.NewReader(data)), etag, nil
+		return io.NopCloser(bytes.NewReader(data)), OpenedSource{Identity: identity, ETag: etag, Bound: true}, nil
 	}
 }
 
@@ -54,14 +62,14 @@ func TestCacheGenerateETagShapeGate(t *testing.T) {
 
 		// openedETag == sourceETag, so today's equality rule would store —
 		// this is the vulnerability the gate closes.
-		first, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", "e1", 32, 32, countingOpener3(data, "e1", &opens))
+		first, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), "e1", 32, 32, countingOpener3(data, "e1", &opens))
 		if err != nil {
 			t.Fatalf("call 1: %v", err)
 		}
 		if from {
 			t.Fatal("non-MD5 source ETag must never report a cache hit")
 		}
-		second, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", "e1", 32, 32, countingOpener3(data, "e1", &opens))
+		second, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), "e1", 32, 32, countingOpener3(data, "e1", &opens))
 		if err != nil {
 			t.Fatalf("call 2: %v", err)
 		}
@@ -96,7 +104,7 @@ func TestCacheGenerateETagShapeGate(t *testing.T) {
 		ctx := context.Background()
 		src := etagA
 
-		first, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", src, 32, 32, countingOpener3(data, src, &opens))
+		first, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), src, 32, 32, countingOpener3(data, src, &opens))
 		if err != nil {
 			t.Fatalf("call 1: %v", err)
 		}
@@ -109,7 +117,7 @@ func TestCacheGenerateETagShapeGate(t *testing.T) {
 		if c.Len() != 1 || c.Bytes() == 0 {
 			t.Fatalf("admissible key must store: Len=%d Bytes=%d", c.Len(), c.Bytes())
 		}
-		second, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", src, 32, 32, countingOpener3(data, src, &opens))
+		second, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), src, 32, 32, countingOpener3(data, src, &opens))
 		if err != nil {
 			t.Fatalf("call 2: %v", err)
 		}
@@ -135,14 +143,14 @@ func TestCacheGenerateSpyOpenerSingleInvocation(t *testing.T) {
 	var opens atomic.Int64
 	ctx := context.Background()
 
-	first, fromCache, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+	first, fromCache, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens))
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
 	if fromCache {
 		t.Fatal("first call must be a miss")
 	}
-	second, fromCache, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+	second, fromCache, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens))
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -177,7 +185,7 @@ func TestCacheGenerateHitBypassesDecodeSlot(t *testing.T) {
 	ctx := context.Background()
 
 	// Warm the cache (miss; acquires and releases one slot).
-	if _, fromCache, err := GenerateContextWithOpenerCachedWithAdmission(ctx, c, admission, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens)); err != nil || fromCache {
+	if _, fromCache, err := GenerateContextWithOpenerCachedWithAdmission(ctx, c, admission, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens)); err != nil || fromCache {
 		t.Fatalf("warm-up: err=%v fromCache=%v", err, fromCache)
 	}
 
@@ -191,7 +199,7 @@ func TestCacheGenerateHitBypassesDecodeSlot(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		img, from, err := GenerateContextWithOpenerCachedWithAdmission(ctx, c, admission, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+		img, from, err := GenerateContextWithOpenerCachedWithAdmission(ctx, c, admission, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens))
 		done <- struct {
 			img  []byte
 			from bool
@@ -226,11 +234,11 @@ func TestCacheGenerateETagChangeMisses(t *testing.T) {
 	var opens1, opens2 atomic.Int64
 	ctx := context.Background()
 
-	out1, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(v1, etagA, &opens1))
+	out1, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(v1, etagA, &opens1))
 	if err != nil || from {
 		t.Fatalf("etagA first call: err=%v fromCache=%v", err, from)
 	}
-	out2, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagB, 32, 32, countingOpener3(v2, etagB, &opens2))
+	out2, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagB, 32, 32, countingOpener3(v2, etagB, &opens2))
 	if err != nil || from {
 		t.Fatalf("etagB first call: err=%v fromCache=%v", err, from)
 	}
@@ -250,10 +258,10 @@ func TestCacheGenerateETagChangeMisses(t *testing.T) {
 		t.Fatal("stale bytes served: etagB output differs from a fresh decode of v2")
 	}
 	// Repeats hit per key; neither opener is re-invoked.
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagB, 32, 32, countingOpener3(v2, etagB, &opens2)); err != nil || !from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagB, 32, 32, countingOpener3(v2, etagB, &opens2)); err != nil || !from {
 		t.Fatalf("etagB repeat: err=%v fromCache=%v", err, from)
 	}
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(v1, etagA, &opens1)); err != nil || !from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(v1, etagA, &opens1)); err != nil || !from {
 		t.Fatalf("etagA repeat: err=%v fromCache=%v", err, from)
 	}
 	if n1, n2 := opens1.Load(), opens2.Load(); n1 != 1 || n2 != 1 {
@@ -273,7 +281,7 @@ func TestCacheGenerateDisabledParity(t *testing.T) {
 	}
 	for _, cache := range []*Cache{nil, NewCache(0, 0)} {
 		var opens atomic.Int64
-		got, from, err := GenerateContextWithOpenerCached(ctx, cache, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+		got, from, err := GenerateContextWithOpenerCached(ctx, cache, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens))
 		if err != nil {
 			t.Fatalf("cached entry point (cache=%v): %v", cache, err)
 		}
@@ -300,12 +308,12 @@ func TestCacheGenerateHitHonorsCanceledContext(t *testing.T) {
 	var opens atomic.Int64
 	ctx := context.Background()
 
-	if _, _, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens)); err != nil {
+	if _, _, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens)); err != nil {
 		t.Fatalf("warm-up: %v", err)
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	img, from, err := GenerateContextWithOpenerCached(canceled, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+	img, from, err := GenerateContextWithOpenerCached(canceled, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled hit: err = %v, want context.Canceled", err)
 	}
@@ -326,14 +334,14 @@ func TestCacheGenerateErrorNeverCached(t *testing.T) {
 
 	bomb := headerOnlyPNG(t, 8193, 8, 8, 6) // declared width > MaxSourceDim
 	var opens atomic.Int64
-	_, _, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(bomb, etagA, &opens))
+	_, _, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(bomb, etagA, &opens))
 	if !errors.Is(err, ErrImageTooLarge) {
 		t.Fatalf("oversized source: err = %v, want ErrImageTooLarge", err)
 	}
 	if c.Len() != 0 {
 		t.Fatalf("failed generation must not be cached: Len = %d", c.Len())
 	}
-	if _, _, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(bomb, etagA, &opens)); !errors.Is(err, ErrImageTooLarge) {
+	if _, _, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(bomb, etagA, &opens)); !errors.Is(err, ErrImageTooLarge) {
 		t.Fatalf("retry: err = %v, want ErrImageTooLarge again (miss on retry)", err)
 	}
 	if n := opens.Load(); n != 2 {
@@ -343,7 +351,7 @@ func TestCacheGenerateErrorNeverCached(t *testing.T) {
 	// Unsupported (non-image) bytes: same never-cached discipline.
 	garbage := []byte("not an image at all, just text bytes")
 	var opens2 atomic.Int64
-	_, _, err = GenerateContextWithOpenerCached(ctx, c, "t1", etagB, 32, 32, countingOpener3(garbage, etagB, &opens2))
+	_, _, err = GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagB, 32, 32, countingOpener3(garbage, etagB, &opens2))
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("garbage source: err = %v, want ErrUnsupported", err)
 	}
@@ -364,7 +372,7 @@ func TestCacheGenerateETagMismatchDoesNotStore(t *testing.T) {
 	var opens atomic.Int64
 	ctx := context.Background()
 
-	img, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagB, &opens))
+	img, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagB, &opens))
 	if err != nil {
 		t.Fatalf("mismatched open: %v", err)
 	}
@@ -377,7 +385,7 @@ func TestCacheGenerateETagMismatchDoesNotStore(t *testing.T) {
 	if c.Len() != 0 {
 		t.Fatalf("ETag-mismatched generation must not be stored: Len = %d", c.Len())
 	}
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagB, &opens)); err != nil || from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagB, &opens)); err != nil || from {
 		t.Fatalf("repeat after mismatch: err=%v fromCache=%v (must miss and re-open)", err, from)
 	}
 	if n := opens.Load(); n != 2 {
@@ -394,12 +402,12 @@ func TestCacheGenerateCrossTenantIsolation(t *testing.T) {
 	var opensA, opensB atomic.Int64
 	ctx := context.Background()
 
-	outA, from, err := GenerateContextWithOpenerCached(ctx, c, "tenantA", etagA, 32, 32, countingOpener3(data, etagA, &opensA))
+	outA, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("tenantA"), etagA, 32, 32, countingOpener3(data, etagA, &opensA, testIdentity("tenantA")))
 	if err != nil || from {
 		t.Fatalf("tenantA first: err=%v fromCache=%v", err, from)
 	}
 	// tenantA repeat: hit (no re-open).
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "tenantA", etagA, 32, 32, countingOpener3(data, etagA, &opensA)); err != nil || !from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("tenantA"), etagA, 32, 32, countingOpener3(data, etagA, &opensA, testIdentity("tenantA"))); err != nil || !from {
 		t.Fatalf("tenantA repeat: err=%v fromCache=%v", err, from)
 	}
 	if n := opensA.Load(); n != 1 {
@@ -407,7 +415,7 @@ func TestCacheGenerateCrossTenantIsolation(t *testing.T) {
 	}
 	// tenantB first call: must MISS despite identical bytes+dims (tenant is
 	// part of the key) and produce byte-identical output (content-addressed).
-	outB, from, err := GenerateContextWithOpenerCached(ctx, c, "tenantB", etagA, 32, 32, countingOpener3(data, etagA, &opensB))
+	outB, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("tenantB"), etagA, 32, 32, countingOpener3(data, etagA, &opensB, testIdentity("tenantB")))
 	if err != nil || from {
 		t.Fatalf("tenantB first: err=%v fromCache=%v (must miss: cross-tenant isolation)", err, from)
 	}
@@ -418,7 +426,7 @@ func TestCacheGenerateCrossTenantIsolation(t *testing.T) {
 		t.Fatal("identical content must produce identical output across tenants")
 	}
 	// A's entry must never serve B: B's second call is a hit on B's own key.
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "tenantB", etagA, 32, 32, countingOpener3(data, etagA, &opensB)); err != nil || !from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("tenantB"), etagA, 32, 32, countingOpener3(data, etagA, &opensB, testIdentity("tenantB"))); err != nil || !from {
 		t.Fatalf("tenantB repeat: err=%v fromCache=%v", err, from)
 	}
 }
@@ -432,22 +440,22 @@ func TestCacheGenerateClampedDimsShareEntry(t *testing.T) {
 	var opens atomic.Int64
 	ctx := context.Background()
 
-	_, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 0, 0, countingOpener3(data, etagA, &opens))
+	_, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 0, 0, countingOpener3(data, etagA, &opens))
 	if err != nil || from {
 		t.Fatalf("(0,0): err=%v fromCache=%v", err, from)
 	}
 	// ?w=256&h=256 clamps to the same effective pair → hit, no re-open.
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 256, 256, countingOpener3(data, etagA, &opens)); err != nil || !from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 256, 256, countingOpener3(data, etagA, &opens)); err != nil || !from {
 		t.Fatalf("(256,256) after (0,0): err=%v fromCache=%v (must share the clamped entry)", err, from)
 	}
 	if n := opens.Load(); n != 1 {
 		t.Fatalf("opener invoked %d times, want 1", n)
 	}
 	// (2048, 2048) then (9999, 9999): both clamp to HardMax → shared entry.
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagB, 2048, 2048, countingOpener3(data, etagB, &opens)); err != nil || from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagB, 2048, 2048, countingOpener3(data, etagB, &opens)); err != nil || from {
 		t.Fatalf("(2048,2048): err=%v fromCache=%v", err, from)
 	}
-	if _, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagB, 9999, 9999, countingOpener3(data, etagB, &opens)); err != nil || !from {
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagB, 9999, 9999, countingOpener3(data, etagB, &opens)); err != nil || !from {
 		t.Fatalf("(9999,9999) after (2048,2048): err=%v fromCache=%v (must share the HardMax entry)", err, from)
 	}
 	if n := opens.Load(); n != 2 {
@@ -464,14 +472,14 @@ func BenchmarkGenerateContextWithOpenerCachedHit(b *testing.B) {
 	fixture := benchFixture(b, 256, 256)
 	var opens atomic.Int64
 	ctx := context.Background()
-	if _, _, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 128, 128, countingOpener3(fixture, etagA, &opens)); err != nil {
+	if _, _, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 128, 128, countingOpener3(fixture, etagA, &opens)); err != nil {
 		b.Fatal(err)
 	}
 	b.SetBytes(int64(len(fixture)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, _, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 128, 128, countingOpener3(fixture, etagA, &opens)); err != nil {
+		if _, _, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 128, 128, countingOpener3(fixture, etagA, &opens)); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -493,7 +501,7 @@ func TestCacheETagShapeGateDeadCtxAndStats(t *testing.T) {
 	cancel()
 	c := NewCache(1<<20, 0)
 	var opens atomic.Int64
-	_, _, err := GenerateContextWithOpenerCached(ctx, c, "t1", "e1", 32, 32, countingOpener3(data, "e1", &opens))
+	_, _, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), "e1", 32, 32, countingOpener3(data, "e1", &opens))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("dead ctx + non-MD5: err = %v, want context.Canceled (fast-fail precedes the shape gate)", err)
 	}
@@ -517,7 +525,7 @@ func TestCacheETagShapeGateDeadCtxAndStats(t *testing.T) {
 		t.Run("shape "+et[:min(len(et), 12)], func(t *testing.T) {
 			c := NewCache(1<<20, 0)
 			var opens atomic.Int64
-			out, from, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", et, 32, 32, countingOpener3(data, et, &opens))
+			out, from, err := GenerateContextWithOpenerCached(context.Background(), c, testIdentity("t1"), et, 32, 32, countingOpener3(data, et, &opens))
 			if err != nil {
 				t.Fatalf("call: %v", err)
 			}
@@ -545,7 +553,7 @@ func TestCacheETagShapeGateDeadCtxAndStats(t *testing.T) {
 func TestGenerateCacheEvictionsForwarded(t *testing.T) {
 	fixture := makePNG(t, 128, 128)
 	probe := NewCache(1<<20, 0)
-	first, _, err := GenerateContextWithOpenerCached(context.Background(), probe, "t1", etagA, 64, 64,
+	first, _, err := GenerateContextWithOpenerCached(context.Background(), probe, testIdentity("t1"), etagA, 64, 64,
 		countingOpener3(fixture, etagA, new(atomic.Int64)))
 	if err != nil {
 		t.Fatalf("probe generation: %v", err)
@@ -554,11 +562,11 @@ func TestGenerateCacheEvictionsForwarded(t *testing.T) {
 		t.Fatal("probe generation returned empty bytes")
 	}
 	c := NewCache(int64(len(first)), 0)
-	if _, _, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", etagA, 64, 64,
+	if _, _, err := GenerateContextWithOpenerCached(context.Background(), c, testIdentity("t1"), etagA, 64, 64,
 		countingOpener3(fixture, etagA, new(atomic.Int64))); err != nil {
 		t.Fatalf("first cached generation: %v", err)
 	}
-	if _, _, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", etagB, 64, 64,
+	if _, _, err := GenerateContextWithOpenerCached(context.Background(), c, testIdentity("t1"), etagB, 64, 64,
 		countingOpener3(fixture, etagB, new(atomic.Int64))); err != nil {
 		t.Fatalf("overflow cached generation: %v", err)
 	}
@@ -570,7 +578,7 @@ func TestGenerateCacheEvictionsForwarded(t *testing.T) {
 
 func TestGenerateCacheStoreRefusalIsNotAnEviction(t *testing.T) {
 	c := NewCache(1, 0)
-	img, from, err := GenerateContextWithOpenerCached(context.Background(), c, "t1", etagA, 64, 64,
+	img, from, err := GenerateContextWithOpenerCached(context.Background(), c, testIdentity("t1"), etagA, 64, 64,
 		countingOpener3(makePNG(t, 128, 128), etagA, new(atomic.Int64)))
 	if err != nil {
 		t.Fatalf("oversized cache generation: %v", err)
@@ -598,7 +606,7 @@ func TestCacheGenerateExpiredReadRerunsMissBody(t *testing.T) {
 	var opens atomic.Int64
 	ctx := context.Background()
 
-	first, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+	first, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens))
 	if err != nil {
 		t.Fatalf("call 1: %v", err)
 	}
@@ -620,7 +628,7 @@ func TestCacheGenerateExpiredReadRerunsMissBody(t *testing.T) {
 	}
 	c.mu.Unlock()
 
-	second, from, err := GenerateContextWithOpenerCached(ctx, c, "t1", etagA, 32, 32, countingOpener3(data, etagA, &opens))
+	second, from, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(data, etagA, &opens))
 	if err != nil {
 		t.Fatalf("call 2: %v", err)
 	}

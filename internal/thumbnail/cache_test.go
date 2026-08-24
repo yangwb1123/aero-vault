@@ -26,8 +26,8 @@ func payload(n int, fill byte) []byte {
 // pass-through and replace semantics (T-1).
 func TestCacheHitMiss(t *testing.T) {
 	c := NewCache(1<<20, 0)
-	k1 := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
-	k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
+	k1 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
+	k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
 
 	// 1. Put then hit: same bytes, exact budget accounting, single entry.
 	a := payload(100, 'a')
@@ -88,9 +88,9 @@ func TestCacheByteBudgetEviction(t *testing.T) {
 	a, b, c := payload(100, 'a'), payload(200, 'b'), payload(50, 'c')
 	budget := int64(len(a) + len(b))
 	cache := NewCache(budget, 0)
-	k1 := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
-	k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
-	k3 := CacheKey{Tenant: "t1", SourceETag: "e3", EffW: 32, EffH: 32}
+	k1 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
+	k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
+	k3 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e3", EffW: 32, EffH: 32}
 
 	cache.Put(k1, a)
 	cache.Put(k2, b)
@@ -150,7 +150,7 @@ func TestCacheByteBudgetEviction(t *testing.T) {
 	// Oversized entry (new key): never stored, and no eviction counter
 	// increment.
 	huge := payload(int(budget)+1, 'x')
-	kBig := CacheKey{Tenant: "t1", SourceETag: "big", EffW: 32, EffH: 32}
+	kBig := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "big", EffW: 32, EffH: 32}
 	before := cache.Len()
 	n = cache.Put(kBig, huge)
 	if n != 0 {
@@ -208,10 +208,10 @@ func TestCacheConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			fill := byte(g)
 			for i := 0; i < iters; i++ {
-				k := CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("g%d-%d", g, i), EffW: 32, EffH: 32}
+				k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("g%d-%d", g, i), EffW: 32, EffH: 32}
 				p := payload(64, fill)
 				c.Put(k, p)
-				hot := CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}
+				hot := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "hot", EffW: 32, EffH: 32}
 				c.Put(hot, p)
 				if got, outcome := c.Get(k); outcome == GetHit {
 					// Payloads are never mutated after storage: any hit must
@@ -223,7 +223,7 @@ func TestCacheConcurrentAccess(t *testing.T) {
 				if got, outcome := c.Get(hot); outcome == GetHit && len(got) != 64 {
 					record("torn hot payload: got %d bytes, want 64", len(got))
 				}
-				if _, outcome := c.Get(CacheKey{Tenant: "t2", SourceETag: "foreign", EffW: 32, EffH: 32}); outcome == GetHit {
+				if _, outcome := c.Get(CacheKey{Identity: SourceIdentity{TenantID: "t2", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "foreign", EffW: 32, EffH: 32}); outcome == GetHit {
 					record("foreign key must never hit")
 				}
 			}
@@ -240,7 +240,7 @@ func TestCacheConcurrentAccess(t *testing.T) {
 		t.Fatal("Len() = 0, want >= 1 (hot key must survive)")
 	}
 	// The hot key was last written by some goroutine with a full payload.
-	if got, outcome := c.Get(CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}); outcome != GetHit || len(got) != 64 {
+	if got, outcome := c.Get(CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "hot", EffW: 32, EffH: 32}); outcome != GetHit || len(got) != 64 {
 		t.Fatalf("hot key: want full payload, got outcome=%v len=%d", outcome, len(got))
 	}
 }
@@ -259,7 +259,7 @@ func TestCacheStressMemoryBounded(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		size := int(next()%2048) + 1
 		fill := byte(next() % 256)
-		k := CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("k%d", i), EffW: int(next() % 33), EffH: int(next() % 33)}
+		k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("k%d", i), EffW: int(next() % 33), EffH: int(next() % 33)}
 		c.Put(k, payload(size, fill))
 		if b := c.Bytes(); b > 4096 {
 			t.Fatalf("iteration %d: Bytes() = %d exceeds budget 4096", i, b)
@@ -278,8 +278,8 @@ func TestCacheStressMemoryBounded(t *testing.T) {
 // entry point).
 func TestCacheStatsCounters(t *testing.T) {
 	c := NewCache(96, 0)
-	k1 := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
-	k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
+	k1 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
+	k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
 
 	if h, m, e, x := c.Stats(); h != 0 || m != 0 || e != 0 || x != 0 {
 		t.Fatalf("fresh cache Stats = %d/%d/%d/%d, want 0/0/0/0", h, m, e, x)
@@ -306,24 +306,26 @@ func TestCacheStatsCounters(t *testing.T) {
 	}
 }
 
-// TestCacheKeyInjectivity pins key hardening: distinct (tenant, ETag, effW,
-// effH) tuples produce distinct map keys, and quoted/multipart ETags are
-// treated as opaque components.
+// TestCacheKeyInjectivity pins key hardening: every source-identity field,
+// source ETag, effective dimension, and schema-version field participates in
+// the comparable cache key. ETag spelling remains opaque at this layer.
 func TestCacheKeyInjectivity(t *testing.T) {
-	base := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	base := CacheKey{
+		Identity:   SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"},
+		SourceETag: "e1", EffW: 32, EffH: 32, Version: CacheKeyVersion,
+	}
 	cases := []struct {
 		name string
 		mut  func(CacheKey) CacheKey
 	}{
-		{"tenant", func(k CacheKey) CacheKey { k.Tenant = "t2"; return k }},
+		{"tenant", func(k CacheKey) CacheKey { k.Identity.TenantID = "t2"; return k }},
+		{"bucket", func(k CacheKey) CacheKey { k.Identity.Bucket = "other-bucket"; return k }},
+		{"key", func(k CacheKey) CacheKey { k.Identity.Key = "other-key"; return k }},
+		{"version-id", func(k CacheKey) CacheKey { k.Identity.VersionID = "other-version"; return k }},
 		{"etag", func(k CacheKey) CacheKey { k.SourceETag = "e2"; return k }},
 		{"effW", func(k CacheKey) CacheKey { k.EffW = 33; return k }},
 		{"effH", func(k CacheKey) CacheKey { k.EffH = 33; return k }},
-		// The pipeline version is key identity too: cache_entry.go:84 keys
-		// the entry by it and the REST wire validator (rest.thumbValidatorETag)
-		// embeds it, so a future bump must never collide entries across
-		// incompatible pipeline outputs.
-		{"version", func(k CacheKey) CacheKey { k.Version = 2; return k }},
+		{"version", func(k CacheKey) CacheKey { k.Version = CacheKeyVersion + 1; return k }},
 		{"etag-quoted", func(k CacheKey) CacheKey { k.SourceETag = `"e1"`; return k }},
 		{"etag-multipart", func(k CacheKey) CacheKey { k.SourceETag = "md5hex-4"; return k }},
 	}
@@ -361,8 +363,8 @@ func TestCacheKeyInjectivity(t *testing.T) {
 func TestCacheExpiredOutcome(t *testing.T) {
 	// 1. Fresh entry must hit with byte-identical payload.
 	c := NewCache(1<<20, time.Hour)
-	k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
-	k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
+	k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
+	k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
 	img := payload(100, 'a')
 	c.Put(k, img)
 	if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
@@ -431,7 +433,7 @@ func TestCacheExpiredOutcome(t *testing.T) {
 func TestCacheTTL(t *testing.T) {
 	t.Run("expired entry is its own class (expired), not a miss and not an LRU eviction", func(t *testing.T) {
 		c := NewCache(1<<20, time.Hour) // 1 MiB: no eviction pressure
-		k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+		k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 		img := payload(100, 'a')
 		c.Put(k, img)
 		if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
@@ -459,7 +461,7 @@ func TestCacheTTL(t *testing.T) {
 		// fresh retention deadline — dropping the refresh would let the new
 		// generation expire on the old deadline (premature expiry).
 		c := NewCache(1<<20, time.Hour)
-		k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+		k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 		c.Put(k, payload(10, 'a'))
 		c.mu.Lock()
 		c.m[k].Value.(*entry).expiresAt = time.Now().Add(-time.Second) // old generation expired
@@ -479,7 +481,7 @@ func TestCacheTTL(t *testing.T) {
 
 	t.Run("wall-clock expiry", func(t *testing.T) {
 		c := NewCache(1<<20, time.Nanosecond)
-		k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+		k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 		c.Put(k, payload(10, 'a'))
 		time.Sleep(2 * time.Millisecond) // bounded, sub-ms scale
 		if got, outcome := c.Get(k); outcome != GetExpired || got != nil {
@@ -498,9 +500,9 @@ func TestCacheTTL(t *testing.T) {
 		a, b, c3 := payload(100, 'a'), payload(200, 'b'), payload(50, 'c')
 		budget := int64(len(a) + len(b)) // 300: inserting c3 (350) exceeds by a margin that evicts exactly the tail
 		cache := NewCache(budget, time.Hour)
-		k1 := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
-		k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
-		k3 := CacheKey{Tenant: "t1", SourceETag: "e3", EffW: 32, EffH: 32}
+		k1 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
+		k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
+		k3 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e3", EffW: 32, EffH: 32}
 		cache.Put(k1, a)
 		cache.Put(k2, b)
 		if _, outcome := cache.Get(k2); outcome != GetHit {
@@ -537,7 +539,7 @@ func TestCacheTTL(t *testing.T) {
 // same operation sequence as a pre-TTL cache.
 func TestCacheTTLDisabled(t *testing.T) {
 	c := NewCache(1<<20, 0)
-	k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 	img := payload(100, 'a')
 	c.Put(k, img)
 	if got, outcome := c.Get(k); outcome != GetHit || !bytes.Equal(got, img) {
@@ -593,13 +595,13 @@ func TestCacheTTLConcurrent(t *testing.T) {
 			defer wg.Done()
 			fill := byte(g)
 			for i := 0; i < iters; i++ {
-				k := CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("g%d-%d", g, i), EffW: 32, EffH: 32}
+				k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("g%d-%d", g, i), EffW: 32, EffH: 32}
 				p := payload(64, fill)
 				c.Put(k, p)
 				if i%32 == 0 {
 					time.Sleep(2 * time.Millisecond) // let the nanosecond TTL lapse mid-round
 				}
-				hot := CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}
+				hot := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "hot", EffW: 32, EffH: 32}
 				c.Put(hot, p)
 				if got, outcome := c.Get(k); outcome == GetHit && len(got) != 64 {
 					record("torn payload under TTL: %d bytes, want 64", len(got))
@@ -646,7 +648,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		keys := make([]CacheKey, 5)
 		sizes := []int{100, 200, 300, 400, 500}
 		for i, sz := range sizes {
-			keys[i] = CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("e%d", i), EffW: 32, EffH: 32}
+			keys[i] = CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("e%d", i), EffW: 32, EffH: 32}
 			c.Put(keys[i], payload(sz, byte('a'+i)))
 		}
 		now := time.Now()
@@ -710,8 +712,8 @@ func TestCacheSweepExpired(t *testing.T) {
 	t.Run("boundary: expiresAt == now survives (strict after)", func(t *testing.T) {
 		c := NewCache(1<<20, time.Hour)
 		now := time.Now()
-		boundary := CacheKey{Tenant: "t1", SourceETag: "boundary", EffW: 32, EffH: 32}
-		past := CacheKey{Tenant: "t1", SourceETag: "past", EffW: 32, EffH: 32}
+		boundary := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "boundary", EffW: 32, EffH: 32}
+		past := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "past", EffW: 32, EffH: 32}
 		c.Put(boundary, payload(100, 'a'))
 		c.Put(past, payload(100, 'b'))
 		c.mu.Lock()
@@ -750,7 +752,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		// ttl=0 must never consult expiry: a backdated entry survives the
 		// sweep and still hits byte-identically (mirrors TestCacheTTLDisabled).
 		c := NewCache(1<<20, 0)
-		k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+		k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 		img := payload(100, 'a')
 		c.Put(k, img)
 		c.mu.Lock()
@@ -786,10 +788,10 @@ func TestCacheSweepExpired(t *testing.T) {
 		// the live entries survive.
 		a, b, c3, d := payload(100, 'a'), payload(100, 'b'), payload(100, 'c'), payload(100, 'd')
 		budget := int64(len(a) + len(b) + len(c3)) // 300
-		k1 := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
-		k2 := CacheKey{Tenant: "t1", SourceETag: "e2", EffW: 32, EffH: 32}
-		k3 := CacheKey{Tenant: "t1", SourceETag: "e3", EffW: 32, EffH: 32}
-		k4 := CacheKey{Tenant: "t1", SourceETag: "e4", EffW: 32, EffH: 32}
+		k1 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
+		k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
+		k3 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e3", EffW: 32, EffH: 32}
+		k4 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e4", EffW: 32, EffH: 32}
 		seed := func() *Cache {
 			c := NewCache(budget, time.Hour)
 			c.Put(k1, a)  // list: [k1]
@@ -844,7 +846,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		keys := make([]CacheKey, 4)
 		sizes := []int{100, 200, 300, 400}
 		for i, sz := range sizes {
-			keys[i] = CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("e%d", i), EffW: 32, EffH: 32}
+			keys[i] = CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("e%d", i), EffW: 32, EffH: 32}
 			c.Put(keys[i], payload(sz, byte('a'+i)))
 		}
 		before, beforeLen := c.Bytes(), c.Len()
@@ -865,7 +867,7 @@ func TestCacheSweepExpired(t *testing.T) {
 		keys := make([]CacheKey, 4)
 		sizes := []int{100, 200, 300, 400}
 		for i, sz := range sizes {
-			keys[i] = CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("e%d", i), EffW: 32, EffH: 32}
+			keys[i] = CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("e%d", i), EffW: 32, EffH: 32}
 			c.Put(keys[i], payload(sz, byte('a'+i)))
 		}
 		now := time.Now()
@@ -918,13 +920,13 @@ func TestCacheSweepExpiredConcurrent(t *testing.T) {
 			defer wg.Done()
 			fill := byte(g)
 			for i := 0; i < iters; i++ {
-				k := CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("g%d-%d", g, i), EffW: 32, EffH: 32}
+				k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("g%d-%d", g, i), EffW: 32, EffH: 32}
 				p := payload(64, fill)
 				c.Put(k, p)
 				if i%32 == 0 {
 					time.Sleep(2 * time.Millisecond) // let the nanosecond TTL lapse mid-round
 				}
-				hot := CacheKey{Tenant: "t1", SourceETag: "hot", EffW: 32, EffH: 32}
+				hot := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "hot", EffW: 32, EffH: 32}
 				c.Put(hot, p)
 				if got, outcome := c.Get(k); outcome == GetHit && len(got) != 64 {
 					record("torn payload under sweep: %d bytes, want 64", len(got))
@@ -983,7 +985,7 @@ func BenchmarkCacheSweepExpired(b *testing.B) {
 	keys := make([]CacheKey, n)
 	data := make([][]byte, n)
 	for i := range keys {
-		keys[i] = CacheKey{Tenant: "t1", SourceETag: fmt.Sprintf("k%d", i), EffW: 32, EffH: 32}
+		keys[i] = CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: fmt.Sprintf("k%d", i), EffW: 32, EffH: 32}
 		data[i] = payload(payloadSize, byte(i))
 	}
 	backdate := func(c *Cache, pred func(int) bool) {
@@ -1033,7 +1035,7 @@ func BenchmarkCacheSweepExpired(b *testing.B) {
 // discipline — never asserted in CI); pins the "zero-cost at default"
 // property: the ttl=0 path performs no wall-clock reads.
 func BenchmarkCacheGetTTL(b *testing.B) {
-	k := CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	k := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 	img := payload(1024, 'a')
 	for _, ttl := range []time.Duration{0, time.Hour} {
 		c := NewCache(1<<20, ttl)
@@ -1061,7 +1063,7 @@ func BenchmarkCacheGetTTL(b *testing.B) {
 // concurrency (-race runs this in the make-check race gate).
 func TestCacheStampedeConcurrentMisses(t *testing.T) {
 	c := NewCache(1<<20, 0) // 1 MiB: 20 entries of the 50 KiB payload fit
-	key := CacheKey{Tenant: "t", SourceETag: "abc123", EffW: 100, EffH: 100, Version: CacheKeyVersion}
+	key := CacheKey{Identity: SourceIdentity{TenantID: "t", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "abc123", EffW: 100, EffH: 100, Version: CacheKeyVersion}
 	payload := bytes.Repeat([]byte{0xAB}, 50<<10)
 
 	const n = 16

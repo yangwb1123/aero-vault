@@ -197,6 +197,10 @@ func buildObjectFromUpload(u repository.Upload, info storage.ObjectInfo, total i
 	if info.ContentType == "" {
 		info.ContentType = u.ContentType
 	}
+	metadata := cloneMetadata(u.Metadata)
+	if generation := info.Metadata[storage.GenerationMetadataKey]; generation != "" {
+		metadata[storage.GenerationMetadataKey] = generation
+	}
 	obj := repository.Object{
 		TenantID:     u.TenantID,
 		Bucket:       u.Bucket,
@@ -207,7 +211,7 @@ func buildObjectFromUpload(u repository.Upload, info storage.ObjectInfo, total i
 		Size:         info.Size,
 		ETag:         info.ETag,
 		ContentType:  info.ContentType,
-		Metadata:     u.Metadata,
+		Metadata:     metadata,
 		Tags:         u.Tags,
 		StorageClass: u.StorageClass,
 	}

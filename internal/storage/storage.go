@@ -15,6 +15,7 @@ var (
 	ErrAlreadyExists          = errors.New("object already exists")
 	ErrInvalidKey             = errors.New("invalid object key")
 	ErrUnsupported            = errors.New("operation not supported by this backend")
+	ErrGenerationMismatch     = errors.New("object generation changed while opening")
 	ErrSSECustomerKeyRequired = errors.New("SSE-C customer key is required")
 	ErrInvalidSSECustomerKey  = errors.New("SSE-C customer key is invalid")
 )
@@ -41,6 +42,10 @@ func validateListPrefix(prefix string) error {
 	}
 	return validateObjectKey(prefix)
 }
+
+// GenerationMetadataKey is the reserved sidecar/repository metadata key used
+// by generation-aware backends to bind a reusable storage key to one write.
+const GenerationMetadataKey = "_aero_storage_generation"
 
 // ObjectInfo describes a stored object.
 type ObjectInfo struct {
@@ -149,6 +154,29 @@ func nonZero(d, fallback time.Duration) time.Duration {
 		return d
 	}
 	return fallback
+}
+
+// GenerationBoundStorage is an optional capability for readers that can prove
+// that the descriptor being returned belongs to the expected storage generation.
+// Storage backends without this capability are deliberately uncached by the
+// thumbnail adapter. The existing Storage interface remains unchanged.
+type GenerationBoundStorage interface {
+	GetGenerationBound(ctx context.Context, key string, expected ObjectInfo) (io.ReadCloser, ObjectInfo, error)
+}
+
+// SupportsGenerationBound reports whether a storage value can provide the
+// optional proof in its current configuration. Wrappers may implement the
+// marker to advertise that their underlying backend lacks the capability;
+// ordinary backends only need to implement GenerationBoundStorage.
+func SupportsGenerationBound(store Storage) bool {
+	if store == nil {
+		return false
+	}
+	if marker, ok := store.(interface{ GenerationBoundAvailable() bool }); ok {
+		return marker.GenerationBoundAvailable()
+	}
+	_, ok := store.(GenerationBoundStorage)
+	return ok
 }
 
 // Storage is the contract every backend (local FS, S3, OSS, ...) implements.

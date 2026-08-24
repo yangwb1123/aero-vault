@@ -87,7 +87,7 @@ func TestThumbnailSweepActivatesInDefaultConfig(t *testing.T) {
 		t.Fatalf("driver did not start:\n%s", buf.String())
 	}
 
-	key := thumbnail.CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	key := thumbnail.CacheKey{Identity: thumbnail.SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 	payload := make([]byte, 1000)
 	cache.Put(key, payload)
 	if cache.Len() != 1 || cache.Bytes() != int64(len(payload)) {
@@ -135,7 +135,7 @@ func TestThumbnailCacheSweepDriver(t *testing.T) {
 		close(done)
 	}()
 
-	key := thumbnail.CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	key := thumbnail.CacheKey{Identity: thumbnail.SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 	payload := make([]byte, 1000)
 	cache.Put(key, payload)
 	if cache.Len() != 1 || cache.Bytes() != int64(len(payload)) {
@@ -201,7 +201,7 @@ func TestThumbnailCacheSweepForwardingLine(t *testing.T) {
 	// Pass 1: empty cache → runs +1, swept +0 (the n==0 arm).
 	sweepThumbnailCache(ctx, cache, logger)
 
-	key := thumbnail.CacheKey{Tenant: "t1", SourceETag: "e1", EffW: 32, EffH: 32}
+	key := thumbnail.CacheKey{Identity: thumbnail.SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
 	payload := make([]byte, 1000)
 	cache.Put(key, payload)
 	time.Sleep(60 * time.Millisecond) // let the TTL elapse

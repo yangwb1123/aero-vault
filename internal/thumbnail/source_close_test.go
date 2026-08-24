@@ -95,16 +95,16 @@ func TestGenerationClearsOpenedETagOnCloseFailure(t *testing.T) {
 		Reader:   bytes.NewReader(makePNG(t, 32, 32)),
 		closeErr: closeErr,
 	}
-	img, etag, err := generateContextWithAdmission(
-		context.Background(), 16, 16, nil, "", func() (io.ReadCloser, string, error) {
-			return source, etagA, nil
+	img, opened, err := generateContextWithAdmission(
+		context.Background(), 16, 16, nil, "", func() (io.ReadCloser, OpenedSource, error) {
+			return source, OpenedSource{Identity: testIdentity("tenant-a"), ETag: etagA, Bound: true}, nil
 		},
 	)
 	if !errors.Is(err, closeErr) {
 		t.Fatalf("error = %v, want close error", err)
 	}
-	if len(img) != 0 || etag != "" {
-		t.Fatalf("result = bytes=%d etag=%q, want empty result", len(img), etag)
+	if len(img) != 0 || opened != (OpenedSource{}) {
+		t.Fatalf("result = bytes=%d opened=%+v, want empty result", len(img), opened)
 	}
 	if got := source.closed.Load(); got != 1 {
 		t.Fatalf("source closed %d times, want exactly once", got)
@@ -118,16 +118,16 @@ func TestCachedGenerationDoesNotStoreCloseFailure(t *testing.T) {
 	data := makePNG(t, 32, 32)
 	var opens atomic.Int32
 	var sources []*closeFailingSource
-	open := func() (io.ReadCloser, string, error) {
+	open := func() (io.ReadCloser, OpenedSource, error) {
 		opens.Add(1)
 		source := &closeFailingSource{Reader: bytes.NewReader(data), closeErr: closeErr}
 		sources = append(sources, source)
-		return source, etagA, nil
+		return source, OpenedSource{Identity: testIdentity("tenant-a"), ETag: etagA, Bound: true}, nil
 	}
 
 	for i := 0; i < 2; i++ {
 		img, fromCache, err := GenerateContextWithOpenerCached(
-			context.Background(), cache, "tenant-a", etagA, 16, 16, open,
+			context.Background(), cache, testIdentity("tenant-a"), etagA, 16, 16, open,
 		)
 		if !errors.Is(err, closeErr) {
 			t.Fatalf("call %d error = %v, want source close error", i+1, err)
@@ -167,8 +167,10 @@ func TestCachedCloseKeepsAdmissionReservationsUntilCloseReturns(t *testing.T) {
 		},
 	}
 	_, fromCache, err := GenerateContextWithOpenerCachedWithAdmission(
-		context.Background(), cache, admission, "tenant-a", etagA, 16, 16,
-		func() (io.ReadCloser, string, error) { return source, etagA, nil },
+		context.Background(), cache, admission, testIdentity("tenant-a"), etagA, 16, 16,
+		func() (io.ReadCloser, OpenedSource, error) {
+			return source, OpenedSource{Identity: testIdentity("tenant-a"), ETag: etagA, Bound: true}, nil
+		},
 	)
 	if !errors.Is(err, closeErr) || fromCache {
 		t.Fatalf("generation error=%v fromCache=%v, want close failure miss", err, fromCache)
@@ -203,8 +205,10 @@ func TestCachedCloseKeepsBlockedReservationsUntilCloseReturns(t *testing.T) {
 	}, 1)
 	go func() {
 		img, fromCache, err := GenerateContextWithOpenerCachedWithAdmission(
-			context.Background(), cache, admission, "tenant-a", etagA, 16, 16,
-			func() (io.ReadCloser, string, error) { return source, etagA, nil },
+			context.Background(), cache, admission, testIdentity("tenant-a"), etagA, 16, 16,
+			func() (io.ReadCloser, OpenedSource, error) {
+				return source, OpenedSource{Identity: testIdentity("tenant-a"), ETag: etagA, Bound: true}, nil
+			},
 		)
 		result <- struct {
 			img       []byte
@@ -295,8 +299,10 @@ func TestCachedVerifierMismatchPropagatesFromClose(t *testing.T) {
 	})
 	tracked := &verifierCloseTracker{ReadCloser: verifier}
 	img, fromCache, err := GenerateContextWithOpenerCachedWithAdmission(
-		context.Background(), cache, admission, "tenant-a", etagA, 16, 16,
-		func() (io.ReadCloser, string, error) { return tracked, etagA, nil },
+		context.Background(), cache, admission, testIdentity("tenant-a"), etagA, 16, 16,
+		func() (io.ReadCloser, OpenedSource, error) {
+			return tracked, OpenedSource{Identity: testIdentity("tenant-a"), ETag: etagA, Bound: true}, nil
+		},
 	)
 	if !errors.Is(err, service.ErrObjectCorrupt) {
 		t.Fatalf("error = %v, want close-time ErrObjectCorrupt", err)

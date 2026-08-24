@@ -45,6 +45,18 @@ func (s *countingStore) Get(ctx context.Context, key string) (io.ReadCloser, sto
 	return s.Storage.Get(ctx, key)
 }
 
+func (s *countingStore) GetGenerationBound(ctx context.Context, key string, expected storage.ObjectInfo) (io.ReadCloser, storage.ObjectInfo, error) {
+	bound, ok := s.Storage.(storage.GenerationBoundStorage)
+	if !ok {
+		return nil, storage.ObjectInfo{}, storage.ErrUnsupported
+	}
+	rc, info, err := bound.GetGenerationBound(ctx, key, expected)
+	if rc != nil || err == nil {
+		s.gets.Add(1)
+	}
+	return rc, info, err
+}
+
 // recordingSink captures published events so the hit-path EventAccessed
 // emission can be counted deterministically.
 type recordingSink struct {

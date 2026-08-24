@@ -66,35 +66,51 @@ func (s *FileService) openObject(ctx context.Context, obj repository.Object) (io
 }
 
 func (s *FileService) openObjectWithOptions(ctx context.Context, obj repository.Object, opts ReadOptions) (io.ReadCloser, error) {
+	rc, _, err := s.openStorageWithOptions(ctx, obj, opts)
+	if err != nil {
+		return nil, err
+	}
+	s.emit(ctx, obj, repository.EventAccessed)
+	return s.wrapReadVerification(obj, rc), nil
+}
+
+func (s *FileService) openStorageWithOptions(
+	ctx context.Context, obj repository.Object, opts ReadOptions,
+) (io.ReadCloser, storage.ObjectInfo, error) {
 	var (
-		rc  io.ReadCloser
-		err error
+		rc   io.ReadCloser
+		info storage.ObjectInfo
+		err  error
 	)
 	if objectUsesSSEC(obj.Metadata) {
 		secure, ok := s.store.(storage.SSECStorage)
 		if !ok || !secure.SupportsSSEC() {
-			return nil, fmt.Errorf("%w: storage backend does not support SSE-C", ErrInvalidArgs)
+			return nil, storage.ObjectInfo{}, fmt.Errorf("%w: storage backend does not support SSE-C", ErrInvalidArgs)
 		}
-		rc, _, err = secure.GetWithOptions(ctx, obj.StorageKey, storageGetOptions(opts))
+		rc, info, err = secure.GetWithOptions(ctx, obj.StorageKey, storageGetOptions(opts))
 	} else {
-		rc, _, err = s.store.Get(ctx, obj.StorageKey)
+		rc, info, err = s.store.Get(ctx, obj.StorageKey)
 	}
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, storage.ObjectInfo{}, ErrNotFound
 		}
-		return nil, err
+		return nil, storage.ObjectInfo{}, err
 	}
-	s.emit(ctx, obj, repository.EventAccessed)
-	if expected, ok := objectVerificationMD5(obj); s.readVerify.Enabled && ok {
-		rc = NewSamplingETagVerifier(rc, ETagVerifierConfig{
-			Expected:   expected,
-			MaxSize:    s.readVerify.MaxSize,
-			Sample:     s.readVerify.Sample,
-			ObjectSize: obj.Size,
-		})
+	return rc, info, nil
+}
+
+func (s *FileService) wrapReadVerification(obj repository.Object, rc io.ReadCloser) io.ReadCloser {
+	expected, ok := objectVerificationMD5(obj)
+	if !s.readVerify.Enabled || !ok {
+		return rc
 	}
-	return rc, nil
+	return NewSamplingETagVerifier(rc, ETagVerifierConfig{
+		Expected:   expected,
+		MaxSize:    s.readVerify.MaxSize,
+		Sample:     s.readVerify.Sample,
+		ObjectSize: obj.Size,
+	})
 }
 
 func objectVerificationMD5(obj repository.Object) (string, bool) {

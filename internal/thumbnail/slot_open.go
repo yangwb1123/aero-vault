@@ -115,14 +115,6 @@ func (c *sourceCapRecorder) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// open3 is the opener contract shared by the generation entry points: it
-// returns the object stream plus the opened object's source ETag. The cached
-// entry point uses the ETag to verify content identity before storing (a
-// concurrent PUT between the caller's Stat and the open must never store
-// new-version bytes under an old-version key); GenerateContextWithOpener
-// discards it (its adapter returns "").
-type open3 func() (io.ReadCloser, string, error)
-
 // GenerateContextWithOpener acquires a decode slot, then invokes open to
 // obtain the object stream, then runs the exact GenerateContext decode
 // pipeline on it (generateLocked). Ordering is load-bearing: the slot is held
@@ -140,9 +132,9 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 	if open == nil {
 		return nil, errors.New("thumbnail: GenerateContextWithOpener: nil opener")
 	}
-	img, _, err := generateContextWithOpener3(ctx, maxW, maxH, func() (io.ReadCloser, string, error) {
+	img, _, err := generateContextWithOpener3(ctx, maxW, maxH, func() (io.ReadCloser, OpenedSource, error) {
 		rc, err := open()
-		return rc, "", err
+		return rc, OpenedSource{}, err
 	})
 	return img, err
 }
@@ -156,20 +148,20 @@ func GenerateContextWithOpener(ctx context.Context, maxW, maxH int, open func() 
 // programming error and returns an error rather than panicking. The opened
 // object's ETag is returned alongside the bytes so the cached entry point can
 // verify content identity before storing.
-func generateContextWithOpener3(ctx context.Context, maxW, maxH int, open open3) ([]byte, string, error) {
+func generateContextWithOpener3(ctx context.Context, maxW, maxH int, open Opener) ([]byte, OpenedSource, error) {
 	return generateContextWithAdmission(ctx, maxW, maxH, nil, "", open)
 }
 
 func generateContextWithAdmission(
-	ctx context.Context, maxW, maxH int, admission *DecodeAdmission, tenant string, open open3,
-) (img []byte, etag string, err error) {
+	ctx context.Context, maxW, maxH int, admission *DecodeAdmission, tenant string, open Opener,
+) (img []byte, opened OpenedSource, err error) {
 	release, err := admission.Acquire(ctx, tenant)
 	if err != nil {
-		return nil, "", err // no slot consumed, no stream opened
+		return nil, OpenedSource{}, err // no slot consumed, no stream opened
 	}
 	defer release() // registered first → runs LAST
 
-	rc, openedETag, err := open()
+	rc, opened, err := open()
 	if err != nil {
 		// Defensive close: an opener may return a non-nil stream together
 		// with an error; the stream must not leak. The close error is
@@ -177,25 +169,25 @@ func generateContextWithAdmission(
 		if rc != nil {
 			_ = rc.Close()
 		}
-		return nil, "", &OpenError{Err: err}
+		return nil, OpenedSource{}, &OpenError{Err: err}
 	}
 	if rc == nil {
-		return nil, "", errors.New("thumbnail: opener returned nil stream with nil error")
+		return nil, OpenedSource{}, errors.New("thumbnail: opener returned nil stream with nil error")
 	}
 	defer func() {
 		closeErr := rc.Close()
 		if err != nil || closeErr != nil {
 			img = nil
-			etag = ""
+			opened = OpenedSource{}
 		}
 		err = joinSourceCloseError(err, closeErr)
 	}() // registered second: close runs before admission release
 
 	img, err = generateLocked(ctx, rc, maxW, maxH)
 	if err != nil {
-		return nil, "", err
+		return nil, OpenedSource{}, err
 	}
-	return img, openedETag, nil
+	return img, opened, nil
 }
 
 // generateLocked is GenerateContext's decode body (dimension clamping through

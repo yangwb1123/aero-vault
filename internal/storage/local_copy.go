@@ -92,9 +92,14 @@ func (s *LocalStorage) Copy(ctx context.Context, srcKey, dstKey string, opts Cop
 		return ObjectInfo{}, err
 	}
 
+	generation, err := newGeneration()
+	if err != nil {
+		return ObjectInfo{}, err
+	}
 	// Build destination metadata: copy source, then apply REPLACE overrides.
 	dstMeta := meta
 	dstMeta.Key = dstKey
+	dstMeta.Metadata = cloneStorageMetadata(dstMeta.Metadata)
 	// The copied blob and its sidecar envelope come from the source.  The
 	// destination instance may have a different SSE configuration, so its
 	// encrypter is not authoritative for the number of plaintext bytes.
@@ -107,6 +112,8 @@ func (s *LocalStorage) Copy(ctx context.Context, srcKey, dstKey string, opts Cop
 			dstMeta.ContentType = opts.ContentType
 		}
 	}
+	dstMeta.Metadata = cloneStorageMetadata(dstMeta.Metadata)
+	dstMeta.Metadata[GenerationMetadataKey] = generation
 
 	if err := writeMeta(s.metaPath(dstPath), dstMeta); err != nil {
 		_ = os.Remove(dstPath)

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/hex"
 	"io"
 	"os"
@@ -103,13 +104,19 @@ func (s *LocalStorage) writeObject(ctx context.Context, path, key string, r io.R
 	if err := os.Rename(tmpName, path); err != nil {
 		return localMeta{}, err
 	}
+	generation, err := newGeneration()
+	if err != nil {
+		return localMeta{}, err
+	}
+	meta := cloneStorageMetadata(opts.Metadata)
+	meta[GenerationMetadataKey] = generation
 	return localMeta{
 		Key:          key,
 		Size:         plaintextSize(written, enc != nil),
 		ETag:         hex.EncodeToString(h.Sum(nil)),
 		ContentType:  opts.ContentType,
 		LastModified: time.Now().UTC(),
-		Metadata:     opts.Metadata,
+		Metadata:     meta,
 		Envelope:     envelope,
 	}, nil
 }
@@ -135,6 +142,25 @@ func (s *LocalStorage) Delete(ctx context.Context, key string) error {
 		return err
 	}
 	return nil
+}
+
+func newGeneration() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func cloneStorageMetadata(meta map[string]string) map[string]string {
+	if len(meta) == 0 {
+		return make(map[string]string, 1)
+	}
+	clone := make(map[string]string, len(meta)+1)
+	for key, value := range meta {
+		clone[key] = value
+	}
+	return clone
 }
 
 // bytesReader is a tiny adapter so we can swap a *bytes.Reader into the io.Reader chain.

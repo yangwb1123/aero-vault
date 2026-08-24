@@ -888,7 +888,8 @@ func TestThumbnailVersionPinnedDerivation(t *testing.T) {
 		t.Fatalf("PUT v2: %d", resp.StatusCode)
 	}
 	effW, effH := thumbnail.EffectiveDims(0, 0)
-	wantETag := fmt.Sprintf(`"%s-thumb-v%d-%dx%d"`, v1ETag, thumbnail.CacheKeyVersion, effW, effH)
+	identity := thumbnail.SourceIdentity{TenantID: "default", Bucket: "default", Key: "photo.jpg", VersionID: v1ID}
+	wantETag := quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, identity, v1ETag, effW, effH))
 	thumbURL := u + "/thumbnail?version=" + v1ID
 	resp, body := req(t, "GET", thumbURL, nil, nil)
 	if resp.StatusCode != http.StatusOK {
@@ -2903,6 +2904,22 @@ func (s *burstStore) Get(ctx context.Context, key string) (io.ReadCloser, storag
 	if err != nil {
 		return nil, info, err
 	}
+	return s.armStream(rc, info)
+}
+
+func (s *burstStore) GetGenerationBound(ctx context.Context, key string, expected storage.ObjectInfo) (io.ReadCloser, storage.ObjectInfo, error) {
+	bound, ok := s.Storage.(storage.GenerationBoundStorage)
+	if !ok {
+		return nil, storage.ObjectInfo{}, storage.ErrUnsupported
+	}
+	rc, info, err := bound.GetGenerationBound(ctx, key, expected)
+	if err != nil {
+		return nil, info, err
+	}
+	return s.armStream(rc, info)
+}
+
+func (s *burstStore) armStream(rc io.ReadCloser, info storage.ObjectInfo) (io.ReadCloser, storage.ObjectInfo, error) {
 	if !s.arm.Load() {
 		return rc, info, nil
 	}
@@ -3600,8 +3617,9 @@ func TestThumbnailOctetStreamMagicPins(t *testing.T) {
 // endpoint pins (R4) additionally lock the emitted 200/304 ETag to the
 // CURRENT constant, so a diverging production call site fails loudly.
 func TestThumbValidatorETagVersioned(t *testing.T) {
-	v1 := thumbValidatorETag(1, "e", 100, 100)
-	v2 := thumbValidatorETag(2, "e", 100, 100)
+	identity := thumbnail.SourceIdentity{TenantID: "tenant", Bucket: "bucket", Key: "key", VersionID: "version"}
+	v1 := thumbValidatorETag(1, identity, "e", 100, 100)
+	v2 := thumbValidatorETag(2, identity, "e", 100, 100)
 	legacy := fmt.Sprintf("%s-thumb-%dx%d", "e", 100, 100)
 	if v1 == v2 {
 		t.Fatalf("thumbValidatorETag(1,…) == thumbValidatorETag(2,…): %q — a version bump must change the wire validator", v1)
@@ -3616,7 +3634,8 @@ func TestThumbValidatorETagVersioned(t *testing.T) {
 	}
 	// The current production value must embed thumbnail.CacheKeyVersion
 	// verbatim — a divergence fails here, not in review prose.
-	if thumbValidatorETag(thumbnail.CacheKeyVersion, "src", 10, 10) != fmt.Sprintf("%s-thumb-v%d-%dx%d", "src", thumbnail.CacheKeyVersion, 10, 10) {
+	current := thumbValidatorETag(thumbnail.CacheKeyVersion, identity, "src", 10, 10)
+	if !strings.HasPrefix(current, fmt.Sprintf("av-thumb-v%d-", thumbnail.CacheKeyVersion)) {
 		t.Fatal("thumbValidatorETag must embed thumbnail.CacheKeyVersion at every production call site")
 	}
 }
@@ -3682,8 +3701,8 @@ func TestThumbnailETagFromEffectiveDims(t *testing.T) {
 	if objETag == "" {
 		t.Fatal("plain GET missing object ETag")
 	}
-	if want := fmt.Sprintf(`"%s-thumb-v%d-2048x256"`, objETag, thumbnail.CacheKeyVersion); etag1 != want {
-		t.Fatalf("validator=%q want %q", etag1, want)
+	if !strings.HasPrefix(etag1, fmt.Sprintf(`"av-thumb-v%d-`, thumbnail.CacheKeyVersion)) || !strings.HasSuffix(etag1, `-2048x256"`) {
+		t.Fatalf("validator=%q has unexpected identity-bound format", etag1)
 	}
 }
 
@@ -3739,8 +3758,8 @@ func TestThumbnailDefaultDimsShareETag(t *testing.T) {
 	if objETag == "" {
 		t.Fatal("plain GET missing object ETag")
 	}
-	if want := fmt.Sprintf(`"%s-thumb-v%d-256x256"`, objETag, thumbnail.CacheKeyVersion); etagZ != want {
-		t.Fatalf("validator=%q want %q", etagZ, want)
+	if !strings.HasPrefix(etagZ, fmt.Sprintf(`"av-thumb-v%d-`, thumbnail.CacheKeyVersion)) || !strings.HasSuffix(etagZ, `-256x256"`) {
+		t.Fatalf("validator=%q has unexpected identity-bound format", etagZ)
 	}
 }
 
@@ -3970,8 +3989,11 @@ func TestThumbnailETagDerivedFromOpenedObject(t *testing.T) {
 		t.Fatalf("control body decode: %v fmt=%s", err, format)
 	}
 	ew, eh := thumbnail.EffectiveDims(100, 100)
-	suffix := fmt.Sprintf("%dx%d", ew, eh)
-	etagB200 := `"` + etagB + "-thumb-v" + strconv.Itoa(int(thumbnail.CacheKeyVersion)) + "-" + suffix + `"`
+	current, err := repo.GetObject(context.Background(), "default", "default", "pic.png")
+	if err != nil {
+		t.Fatalf("read current object: %v", err)
+	}
+	etagB200 := quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(current), current.ETag, ew, eh))
 	if got := resp.Header.Get("ETag"); got != etagB200 {
 		t.Fatalf("control ETag=%q want %q", got, etagB200)
 	}
@@ -3993,7 +4015,7 @@ func TestThumbnailETagDerivedFromOpenedObject(t *testing.T) {
 	if got := resp.Header.Get("ETag"); got != etagB200 {
 		t.Fatalf("200 ETag=%q want %q (opened-object validator); got the pre-open Stat validator?", got, etagB200)
 	}
-	if got := resp.Header.Get("ETag"); got == `"`+etagA+"-thumb-v"+strconv.Itoa(int(thumbnail.CacheKeyVersion))+"-"+suffix+`"` {
+	if got := resp.Header.Get("ETag"); got == quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(current), etagA, ew, eh)) {
 		t.Fatalf("200 ETag must not derive from the pre-open Stat (stale v1): %q", got)
 	}
 }
@@ -4078,27 +4100,30 @@ func TestThumbnail304ShortCircuitsBeforeOpen(t *testing.T) {
 	// path never opens the blob, so no storage write is required. The seeded
 	// ETag matches the client's validator below, so the re-Stat confirms the
 	// match and the 304 fires — the seam stays disarmed.
-	if _, err := repo.UpsertObject(context.Background(), repository.Object{
+	seed, err := repo.UpsertObject(context.Background(), repository.Object{
 		TenantID:    "default",
 		Bucket:      "default",
 		Key:         "pic.png",
+		VersionID:   "seed-version",
 		StorageKey:  "default/default/pic.png",
 		Size:        1,
 		ETag:        "seed-etag",
 		ContentType: "image/png",
-		Metadata:    map[string]string{},
-	}); err != nil {
+		Metadata:    map[string]string{storage.GenerationMetadataKey: "seed-generation"},
+	})
+	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	ew, eh := thumbnail.EffectiveDims(100, 100)
-	suffix := fmt.Sprintf("%dx%d", ew, eh)
+	effW, effH := thumbnail.EffectiveDims(100, 100)
+	suffix := fmt.Sprintf("%dx%d", effW, effH)
+	seedETag := quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(seed), seed.ETag, effW, effH))
 	u := srv.URL + "/v1/files/pic.png/thumbnail?w=100&h=100"
 
 	// Matching validator: the 304 fast path completes with exactly 2
 	// target-key repository reads (pre-open Stat + re-Stat) and never opens
 	// the stream / never touches a decode slot.
-	resp, _ := req(t, "GET", u, nil, map[string]string{"If-None-Match": `"seed-etag-thumb-v` + strconv.Itoa(int(thumbnail.CacheKeyVersion)) + "-" + suffix + `"`})
+	resp, _ := req(t, "GET", u, nil, map[string]string{"If-None-Match": seedETag})
 	if resp.StatusCode != http.StatusNotModified {
 		t.Fatalf("If-None-Match: status=%d want 304", resp.StatusCode)
 	}
@@ -4197,7 +4222,11 @@ func (h *thumbnail304Harness) primeVersions() (staleV1, etagB200, suffix string,
 	}
 	ew, eh := thumbnail.EffectiveDims(100, 100)
 	suffix = fmt.Sprintf("%dx%d", ew, eh)
-	etagB200 = `"` + etagB + "-thumb-v" + strconv.Itoa(int(thumbnail.CacheKeyVersion)) + "-" + suffix + `"`
+	current, err := h.repo.GetObject(context.Background(), "default", "default", "pic.png")
+	if err != nil {
+		t.Fatalf("read current object: %v", err)
+	}
+	etagB200 = quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(current), current.ETag, ew, eh))
 	if got := resp.Header.Get("ETag"); got != etagB200 {
 		t.Fatalf("control v2 ETag=%q want %q", got, etagB200)
 	}
@@ -4208,6 +4237,16 @@ func (h *thumbnail304Harness) primeVersions() (staleV1, etagB200, suffix string,
 		t.Fatalf("primeVersions: target-key GetObject calls = %d, want 12 (2 PUTs × 3 reads [preparePutAccess + checkOverwriteProtection + objectWriteUsage] + 2 HEAD Stats + 2 control-GET Stat/open pairs)", calls)
 	}
 	return staleV1, etagB200, suffix, bodyB
+}
+
+func (h *thumbnail304Harness) validatorForETag(etag string) string {
+	h.t.Helper()
+	obj, err := h.repo.GetObject(context.Background(), "default", "default", "pic.png")
+	if err != nil {
+		h.t.Fatalf("read validator object: %v", err)
+	}
+	effW, effH := thumbnail.EffectiveDims(100, 100)
+	return quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(obj), etag, effW, effH))
 }
 
 func (h *thumbnail304Harness) headETag() string {
@@ -4277,7 +4316,7 @@ func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
 		staleV1, etagB200, suffix, bodyB := h.primeVersions()
 		armStatSwap(h, staleV1)
 		legacyInM := `"` + staleV1 + "-thumb-" + suffix + `"`
-		versionedInM := `"` + staleV1 + "-thumb-v" + strconv.Itoa(int(thumbnail.CacheKeyVersion)) + "-" + suffix + `"`
+		versionedInM := h.validatorForETag(staleV1)
 		// Legacy (unversioned) validator: a miss on the pre-open Stat — the
 		// re-Stat block is skipped, the opener runs (14 calls), and the 200
 		// carries the CURRENT versioned validator.
@@ -4294,6 +4333,7 @@ func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
 		h2 := newThumbnail304Harness(t)
 		staleV1, etagB200, suffix, bodyB = h2.primeVersions()
 		armStatSwap(h2, staleV1)
+		versionedInM = h2.validatorForETag(staleV1)
 		resp, body = req(t, "GET", thumbURL(h2), nil, map[string]string{"If-None-Match": versionedInM})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status=%d want 200 — the object changed between the two Stats, never a stale 304", resp.StatusCode)
@@ -4338,9 +4378,9 @@ func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
 		// FRESH validator. A naive statETag != freshETag → 200 comparator
 		// fails this arm.
 		h := newThumbnail304Harness(t)
-		staleV1, etagB200, suffix, _ := h.primeVersions()
+		staleV1, etagB200, _, _ := h.primeVersions()
 		armStatSwap(h, staleV1)
-		inm := `"` + staleV1 + "-thumb-v" + strconv.Itoa(int(thumbnail.CacheKeyVersion)) + "-" + suffix + `", ` + etagB200
+		inm := h.validatorForETag(staleV1) + `, ` + etagB200
 		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": inm})
 		if resp.StatusCode != http.StatusNotModified {
 			t.Fatalf("status=%d want 304 (re-evaluated match against the fresh validator); INM=%s", resp.StatusCode, inm)
@@ -4368,9 +4408,9 @@ func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
 		// matching the stale Stat still falls through to 200 when the fresh
 		// validator no longer matches.
 		h := newThumbnail304Harness(t)
-		staleV1, etagB200, suffix, _ := h.primeVersions()
+		staleV1, etagB200, _, _ := h.primeVersions()
 		armStatSwap(h, staleV1)
-		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": `W/` + `"` + staleV1 + "-thumb-" + suffix + `"`})
+		resp, _ := req(t, "GET", thumbURL(h), nil, map[string]string{"If-None-Match": `W/` + h.validatorForETag(staleV1)})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status=%d want 200 — a weak match on the stale Stat must not certify 304 after drift", resp.StatusCode)
 		}
@@ -4420,9 +4460,9 @@ func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
 		// QA F6: GET and HEAD share the handler, so the armed drift yields
 		// 200 with the current validator for both verbs (FR-6).
 		h := newThumbnail304Harness(t)
-		staleV1, etagB200, suffix, _ := h.primeVersions()
+		staleV1, etagB200, _, _ := h.primeVersions()
 		armStatSwap(h, staleV1)
-		resp, body := req(t, "HEAD", thumbURL(h), nil, map[string]string{"If-None-Match": `"` + staleV1 + "-thumb-" + suffix + `"`})
+		resp, body := req(t, "HEAD", thumbURL(h), nil, map[string]string{"If-None-Match": h.validatorForETag(staleV1)})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status=%d want 200 for HEAD (drift must not 304)", resp.StatusCode)
 		}
@@ -4490,18 +4530,16 @@ func TestThumbnail304RevalidatesAfterStatErrors(t *testing.T) {
 			TenantID:    "default",
 			Bucket:      "default",
 			Key:         "pic.png",
+			VersionID:   "seed-version",
 			StorageKey:  "default/default/pic.png",
 			Size:        1,
 			ETag:        "seed-etag",
 			ContentType: "image/png",
-			Metadata:    map[string]string{},
+			Metadata:    map[string]string{storage.GenerationMetadataKey: "seed-generation"},
 		}); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	ew, eh := thumbnail.EffectiveDims(100, 100)
-	suffix := fmt.Sprintf("%dx%d", ew, eh)
-
 	t.Run("deleted between stats returns 404 never 304", func(t *testing.T) {
 		// AC-2 Arm C: pre-open Stat = call 1 (real seeded row, matching
 		// validator); re-Stat = call 2 → ErrNotFound → 404. Pre-fix this
@@ -4511,7 +4549,7 @@ func TestThumbnail304RevalidatesAfterStatErrors(t *testing.T) {
 		h.wrapped.mu.Lock()
 		h.wrapped.failErr, h.wrapped.failCall = repository.ErrNotFound, h.wrapped.calls+2
 		h.wrapped.mu.Unlock()
-		resp, body := req(t, "GET", h.u+"/thumbnail?w=100&h=100", nil, map[string]string{"If-None-Match": `"seed-etag-thumb-` + suffix + `"`})
+		resp, body := req(t, "GET", h.u+"/thumbnail?w=100&h=100", nil, map[string]string{"If-None-Match": h.validatorForETag("seed-etag")})
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status=%d want 404 — never a 304 for a state we could not observe; body=%s", resp.StatusCode, body)
 		}
@@ -4535,7 +4573,7 @@ func TestThumbnail304RevalidatesAfterStatErrors(t *testing.T) {
 		h.wrapped.mu.Lock()
 		h.wrapped.failErr, h.wrapped.failCall = service.ErrObjectCorrupt, h.wrapped.calls+2
 		h.wrapped.mu.Unlock()
-		resp, body := req(t, "GET", h.u+"/thumbnail?w=100&h=100", nil, map[string]string{"If-None-Match": `"seed-etag-thumb-` + suffix + `"`})
+		resp, body := req(t, "GET", h.u+"/thumbnail?w=100&h=100", nil, map[string]string{"If-None-Match": h.validatorForETag("seed-etag")})
 		if resp.StatusCode != http.StatusGone {
 			t.Fatalf("status=%d want 410 ObjectCorrupt — never a 304 for a state we could not observe; body=%s", resp.StatusCode, body)
 		}
@@ -4612,7 +4650,11 @@ func TestThumbnailETagDerivedFromOpenedObjectSniffBucket(t *testing.T) {
 		t.Fatalf("control body decode: %v fmt=%s", err, format)
 	}
 	ew, eh := thumbnail.EffectiveDims(100, 100)
-	etagB200 := `"` + etagB + "-thumb-v" + strconv.Itoa(int(thumbnail.CacheKeyVersion)) + "-" + fmt.Sprintf("%dx%d", ew, eh) + `"`
+	current, err := repo.GetObject(context.Background(), "default", "default", "pic.bin")
+	if err != nil {
+		t.Fatalf("read current object: %v", err)
+	}
+	etagB200 := quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(current), current.ETag, ew, eh))
 	if got := resp.Header.Get("ETag"); got != etagB200 {
 		t.Fatalf("control ETag=%q want %q", got, etagB200)
 	}
@@ -4634,7 +4676,7 @@ func TestThumbnailETagDerivedFromOpenedObjectSniffBucket(t *testing.T) {
 	if got := resp.Header.Get("ETag"); got != etagB200 {
 		t.Fatalf("200 ETag=%q want %q (opened-object validator through the sniff wrapper)", got, etagB200)
 	}
-	if got := resp.Header.Get("ETag"); got == `"`+etagA+"-thumb-v"+strconv.Itoa(int(thumbnail.CacheKeyVersion))+"-"+fmt.Sprintf("%dx%d", ew, eh)+`"` {
+	if got := resp.Header.Get("ETag"); got == quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(current), etagA, ew, eh)) {
 		t.Fatalf("200 ETag must not derive from the pre-open Stat (stale v1) on the sniff path: %q", got)
 	}
 }
@@ -4700,12 +4742,11 @@ func TestThumbnailLastModifiedDerivedFromOpenedObjectSniffBucket(t *testing.T) {
 		t.Fatalf("control body decode: %v fmt=%s", err, format)
 	}
 	ew, eh := thumbnail.EffectiveDims(100, 100)
-	etagB200 := `"` + etagB + "-thumb-v" + strconv.Itoa(int(thumbnail.CacheKeyVersion)) + "-" + fmt.Sprintf("%dx%d", ew, eh) + `"`
-
 	obj, err := repo.GetObject(context.Background(), "default", "default", "pic.bin")
 	if err != nil {
 		t.Fatalf("read real row: %v", err)
 	}
+	etagB200 := quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, thumbnailSourceIdentity(obj), obj.ETag, ew, eh))
 	fresh := obj.UpdatedAt.UTC().Format(http.TimeFormat)
 	stale := obj.UpdatedAt.Add(-time.Hour)
 
@@ -5019,7 +5060,8 @@ func TestThumbnailHeadVersionPinParity(t *testing.T) {
 		t.Fatalf("version-pinned derivation: body not a decodable image: %v", err)
 	}
 	effW, effH := thumbnail.EffectiveDims(0, 0)
-	wantETag := fmt.Sprintf(`"%s-thumb-v%d-%dx%d"`, oldETag, thumbnail.CacheKeyVersion, effW, effH)
+	identity := thumbnail.SourceIdentity{TenantID: "default", Bucket: "default", Key: "img.png", VersionID: oldID}
+	wantETag := quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion, identity, oldETag, effW, effH))
 	if et := getResp.Header.Get("ETag"); et != wantETag {
 		t.Fatalf("version-pinned derivation: GET ETag=%q want %q (from v1, not the current version)", et, wantETag)
 	}

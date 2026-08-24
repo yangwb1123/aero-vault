@@ -115,13 +115,19 @@ func (s *LocalStorage) CompleteMultipartWithOptions(ctx context.Context, key, up
 	if err != nil {
 		return ObjectInfo{}, err
 	}
+	generation, err := newGeneration()
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	metaData := cloneStorageMetadata(up.opts.Metadata)
+	metaData[GenerationMetadataKey] = generation
 	meta := localMeta{
 		Key:          key,
 		Size:         total,
 		ETag:         etag,
 		ContentType:  up.opts.ContentType,
 		LastModified: time.Now().UTC(),
-		Metadata:     up.opts.Metadata,
+		Metadata:     metaData,
 		Envelope:     envelope,
 	}
 	if err := writeMeta(s.metaPath(dst), meta); err != nil {

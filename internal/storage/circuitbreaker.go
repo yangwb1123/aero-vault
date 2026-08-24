@@ -188,6 +188,7 @@ func isBackendFailure(err error) bool {
 		errors.Is(err, ErrAlreadyExists),
 		errors.Is(err, ErrInvalidKey),
 		errors.Is(err, ErrUnsupported),
+		errors.Is(err, ErrGenerationMismatch),
 		errors.Is(err, ErrSSECustomerKeyRequired),
 		errors.Is(err, ErrInvalidSSECustomerKey),
 		errors.Is(err, ErrBackendUnavailable),
@@ -271,6 +272,23 @@ func (cb *circuitBreaker) Get(ctx context.Context, key string) (io.ReadCloser, O
 		return nil, ObjectInfo{}, err
 	}
 	rc, info, err := cb.Storage.Get(ctx, key)
+	cb.recordOutcome(err)
+	return rc, info, err
+}
+
+func (cb *circuitBreaker) GenerationBoundAvailable() bool {
+	return SupportsGenerationBound(cb.Storage)
+}
+
+func (cb *circuitBreaker) GetGenerationBound(ctx context.Context, key string, expected ObjectInfo) (io.ReadCloser, ObjectInfo, error) {
+	if err := cb.beforeRequest(); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	bound, ok := cb.Storage.(GenerationBoundStorage)
+	if !ok {
+		return nil, ObjectInfo{}, ErrUnsupported
+	}
+	rc, info, err := bound.GetGenerationBound(ctx, key, expected)
 	cb.recordOutcome(err)
 	return rc, info, err
 }

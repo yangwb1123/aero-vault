@@ -197,6 +197,10 @@ func (s *FileService) Put(ctx context.Context, tenant, bucket, key string, r io.
 
 // buildPutObject constructs a repository.Object from storage info and options.
 func (s *FileService) buildPutObject(key string, tenant string, bucket string, bcfg repository.BucketConfig, opts PutOptions, sk string, versionID string, info storage.ObjectInfo) repository.Object {
+	metadata := cloneMetadata(opts.Metadata)
+	if generation := info.Metadata[storage.GenerationMetadataKey]; generation != "" {
+		metadata[storage.GenerationMetadataKey] = generation
+	}
 	obj := repository.Object{
 		TenantID:     tenant,
 		Bucket:       bucket,
@@ -207,7 +211,7 @@ func (s *FileService) buildPutObject(key string, tenant string, bucket string, b
 		Size:         info.Size,
 		ETag:         info.ETag,
 		ContentType:  opts.ContentType,
-		Metadata:     opts.Metadata,
+		Metadata:     metadata,
 		Tags:         opts.Tags,
 		StorageClass: opts.StorageClass,
 	}
