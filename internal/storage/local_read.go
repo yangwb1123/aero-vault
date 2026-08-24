@@ -30,6 +30,8 @@ func (s *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, Obje
 }
 
 func (s *LocalStorage) GetGenerationBound(ctx context.Context, key string, expected ObjectInfo) (io.ReadCloser, ObjectInfo, error) {
+	s.generationMu.RLock()
+	defer s.generationMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return nil, ObjectInfo{}, err
 	}

@@ -63,6 +63,8 @@ func RewrapStale(ctx context.Context, store Storage) (RewrapReport, error) {
 // RewrapObject re-wraps a single object's SSE data key to the current master key,
 // rewriting only the sidecar envelope. See Rewrapper.
 func (s *LocalStorage) RewrapObject(ctx context.Context, key string) (bool, error) {
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
 	if s.enc == nil {
 		return false, nil // SSE disabled
 	}

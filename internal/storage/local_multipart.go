@@ -92,6 +92,8 @@ func (s *LocalStorage) CompleteMultipartWithOptions(ctx context.Context, key, up
 		delete(s.uploads, uploadID)
 	}
 	s.mu.Unlock()
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
 	if !ok || up.key != key {
 		return ObjectInfo{}, fmt.Errorf("unknown upload %s", uploadID)
 	}

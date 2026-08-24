@@ -33,6 +33,8 @@ func (s *LocalStorage) Copy(ctx context.Context, srcKey, dstKey string, opts Cop
 		),
 	)
 	defer span.End()
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
 
 	// Resolve source path and read its metadata.
 	srcPath, err := s.objectPath(srcKey)

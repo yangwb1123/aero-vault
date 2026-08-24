@@ -33,8 +33,9 @@ type LocalStorage struct {
 	cfg LocalConfig
 	enc *envelopeEncrypter // nil when SSE disabled
 
-	mu      sync.RWMutex
-	uploads map[string]*localUpload // uploadID -> parts dir state
+	mu           sync.RWMutex
+	generationMu sync.RWMutex
+	uploads      map[string]*localUpload // uploadID -> parts dir state
 }
 
 type localUpload struct {

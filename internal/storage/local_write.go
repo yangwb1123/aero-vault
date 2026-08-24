@@ -25,6 +25,8 @@ func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader, size in
 	if err := s.validateServerSideEncryption(opts); err != nil {
 		return ObjectInfo{}, err
 	}
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
 
 	path, err := s.objectPath(key)
 	if err != nil {
@@ -133,6 +135,8 @@ func plaintextSize(written int64, encrypted bool) int64 {
 }
 
 func (s *LocalStorage) Delete(ctx context.Context, key string) error {
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
 	path, err := s.objectPath(key)
 	if err != nil {
 		return err
