@@ -23,13 +23,13 @@ func (e *OpenError) Error() string { return "thumbnail: open object stream: " + 
 func (e *OpenError) Unwrap() error { return e.Err }
 
 // SourceReadError wraps an error returned by the caller-supplied source
-// stream mid-decode. It lets callers distinguish storage/verification read
-// failures that surface through the codec read chains (local FS I/O, S3/OSS/
-// COS network errors, an on-read ETagVerifier checksum mismatch) from
-// codec-synthesized decode errors (image.ErrFormat, jpeg/png FormatError,
-// io.ErrUnexpectedEOF from truncation) and from context errors, which stay
-// unwrapped. The sets are disjoint, so errors.As on *SourceReadError before
-// sentinel checks is exact (same contract as OpenError).
+// stream while reading or closing. It lets callers distinguish storage/
+// verification failures (local FS I/O, S3/OSS/COS network errors, an on-read
+// or close-time ETagVerifier checksum mismatch) from codec-synthesized decode
+// errors. Decode-site context errors stay unwrapped; close-time context errors
+// use this wrapper while preserving errors.Is. The sets are disjoint at each
+// boundary, so errors.As on *SourceReadError is exact (same contract as
+// OpenError).
 type SourceReadError struct{ Err error }
 
 func (e *SourceReadError) Error() string {
@@ -162,13 +162,14 @@ func generateContextWithOpener3(ctx context.Context, maxW, maxH int, open open3)
 
 func generateContextWithAdmission(
 	ctx context.Context, maxW, maxH int, admission *DecodeAdmission, tenant string, open open3,
-) ([]byte, string, error) {
+) (img []byte, etag string, err error) {
 	release, err := admission.Acquire(ctx, tenant)
 	if err != nil {
 		return nil, "", err // no slot consumed, no stream opened
 	}
 	defer release() // registered first → runs LAST
-	rc, etag, err := open()
+
+	rc, openedETag, err := open()
 	if err != nil {
 		// Defensive close: an opener may return a non-nil stream together
 		// with an error; the stream must not leak. The close error is
@@ -181,9 +182,20 @@ func generateContextWithAdmission(
 	if rc == nil {
 		return nil, "", errors.New("thumbnail: opener returned nil stream with nil error")
 	}
-	defer rc.Close() // registered second → runs FIRST: stream closed while the slot is still held
-	img, err := generateLocked(ctx, rc, maxW, maxH)
-	return img, etag, err
+	defer func() {
+		closeErr := rc.Close()
+		if err != nil || closeErr != nil {
+			img = nil
+			etag = ""
+		}
+		err = joinSourceCloseError(err, closeErr)
+	}() // registered second: close runs before admission release
+
+	img, err = generateLocked(ctx, rc, maxW, maxH)
+	if err != nil {
+		return nil, "", err
+	}
+	return img, openedETag, nil
 }
 
 // generateLocked is GenerateContext's decode body (dimension clamping through

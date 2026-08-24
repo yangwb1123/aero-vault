@@ -34,7 +34,8 @@ import (
 // generateLocked, so the key can never drift from the produced bytes); a
 // hit returns the stored JPEG with no slot acquisition, no opener
 // invocation, no decode; a miss runs the exact shared slot→open→
-// generateLocked body; errors are never cached.
+// generateLocked→close body; source close is part of generation success,
+// and errors are never cached.
 func GenerateContextWithOpenerCached(
 	ctx context.Context,
 	cache *Cache,
@@ -121,7 +122,8 @@ func generateContextWithOpenerCached(
 	}
 
 	// Miss path: the exact shared body of GenerateContextWithOpener (slot →
-	// open → *OpenError wrap → close → generateLocked), byte-identical.
+	// open → *OpenError wrap → generateLocked → close), byte-identical. A
+	// close failure is an error, so the cache gate below is never reached.
 	img, openedETag, err := generateContextWithAdmission(ctx, maxW, maxH, admission, tenant, open)
 	if err != nil {
 		// Errors are never cached; the sentinel/classification surface is
