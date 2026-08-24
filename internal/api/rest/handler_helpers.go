@@ -138,6 +138,14 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 		h.writeError(w, r, thumbnail.ErrSourceTooLarge)
 		return
 	}
+	if errors.Is(err, thumbnail.ErrUnsupported) {
+		// Preserve the existing 400 decode classification when a decode error
+		// is joined with a source-close failure. Without this branch the
+		// SourceReadError arm below would incorrectly let the secondary close
+		// error decide the wire status (typically 500).
+		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
+		return
+	}
 	// Source-stream read or close failures (storage I/O, on-read or close-time
 	// verification) are marked by the thumbnail module: classify the underlying
 	// error raw — default → 500 InternalError; an ETagVerifier mismatch wraps

@@ -154,10 +154,10 @@ test-race-thumbnail:
 # REST cache path under -race: the server-side thumbnail LRU is consulted on
 # the request path (Get/Put under a mutex) and the cache-specific handler
 # tests pin the concurrency contract; race them without the full (slow) REST
-# suite by scoping to the cache test names.
+# suite by scoping to the cache, revalidation, and close-lifecycle test names.
 test-race-rest-cache:
 	@echo "[check] data race detection (REST thumbnail cache path) ..."
-	go test -race -count=1 -timeout 300s -run 'ThumbnailCache|Thumbnail.*(Cache|Revalid)' ./internal/api/rest/
+	go test -race -count=1 -timeout 300s -run 'ThumbnailCache|ThumbnailClose|Thumbnail.*(Cache|Revalid)' ./internal/api/rest/
 	@echo "  OK (no races detected)"
 
 .PHONY: test-race-rest-cache

@@ -99,9 +99,10 @@ jobs:
         # concurrency — exactly the pattern the race detector exists for
         # (QA-5). The 304-revalidation tests reuse the mutex-guarded
         # etagSwapRepo seam (swap/fail arms), so they race under the same
-        # detector too. Scoped via -run so the full REST package is not
-        # covered here.
-        run: go test -race -short -count=1 -timeout 120s ./internal/api/rest/ -run 'TestThumbnailMidDecode|TestThumbnail304RevalidatesAfterStat|TestThumbnail304ShortCircuitsBeforeOpen|TestThumbnailGeneration'
+        # detector too. Close-lifecycle tests cover the source-close/error
+        # path and are included explicitly rather than by incidental naming.
+        # Scoped via -run so the full REST package is not covered here.
+        run: go test -race -short -count=1 -timeout 120s ./internal/api/rest/ -run 'TestThumbnailMidDecode|TestThumbnail304RevalidatesAfterStat|TestThumbnail304ShortCircuitsBeforeOpen|TestThumbnailGeneration|TestThumbnailClose'
 
       - name: Coverage
         run: |
