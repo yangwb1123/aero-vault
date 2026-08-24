@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -349,4 +350,71 @@ func varyContains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+type thumbnailPreconditionSwapRepo struct {
+	repository.Repository
+	target  string
+	initial repository.Object
+	calls   atomic.Int64
+}
+
+func (r *thumbnailPreconditionSwapRepo) GetObject(ctx context.Context, tenant, bucket, key string) (repository.Object, error) {
+	if key == r.target && r.calls.Add(1) == 1 {
+		return r.initial, nil
+	}
+	return r.Repository.GetObject(ctx, tenant, bucket, key)
+}
+
+func TestThumbnailStrongPreconditionRechecksOpenedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "thumb.db"))
+	if err != nil {
+		t.Fatalf("repository.Open: %v", err)
+	}
+	if err := repo.Migrate(context.Background()); err != nil {
+		_ = repo.Close()
+		t.Fatalf("repo.Migrate: %v", err)
+	}
+	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		_ = repo.Close()
+		t.Fatalf("storage.NewLocal: %v", err)
+	}
+	wrapped := &thumbnailPreconditionSwapRepo{Repository: repo, target: "race.png"}
+	svc := service.NewFileService(store, wrapped, nil).WithDeleteFailOpen(true)
+	h := NewHandler(svc, nil).WithThumbnailCache(thumbnail.NewCache(1<<20, 0))
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	r.Head("/v1/files/*", h.Head)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() { srv.Close(); _ = repo.Close() })
+
+	base := srv.URL + "/v1/files/race.png"
+	hdr := map[string]string{"Content-Type": "image/png"}
+	if resp, _ := req(t, http.MethodPut, base, pngBytes(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT A: %d", resp.StatusCode)
+	}
+	first, err := repo.GetObject(context.Background(), "default", "default", "race.png")
+	if err != nil {
+		t.Fatalf("read A: %v", err)
+	}
+	if resp, _ := req(t, http.MethodPut, base, pngBytesAlt(t, 64, 64), hdr); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT B: %d", resp.StatusCode)
+	}
+	width, height := thumbnail.EffectiveDims(32, 32)
+	oldValidator := quotedThumbETag(thumbValidatorETag(thumbnail.CacheKeyVersion,
+		thumbnailSourceIdentity(first), first.ETag, width, height))
+	wrapped.initial = first
+	wrapped.calls.Store(0)
+
+	resp, body := req(t, http.MethodGet, base+"/thumbnail?w=32&h=32", nil,
+		map[string]string{"If-Match": oldValidator})
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("raced If-Match status=%d body=%q, want 412", resp.StatusCode, body)
+	}
+	if h.thumbnailCache.Len() != 0 {
+		t.Fatalf("failed opened-generation precondition populated cache: len=%d", h.thumbnailCache.Len())
+	}
 }

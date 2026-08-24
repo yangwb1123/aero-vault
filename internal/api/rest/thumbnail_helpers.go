@@ -84,6 +84,14 @@ func thumbnailSourceIdentity(obj repository.Object) thumbnail.SourceIdentity {
 	}
 }
 
+func openedThumbnailValidator(source *service.ThumbnailSource, effW, effH int) string {
+	if source == nil || !source.Bound {
+		return ""
+	}
+	identity := thumbnailSourceIdentity(source.Object)
+	return thumbValidatorETag(thumbnail.CacheKeyVersion, identity, source.Object.ETag, effW, effH)
+}
+
 func addThumbnailVary(w http.ResponseWriter) {
 	want := []string{"Authorization", "X-Aero-Tenant", "X-Api-Key"}
 	seen := make(map[string]bool)

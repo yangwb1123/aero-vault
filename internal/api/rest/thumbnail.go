@@ -412,6 +412,14 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		h.writeThumbnailGenerateError(w, r, err)
 		return
 	}
+	// A source replacement can become visible between the pre-open Stat and
+	// the opener. Re-evaluate strong preconditions against the object whose
+	// bytes were actually decoded; otherwise If-Match for generation A could
+	// incorrectly return generation B with a 200 response.
+	if opened != nil && readPreconditionFailedForETag(r, opened.Object, openedThumbnailValidator(opened, effW, effH)) {
+		h.writeError(w, r, service.ErrPreconditionFailed)
+		return
+	}
 	if fromCache {
 		// Deterministic access evidence: every successful 200 thumbnail
 		// response emits exactly one EventAccessed. Misses emit it on stream

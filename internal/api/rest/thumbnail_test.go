@@ -4499,8 +4499,13 @@ func TestThumbnail304RevalidatesAfterStat(t *testing.T) {
 		// version segment) would silently reintroduce.
 		h := newThumbnail304Harness(t)
 		_, etagB200, suffix, bodyB := h.primeVersions()
-		legacy := `"` + strings.TrimSuffix(strings.Trim(etagB200, `"`),
-			"-thumb-v"+strconv.Itoa(int(thumbnail.CacheKeyVersion))+"-"+suffix) + "-thumb-" + suffix + `"`
+		current, err := h.repo.GetObject(context.Background(), "default", "default", "pic.png")
+		if err != nil {
+			t.Fatalf("read current object: %v", err)
+		}
+		// Literal v1 wire form: the previous implementation exposed the raw
+		// source ETag and did not include source identity in the validator.
+		legacy := quotedThumbETag(fmt.Sprintf("%s-thumb-v1-%s", current.ETag, suffix))
 		for _, probe := range []string{legacy, `W/` + legacy} {
 			// Weak comparison (etagListMatches strips W/) changes nothing
 			// here: both must miss against the versioned statETag.
