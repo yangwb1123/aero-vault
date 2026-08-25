@@ -11,6 +11,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080")
 SERVER_BIN = os.environ.get("SERVER_BIN", "./bin/aero-vault")
 SUITES = [
     ("E2E", "test_e2e.py"),
+    ("Thumbnail", "test_thumbnail_e2e.py"),
     ("Adversarial", "test_adversarial.py"),
     ("Interop", "test_interop.py"),
     ("S3", "test_s3.py"),
