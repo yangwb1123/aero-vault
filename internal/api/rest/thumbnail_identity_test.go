@@ -238,6 +238,9 @@ func TestThumbnailUnsupportedBackendOmitsUnprovenValidator(t *testing.T) {
 		if wildcard.StatusCode != http.StatusNotModified || len(wildcardBody) != 0 {
 			t.Fatalf("unbound %s wildcard: status=%d body=%d, want 304/0", method, wildcard.StatusCode, len(wildcardBody))
 		}
+		if wildcard.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("unbound %s wildcard Cache-Control=%q, want no-store", method, wildcard.Header.Get("Cache-Control"))
+		}
 	}
 	if counting.gets.Load() != before {
 		t.Fatalf("wildcard revalidation reopened storage: gets=%d before=%d", counting.gets.Load(), before)
@@ -246,6 +249,9 @@ func TestThumbnailUnsupportedBackendOmitsUnprovenValidator(t *testing.T) {
 		date, dateBody := req(t, method, thumb, nil, map[string]string{"If-Modified-Since": lastModified})
 		if date.StatusCode != http.StatusNotModified || len(dateBody) != 0 {
 			t.Fatalf("unbound %s date: status=%d body=%d, want 304/0", method, date.StatusCode, len(dateBody))
+		}
+		if date.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("unbound %s date Cache-Control=%q, want no-store", method, date.Header.Get("Cache-Control"))
 		}
 	}
 	if counting.gets.Load() != before {

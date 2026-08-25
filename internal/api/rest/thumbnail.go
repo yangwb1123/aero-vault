@@ -317,7 +317,14 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 			// (thumbFreshnessMaxAge + must-revalidate), and one holding the
 			// anonymous public entry cannot have its stored directive
 			// rewritten to private by an authenticated 304.
-			w.Header().Set("Cache-Control", cacheControl)
+			// A validator-suppressed 200 uses no-store; preserve that policy
+			// on wildcard/date 304 responses instead of making revalidation
+			// create a fresh cache entry.
+			freshCacheControl := cacheControl
+			if freshETag == "" {
+				freshCacheControl = "no-store"
+			}
+			w.Header().Set("Cache-Control", freshCacheControl)
 			// Revalidation observability: bounded client freshness converts
 			// silent cache hits into these conditionals (per client per URL
 			// per window); each certified 304 costs three repo point reads
