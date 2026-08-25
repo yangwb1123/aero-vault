@@ -23,9 +23,20 @@ const forcedThumbnailETag = "0123456789abcdef0123456789abcdef"
 
 type unsupportedThumbnailStore struct{ storage.Storage }
 
+type generationMismatchThumbnailStore struct{ storage.Storage }
+
 type forcedThumbnailETagStore struct {
 	storage.Storage
 	etag string
+}
+
+func (s *generationMismatchThumbnailStore) GetGenerationBound(ctx context.Context, key string, _ storage.ObjectInfo) (io.ReadCloser, storage.ObjectInfo, error) {
+	rc, info, err := s.Storage.Get(ctx, key)
+	if err != nil {
+		return nil, storage.ObjectInfo{}, err
+	}
+	info.ETag = "contradictory-proof"
+	return rc, info, nil
 }
 
 func (s *forcedThumbnailETagStore) Put(ctx context.Context, key string, r io.Reader, size int64, opts storage.PutOptions) (storage.ObjectInfo, error) {
@@ -217,13 +228,69 @@ func TestThumbnailUnsupportedBackendOmitsUnprovenValidator(t *testing.T) {
 	if first.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("unbound Cache-Control=%q, want no-store", first.Header.Get("Cache-Control"))
 	}
+	lastModified := first.Header.Get("Last-Modified")
+	if lastModified == "" {
+		t.Fatal("unbound response must retain Last-Modified for date validation")
+	}
 	before := counting.gets.Load()
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		wildcard, wildcardBody := req(t, method, thumb, nil, map[string]string{"If-None-Match": "*"})
+		if wildcard.StatusCode != http.StatusNotModified || len(wildcardBody) != 0 {
+			t.Fatalf("unbound %s wildcard: status=%d body=%d, want 304/0", method, wildcard.StatusCode, len(wildcardBody))
+		}
+	}
+	if counting.gets.Load() != before {
+		t.Fatalf("wildcard revalidation reopened storage: gets=%d before=%d", counting.gets.Load(), before)
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		date, dateBody := req(t, method, thumb, nil, map[string]string{"If-Modified-Since": lastModified})
+		if date.StatusCode != http.StatusNotModified || len(dateBody) != 0 {
+			t.Fatalf("unbound %s date: status=%d body=%d, want 304/0", method, date.StatusCode, len(dateBody))
+		}
+	}
+	if counting.gets.Load() != before {
+		t.Fatalf("date revalidation reopened storage: gets=%d before=%d", counting.gets.Load(), before)
+	}
 	second, secondBody := req(t, http.MethodGet, thumb, nil, map[string]string{"If-None-Match": `"stale"`})
 	if second.StatusCode != http.StatusOK || len(secondBody) == 0 {
 		t.Fatalf("unbound conditional request: status=%d body=%d", second.StatusCode, len(secondBody))
 	}
 	if counting.gets.Load() != before+1 {
-		t.Fatalf("unbound source should reopen after every request: gets=%d before=%d", counting.gets.Load(), before)
+		t.Fatalf("unbound source should reopen after every nonmatching request: gets=%d before=%d", counting.gets.Load(), before)
+	}
+}
+
+func TestThumbnailGenerationProofMismatchNoStore(t *testing.T) {
+	dir := t.TempDir()
+	real, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("storage.NewLocal: %v", err)
+	}
+	counting := &countingStore{Storage: real}
+	store := &generationMismatchThumbnailStore{Storage: counting}
+	srv, _ := newThumbnailIdentityREST(t, store, true)
+	base := srv.URL + "/v1/files/mismatch.png"
+	if resp, _ := req(t, http.MethodPut, base, pngBytes(t, 64, 64), map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT: %d", resp.StatusCode)
+	}
+	thumb := base + "/thumbnail?w=32&h=32"
+	first, body := req(t, http.MethodGet, thumb, nil, nil)
+	if first.StatusCode != http.StatusOK || len(body) == 0 {
+		t.Fatalf("mismatched-proof thumbnail: status=%d bytes=%d", first.StatusCode, len(body))
+	}
+	if first.Header.Get("ETag") != "" || first.Header.Get("X-Version-Id") != "" {
+		t.Fatalf("mismatched proof exposed validators: etag=%q version=%q", first.Header.Get("ETag"), first.Header.Get("X-Version-Id"))
+	}
+	if first.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("mismatched-proof Cache-Control=%q, want no-store", first.Header.Get("Cache-Control"))
+	}
+	before := counting.gets.Load()
+	second, secondBody := req(t, http.MethodGet, thumb, nil, nil)
+	if second.StatusCode != http.StatusOK || len(secondBody) == 0 {
+		t.Fatalf("mismatched-proof repeat: status=%d bytes=%d", second.StatusCode, len(secondBody))
+	}
+	if counting.gets.Load() <= before {
+		t.Fatalf("mismatched-proof response reused storage/cache: gets before=%d after=%d", before, counting.gets.Load())
 	}
 }
 

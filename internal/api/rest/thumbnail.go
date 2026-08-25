@@ -239,11 +239,16 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	addThumbnailVary(w)
 	// Unpinned X-Version-Id emission needs the bucket versioning gate (S3 parity).
 	versioning := version != "" || h.bucketVersioning(r.Context(), tenant)
-	// Conditional re-observation gate: an INM match OR an IMS-only request
-	// (no INM header) enters the re-Stat block — the IMS arm needs the fresh
-	// observation to evaluate the date comparison (RFC 9110 §13).
-	if statETag != "" && (etagListMatches(r.Header.Get("If-None-Match"), statETag) ||
-		(r.Header.Get("If-None-Match") == "" && r.Header.Get("If-Modified-Since") != "")) {
+	// Conditional re-observation gate: an INM match (including wildcard) OR
+	// an IMS-only request enters the re-Stat block. Wildcard and date
+	// conditions remain meaningful when a backend cannot provide a reusable
+	// derived ETag: the current representation still exists and
+	// Last-Modified is still an applicable validator (RFC 9110 §13).
+	inm := r.Header.Get("If-None-Match")
+	inmHit := statETag != "" && etagListMatches(inm, statETag)
+	inmWildcard := inm != "" && etagListMatches(inm, "")
+	imsOnly := inm == "" && r.Header.Get("If-Modified-Since") != ""
+	if inmHit || inmWildcard || imsOnly {
 		// Re-observe the object before certifying Not Modified. The pre-open
 		// Stat above and this emission are separate moments: a concurrent PUT
 		// between them would otherwise pair a stale validator with 304, and a
@@ -282,17 +287,22 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		// Conditional evaluation per RFC 9110 §13: If-None-Match takes
 		// precedence when present; otherwise If-Modified-Since is evaluated
 		// against the re-observed Last-Modified.
-		inmHit := freshETag != "" && etagListMatches(r.Header.Get("If-None-Match"), freshETag)
+		inmHit := freshETag != "" && etagListMatches(inm, freshETag)
+		if !inmHit {
+			// A wildcard matches the current representation even when no
+			// reusable ETag is emitted for the opened bytes.
+			inmHit = inmWildcard
+		}
 		imsHit := false
-		if r.Header.Get("If-None-Match") == "" {
+		if inm == "" {
 			if ims := r.Header.Get("If-Modified-Since"); ims != "" {
 				if t, perr := http.ParseTime(ims); perr == nil {
 					imsHit = !fresh.UpdatedAt.Truncate(time.Second).After(t)
 				}
 			}
 		}
-		if freshETag != "" && (inmHit || imsHit) {
-			if (version != "" || versioning) && fresh.VersionID != "" {
+		if inmHit || imsHit {
+			if freshETag != "" && (version != "" || versioning) && fresh.VersionID != "" {
 				w.Header().Set("X-Version-Id", fresh.VersionID)
 			}
 			setThumbnailETag(w, freshETag)
