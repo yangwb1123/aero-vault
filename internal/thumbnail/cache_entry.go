@@ -7,6 +7,16 @@ import (
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
+// CachedGenerationResult includes the source metadata needed by protocol
+// adapters when a successful result was produced by another flight caller.
+// Opened is valid when HasOpened is true; resident cache hits leave it false.
+type CachedGenerationResult struct {
+	Image     []byte
+	FromCache bool
+	Opened    OpenedSource
+	HasOpened bool
+}
+
 // GenerateContextWithOpenerCached generates a thumbnail with an identity-bound
 // output cache. Incomplete identities bypass both lookup and storage.
 func GenerateContextWithOpenerCached(
@@ -34,6 +44,21 @@ func GenerateContextWithOpenerCachedWithAdmission(
 	return generateContextWithOpenerCached(ctx, cache, admission, identity, sourceETag, maxW, maxH, open)
 }
 
+// GenerateContextWithOpenerCachedWithAdmissionResult is the metadata-preserving
+// form used by adapters that must construct a response from a coalesced
+// leader's opened representation.
+func GenerateContextWithOpenerCachedWithAdmissionResult(
+	ctx context.Context,
+	cache *Cache,
+	admission *DecodeAdmission,
+	identity SourceIdentity,
+	sourceETag string,
+	maxW, maxH int,
+	open Opener,
+) (CachedGenerationResult, error) {
+	return generateContextWithOpenerCachedResult(ctx, cache, admission, identity, sourceETag, maxW, maxH, open)
+}
+
 func generateContextWithOpenerCached(
 	ctx context.Context,
 	cache *Cache,
@@ -43,40 +68,92 @@ func generateContextWithOpenerCached(
 	maxW, maxH int,
 	open Opener,
 ) ([]byte, bool, error) {
+	result, err := generateContextWithOpenerCachedResult(ctx, cache, admission, identity, sourceETag, maxW, maxH, open)
+	return result.Image, result.FromCache, err
+}
+
+func generateContextWithOpenerCachedResult(
+	ctx context.Context,
+	cache *Cache,
+	admission *DecodeAdmission,
+	identity SourceIdentity,
+	sourceETag string,
+	maxW, maxH int,
+	open Opener,
+) (result CachedGenerationResult, err error) {
 	if open == nil {
-		return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: nil opener")
+		return result, errors.New("thumbnail: GenerateContextWithOpenerCached: nil opener")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, false, err
+		return result, err
 	}
 	if !identity.Complete() {
-		return generateUncached(ctx, admission, identity.TenantID, maxW, maxH, open)
+		result.Image, result.FromCache, err = generateUncached(ctx, admission, identity.TenantID, maxW, maxH, open)
+		return result, err
 	}
 	if !ContentMD5ETag(sourceETag) {
 		if cache != nil && cache.Enabled() {
 			telemetry.IncThumbnailCacheBypass(ctx, "non-content-md5")
 		}
-		return generateUncached(ctx, admission, identity.TenantID, maxW, maxH, open)
+		result.Image, result.FromCache, err = generateUncached(ctx, admission, identity.TenantID, maxW, maxH, open)
+		return result, err
 	}
 	effW, effH := EffectiveDims(maxW, maxH)
 	key := CacheKey{
 		Identity: identity, SourceETag: sourceETag,
 		EffW: effW, EffH: effH, Version: CacheKeyVersion,
 	}
-	if cached, hit, err := lookupCached(ctx, cache, key); err != nil {
-		return nil, false, err
+	if cached, hit, lookupErr := lookupCached(ctx, cache, key); lookupErr != nil {
+		return result, lookupErr
 	} else if hit {
-		return cached, true, nil
+		return CachedGenerationResult{Image: cached, FromCache: true}, nil
 	}
+	flight, leader := beginFlight(cache, key)
+	if flight == nil {
+		return generateMiss(ctx, cache, admission, identity, sourceETag, key, maxW, maxH, open)
+	}
+	if !leader {
+		return waitFlightResult(ctx, flight)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			finishFlight(cache, key, flight, CachedGenerationResult{}, errCoalescedLeaderPanic)
+			panic(recovered)
+		}
+		finishFlight(cache, key, flight, result, err)
+	}()
+	// A flight may have completed between the caller's first lookup and
+	// beginFlight. Recheck while owning the new flight so a late caller does
+	// not start duplicate work after a previous leader stored the result.
+	// This observational peek deliberately does not count a second miss or
+	// mutate LRU hit state.
+	if cached, hit, lookupErr := cache.peekContext(ctx, key); lookupErr != nil {
+		return result, lookupErr
+	} else if hit {
+		return CachedGenerationResult{Image: cached, FromCache: true}, nil
+	}
+	return generateMiss(ctx, cache, admission, identity, sourceETag, key, maxW, maxH, open)
+}
+
+func generateMiss(
+	ctx context.Context,
+	cache *Cache,
+	admission *DecodeAdmission,
+	identity SourceIdentity,
+	sourceETag string,
+	key CacheKey,
+	maxW, maxH int,
+	open Opener,
+) (CachedGenerationResult, error) {
 	img, opened, err := generateContextWithAdmission(ctx, maxW, maxH, admission, identity.TenantID, open)
 	if err != nil {
-		return nil, false, err
+		return CachedGenerationResult{}, err
 	}
 	if len(img) == 0 {
-		return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: empty result")
+		return CachedGenerationResult{}, errors.New("thumbnail: GenerateContextWithOpenerCached: empty result")
 	}
 	storeCached(ctx, cache, key, identity, sourceETag, opened, img)
-	return img, false, nil
+	return CachedGenerationResult{Image: img, Opened: opened, HasOpened: true}, nil
 }
 
 func generateUncached(

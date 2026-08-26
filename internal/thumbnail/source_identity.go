@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"time"
 )
 
 // SourceIdentity is the authoritative identity of the object generation used
@@ -20,9 +21,10 @@ type SourceIdentity struct {
 // OpenedSource describes the source actually opened by a cached generation.
 // Bound is a storage-generation proof, not merely a repository metadata echo.
 type OpenedSource struct {
-	Identity SourceIdentity
-	ETag     string
-	Bound    bool
+	Identity  SourceIdentity
+	ETag      string
+	Bound     bool
+	UpdatedAt time.Time // response metadata for coalesced adapter callers
 }
 
 // Opener opens one source stream and reports the identity and ETag observed for

@@ -84,12 +84,11 @@ func thumbnailSourceIdentity(obj repository.Object) thumbnail.SourceIdentity {
 	}
 }
 
-func openedThumbnailValidator(source *service.ThumbnailSource, effW, effH int) string {
+func openedThumbnailValidator(source *thumbnail.OpenedSource, effW, effH int) string {
 	if source == nil || !source.Bound {
 		return ""
 	}
-	identity := thumbnailSourceIdentity(source.Object)
-	return thumbValidatorETag(thumbnail.CacheKeyVersion, identity, source.Object.ETag, effW, effH)
+	return thumbValidatorETag(thumbnail.CacheKeyVersion, source.Identity, source.ETag, effW, effH)
 }
 
 func addThumbnailVary(w http.ResponseWriter) {

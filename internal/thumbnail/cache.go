@@ -51,12 +51,14 @@ type entry struct {
 // Cache is a bounded, in-process LRU cache of generated thumbnail bytes,
 // keyed by CacheKey. The byte budget (maxBytes) is enforced by evicting
 // least-recently-used entries from the tail on overflow; a single payload
-// larger than the whole budget (or empty) is never stored. All state is
-// guarded by mu; the type spawns no goroutines and owns no timers. When
-// ttl > 0, Get/Put perform monotonic wall-clock comparisons inside the
-// existing critical sections; when ttl <= 0, no wall-clock reads occur on
-// any path. The type is otherwise deterministic and safe for concurrent use
-// under -race.
+// larger than the whole budget (or empty) is never stored. LRU state and
+// counters are guarded by mu; cached-generation flights are guarded by
+// flightMu. The type spawns no goroutines and owns no timers. When ttl > 0,
+// Get/Put perform monotonic wall-clock comparisons inside the existing
+// critical sections; when ttl <= 0, no wall-clock reads occur on any path.
+// Raw Get/Put remain LRU primitives; flights are used only by the cached
+// generation entry point. The type is otherwise deterministic and safe for
+// concurrent use under -race.
 //
 // A cache created with maxBytes <= 0 is disabled: Get always misses, Put is
 // a no-op, Len/Bytes/Stats report zeros, and no state is allocated beyond
@@ -98,6 +100,8 @@ type Cache struct {
 	expired   uint64        // TTL-lazy-expiry removals; distinct from misses (hit-ratio class) and evictions
 	disabled  bool          // immutable after NewCache
 	ttl       time.Duration // immutable after NewCache; <= 0 = no expiry
+	flightMu  sync.Mutex
+	flights   map[CacheKey]*cacheFlight
 }
 
 // NewCache returns a thumbnail output cache with the given byte budget and
@@ -149,6 +153,29 @@ func (c *Cache) PayloadFits(img []byte) bool {
 func (c *Cache) Get(k CacheKey) ([]byte, GetOutcome) {
 	data, outcome, _ := c.getContext(nil, k)
 	return data, outcome
+}
+
+// peekContext observes a live entry without changing LRU or hit/miss state.
+// It closes the gap between an initial miss and flight ownership without
+// double-counting a miss when another leader stored the result meanwhile.
+func (c *Cache) peekContext(ctx context.Context, k CacheKey) ([]byte, bool, error) {
+	if c == nil || c.disabled || !k.Identity.Complete() {
+		return nil, false, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.m[k]
+	if !ok {
+		return nil, false, nil
+	}
+	e := el.Value.(*entry)
+	if c.ttl > 0 && time.Now().After(e.expiresAt) {
+		return nil, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	return e.data, true, nil
 }
 
 // getContext is the internal entry point for request-cancellable lookups.

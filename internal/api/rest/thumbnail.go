@@ -389,20 +389,21 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	// caches new-version bytes under an old-version key; for pins the ETag
 	// is immutable, so the rule is trivially satisfied and remains the
 	// residual guard).
-	var opened *service.ThumbnailSource
-	img, fromCache, err := thumbnail.GenerateContextWithOpenerCachedWithAdmission(
+	var opened *thumbnail.OpenedSource
+	generated, err := thumbnail.GenerateContextWithOpenerCachedWithAdmissionResult(
 		r.Context(), cache, h.thumbnailAdmission, identity, obj.ETag, maxW, maxH,
 		func() (io.ReadCloser, thumbnail.OpenedSource, error) {
 			source, err := h.svc.OpenThumbnailSource(r.Context(), obj, version)
 			if err != nil {
 				return nil, thumbnail.OpenedSource{}, err
 			}
-			opened = &source
 			openedSource := thumbnail.OpenedSource{
-				Identity: thumbnailSourceIdentity(source.Object),
-				ETag:     source.Object.ETag,
-				Bound:    source.Bound,
+				Identity:  thumbnailSourceIdentity(source.Object),
+				ETag:      source.Object.ETag,
+				Bound:     source.Bound,
+				UpdatedAt: source.Object.UpdatedAt,
 			}
+			opened = &openedSource
 			rc := source.Reader
 			if !sniffBytes {
 				return rc, openedSource, nil
@@ -429,20 +430,32 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		h.writeThumbnailGenerateError(w, r, err)
 		return
 	}
+	img, fromCache := generated.Image, generated.FromCache
+	if generated.HasOpened {
+		openedCopy := generated.Opened
+		opened = &openedCopy
+	}
 	// A source replacement can become visible between the pre-open Stat and
 	// the opener. Re-evaluate strong preconditions against the object whose
 	// bytes were actually decoded; otherwise If-Match for generation A could
 	// incorrectly return generation B with a 200 response.
-	if opened != nil && readPreconditionFailedForETag(r, opened.Object, openedThumbnailValidator(opened, effW, effH)) {
-		h.writeError(w, r, service.ErrPreconditionFailed)
-		return
+	if opened != nil {
+		openedObject := obj
+		openedObject.ETag = opened.ETag
+		openedObject.VersionID = opened.Identity.VersionID
+		openedObject.UpdatedAt = opened.UpdatedAt
+		if readPreconditionFailedForETag(r, openedObject, openedThumbnailValidator(opened, effW, effH)) {
+			h.writeError(w, r, service.ErrPreconditionFailed)
+			return
+		}
 	}
 	if fromCache {
-		// Deterministic access evidence: every successful 200 thumbnail
-		// response emits exactly one EventAccessed. Misses emit it on stream
-		// open inside the service; hits bypass the stream, so the handler
-		// emits it here (best-effort like every other event emission). For a
-		// pinned request the event names the pinned object.
+		// fromCache means this caller skipped the source-open miss body: it
+		// covers resident hits and successful coalesced-flight joiners. Both
+		// bypass the stream, so the handler emits the one access event that
+		// the service emits on a leader miss (best-effort like every other
+		// event emission). For a pinned request the event names the pinned
+		// object.
 		h.svc.EmitAccessed(r.Context(), obj)
 	}
 	// A complete authoritative identity still has a safe opaque validator when
@@ -452,12 +465,12 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	lastModified := obj.UpdatedAt.UTC().Format(http.TimeFormat)
 	versionID := obj.VersionID
 	if opened != nil {
-		openedIdentity := thumbnailSourceIdentity(opened.Object)
+		openedIdentity := opened.Identity
 		etag = ""
-		lastModified = opened.Object.UpdatedAt.UTC().Format(http.TimeFormat)
-		versionID = opened.Object.VersionID
+		lastModified = opened.UpdatedAt.UTC().Format(http.TimeFormat)
+		versionID = opened.Identity.VersionID
 		if opened.Bound && openedIdentity.Complete() {
-			etag = thumbValidatorETag(thumbnail.CacheKeyVersion, openedIdentity, opened.Object.ETag, effW, effH)
+			etag = thumbValidatorETag(thumbnail.CacheKeyVersion, openedIdentity, opened.ETag, effW, effH)
 		} else if !opened.Bound || !openedIdentity.Complete() {
 			// The source was read without a complete, reusable identity or
 			// through an unbound fallback. Do not let an intermediary retain
@@ -480,8 +493,7 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		// describes the served bytes).
 		w.Header().Set("X-Version-Id", versionID)
 	}
-	// The 200 outcome is the contract (cache hit or miss alike); 304s returned
-	// before this point, so exactly one success per 200 response.
+	// The 200 outcome is the contract (cache hit or miss alike); 304s returned before this point, so exactly one success per 200 response.
 	telemetry.IncThumbnailGenerationSuccess(r.Context())
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(img)
