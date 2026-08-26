@@ -161,6 +161,13 @@ func generateContextWithAdmission(
 	}
 	defer release() // registered first → runs LAST
 
+	// Admission can succeed concurrently with cancellation. Check again
+	// before opening the object stream so a canceled request releases both
+	// reservations without invoking the context-free opener.
+	if err := ctx.Err(); err != nil {
+		return nil, OpenedSource{}, err
+	}
+
 	rc, opened, err := open()
 	if err != nil {
 		// Defensive close: an opener may return a non-nil stream together
