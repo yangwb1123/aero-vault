@@ -2,6 +2,7 @@ package thumbnail
 
 import (
 	"container/list"
+	"context"
 	"sync"
 	"time"
 )
@@ -146,8 +147,16 @@ func (c *Cache) PayloadFits(img []byte) bool {
 // not a miss, not an LRU eviction); on a genuine miss or a disabled cache it
 // returns GetMiss with nil bytes.
 func (c *Cache) Get(k CacheKey) ([]byte, GetOutcome) {
+	data, outcome, _ := c.getContext(context.Background(), k)
+	return data, outcome
+}
+
+// getContext keeps the cancellation check inside the cache critical section.
+// A request may pass its entry-point check and then wait for c.mu; checking
+// only after Get returns would let a canceled hit refresh the LRU and counters.
+func (c *Cache) getContext(ctx context.Context, k CacheKey) ([]byte, GetOutcome, error) {
 	if c == nil || c.disabled || !k.Identity.Complete() {
-		return nil, GetMiss // counted by nothing; lookupCached's own guard makes this unreachable in production
+		return nil, GetMiss, nil // counted by nothing; lookupCached guards this path
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -164,14 +173,17 @@ func (c *Cache) Get(k CacheKey) ([]byte, GetOutcome) {
 			delete(c.m, k)
 			c.bytes -= int64(len(e.data))
 			c.expired++
-			return nil, GetExpired
+			return nil, GetExpired, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, GetHit, err
 		}
 		c.ll.MoveToFront(el)
 		c.hits++
-		return e.data, GetHit
+		return e.data, GetHit, nil
 	}
 	c.misses++
-	return nil, GetMiss
+	return nil, GetMiss, nil
 }
 
 // Put stores a COPY of img under key k (the caller's slice is never

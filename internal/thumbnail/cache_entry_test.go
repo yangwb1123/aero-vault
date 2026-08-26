@@ -14,6 +14,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -322,6 +324,93 @@ func TestCacheGenerateHitHonorsCanceledContext(t *testing.T) {
 	}
 	if n := opens.Load(); n != 1 {
 		t.Fatalf("opener invoked %d times, want 1 (canceled hit must not open)", n)
+	}
+}
+
+type initialErrProbeContext struct {
+	context.Context
+	passed chan struct{}
+	once   sync.Once
+}
+
+func (c *initialErrProbeContext) Err() error {
+	c.once.Do(func() { close(c.passed) })
+	return c.Context.Err()
+}
+
+// TestCacheGenerateCanceledWhileWaitingOnCacheLockDoesNotRefreshHitOrLRU
+// pins the cancellation window after the entry-point check but before a
+// contended cache hit can mutate hit counters or LRU recency.
+func TestCacheGenerateCanceledWhileWaitingOnCacheLockDoesNotRefreshHitOrLRU(t *testing.T) {
+	c := NewCache(1<<20, 0)
+	data := makePNG(t, 64, 64)
+	target := testIdentity("t1")
+	target.Key = "target"
+	other := target
+	other.Key = "other"
+	var opens atomic.Int64
+	ctx := context.Background()
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, target, etagA, 32, 32, countingOpener3(data, etagA, &opens, target)); err != nil || from {
+		t.Fatalf("target warm-up: err=%v fromCache=%v", err, from)
+	}
+	if _, from, err := GenerateContextWithOpenerCached(ctx, c, other, etagB, 32, 32, countingOpener3(data, etagB, &opens, other)); err != nil || from {
+		t.Fatalf("other warm-up: err=%v fromCache=%v", err, from)
+	}
+	targetKey := CacheKey{Identity: target, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	c.mu.Lock()
+	beforeOrder := listOrder(c)
+	beforeHits := c.hits
+	if len(beforeOrder) != 2 || !reflect.DeepEqual(beforeOrder[1], targetKey) {
+		c.mu.Unlock()
+		t.Fatalf("target must be the non-front LRU entry: order=%v target=%v", beforeOrder, targetKey)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	probe := &initialErrProbeContext{Context: canceled, passed: make(chan struct{})}
+	done := make(chan struct {
+		img  []byte
+		from bool
+		err  error
+	}, 1)
+	go func() {
+		img, from, err := GenerateContextWithOpenerCached(probe, c, target, etagA, 32, 32, countingOpener3(data, etagA, &opens, target))
+		done <- struct {
+			img  []byte
+			from bool
+			err  error
+		}{img, from, err}
+	}()
+	select {
+	case <-probe.passed:
+	case <-time.After(2 * time.Second):
+		c.mu.Unlock()
+		t.Fatal("cached-hit call did not pass the entry-point cancellation check")
+	}
+	cancel()
+	c.mu.Unlock()
+
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("contended canceled hit: err=%v, want context.Canceled", result.err)
+		}
+		if result.img != nil || result.from {
+			t.Fatalf("contended canceled hit returned cache bytes: len=%d fromCache=%v", len(result.img), result.from)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("contended canceled hit did not return")
+	}
+	c.mu.Lock()
+	afterOrder := listOrder(c)
+	afterHits := c.hits
+	c.mu.Unlock()
+	if afterHits != beforeHits {
+		t.Fatalf("canceled hit changed hits: before=%d after=%d", beforeHits, afterHits)
+	}
+	if !reflect.DeepEqual(afterOrder, beforeOrder) {
+		t.Fatalf("canceled hit changed LRU order: before=%v after=%v", beforeOrder, afterOrder)
+	}
+	if opens.Load() != 2 {
+		t.Fatalf("canceled hit invoked opener: opens=%d, want 2 warm-up calls", opens.Load())
 	}
 }
 

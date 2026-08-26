@@ -96,7 +96,10 @@ func lookupCached(ctx context.Context, cache *Cache, key CacheKey) ([]byte, bool
 	if cache == nil || cache.disabled || !key.Identity.Complete() {
 		return nil, false, nil
 	}
-	img, outcome := cache.Get(key)
+	img, outcome, err := cache.getContext(ctx, key)
+	if err != nil {
+		return nil, false, err
+	}
 	switch outcome {
 	case GetExpired:
 		telemetry.IncThumbnailCacheExpired(ctx)
@@ -105,9 +108,6 @@ func lookupCached(ctx context.Context, cache *Cache, key CacheKey) ([]byte, bool
 		telemetry.IncThumbnailCacheMiss(ctx)
 		return nil, false, nil
 	default:
-		if err := ctx.Err(); err != nil {
-			return nil, false, err
-		}
 		telemetry.IncThumbnailCacheHit(ctx)
 		return img, true, nil
 	}
