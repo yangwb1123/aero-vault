@@ -50,12 +50,22 @@ func (id SourceIdentity) Token() string {
 }
 
 // DerivedValidatorToken hashes every input that affects the derived
-// representation. The domain separator prevents this digest from being
-// confused with another application-level token.
+// representation. version is the schema/wire family version; the current
+// output representation token is included independently so a representation
+// rollout cannot accidentally retain a strong validator.
 func DerivedValidatorToken(version uint8, id SourceIdentity, sourceETag string, effW, effH int) string {
+	return DerivedValidatorTokenWithRepresentation(version, currentRepresentationToken, id, sourceETag, effW, effH)
+}
+
+// DerivedValidatorTokenWithRepresentation hashes an explicit output
+// representation token along with the schema version, source identity, source
+// ETag, and effective dimensions. The domain separator keeps this opaque
+// digest distinct from other application-level tokens.
+func DerivedValidatorTokenWithRepresentation(version uint8, representation string, id SourceIdentity, sourceETag string, effW, effH int) string {
 	h := sha256.New()
 	writeString(h, "aero-vault/thumbnail-validator/v2")
 	writeUint(h, uint64(version))
+	writeString(h, representation)
 	writeString(h, id.TenantID)
 	writeString(h, id.Bucket)
 	writeString(h, id.Key)

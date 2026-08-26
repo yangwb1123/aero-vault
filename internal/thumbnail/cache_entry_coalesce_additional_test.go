@@ -76,8 +76,8 @@ func TestCacheGenerateConcurrentDifferentKeysDoNotShareFlight(t *testing.T) {
 	if c.Len() != 2 {
 		t.Fatalf("different-key cache entries=%d, want 2", c.Len())
 	}
-	assertFlightGone(t, c, CacheKey{Identity: identity, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion})
-	assertFlightGone(t, c, CacheKey{Identity: identity, SourceETag: etagA, EffW: 48, EffH: 48, Version: CacheKeyVersion})
+	assertFlightGone(t, c, currentThumbnailCacheKey(identity, etagA, 32, 32))
+	assertFlightGone(t, c, currentThumbnailCacheKey(identity, etagA, 48, 48))
 }
 
 func TestCacheGenerateConcurrentSameKeyDifferentCachesIndependent(t *testing.T) {
@@ -140,7 +140,7 @@ func TestCacheGenerateConcurrentSameKeyDifferentCachesIndependent(t *testing.T) 
 	if cacheA.Len() != 1 || cacheB.Len() != 1 {
 		t.Fatalf("same-key different-caches cache entries=%d/%d, want 1/1", cacheA.Len(), cacheB.Len())
 	}
-	key := CacheKey{Identity: identity, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	key := currentThumbnailCacheKey(identity, etagA, 32, 32)
 	assertFlightGone(t, cacheA, key)
 	assertFlightGone(t, cacheB, key)
 }
@@ -168,7 +168,7 @@ func TestCacheGenerateConcurrentSameKeySuccessWithoutStoreRetriesLater(t *testin
 	}
 	close(start)
 	waitFlightEntered(t, opener)
-	key := CacheKey{Identity: identity, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	key := currentThumbnailCacheKey(identity, etagA, 32, 32)
 	waitFlightJoiners(t, c, key, callers-1)
 	close(opener.release)
 	var first []byte

@@ -114,7 +114,7 @@ func TestCacheGenerateConcurrentSameKeySuccessCoalesces(t *testing.T) {
 	}
 	close(start)
 	waitFlightEntered(t, opener)
-	key := CacheKey{Identity: identity, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	key := currentThumbnailCacheKey(identity, etagA, 32, 32)
 	waitFlightJoiners(t, c, key, callers-1)
 	close(opener.release)
 	var first []byte
@@ -169,7 +169,7 @@ func TestCacheGenerateConcurrentSameKeyFailureCoalesces(t *testing.T) {
 	}
 	close(start)
 	waitFlightEntered(t, opener)
-	key := CacheKey{Identity: identity, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	key := currentThumbnailCacheKey(identity, etagA, 32, 32)
 	waitFlightJoiners(t, c, key, callers-1)
 	close(opener.release)
 	for i := 0; i < callers; i++ {
@@ -212,7 +212,7 @@ func TestCacheGenerateJoinedCallerCancellation(t *testing.T) {
 		leaderDone <- err
 	}()
 	waitFlightEntered(t, opener)
-	key := CacheKey{Identity: identity, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	key := currentThumbnailCacheKey(identity, etagA, 32, 32)
 	joinCtx, cancel := context.WithCancel(context.Background())
 	joinDone := make(chan error, 1)
 	go func() {
@@ -257,7 +257,7 @@ func TestCacheGenerateLeaderPanicCleansFlight(t *testing.T) {
 		data: data, identity: identity, etag: etagA,
 		entered: make(chan struct{}), release: make(chan struct{}), panicValue: panicValue,
 	}
-	key := CacheKey{Identity: identity, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	key := currentThumbnailCacheKey(identity, etagA, 32, 32)
 	leaderDone := make(chan any, 1)
 	go func() {
 		defer func() { leaderDone <- recover() }()

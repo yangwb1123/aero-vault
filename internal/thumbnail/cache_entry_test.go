@@ -135,6 +135,38 @@ func TestCacheGenerateETagShapeGate(t *testing.T) {
 	})
 }
 
+func TestCacheGenerateOldRepresentationMissesThenSelfHeals(t *testing.T) {
+	cache := NewCache(1<<20, 0)
+	identity := testIdentity("t1")
+	oldKey := currentThumbnailCacheKey(identity, etagA, 32, 32)
+	oldKey.Representation = representationTokenForJPEGQuality(alternateJPEGQuality())
+	cache.Put(oldKey, []byte("old-representation"))
+	data := makePNG(t, 64, 64)
+	var opens atomic.Int64
+	open := countingOpener3(data, etagA, &opens, identity)
+
+	first, from, err := GenerateContextWithOpenerCached(context.Background(), cache, identity, etagA, 32, 32, open)
+	if err != nil || from || bytes.Equal(first, []byte("old-representation")) {
+		t.Fatalf("rollover miss: err=%v fromCache=%v oldBytes=%v", err, from, bytes.Equal(first, []byte("old-representation")))
+	}
+	if h, m, _, _ := cache.Stats(); h != 0 || m != 1 {
+		t.Fatalf("rollover miss stats=%d/%d, want 0/1", h, m)
+	}
+	second, from, err := GenerateContextWithOpenerCached(context.Background(), cache, identity, etagA, 32, 32, open)
+	if err != nil || !from || !bytes.Equal(first, second) {
+		t.Fatalf("rollover hit: err=%v fromCache=%v sameBytes=%v", err, from, bytes.Equal(first, second))
+	}
+	if h, m, _, _ := cache.Stats(); h != 1 || m != 1 {
+		t.Fatalf("rollover hit stats=%d/%d, want 1/1", h, m)
+	}
+	if opens.Load() != 1 {
+		t.Fatalf("rollover opener calls=%d, want 1", opens.Load())
+	}
+	if cache.Len() != 2 {
+		t.Fatalf("rollover cache entries=%d, want 2 (old entry remains unreachable)", cache.Len())
+	}
+}
+
 // TestCacheGenerateSpyOpenerSingleInvocation pins REQ-2/A2: the second
 // identical call is served from the cache — the opener is invoked exactly
 // once — and the cached output is byte-identical to a fresh uncached decode
@@ -356,7 +388,7 @@ func TestCacheGenerateCanceledWhileWaitingOnCacheLockDoesNotRefreshHitOrLRU(t *t
 	if _, from, err := GenerateContextWithOpenerCached(ctx, c, other, etagB, 32, 32, countingOpener3(data, etagB, &opens, other)); err != nil || from {
 		t.Fatalf("other warm-up: err=%v fromCache=%v", err, from)
 	}
-	targetKey := CacheKey{Identity: target, SourceETag: etagA, EffW: 32, EffH: 32, Version: CacheKeyVersion}
+	targetKey := currentThumbnailCacheKey(target, etagA, 32, 32)
 	c.mu.Lock()
 	beforeOrder := listOrder(c)
 	beforeHits := c.hits

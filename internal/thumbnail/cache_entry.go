@@ -102,6 +102,7 @@ func generateContextWithOpenerCachedResult(
 	key := CacheKey{
 		Identity: identity, SourceETag: sourceETag,
 		EffW: effW, EffH: effH, Version: CacheKeyVersion,
+		Representation: currentRepresentationToken,
 	}
 	if cached, hit, lookupErr := lookupCached(ctx, cache, key); lookupErr != nil {
 		return result, lookupErr

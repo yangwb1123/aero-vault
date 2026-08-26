@@ -7,9 +7,11 @@ import (
 	"time"
 )
 
-// CacheKeyVersion is the cache-key schema version. Version 2 binds entries to
-// the complete authoritative source identity as well as source ETag and
-// effective dimensions; old entries are never looked up.
+// CacheKeyVersion is the cache/wire schema family version. Version 2 binds
+// entries to the complete authoritative source identity, source ETag,
+// effective dimensions, and the output representation token; old entries are
+// never looked up. Representation changes are tracked independently so they
+// do not rely on manually bumping this schema version.
 const CacheKeyVersion = 2
 
 // GetOutcome classifies one Cache.Get result. GetHit: stored bytes served,
@@ -31,10 +33,11 @@ const (
 // separate so tenant, bucket, key, and generation cannot alias at delimiters.
 // An incomplete identity is never looked up or stored.
 type CacheKey struct {
-	Identity   SourceIdentity
-	SourceETag string
-	EffW, EffH int
-	Version    uint8
+	Identity       SourceIdentity
+	SourceETag     string
+	EffW, EffH     int
+	Version        uint8
+	Representation string
 }
 
 // entry is one cached payload, linked into Cache's LRU list. data is

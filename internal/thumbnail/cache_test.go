@@ -310,10 +310,10 @@ func TestCacheStatsCounters(t *testing.T) {
 // source ETag, effective dimension, and schema-version field participates in
 // the comparable cache key. ETag spelling remains opaque at this layer.
 func TestCacheKeyInjectivity(t *testing.T) {
-	base := CacheKey{
-		Identity:   SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"},
-		SourceETag: "e1", EffW: 32, EffH: 32, Version: CacheKeyVersion,
-	}
+	base := currentThumbnailCacheKey(
+		SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"},
+		"e1", 32, 32,
+	)
 	cases := []struct {
 		name string
 		mut  func(CacheKey) CacheKey
@@ -326,6 +326,10 @@ func TestCacheKeyInjectivity(t *testing.T) {
 		{"effW", func(k CacheKey) CacheKey { k.EffW = 33; return k }},
 		{"effH", func(k CacheKey) CacheKey { k.EffH = 33; return k }},
 		{"version", func(k CacheKey) CacheKey { k.Version = CacheKeyVersion + 1; return k }},
+		{"representation", func(k CacheKey) CacheKey {
+			k.Representation = representationTokenForJPEGQuality(alternateJPEGQuality())
+			return k
+		}},
 		{"etag-quoted", func(k CacheKey) CacheKey { k.SourceETag = `"e1"`; return k }},
 		{"etag-multipart", func(k CacheKey) CacheKey { k.SourceETag = "md5hex-4"; return k }},
 	}
