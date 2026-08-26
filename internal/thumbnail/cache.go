@@ -147,13 +147,15 @@ func (c *Cache) PayloadFits(img []byte) bool {
 // not a miss, not an LRU eviction); on a genuine miss or a disabled cache it
 // returns GetMiss with nil bytes.
 func (c *Cache) Get(k CacheKey) ([]byte, GetOutcome) {
-	data, outcome, _ := c.getContext(context.Background(), k)
+	data, outcome, _ := c.getContext(nil, k)
 	return data, outcome
 }
 
-// getContext keeps the cancellation check inside the cache critical section.
-// A request may pass its entry-point check and then wait for c.mu; checking
-// only after Get returns would let a canceled hit refresh the LRU and counters.
+// getContext is the internal entry point for request-cancellable lookups.
+// Callers that need cancellation-aware semantics must use this helper, not
+// Cache.Get followed by a post-return ctx.Err() check — the hit-side effects
+// commit under c.mu. A nil ctx disables the veto for context-oblivious callers
+// such as Cache.Get.
 func (c *Cache) getContext(ctx context.Context, k CacheKey) ([]byte, GetOutcome, error) {
 	if c == nil || c.disabled || !k.Identity.Complete() {
 		return nil, GetMiss, nil // counted by nothing; lookupCached guards this path
@@ -175,8 +177,10 @@ func (c *Cache) getContext(ctx context.Context, k CacheKey) ([]byte, GetOutcome,
 			c.expired++
 			return nil, GetExpired, nil
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, GetHit, err
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, GetHit, err
+			}
 		}
 		c.ll.MoveToFront(el)
 		c.hits++
