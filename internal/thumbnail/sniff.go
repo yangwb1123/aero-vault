@@ -7,7 +7,7 @@ const (
 	FormatUnknown Format = iota // no recognized magic (or head too short)
 	FormatJPEG                  // 0xFF 0xD8 (SOI)
 	FormatPNG                   // 0x89 'P' 'N' 'G'
-	FormatGIF                   // "GIF" (GIF87a / GIF89a)
+	FormatGIF                   // GIF87a / GIF89a
 	FormatWebP                  // "RIFF" .... "WEBP"
 )
 
@@ -35,7 +35,9 @@ func Sniff(head []byte) Format {
 	if len(head) >= 4 && head[0] == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G' {
 		return FormatPNG
 	}
-	if len(head) >= 3 && head[0] == 'G' && head[1] == 'I' && head[2] == 'F' {
+	if len(head) >= 6 &&
+		head[0] == 'G' && head[1] == 'I' && head[2] == 'F' &&
+		head[3] == '8' && (head[4] == '7' || head[4] == '9') && head[5] == 'a' {
 		return FormatGIF
 	}
 	if len(head) >= 12 &&

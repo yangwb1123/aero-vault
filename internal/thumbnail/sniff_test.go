@@ -93,6 +93,39 @@ func TestSniff(t *testing.T) {
 	}
 }
 
+func TestSniffRejectsFakeGIFPrefixes(t *testing.T) {
+	cases := []struct {
+		name string
+		head []byte
+	}{
+		{"too short", []byte("GIF")},
+		{"wrong version", []byte("GIF90a")},
+		{"wrong 87 suffix", []byte("GIF87b")},
+		{"wrong 89 suffix", []byte("GIF89b")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Sniff(tc.head); got != FormatUnknown {
+				t.Fatalf("Sniff(%q) = %v, want FormatUnknown", tc.head, got)
+			}
+		})
+	}
+}
+
+// TestAdmitByMagicRejectsFakeGIFPrefixes ensures invalid GIF-looking bytes
+// use the existing client-argument rejection path rather than admission.
+func TestAdmitByMagicRejectsFakeGIFPrefixes(t *testing.T) {
+	for _, head := range [][]byte{[]byte("GIF"), []byte("GIF90a"), []byte("GIF87b"), []byte("GIF89b")} {
+		replay, err := AdmitByMagic(head)
+		if !errors.Is(err, ErrNotAnImage) {
+			t.Fatalf("AdmitByMagic(%q) error=%v, want ErrNotAnImage", head, err)
+		}
+		if replay != nil {
+			t.Fatalf("AdmitByMagic(%q) replay=%q, want nil", head, replay)
+		}
+	}
+}
+
 // TestAdmitByMagic pins the extracted admission decision: the decodable
 // formats replay the head exactly as read; WebP is the server-capability
 // rejection (ErrUnsupportedFormat); unknown and too-short bytes are the
