@@ -33,6 +33,57 @@ func TestGenerateNilReader(t *testing.T) {
 	assertSlotsReleased(t)
 }
 
+func TestGenerateContextNilReaderCanceledCtx(t *testing.T) {
+	slotSaturate()
+	defer releaseAndRecoverSlots(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := make(chan struct {
+		err   error
+		panic any
+	}, 1)
+	go func() {
+		var err error
+		var panicValue any
+		func() {
+			defer func() { panicValue = recover() }()
+			_, err = GenerateContext(ctx, nil, 16, 16)
+		}()
+		result <- struct {
+			err   error
+			panic any
+		}{err: err, panic: panicValue}
+	}()
+
+	select {
+	case got := <-result:
+		if got.panic != nil {
+			t.Fatalf("canceled nil-reader call panicked: %v", got.panic)
+		}
+		assertNilReaderError(t, got.err)
+		if errors.Is(got.err, context.Canceled) {
+			t.Fatal("nil-reader error must win over canceled context")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("canceled nil-reader call waited for a decode slot")
+	}
+	if held := len(decodeSlots); held != maxConcurrentDecodes {
+		t.Fatalf("canceled nil-reader changed held slots: got %d, want %d", held, maxConcurrentDecodes)
+	}
+}
+
+func TestGenerateContextNilContextStillPanics(t *testing.T) {
+	var panicValue any
+	func() {
+		defer func() { panicValue = recover() }()
+		_, _ = GenerateContext(nil, nil, 16, 16)
+	}()
+	if panicValue == nil {
+		t.Fatal("nil context must retain the existing caller-bug panic")
+	}
+	assertSlotsReleased(t)
+}
+
 func TestGenerateContextNilReader(t *testing.T) {
 	slotSaturate()
 	defer releaseAndRecoverSlots(t)
