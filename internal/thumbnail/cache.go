@@ -52,12 +52,13 @@ type entry struct {
 }
 
 // Cache is a bounded, in-process LRU cache of generated thumbnail bytes,
-// keyed by CacheKey. The byte budget (maxBytes) is enforced by evicting
-// least-recently-used entries from the tail on overflow; a single payload
-// larger than the whole budget (or empty) is never stored. LRU state and
-// counters are guarded by mu; cached-generation flights are guarded by
-// flightMu. The type spawns no goroutines and owns no timers. When ttl > 0,
-// Get/Put perform monotonic wall-clock comparisons inside the existing
+// keyed by CacheKey. The byte budget (maxBytes) is enforced by reclaiming
+// resident expired entries first when ttl > 0 and a Put overflows, then by
+// evicting least-recently-used live entries from the tail if needed; a
+// single payload larger than the whole budget (or empty) is never stored.
+// LRU state and counters are guarded by mu; cached-generation flights are
+// guarded by flightMu. The type spawns no goroutines and owns no timers.
+// When ttl > 0, Get/Put perform monotonic wall-clock comparisons inside the
 // critical sections; when ttl <= 0, no wall-clock reads occur on any path.
 // Raw Get/Put remain LRU primitives; flights are used only by the cached
 // generation entry point. The type is otherwise deterministic and safe for
@@ -76,10 +77,13 @@ type entry struct {
 // served, counted in the cache's expired counter / thumbnail.cache.expired_total,
 // never in the hit-ratio miss class). When ttl <= 0
 // (default) entries live until LRU byte-budget pressure evicts them,
-// byte-for-byte the pre-TTL behavior. Lazy expiry bounds served retention
-// strictly; SweepExpired additionally bounds physical retention of
-// never-read expired keys. cmd/server owns the timer driver and runs this
-// pass whenever TTL is enabled; Cache itself still owns no goroutines/timers.
+// byte-for-byte the pre-TTL behavior. When ttl > 0, a Put that overflows
+// first reclaims resident expired entries without counting them as
+// evictions, then falls back to live tail eviction only if needed. Lazy
+// expiry bounds served retention strictly; SweepExpired additionally bounds
+// physical retention of never-read expired keys. cmd/server owns the timer
+// driver and runs this pass whenever TTL is enabled; Cache itself still owns
+// no goroutines/timers.
 //
 // FR-4 (campaign add-ttl-lifecycle-invalidation-to-the-thumbnail) is
 // implemented below: SweepExpired walks the LRU list under c.mu removing
@@ -222,15 +226,17 @@ func (c *Cache) getContext(ctx context.Context, k CacheKey) ([]byte, GetOutcome,
 
 // Put stores a COPY of img under key k (the caller's slice is never
 // retained, keeping the byte budget exact: bytes == Σ len(stored payloads))
-// and returns the number of entries evicted to fit the budget. An empty
+// and returns the number of live entries evicted to fit the budget. An empty
 // payload is a strict no-op (entry untouched). A payload larger than the
 // whole budget is refused: a superseded entry under the same key is removed
 // (its payload must not be served as current) but no eviction is counted
 // (a refusal, not budget pressure). An existing key is replaced in place
 // (recency refreshed, no duplicate entry; a replacement is a new generation
 // → a fresh expiry when ttl > 0). When ttl <= 0, no wall-clock reads occur
-// on this path. On overflow, least-recently-used entries are evicted from
-// the tail until bytes <= maxBytes.
+// on this path. When ttl > 0 and the store overflows, resident expired
+// entries are reclaimed first without counting them as evictions; live
+// least-recently-used entries are evicted from the tail only if bytes still
+// exceed maxBytes.
 func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 	if c == nil || c.disabled || !k.Identity.Complete() || len(img) == 0 {
 		return 0
@@ -254,11 +260,15 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 	defer c.mu.Unlock()
 	data := append([]byte(nil), img...)
 	// A fresh retention deadline per store; the zero value when ttl <= 0 is
-	// never consulted by Get (guarded by c.ttl > 0), so no wall-clock read
-	// happens on the disabled path.
-	var expiresAt time.Time
+	// never consulted by Get (guarded by c.ttl > 0), so the non-expiring path
+	// performs no wall-clock read.
+	var (
+		now       time.Time
+		expiresAt time.Time
+	)
 	if c.ttl > 0 {
-		expiresAt = time.Now().Add(c.ttl) // monotonic clock participates in comparisons
+		now = time.Now()
+		expiresAt = now.Add(c.ttl) // monotonic clock participates in comparisons
 	}
 	if el, ok := c.m[k]; ok {
 		e := el.Value.(*entry)
@@ -269,6 +279,9 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 	} else {
 		c.m[k] = c.ll.PushFront(&entry{key: k, data: data, expiresAt: expiresAt})
 		c.bytes += int64(len(data))
+	}
+	if c.ttl > 0 && c.bytes > c.maxBytes {
+		c.reclaimExpiredLocked(now)
 	}
 	for c.bytes > c.maxBytes {
 		last := c.ll.Back()
@@ -283,6 +296,27 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 		evicted++
 	}
 	return evicted
+}
+
+// reclaimExpiredLocked removes resident entries whose retention deadline has
+// passed according to the caller-supplied clock. The caller must hold c.mu.
+// It preserves the LRU order of survivors, decrements c.bytes by exactly
+// len(e.data) per removal, and does not touch hit/miss/eviction/expired
+// counters because this physical purge is neither a read nor a live LRU
+// eviction.
+func (c *Cache) reclaimExpiredLocked(now time.Time) (removed int) {
+	for el := c.ll.Front(); el != nil; {
+		next := el.Next()
+		e := el.Value.(*entry)
+		if now.After(e.expiresAt) {
+			c.ll.Remove(el)
+			delete(c.m, e.key)
+			c.bytes -= int64(len(e.data))
+			removed++
+		}
+		el = next
+	}
+	return removed
 }
 
 // SweepExpired removes every stored entry whose retention deadline has
@@ -321,18 +355,7 @@ func (c *Cache) SweepExpired(now time.Time) (n int) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for el := c.ll.Front(); el != nil; {
-		next := el.Next()
-		e := el.Value.(*entry)
-		if now.After(e.expiresAt) {
-			c.ll.Remove(el)
-			delete(c.m, e.key)
-			c.bytes -= int64(len(e.data))
-			n++
-		}
-		el = next
-	}
-	return n
+	return c.reclaimExpiredLocked(now)
 }
 
 // Len returns the number of stored entries (0 for a disabled cache).
@@ -357,8 +380,9 @@ func (c *Cache) Bytes() int64 {
 
 // Stats returns the cumulative hit/miss/eviction/expired counters. A disabled
 // cache always reports zeros — the entry point never consults or counts
-// through it. expired counts lazy TTL-expiry removals only (SweepExpired
-// removals are not reads and touch none of these counters).
+// through it. expired counts lazy TTL-expiry removals only; SweepExpired
+// removals and Put-side expired reclamation are physical purges, not reads,
+// and touch none of these counters.
 func (c *Cache) Stats() (hits, misses, evictions, expired uint64) {
 	if c.disabled {
 		return 0, 0, 0, 0

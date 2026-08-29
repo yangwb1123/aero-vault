@@ -496,43 +496,54 @@ func TestCacheTTL(t *testing.T) {
 		}
 	})
 
-	t.Run("expired entry at LRU tail evicted by overflow counts exactly one eviction", func(t *testing.T) {
-		// QA-F2 pin: the TTL-removal path and the overflow-eviction path are
-		// mutually exclusive under mu — an expired entry at the tail evicted
-		// by budget pressure is counted as ONE eviction with exact byte
-		// accounting (never double-decremented, never zero-counted).
-		a, b, c3 := payload(100, 'a'), payload(200, 'b'), payload(50, 'c')
-		budget := int64(len(a) + len(b)) // 300: inserting c3 (350) exceeds by a margin that evicts exactly the tail
-		cache := NewCache(budget, time.Hour)
-		k1 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
-		k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
-		k3 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e3", EffW: 32, EffH: 32}
+	t.Run("overflow reclaims expired bytes before live tail eviction fallback", func(t *testing.T) {
+		// QA-F2 pin: reclaiming an expired tail entry is free (not an
+		// eviction), but if the reclaimed bytes still do not fit the new
+		// payload Put must fall back to exactly one live tail eviction.
+		a, b, c3, d := payload(40, 'a'), payload(140, 'b'), payload(120, 'c'), payload(100, 'd')
+		cache := NewCache(int64(len(a)+len(b)+len(c3)), time.Hour)
+		k1, k2, k3, k4 := cacheKeyForETag("e1"), cacheKeyForETag("e2"), cacheKeyForETag("e3"), cacheKeyForETag("e4")
 		cache.Put(k1, a)
 		cache.Put(k2, b)
-		if _, outcome := cache.Get(k2); outcome != GetHit {
-			t.Fatal("k2 must be present before the touch")
+		cache.Put(k3, c3)
+		cache.mu.Lock()
+		cache.m[k1].Value.(*entry).expiresAt = time.Now().Add(-time.Second)
+		cache.mu.Unlock()
+		h0, m0, e0, x0 := cache.Stats()
+		if n := cache.Put(k4, d); n != 1 {
+			t.Fatalf("overflow Put evicted %d entries, want 1 live fallback eviction", n)
+		}
+		if h, m, e, x := cache.Stats(); h != h0 || m != m0 || e != e0+1 || x != x0 {
+			t.Fatalf("Stats after partial reclaim = %d/%d/%d/%d, want %d/%d/%d/%d", h, m, e, x, h0, m0, e0+1, x0)
+		}
+		if cache.Len() != 2 || cache.Bytes() != int64(len(c3)+len(d)) {
+			t.Fatalf("Len/Bytes = %d/%d, want 2/%d", cache.Len(), cache.Bytes(), len(c3)+len(d))
 		}
 		cache.mu.Lock()
-		cache.m[k1].Value.(*entry).expiresAt = time.Now().Add(-time.Second) // expired, still resident
-		cache.mu.Unlock()
-		n := cache.Put(k3, c3) // overflow: evicts the LRU tail (k1)
-		if n != 1 {
-			t.Fatalf("overflow Put evicted %d entries, want 1", n)
+		defer cache.mu.Unlock()
+		if _, ok := cache.m[k1]; ok {
+			t.Fatal("expired tail entry must be reclaimed before live eviction")
 		}
-		if _, outcome := cache.Get(k1); outcome == GetHit {
-			t.Fatal("expired tail entry must be gone after overflow")
+		if _, ok := cache.m[k2]; ok {
+			t.Fatal("live fallback eviction must remove k2 after reclaiming k1")
 		}
-		if _, outcome := cache.Get(k2); outcome != GetHit {
-			t.Fatal("touched k2 must survive")
+		for name, tc := range map[string]struct {
+			key  CacheKey
+			want []byte
+		}{
+			"k3": {key: k3, want: c3},
+			"k4": {key: k4, want: d},
+		} {
+			el, ok := cache.m[tc.key]
+			if !ok {
+				t.Fatalf("%s missing after partial reclaim fallback", name)
+			}
+			if got := el.Value.(*entry).data; !bytes.Equal(got, tc.want) {
+				t.Fatalf("%s payload changed: got %q want %q", name, got, tc.want)
+			}
 		}
-		if _, outcome := cache.Get(k3); outcome != GetHit {
-			t.Fatal("k3 must be present after insertion")
-		}
-		if cache.Len() != 2 || cache.Bytes() != int64(len(b)+len(c3)) {
-			t.Fatalf("byte accounting broken: Len=%d Bytes=%d, want 2/%d", cache.Len(), cache.Bytes(), len(b)+len(c3))
-		}
-		if _, _, e, _ := cache.Stats(); e != 1 {
-			t.Fatalf("evictions = %d, want exactly 1 (budget-pressure eviction, not a double-counted TTL removal)", e)
+		if order := listOrder(cache); !slices.Equal(order, []CacheKey{k4, k3}) {
+			t.Fatalf("LRU order = %v, want [%v %v]", order, k4, k3)
 		}
 	})
 }
@@ -784,65 +795,71 @@ func TestCacheSweepExpired(t *testing.T) {
 		}
 	})
 
-	t.Run("sweep frees the budget so live traffic is not LRU-evicted", func(t *testing.T) {
-		// Problem scenario (the direction's stated payoff): an expired entry
-		// resident in the middle of the LRU list pins the byte budget, so a
-		// live Put evicts a LIVE entry from the tail. The sweep removes the
-		// dead weight for free, so the same Put fits with evicted == 0 and
-		// the live entries survive.
+	t.Run("direct Put reclaim matches explicit prior sweep", func(t *testing.T) {
+		// The explicit sweep remains valid, but it is no longer required for
+		// correctness: a reclaim-only overflow Put must converge to the same
+		// resident state and counter accounting as a prior SweepExpired.
 		a, b, c3, d := payload(100, 'a'), payload(100, 'b'), payload(100, 'c'), payload(100, 'd')
-		budget := int64(len(a) + len(b) + len(c3)) // 300
-		k1 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e1", EffW: 32, EffH: 32}
-		k2 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e2", EffW: 32, EffH: 32}
-		k3 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e3", EffW: 32, EffH: 32}
-		k4 := CacheKey{Identity: SourceIdentity{TenantID: "t1", Bucket: "bucket", Key: "key", VersionID: "version"}, SourceETag: "e4", EffW: 32, EffH: 32}
+		budget := int64(len(a) + len(b) + len(c3))
+		k1, k2, k3, k4 := cacheKeyForETag("e1"), cacheKeyForETag("e2"), cacheKeyForETag("e3"), cacheKeyForETag("e4")
 		seed := func() *Cache {
 			c := NewCache(budget, time.Hour)
-			c.Put(k1, a)  // list: [k1]
-			c.Put(k2, b)  // list: [k2 k1]
-			c.Put(k3, c3) // list: [k3 k2 k1] — k2 the expired middle, k1 the live tail
+			c.Put(k1, a)
+			c.Put(k2, b)
+			c.Put(k3, c3)
 			c.mu.Lock()
 			c.m[k2].Value.(*entry).expiresAt = time.Now().Add(-time.Second)
 			c.mu.Unlock()
 			return c
 		}
-		// Control: without the sweep, the live Put evicts the live tail k1
-		// (the expired middle k2 stays resident) and bumps the eviction
-		// counter.
-		ctrl := seed()
-		if ev := ctrl.Put(k4, d); ev != 1 {
-			t.Fatalf("control Put evicted %d entries, want 1 (live tail evicted)", ev)
-		}
-		if _, outcome := ctrl.Get(k1); outcome == GetHit {
-			t.Fatal("control: live k1 must be evicted without the sweep")
-		}
-		if _, outcome := ctrl.Get(k2); outcome != GetExpired {
-			t.Fatalf("control: expired k2 must be resident and lazy-expired by this Get (got %v, want GetExpired)", outcome)
-		}
-		if _, _, e, _ := ctrl.Stats(); e != 1 {
-			t.Fatalf("control evictions = %d, want 1 (an expired entry cost a budget eviction)", e)
-		}
-		// With the sweep: the expired k2 is removed for free (no counter
-		// bump), the budget is freed, and the same live Put fits with zero
-		// evictions.
-		c := seed()
-		if n := c.SweepExpired(time.Now()); n != 1 {
-			t.Fatalf("SweepExpired = %d, want 1", n)
-		}
-		if ev := c.Put(k4, d); ev != 0 {
-			t.Fatalf("live Put after sweep evicted %d entries, want 0 (budget freed by the sweep)", ev)
-		}
-		for name, k := range map[string]CacheKey{"k1": k1, "k3": k3, "k4": k4} {
-			if _, outcome := c.Get(k); outcome != GetHit {
-				t.Fatalf("%s must survive the post-sweep Put", name)
+		assertState := func(t *testing.T, c *Cache) {
+			t.Helper()
+			if c.Len() != 3 || c.Bytes() != budget {
+				t.Fatalf("Len/Bytes = %d/%d, want 3/%d", c.Len(), c.Bytes(), budget)
+			}
+			if h, m, e, x := c.Stats(); h != 0 || m != 0 || e != 0 || x != 0 {
+				t.Fatalf("Stats = %d/%d/%d/%d, want 0/0/0/0", h, m, e, x)
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if _, ok := c.m[k2]; ok {
+				t.Fatal("expired middle entry must be reclaimed")
+			}
+			for name, tc := range map[string]struct {
+				key  CacheKey
+				want []byte
+			}{
+				"k1": {key: k1, want: a},
+				"k3": {key: k3, want: c3},
+				"k4": {key: k4, want: d},
+			} {
+				el, ok := c.m[tc.key]
+				if !ok {
+					t.Fatalf("%s missing after reclaim-only Put", name)
+				}
+				if got := el.Value.(*entry).data; !bytes.Equal(got, tc.want) {
+					t.Fatalf("%s payload changed: got %q want %q", name, got, tc.want)
+				}
+			}
+			if order := listOrder(c); !slices.Equal(order, []CacheKey{k4, k3, k1}) {
+				t.Fatalf("LRU order = %v, want [%v %v %v]", order, k4, k3, k1)
 			}
 		}
-		if _, outcome := c.Get(k2); outcome == GetHit {
-			t.Fatal("expired k2 must be gone after the sweep")
+
+		direct := seed()
+		if ev := direct.Put(k4, d); ev != 0 {
+			t.Fatalf("direct Put evicted %d entries, want 0", ev)
 		}
-		if _, _, e, _ := c.Stats(); e != 0 {
-			t.Fatalf("evictions = %d, want 0 (sweep removals are not LRU evictions)", e)
+		assertState(t, direct)
+
+		swept := seed()
+		if n := swept.SweepExpired(time.Now()); n != 1 {
+			t.Fatalf("SweepExpired = %d, want 1", n)
 		}
+		if ev := swept.Put(k4, d); ev != 0 {
+			t.Fatalf("post-sweep Put evicted %d entries, want 0", ev)
+		}
+		assertState(t, swept)
 	})
 
 	t.Run("loop extreme: nothing expired", func(t *testing.T) {
