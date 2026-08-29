@@ -245,7 +245,7 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 
 // Generate decodes an image from r and returns a JPEG thumbnail no larger than
 // maxW×maxH (aspect ratio preserved; never upscaled). Zero bounds default to
-// DefaultMax; bounds are clamped to HardMax.
+// DefaultMax; bounds are clamped to HardMax. A nil reader returns an error.
 //
 // Generate is equivalent to GenerateContext with context.Background(); it
 // exists so non-cancellation callers and the deterministic semaphore tests
@@ -256,8 +256,9 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 
 // GenerateContext is Generate with cancellation: if the caller's context is
 // done while the caller is waiting for a decode slot, it returns ctx.Err()
-// without reading from r and without consuming a slot. A nil ctx is a caller
-// bug (stdlib convention); the wrapper and the REST handler always pass a
+// without reading from r and without consuming a slot. For a non-nil context,
+// a nil reader returns an error before slot acquisition or decode. A nil ctx is
+// a caller bug (stdlib convention); the wrapper and the REST handler always pass a
 // non-nil context. Cancellation is honored at acquisition (returns ctx.Err()
 // without reading the stream or consuming a slot) and mid-decode: a stream
 // failure caused by the context's deadline or cancellation is surfaced as
@@ -279,6 +280,10 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // acquisition, so at most maxConcurrentDecodes object streams are open at
 // once and waiters hold no stream.
 func GenerateContext(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, error) {
+	_ = ctx.Done() // preserve the existing nil-context caller-bug behavior
+	if r == nil {
+		return nil, errors.New("thumbnail: nil reader")
+	}
 	if err := acquireDecodeSlotContext(ctx); err != nil {
 		return nil, err // before generateLocked: stream untouched, no slot consumed
 	}
