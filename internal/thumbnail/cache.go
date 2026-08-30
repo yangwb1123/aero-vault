@@ -205,9 +205,7 @@ func (c *Cache) getContext(ctx context.Context, k CacheKey) ([]byte, GetOutcome,
 			// expired entry must not earn a fresh LRU lease — and it is not
 			// a miss (the hit-ratio class): the expired class is its own
 			// counter, forwarded by lookupCached to thumbnail.cache.expired_total.
-			c.ll.Remove(el)
-			delete(c.m, k)
-			c.bytes -= int64(len(e.data))
+			c.removeElementLocked(el)
 			c.expired++
 			return nil, GetExpired, nil
 		}
@@ -249,10 +247,7 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if el, ok := c.m[k]; ok {
-			e := el.Value.(*entry)
-			c.ll.Remove(el)
-			delete(c.m, k)
-			c.bytes -= int64(len(e.data))
+			c.removeElementLocked(el)
 		}
 		return 0
 	}
@@ -288,14 +283,19 @@ func (c *Cache) Put(k CacheKey, img []byte) (evicted int) {
 		if last == nil {
 			break
 		}
-		e := last.Value.(*entry)
-		c.ll.Remove(last)
-		delete(c.m, e.key)
-		c.bytes -= int64(len(e.data))
+		c.removeElementLocked(last)
 		c.evictions++
 		evicted++
 	}
 	return evicted
+}
+
+func (c *Cache) removeElementLocked(el *list.Element) *entry {
+	e := el.Value.(*entry)
+	c.ll.Remove(el)
+	delete(c.m, e.key)
+	c.bytes -= int64(len(e.data))
+	return e
 }
 
 // reclaimExpiredLocked removes resident entries whose retention deadline has
@@ -309,9 +309,7 @@ func (c *Cache) reclaimExpiredLocked(now time.Time) (removed int) {
 		next := el.Next()
 		e := el.Value.(*entry)
 		if now.After(e.expiresAt) {
-			c.ll.Remove(el)
-			delete(c.m, e.key)
-			c.bytes -= int64(len(e.data))
+			c.removeElementLocked(el)
 			removed++
 		}
 		el = next
@@ -356,6 +354,29 @@ func (c *Cache) SweepExpired(now time.Time) (n int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.reclaimExpiredLocked(now)
+}
+
+// InvalidateSource removes every resident entry derived from the exact
+// authoritative source generation id, regardless of ETag, dimensions, cache
+// schema version, representation, or TTL state. It is a resident-only purge:
+// disabled caches and incomplete identities are strict no-ops, and in-flight
+// coalesced generations are intentionally untouched.
+func (c *Cache) InvalidateSource(id SourceIdentity) (removed int) {
+	if c == nil || c.disabled || !id.Complete() {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for el := c.ll.Front(); el != nil; {
+		next := el.Next()
+		e := el.Value.(*entry)
+		if e.key.Identity.Equal(id) {
+			c.removeElementLocked(el)
+			removed++
+		}
+		el = next
+	}
+	return removed
 }
 
 // Len returns the number of stored entries (0 for a disabled cache).
