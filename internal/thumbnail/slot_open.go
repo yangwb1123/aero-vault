@@ -366,11 +366,14 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				return nil, err // same instance
 			}
-			// Any other read error (EOF/truncation/generic): stop the walk
-			// with orientation 1 and let Decode re-encounter the same bytes
-			// and error — marked source-stream errors re-surface as
-			// *SourceReadError (server error class); codec/truncation errors
-			// classify as before (→ ErrUnsupported).
+			var sre *SourceReadError
+			if errors.As(err, &sre) {
+				return nil, sre
+			}
+			// Any other walk error (EOF/truncation/generic): stop with
+			// orientation 1 and let Decode re-encounter the same bytes.
+			// Marked *SourceReadError is terminal above because replayed bytes
+			// can otherwise hide a one-shot source failure.
 			pngOrient = 1
 		}
 		decodeR = io.MultiReader(bytes.NewReader(head.buf.Bytes()), bytes.NewReader(replay.buf.Bytes()), payloadR)

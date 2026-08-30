@@ -8,9 +8,9 @@ package thumbnail
 // 400 InvalidArgument) — while EOF/truncation, codec-synthesized errors and
 // wrapped context sentinels keep their pinned behavior byte-for-byte.
 //
-// Determinism discipline: every failure is injected through the
-// errAfterDataReader pattern (sticky error after a served prefix), so no
-// wall-clock timing enters any assertion.
+// Determinism discipline: every failure is injected through deterministic
+// reader doubles (sticky error-after-prefix or one-shot partial-error
+// shapes), so no wall-clock timing enters any assertion.
 
 import (
 	"bytes"
@@ -107,6 +107,57 @@ type recordingReadCloser struct {
 func (r *recordingReadCloser) Close() error {
 	r.closed.Add(1)
 	return nil
+}
+
+// pngPostIHDRPartialErrorReader serves a valid PNG through the 33-byte
+// signature+IHDR prefix, then returns 3 bytes plus err in the same Read once,
+// then serves the remainder normally. It pins the io.ReadFull partial-read
+// shape the PNG orientation walk must surface as *SourceReadError.
+type pngPostIHDRPartialErrorReader struct {
+	data  []byte
+	err   error
+	off   int
+	fired bool
+}
+
+func (r *pngPostIHDRPartialErrorReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.off < 33 {
+		n := 33 - r.off
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > len(r.data)-r.off {
+			n = len(r.data) - r.off
+		}
+		if n == 0 {
+			return 0, io.EOF
+		}
+		copied := copy(p[:n], r.data[r.off:r.off+n])
+		r.off += copied
+		return copied, nil
+	}
+	if !r.fired {
+		r.fired = true
+		n := 3
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > len(r.data)-r.off {
+			n = len(r.data) - r.off
+		}
+		copied := copy(p[:n], r.data[r.off:r.off+n])
+		r.off += copied
+		return copied, r.err
+	}
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	copied := copy(p, r.data[r.off:])
+	r.off += copied
+	return copied, nil
 }
 
 // wantKind discriminates the three expected outcomes of the AC-1 table.
@@ -215,6 +266,82 @@ func TestGenerateContextMidStreamIOError(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGenerateContextPNGOrientationPartialReadError pins the escaped PNG
+// same-Read partial-error seam: once the post-IHDR walk sees 3 bytes plus a
+// source error in the same Read, both Generate entry points must return the
+// marked *SourceReadError, never succeed and never flatten to ErrUnsupported.
+func TestGenerateContextPNGOrientationPartialReadError(t *testing.T) {
+	t.Cleanup(func() { recoverSlots(t) })
+	png := makePNG(t, 64, 64)
+	injected := fmt.Errorf("s3 read failed: %w", errors.New("i/o error"))
+	cases := []struct {
+		name string
+		run  func(io.Reader) ([]byte, error)
+	}{
+		{"Generate", func(r io.Reader) ([]byte, error) { return Generate(r, 32, 32) }},
+		{"GenerateContext", func(r io.Reader) ([]byte, error) { return GenerateContext(context.Background(), r, 32, 32) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			img, err := tc.run(&pngPostIHDRPartialErrorReader{data: png, err: injected})
+			var sre *SourceReadError
+			if !errors.As(err, &sre) {
+				t.Fatalf("err = %v (%T), want *SourceReadError", err, err)
+			}
+			if sre.Err != injected {
+				t.Fatalf("wrapped instance = %v, want the injected instance %v", sre.Err, injected)
+			}
+			if !errors.Is(err, injected) {
+				t.Fatalf("errors.Is(err, injected) = false, want true")
+			}
+			if errors.Is(err, ErrUnsupported) {
+				t.Fatalf("err = %v, must not be ErrUnsupported", err)
+			}
+			if len(img) != 0 {
+				t.Fatalf("len(img) = %d, want 0", len(img))
+			}
+		})
+	}
+}
+
+func TestCachedGenerationPNGOrientationPartialReadErrorDoesNotStore(t *testing.T) {
+	t.Cleanup(func() { recoverSlots(t) })
+	cache := NewCache(1<<20, 0)
+	identity := testIdentity("tenant-a")
+	png := makePNG(t, 64, 64)
+	injected := fmt.Errorf("s3 read failed: %w", errors.New("i/o error"))
+	beforeLen, beforeBytes := cache.Len(), cache.Bytes()
+	img, fromCache, err := GenerateContextWithOpenerCached(
+		context.Background(), cache, identity, etagA, 32, 32,
+		func() (io.ReadCloser, OpenedSource, error) {
+			return io.NopCloser(&pngPostIHDRPartialErrorReader{data: png, err: injected}), OpenedSource{
+				Identity: identity,
+				ETag:     etagA,
+				Bound:    true,
+			}, nil
+		},
+	)
+	var sre *SourceReadError
+	if !errors.As(err, &sre) {
+		t.Fatalf("err = %v (%T), want *SourceReadError", err, err)
+	}
+	if sre.Err != injected {
+		t.Fatalf("wrapped instance = %v, want the injected instance %v", sre.Err, injected)
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("errors.Is(err, injected) = false, want true")
+	}
+	if fromCache {
+		t.Fatal("fromCache = true, want false")
+	}
+	if len(img) != 0 {
+		t.Fatalf("len(img) = %d, want 0", len(img))
+	}
+	if cache.Len() != beforeLen || cache.Bytes() != beforeBytes {
+		t.Fatalf("cache changed: len=%d/%d bytes=%d/%d", cache.Len(), beforeLen, cache.Bytes(), beforeBytes)
 	}
 }
 
