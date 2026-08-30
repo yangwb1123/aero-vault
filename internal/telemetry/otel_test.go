@@ -20,7 +20,7 @@ func TestSetup_NoEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 	ctx := context.Background()
-	shutdown, err := Setup(ctx, "aero-vault", discardLogger())
+	shutdown, err := Setup(ctx, "aero-vault", discardLogger(), false)
 	if err != nil {
 		t.Fatalf("expected no error from Setup with no endpoint, got: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestSetup_ShutdownNoError(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 	ctx := context.Background()
-	shutdown, err := Setup(ctx, "aero-vault", discardLogger())
+	shutdown, err := Setup(ctx, "aero-vault", discardLogger(), false)
 	if err != nil {
 		t.Fatalf("unexpected Setup error: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestSetup_EmptyServiceName(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 	ctx := context.Background()
-	shutdown, err := Setup(ctx, "", discardLogger())
+	shutdown, err := Setup(ctx, "", discardLogger(), false)
 	if err != nil {
 		t.Fatalf("expected no error with empty service name, got: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestSetup_ShutdownType(t *testing.T) {
 	ctx := context.Background()
 	var s Shutdown
 	var err error
-	s, err = Setup(ctx, "svc", discardLogger())
+	s, err = Setup(ctx, "svc", discardLogger(), false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestSetup_CancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	shutdown, err := Setup(ctx, "aero-vault", discardLogger())
+	shutdown, err := Setup(ctx, "aero-vault", discardLogger(), false)
 	if err != nil {
 		t.Fatalf("expected no error for no-op path even with cancelled ctx, got: %v", err)
 	}

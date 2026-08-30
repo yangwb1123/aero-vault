@@ -84,7 +84,9 @@ func sweepThumbnailCache(ctx context.Context, cache *thumbnail.Cache, logger *sl
 	// both when the driver is healthy-but-idle and when it is dead, so the
 	// stalled-sweep alert keys off this counter's increase.
 	telemetry.IncThumbnailCacheSweepRun(ctx)
-	// Refresh the last-run gauge on EVERY pass — the alert's staleness basis.
+	// Refresh the last-run gauge on EVERY pass without clearing the previously
+	// published cadence; interval=0 is the telemetry helper's pass-refresh
+	// sentinel, preserving the alert's interval > 0 arm.
 	telemetry.SetThumbnailCacheSweepCadence(ctx, 0, time.Now().Unix())
 	if n := cache.SweepExpired(time.Now()); n > 0 {
 		telemetry.IncThumbnailCacheSwept(ctx, int64(n))

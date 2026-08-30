@@ -1,12 +1,9 @@
 package telemetry
 
 // NOTE on test design:
-// EnablePrometheus() registers metrics with the global prometheus.DefaultRegisterer.
-// Re-registering the same collector (target_info, etc.) causes a 500 scrape error
-// because Go's prometheus library panics/errors on duplicate registration. Therefore
-// all Prometheus tests MUST share a single EnablePrometheus() call. We do this with
-// TestMain + a package-level setup, calling EnablePrometheus() exactly once and
-// reusing the resulting handler across every sub-test.
+// The first EnablePrometheus() call registers the exporter with the global
+// prometheus.DefaultRegisterer. These tests share a single setup via TestMain,
+// then reuse the cached handler/provider across sub-tests.
 
 import (
 	"net/http"
@@ -49,20 +46,14 @@ func TestEnablePrometheus_InstalledSDKProvider(t *testing.T) {
 	}
 }
 
-// TestEnablePrometheus_PreservesExistingOTLPProvider verifies the guard that
-// prevents EnablePrometheus from clobbering an OTLP provider Setup installed.
-// The SDK can't merge a second reader onto a live provider, so when one is
-// already present EnablePrometheus must leave it in place. We assert the global
-// provider identity is unchanged across a second call (which fails on duplicate
-// Prometheus registration but must never swap the provider).
+// TestEnablePrometheus_PreservesExistingOTLPProvider verifies repeated calls
+// reuse the already-configured handler/provider instead of swapping the global
+// SDK provider.
 func TestEnablePrometheus_PreservesExistingOTLPProvider(t *testing.T) {
 	before, ok := otel.GetMeterProvider().(*metric.MeterProvider)
 	if !ok {
 		t.Skip("no SDK meter provider installed; guard not exercisable")
 	}
-	// A second call: prometheus.New re-registers the same collector with the
-	// default registerer and returns an error, but the global provider must be
-	// untouched regardless of which branch is reached.
 	_, _ = EnablePrometheus()
 	after, ok := otel.GetMeterProvider().(*metric.MeterProvider)
 	if !ok {

@@ -416,8 +416,8 @@ File delete (`FileService.Delete`, hard and soft) commits the metadata delete an
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(empty)_ | OTLP/HTTP endpoint for traces + metrics, e.g. `http://localhost:4318`. Empty installs no-op providers (still propagates trace headers). |
-| `PROMETHEUS_ENABLED` | `false` | Expose Prometheus metrics at `/metrics`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(empty)_ | OTLP/HTTP endpoint for traces + metrics, e.g. `http://localhost:4318`. Empty installs no-op providers (still propagates trace headers). May be combined with `PROMETHEUS_ENABLED=true`; in mixed mode the same meter provider exports domain metrics to both OTLP and `/metrics`. |
+| `PROMETHEUS_ENABLED` | `false` | Expose Prometheus metrics at `/metrics`. May be combined with `OTEL_EXPORTER_OTLP_ENDPOINT`; when both are set, `/metrics` keeps the existing metric names and OTLP export remains enabled. |
 
 ## Other gateways
 

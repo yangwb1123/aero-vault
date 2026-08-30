@@ -1,50 +1,64 @@
 package telemetry
 
 import (
+	"errors"
 	"net/http"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/prometheus"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/sdk/metric"
 )
 
-// EnablePrometheus mounts a Prometheus exporter and returns an http.Handler
-// callers mount at /metrics.
+var (
+	promHandlerMu sync.Mutex
+	promHandler   http.Handler
+)
+
+func configuredPrometheusHandler() http.Handler {
+	promHandlerMu.Lock()
+	defer promHandlerMu.Unlock()
+	return promHandler
+}
+
+func setConfiguredPrometheusHandler(h http.Handler) {
+	promHandlerMu.Lock()
+	defer promHandlerMu.Unlock()
+	promHandler = h
+}
+
+func installPrometheusHandler() http.Handler {
+	h := promhttp.Handler()
+	setConfiguredPrometheusHandler(h)
+	return h
+}
+
+func newPrometheusExporter() (*otelprom.Exporter, error) {
+	return otelprom.New()
+}
+
+// EnablePrometheus returns the /metrics handler. When Setup already wired the
+// Prometheus reader onto the SDK provider (Prometheus-only or mixed OTLP+
+// Prometheus mode), this is a pure accessor. Otherwise it installs a
+// Prometheus-only meter provider for no-OTLP callers.
 //
 // The metric SDK (v1.43) does not allow adding a Reader to an already-built
-// *metric.MeterProvider — NewMeterProvider's doc is explicit ("Readers cannot
-// be added after a MeterProvider is created") and the provider's readers/
-// resource are unexported, so they can't be re-attached to a fresh provider
-// either. We therefore must not clobber an OTLP provider that Setup installed:
-//
-//   - If the global meter provider is already an SDK *metric.MeterProvider
-//     (Setup ran with OTLP enabled), leave it in place so OTLP export keeps
-//     working — we do NOT install a Prometheus-only provider over it. /metrics
-//     still serves runtime metrics via the promhttp default registerer.
-//     (Co-locating both readers on one provider requires Setup to wire the
-//     Prometheus reader at construction time, which is out of scope here.)
-//   - Otherwise (OTLP disabled — the global is the no-op/delegating provider),
-//     build a Prometheus-backed SDK provider and install it globally so domain
-//     metrics flow to /metrics.
+// *metric.MeterProvider. If an SDK provider already exists and Setup did not
+// preconfigure Prometheus, fail closed instead of silently serving /metrics
+// without the domain metrics.
 func EnablePrometheus() (http.Handler, error) {
-	exp, err := prometheus.New()
+	if h := configuredPrometheusHandler(); h != nil {
+		return h, nil
+	}
+	if _, ok := otel.GetMeterProvider().(*metric.MeterProvider); ok {
+		return nil, errors.New("prometheus exporter must be enabled during telemetry setup when an SDK meter provider is already installed")
+	}
+	exp, err := newPrometheusExporter()
 	if err != nil {
 		return promhttp.Handler(), err
 	}
-	if _, ok := otel.GetMeterProvider().(*metric.MeterProvider); ok {
-		// An OTLP SDK provider is already installed by Setup. Installing a
-		// Prometheus-only provider here would silently replace it and drop OTLP
-		// export. The SDK exposes no way to add a Reader to a live provider or
-		// to recover its existing reader/resource, so we cannot merge the two
-		// onto one provider from here. Preserve OTLP rather than clobber it; the
-		// exporter (registered with the default registerer by prometheus.New)
-		// still backs /metrics for runtime metrics.
-		return promhttp.Handler(), nil
-	}
-	// No SDK provider installed (OTLP disabled): install one backed by the
-	// Prometheus reader so domain metrics surface at /metrics.
 	provider := metric.NewMeterProvider(metric.WithReader(exp))
 	otel.SetMeterProvider(provider)
-	return promhttp.Handler(), nil
+	return installPrometheusHandler(), nil
 }

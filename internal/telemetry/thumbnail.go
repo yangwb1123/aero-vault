@@ -107,11 +107,12 @@ func IncThumbnailCacheSweepRun(ctx context.Context) {
 // ((now - last_run) > 3 * interval) instead of a static lookback window, so
 // a TTL-driven cadence anywhere in the validated 1s..1y envelope stays
 // alert-correct — a static 1h window would permanently fire for TTL >= ~75m.
-// The driver calls this on every pass (lastRun) and once at start (interval);
-// zero values are never consulted by the alert (interval > 0 guard).
+// The driver calls this once at start with a positive interval and then on
+// every pass to refresh lastRun; non-positive interval values are a sentinel
+// meaning “update last-run without clearing the previously published cadence”.
 func SetThumbnailCacheSweepCadence(ctx context.Context, intervalSeconds, lastRunUnix int64) {
 	initDomain()
-	if mThumbnailCacheSweepInterv != nil {
+	if intervalSeconds > 0 && mThumbnailCacheSweepInterv != nil {
 		mThumbnailCacheSweepInterv.Record(ctx, intervalSeconds)
 	}
 	if mThumbnailCacheSweepLastRun != nil {

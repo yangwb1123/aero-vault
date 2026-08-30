@@ -13,7 +13,7 @@ import (
 )
 
 func initInfrastructure(ctx context.Context, cfg *config.Config, logger *slog.Logger) (storage.Storage, repository.Repository, *events.Bus, func(context.Context) error, error) {
-	shutdownOtel, err := telemetry.Setup(ctx, "aero-vault", logger)
+	shutdownOtel, err := telemetry.Setup(ctx, "aero-vault", logger, cfg.Telemetry.PrometheusEnabled)
 	if err != nil {
 		logger.Warn("otel setup failed; continuing without", "err", err)
 		shutdownOtel = func(context.Context) error { return nil }
