@@ -153,6 +153,9 @@ func generateMiss(
 	if len(img) == 0 {
 		return CachedGenerationResult{}, errors.New("thumbnail: GenerateContextWithOpenerCached: empty result")
 	}
+	if err := ctx.Err(); err != nil {
+		return CachedGenerationResult{}, err
+	}
 	storeCached(ctx, cache, key, identity, sourceETag, opened, img)
 	return CachedGenerationResult{Image: img, Opened: opened, HasOpened: true}, nil
 }
@@ -166,6 +169,9 @@ func generateUncached(
 	}
 	if len(img) == 0 {
 		return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: empty result")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
 	return img, false, nil
 }
