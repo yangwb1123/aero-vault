@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/config"
+	"github.com/aero-vault/aero-vault/internal/events"
+	"github.com/aero-vault/aero-vault/internal/jobs"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 )
 
 // captureLogger returns a slog logger writing into buf (assertable text
@@ -21,6 +24,131 @@ func captureLogger(buf *bytes.Buffer) *slog.Logger {
 }
 
 // ── AC-4: EVENT_OUTBOX_ENABLED=false gates the relay loop (D1/F1) ───────────
+
+func openServerTestRepository(t *testing.T, ctx context.Context, dir string) repository.Repository {
+	t.Helper()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "server.db"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrate repository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	return repo
+}
+
+func TestBuildBackgroundWorkersDoesNotOverridePrimaryDefaultStorageClass(t *testing.T) {
+	previous := service.DefaultStorageClass
+	t.Cleanup(func() { service.DefaultStorageClass = previous })
+	ctx, cancel := context.WithCancel(context.Background())
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Storage: config.StorageConfig{
+			Backend:      "local",
+			DefaultClass: "STANDARD",
+			Local:        config.LocalStorageConfig{Root: filepath.Join(dir, "primary")},
+		},
+		Replication: config.ReplicationCfg{
+			Enabled: true,
+			Storage: config.StorageConfig{
+				Backend:      "local",
+				DefaultClass: "GLACIER",
+				Local:        config.LocalStorageConfig{Root: filepath.Join(dir, "replica")},
+			},
+		},
+		Jobs: config.JobsCfg{Workers: 1},
+	}
+	primary, err := buildStorage(ctx, cfg)
+	if err != nil {
+		t.Fatalf("build primary storage: %v", err)
+	}
+	if service.DefaultStorageClass != "STANDARD" {
+		t.Fatalf("primary default = %q, want STANDARD", service.DefaultStorageClass)
+	}
+	repo := openServerTestRepository(t, ctx, dir)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	bus := events.New(repo, logger)
+	t.Cleanup(func() {
+		cancel()
+		bus.Close()
+	})
+	registry := jobs.NewRegistry()
+	queue := jobs.NewQueue(repo)
+	svc := service.NewFileService(primary, repo, logger).WithEventSink(bus)
+	if err := buildBackgroundWorkers(ctx, cfg, logger, repo, primary, bus, registry, queue, svc); err != nil {
+		t.Fatalf("build background workers: %v", err)
+	}
+	if service.DefaultStorageClass != "STANDARD" {
+		t.Fatalf("replication changed default to %q, want STANDARD", service.DefaultStorageClass)
+	}
+
+	const payload = "primary default"
+	obj, err := svc.Put(ctx, "default", "default", "default.txt", strings.NewReader(payload), int64(len(payload)), service.PutOptions{})
+	if err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+	stored, err := repo.GetObject(ctx, "default", "default", "default.txt")
+	if err != nil {
+		t.Fatalf("reload object: %v", err)
+	}
+	if obj.StorageClass != "STANDARD" || stored.StorageClass != "STANDARD" {
+		t.Fatalf("storage classes = returned %q, persisted %q; want STANDARD", obj.StorageClass, stored.StorageClass)
+	}
+}
+
+func TestBuildBackgroundWorkersReplicaBootstrapFailureDoesNotOverridePrimaryDefaultStorageClass(t *testing.T) {
+	previous := service.DefaultStorageClass
+	t.Cleanup(func() { service.DefaultStorageClass = previous })
+	ctx, cancel := context.WithCancel(context.Background())
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Storage: config.StorageConfig{
+			Backend:      "local",
+			DefaultClass: "STANDARD",
+			Local:        config.LocalStorageConfig{Root: filepath.Join(dir, "primary")},
+		},
+		Replication: config.ReplicationCfg{
+			Enabled: true,
+			Storage: config.StorageConfig{Backend: "invalid", DefaultClass: "GLACIER"},
+		},
+		Jobs: config.JobsCfg{Workers: 1},
+	}
+	primary, err := buildStorage(ctx, cfg)
+	if err != nil {
+		t.Fatalf("build primary storage: %v", err)
+	}
+	repo := openServerTestRepository(t, ctx, dir)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	bus := events.New(repo, logger)
+	t.Cleanup(func() {
+		cancel()
+		bus.Close()
+	})
+	err = buildBackgroundWorkers(ctx, cfg, logger, repo, primary, bus, jobs.NewRegistry(), jobs.NewQueue(repo), service.NewFileService(primary, repo, logger))
+	if err == nil {
+		t.Fatal("replica bootstrap unexpectedly succeeded")
+	}
+	if service.DefaultStorageClass != "STANDARD" {
+		t.Fatalf("failed replication changed default to %q, want STANDARD", service.DefaultStorageClass)
+	}
+}
+
+func TestBuildStorageBlankPrimaryDefaultUsesServiceFallback(t *testing.T) {
+	previous := service.DefaultStorageClass
+	t.Cleanup(func() { service.DefaultStorageClass = previous })
+	service.WithDefaultStorageClass("GLACIER")
+	cfg := &config.Config{Storage: config.StorageConfig{
+		Backend: "local",
+		Local:   config.LocalStorageConfig{Root: t.TempDir()},
+	}}
+	if _, err := buildStorage(context.Background(), cfg); err != nil {
+		t.Fatalf("build primary storage: %v", err)
+	}
+	if service.DefaultStorageClass != primaryStorageClassFallback {
+		t.Fatalf("blank primary default = %q, want fallback %q", service.DefaultStorageClass, primaryStorageClassFallback)
+	}
+}
 
 func TestStartEventOutboxRelay_Disabled(t *testing.T) {
 	ctx := context.Background()

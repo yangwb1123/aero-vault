@@ -18,12 +18,31 @@ import (
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
+// primaryStorageClassFallback is captured before startup assembly can change
+// service.DefaultStorageClass. Only the primary storage path owns that global.
+var primaryStorageClassFallback = service.DefaultStorageClass
+
 func buildStorage(ctx context.Context, cfg *config.Config) (storage.Storage, error) {
-	return buildStorageFrom(ctx, cfg.Storage)
+	store, err := buildStorageFrom(ctx, cfg.Storage)
+	if err != nil {
+		return nil, err
+	}
+	applyPrimaryDefaultStorageClass(cfg.Storage.DefaultClass)
+	return store, nil
 }
 
+func applyPrimaryDefaultStorageClass(class string) {
+	if class == "" {
+		service.DefaultStorageClass = primaryStorageClassFallback
+		return
+	}
+	service.WithDefaultStorageClass(class)
+}
+
+// buildStorageFrom constructs a backend without changing process-global state.
+// The primary build applies its default after successful construction; secondary
+// backends, such as replication, must not affect the server-wide default.
 func buildStorageFrom(ctx context.Context, sc config.StorageConfig) (storage.Storage, error) {
-	service.WithDefaultStorageClass(sc.DefaultClass)
 	fc := storage.NewDefaultFactoryConfig()
 	fc.Kind = storage.BackendKind(sc.Backend)
 	if sc.ConnectTimeout > 0 {
