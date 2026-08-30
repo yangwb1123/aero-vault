@@ -153,6 +153,8 @@ func generateMiss(
 	if len(img) == 0 {
 		return CachedGenerationResult{}, errors.New("thumbnail: GenerateContextWithOpenerCached: empty result")
 	}
+	// Honor a request that died after generation succeeded but before this
+	// wrapper commits cache admission.
 	if err := ctx.Err(); err != nil {
 		return CachedGenerationResult{}, err
 	}
@@ -170,6 +172,8 @@ func generateUncached(
 	if len(img) == 0 {
 		return nil, false, errors.New("thumbnail: GenerateContextWithOpenerCached: empty result")
 	}
+	// Honor a request that died after generation succeeded but before this
+	// wrapper reports success.
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
