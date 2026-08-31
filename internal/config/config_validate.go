@@ -3,11 +3,17 @@ package config
 import (
 	"errors"
 	"fmt"
+	"time"
 )
+
+const maxOrphanGraceMinutes = int64(^uint64(0)>>1) / int64(time.Minute)
 
 func (c *Config) Validate() error {
 	if c.Reconcile.OrphanGraceMinutes < 0 {
 		return errors.New("RECONCILE_ORPHAN_GRACE_MINUTES must be >= 0")
+	}
+	if int64(c.Reconcile.OrphanGraceMinutes) > maxOrphanGraceMinutes {
+		return fmt.Errorf("RECONCILE_ORPHAN_GRACE_MINUTES must be <= %d (time.Duration-safe)", maxOrphanGraceMinutes)
 	}
 	if err := c.validateStorage(); err != nil {
 		return err
