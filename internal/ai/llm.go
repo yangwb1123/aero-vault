@@ -228,6 +228,9 @@ func parseSSELine(line string) (parsedStreamLine, bool, error) {
 	}, false, nil
 }
 
+// decodeStreamUsage keeps only non-negative integer usage fields. Values that
+// are absent, null, fractional, nested, negative, or outside int range are
+// ignored without invalidating the surrounding content chunk.
 func decodeStreamUsage(raw json.RawMessage) (map[string]int, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -244,7 +247,7 @@ func decodeStreamUsage(raw json.RawMessage) (map[string]int, bool) {
 			continue
 		}
 		var count int
-		if err := json.Unmarshal(value, &count); err == nil {
+		if err := json.Unmarshal(value, &count); err == nil && count >= 0 {
 			usage[name] = count
 		}
 	}
