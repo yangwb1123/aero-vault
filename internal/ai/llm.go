@@ -149,7 +149,15 @@ type streamChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
-	Model string `json:"model,omitempty"`
+	Model string          `json:"model,omitempty"`
+	Usage json.RawMessage `json:"usage,omitempty"`
+}
+
+type parsedStreamLine struct {
+	token    string
+	model    string
+	usage    map[string]int
+	hasUsage bool
 }
 
 // ChatStream POSTs with "stream":true and parses the SSE response (one
@@ -173,39 +181,74 @@ func (l *HTTPLLM) ChatStream(ctx context.Context, req ChatRequest, onChunk func(
 		return ChatResponse{}, fmt.Errorf("llm stream http %d: %s", resp.StatusCode, string(raw))
 	}
 	var content strings.Builder
+	responseModel := req.Model
+	var usage map[string]int
 	scanner := newSSEScanner(resp.Body)
 	for scanner.Scan() {
-		token, done, err := parseSSELine(scanner.Text())
+		parsed, done, err := parseSSELine(scanner.Text())
 		if err != nil {
 			continue
 		}
 		if done {
 			break
 		}
-		if token != "" {
-			content.WriteString(token)
+		if parsed.model != "" {
+			responseModel = parsed.model
+		}
+		if parsed.hasUsage {
+			usage = parsed.usage
+		}
+		if parsed.token != "" {
+			content.WriteString(parsed.token)
 			if onChunk != nil {
-				onChunk(token)
+				onChunk(parsed.token)
 			}
 		}
 	}
-	return ChatResponse{Content: content.String(), Model: req.Model}, scanner.Err()
+	return ChatResponse{Content: content.String(), Model: responseModel, Usage: usage}, scanner.Err()
 }
 
-func parseSSELine(line string) (token string, done bool, err error) {
+func parseSSELine(line string) (parsedStreamLine, bool, error) {
 	if line == "[DONE]" {
-		return "", true, nil
+		return parsedStreamLine{}, true, nil
 	}
 	var ch streamChunk
 	if err := json.Unmarshal([]byte(line), &ch); err != nil {
-		return "", false, err
+		return parsedStreamLine{}, false, err
 	}
+	var token string
 	for _, c := range ch.Choices {
 		if c.Delta.Content != "" {
 			token += c.Delta.Content
 		}
 	}
-	return token, false, nil
+	usage, hasUsage := decodeStreamUsage(ch.Usage)
+	return parsedStreamLine{
+		token: token, model: ch.Model, usage: usage, hasUsage: hasUsage,
+	}, false, nil
+}
+
+func decodeStreamUsage(raw json.RawMessage) (map[string]int, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil || fields == nil {
+		return nil, false
+	}
+	usage := make(map[string]int, len(fields))
+	for name, value := range fields {
+		value = bytes.TrimSpace(value)
+		if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+			continue
+		}
+		var count int
+		if err := json.Unmarshal(value, &count); err == nil {
+			usage[name] = count
+		}
+	}
+	return usage, true
 }
 
 func (l *HTTPLLM) buildChatRequest(ctx context.Context, req ChatRequest) (*http.Request, error) {
