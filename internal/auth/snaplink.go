@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/yangwb1123/snaplink/interfaces/ssoclient/remote"
 	"github.com/yangwb1123/snaplink/interfaces/ssoclient/rs"
 )
@@ -83,10 +84,25 @@ func (v *SnaplinkVerifier) Verify(ctx context.Context, token string) (Key, error
 	}
 	return Key{
 		Token: token, Tenant: tenant, SubjectID: claims.Subject,
+		Kind:   snaplinkPrincipalKind(claims),
 		Roles:  stringSliceClaim(claims.Raw, "roles"),
 		Groups: stringSliceClaim(claims.Raw, "groups"),
 		Scopes: scopes,
 	}, nil
+}
+
+func snaplinkPrincipalKind(claims *rs.Claims) access.PrincipalKind {
+	if claims != nil && claims.ClientID != "" && claims.Subject == claims.ClientID && claims.JTI != "" &&
+		!hasClaim(claims.Raw, "auth_time") && !hasClaim(claims.Raw, "sid") &&
+		!hasClaim(claims.Raw, "act") && !hasClaim(claims.Raw, "may_act") {
+		return access.PrincipalService
+	}
+	return access.PrincipalUser
+}
+
+func hasClaim(raw map[string]any, name string) bool {
+	_, ok := raw[name]
+	return ok
 }
 
 func (v *SnaplinkVerifier) matchesAudience(claims *rs.Claims, clientID string) bool {

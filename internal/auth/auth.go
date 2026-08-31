@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aero-vault/aero-vault/internal/access"
 )
 
 type Scope string
@@ -39,6 +41,7 @@ type Key struct {
 	Token     string
 	Tenant    string
 	SubjectID string
+	Kind      access.PrincipalKind
 	Roles     []string
 	Groups    []string
 	Scopes    map[Scope]bool

@@ -135,6 +135,7 @@ func init() {
 
 		// Usage
 		{Method: "GET", Path: "/v1/session", Summary: "Get the normalized current session", Tag: "auth", Status: 200, Response: `{"authenticated":true,"subject_id":"user-7","tenant_id":"acme","principal_kind":"user","roles":["vault.user"],"groups":["engineering"],"scopes":["read"]}`},
+		{Method: "GET", Path: "/v1/internal/account-summary", Summary: "Read a bounded Aero ID account-source summary", Tag: "integration", Status: 200, Response: `{"source_region":"local","version":1,"generated_at":"2026-01-01T00:00:00Z","complete":true,"datasets":{},"sources":[],"memberships":[]}`},
 		{Method: "GET", Path: "/v1/usage", Summary: "Get tenant usage", Tag: "admin", Status: 200, Response: `{"used_bytes":1000,"max_bytes":1000000}`},
 
 		// Batch
@@ -333,6 +334,7 @@ func newRouter(svc *service.FileService, repo repository.Repository, search *ai.
 
 	// Self-serve usage
 	r.Get("/session", h.Session)
+	r.Get("/internal/account-summary", adm.AccountSummary)
 	r.Get("/usage", adm.Usage)
 	if h.access != nil {
 		r.Get("/access/acl", h.ListResourceACL)

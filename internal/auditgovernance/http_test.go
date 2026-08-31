@@ -143,6 +143,15 @@ func assertGovernanceBody(t *testing.T, body map[string]any) {
 	if body["source_system"] != source {
 		t.Fatalf("source_system=%v want=%s", body["source_system"], source)
 	}
+	wantTarget := strings.Replace(redactor.digest("acme", "target", "private/path"),
+		"hmac-sha256:", "hmac-sha256.", 1)
+	if body["aggregate_id"] != wantTarget || strings.Contains(wantTarget, ":") {
+		t.Fatalf("aggregate_id=%v want separator-safe %s", body["aggregate_id"], wantTarget)
+	}
+	targets, ok := body["targets"].([]any)
+	if !ok || len(targets) != 1 || targets[0].(map[string]any)["id"] != wantTarget {
+		t.Fatalf("targets=%#v want canonical target %s", body["targets"], wantTarget)
+	}
 	payload, ok := body["payload"].(map[string]any)
 	if !ok || len(payload) != 5 || payload["fact_kind"] != "file" {
 		t.Fatalf("payload=%#v", body["payload"])

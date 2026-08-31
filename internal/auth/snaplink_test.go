@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aero-vault/aero-vault/internal/access"
 )
 
 func TestSnaplinkVerifierMapsVerifiedIdentity(t *testing.T) {
@@ -39,6 +41,46 @@ func TestSnaplinkVerifierMapsVerifiedIdentity(t *testing.T) {
 	}
 	if len(key.Roles) != 1 || key.Roles[0] != "editor" || len(key.Groups) != 1 {
 		t.Fatalf("mapped roles/groups = %#v/%#v", key.Roles, key.Groups)
+	}
+}
+
+func TestSnaplinkVerifierMarksStrictClientCredentialsAsService(t *testing.T) {
+	server, privateKey := snaplinkTestIssuer(t)
+	token := signSnaplinkTestToken(t, privateKey, map[string]any{
+		"iss": "https://sso.example", "sub": "aero-id-vault-source",
+		"client_id": "aero-id-vault-source", "jti": "machine-token-1",
+		"aud": "aero-vault", "scope": "read", "exp": time.Now().Add(time.Minute).Unix(),
+	})
+	verifier, err := NewSnaplinkVerifier(t.Context(), SnaplinkConfig{
+		Issuer: "https://sso.example", JWKSURL: server.URL, Audience: "aero-vault",
+		ClientTenants: map[string]string{
+			"aero-id-vault-source": "acme",
+			"aero-vault":           "acme",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer verifier.Close()
+	key, err := verifier.Verify(t.Context(), token)
+	if err != nil {
+		t.Fatalf("verify Snaplink token: %v", err)
+	}
+	if key.Kind != access.PrincipalService || PrincipalForKey(key).Kind != access.PrincipalService {
+		t.Fatalf("machine principal kind = %q/%q, want service", key.Kind, PrincipalForKey(key).Kind)
+	}
+
+	humanToken := signSnaplinkTestToken(t, privateKey, map[string]any{
+		"iss": "https://sso.example", "sub": "user-42", "client_id": "aero-vault",
+		"jti": "human-token-1", "aud": "aero-vault", "scope": "read",
+		"auth_time": time.Now().Unix(), "exp": time.Now().Add(time.Minute).Unix(),
+	})
+	human, err := verifier.Verify(t.Context(), humanToken)
+	if err != nil {
+		t.Fatalf("verify human token: %v", err)
+	}
+	if human.Kind != access.PrincipalUser {
+		t.Fatalf("human principal kind = %q, want user", human.Kind)
 	}
 }
 

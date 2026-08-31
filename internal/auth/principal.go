@@ -23,10 +23,14 @@ func PrincipalForKey(key Key) access.Principal {
 		}
 	}
 	slices.Sort(scopes)
+	kind := key.Kind
+	if kind == "" {
+		kind = access.PrincipalUser
+	}
 	return access.Principal{
 		SubjectID: subjectID,
 		TenantID:  key.Tenant,
-		Kind:      access.PrincipalUser,
+		Kind:      kind,
 		Roles:     append([]string(nil), key.Roles...),
 		Groups:    append([]string(nil), key.Groups...),
 		Scopes:    scopes,

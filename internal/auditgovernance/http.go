@@ -144,18 +144,25 @@ func governanceWire(fact repository.AuditGovernanceFact, source string) governan
 	if actor == "" {
 		actor = SourcePrefix
 	}
+	targetID := governanceAggregateID(fact.TargetDigest)
 	event := governanceEvent{
 		EventID: fact.ID, SourceSystem: source, EventType: SchemaID, SchemaID: SchemaID,
 		SchemaVersion: SchemaVersion, OccurredAt: fact.OccurredAt.UTC(), OperationID: fact.RequestID,
 		Actor: governanceActor{ID: actor, Type: "principal"}, AggregateType: fact.FactKind,
-		AggregateID: fact.TargetDigest, Action: fact.Action, Outcome: "success",
+		AggregateID: targetID, Action: fact.Action, Outcome: "success",
 		Payload: governancePayload(fact), DataClassification: Classification,
 		RetentionClass: RetentionClass, IdempotencyKey: fact.ID,
 	}
-	if fact.TargetDigest != "" {
-		event.Targets = []governanceTarget{{Type: fact.FactKind, ID: fact.TargetDigest}}
+	if targetID != "" {
+		event.Targets = []governanceTarget{{Type: fact.FactKind, ID: targetID}}
 	}
 	return event
+}
+
+// governanceAggregateID keeps the redacted target stable while replacing the
+// digest prefix separator that Audit Governance reserves for stream framing.
+func governanceAggregateID(digest string) string {
+	return strings.Replace(digest, "hmac-sha256:", "hmac-sha256.", 1)
 }
 
 func governancePayload(fact repository.AuditGovernanceFact) map[string]any {
