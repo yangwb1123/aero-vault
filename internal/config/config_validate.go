@@ -6,6 +6,9 @@ import (
 )
 
 func (c *Config) Validate() error {
+	if c.Reconcile.OrphanGraceMinutes < 0 {
+		return errors.New("RECONCILE_ORPHAN_GRACE_MINUTES must be >= 0")
+	}
 	if err := c.validateStorage(); err != nil {
 		return err
 	}
