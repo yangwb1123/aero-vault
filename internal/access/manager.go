@@ -121,38 +121,6 @@ func (m *Manager) ListDepartmentMembers(ctx context.Context, tenant, departmentI
 	return m.store.ListDepartmentMembers(ctx, tenant, departmentID)
 }
 
-func (m *Manager) PutACL(ctx context.Context, entry ACLEntry) (ACLEntry, error) {
-	normalizeACLResource(&entry)
-	if err := validateACL(entry); err != nil {
-		return ACLEntry{}, err
-	}
-	if err := m.validateACLPrincipal(ctx, entry); err != nil {
-		return ACLEntry{}, err
-	}
-	if err := m.require(ctx, ActionManageACL, entry.resource()); err != nil {
-		return ACLEntry{}, err
-	}
-	if entry.ID == "" {
-		existing, err := m.findMatchingACL(ctx, entry)
-		if err != nil {
-			return ACLEntry{}, err
-		}
-		if existing.ID != "" {
-			entry.ID, entry.CreatedBy, entry.CreatedAt = existing.ID, existing.CreatedBy, existing.CreatedAt
-		} else {
-			entry.ID = uuid.NewString()
-		}
-	}
-	if entry.CreatedAt.IsZero() {
-		entry.CreatedBy = subjectFromContext(ctx)
-		entry.CreatedAt = time.Now().UTC()
-	}
-	if err := m.store.PutACLEntry(ctx, entry); err != nil {
-		return ACLEntry{}, err
-	}
-	return entry, nil
-}
-
 func (m *Manager) validateACLPrincipal(ctx context.Context, entry ACLEntry) error {
 	if entry.PrincipalType != PrincipalTypeDepartment {
 		return nil

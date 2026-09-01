@@ -16,6 +16,7 @@ type Store interface {
 
 	PutACLEntry(context.Context, ACLEntry) error
 	GetACLEntry(context.Context, string, string) (ACLEntry, error)
+	GetACLEntryByID(context.Context, string) (ACLEntry, error)
 	DeleteACLEntry(context.Context, string, string) error
 	ListResourceACL(context.Context, string, string, string, ResourceKind) ([]ACLEntry, error)
 	ListApplicableACL(context.Context, string, string, string) ([]ACLEntry, error)

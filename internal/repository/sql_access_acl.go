@@ -12,16 +12,36 @@ const accessACLColumns = `id, tenant_id, bucket, resource_key, resource_kind,
  principal_type, principal_id, action, effect, inherit_acl, created_by, created_at`
 
 func (s *sqlStore) PutACLEntry(ctx context.Context, entry access.ACLEntry) error {
-	_, err := s.db.ExecContext(ctx, s.rebind(
+	result, err := s.db.ExecContext(ctx, s.rebind(
 		`INSERT INTO resource_acls (`+accessACLColumns+`)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		 ON CONFLICT (id) DO UPDATE SET principal_type=excluded.principal_type,
 		 principal_id=excluded.principal_id, action=excluded.action,
-		 effect=excluded.effect, inherit_acl=excluded.inherit_acl`),
+		 effect=excluded.effect, inherit_acl=excluded.inherit_acl
+		 WHERE resource_acls.tenant_id=excluded.tenant_id
+		 AND resource_acls.bucket=excluded.bucket
+		 AND resource_acls.resource_key=excluded.resource_key
+		 AND resource_acls.resource_kind=excluded.resource_kind`),
 		entry.ID, entry.TenantID, entry.Bucket, entry.Key, string(entry.ResourceKind),
 		string(entry.PrincipalType), entry.PrincipalID, string(entry.Action), string(entry.Effect),
 		boolInt(entry.Inherit), entry.CreatedBy, accessTimeString(entry.CreatedAt))
-	return err
+	if err != nil {
+		return err
+	}
+	return validateACLWriteResult(result)
+}
+
+func validateACLWriteResult(result interface {
+	RowsAffected() (int64, error)
+}) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return access.ErrInvalidArgument
+	}
+	return nil
 }
 
 func (s *sqlStore) DeleteACLEntry(ctx context.Context, tenant, id string) error {
@@ -34,6 +54,16 @@ func (s *sqlStore) GetACLEntry(ctx context.Context, tenant, id string) (access.A
 	row := s.db.QueryRowContext(ctx, s.rebind(
 		`SELECT `+accessACLColumns+` FROM resource_acls WHERE tenant_id=$1 AND id=$2`),
 		tenant, id)
+	entry, err := scanACLEntry(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return access.ACLEntry{}, access.ErrNotFound
+	}
+	return entry, err
+}
+
+func (s *sqlStore) GetACLEntryByID(ctx context.Context, id string) (access.ACLEntry, error) {
+	row := s.db.QueryRowContext(ctx, s.rebind(
+		`SELECT `+accessACLColumns+` FROM resource_acls WHERE id=$1`), id)
 	entry, err := scanACLEntry(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return access.ACLEntry{}, access.ErrNotFound
