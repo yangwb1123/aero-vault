@@ -32,9 +32,9 @@ import (
 // intentionally unclamped (int8 range [-128, 127]): boundary±1 is seeded
 // and mutation drift probes budget-drift space. cancel=true runs
 // GenerateContext with a deterministic cancel-vs-budget handshake: seed S7
-// pins the budget-wins-over-cancel ordering at the exact 8 MiB boundary
-// (the DecodeConfig tee is deliberately not ctx-wrapped, slot_open.go /
-// ctx_reader.go); mutated cancel inputs assert the
+// pins the budget-wins-over-cancel ordering at the exact 8 MiB boundary by
+// canceling while the overflowing DecodeConfig read is already in flight;
+// mutated cancel inputs assert the
 // ErrMetadataTooLarge|ErrImageTooLarge|context.Canceled outcome set (the
 // dims gates run before the post-config ctx check, so a canceled ctx with
 // oversized declared dims yields ErrImageTooLarge, not the context error).
@@ -84,11 +84,15 @@ func FuzzGenerateBudgets(f *testing.F) {
 		}
 		shape %= 2
 		if cancel {
-			err := runCancelLeg(t, budgetStream(shape, delta, data))
+			// Only over-budget metadata legs can reach the overflow gate;
+			// under-budget metadata and all source-cap legs use the first-read
+			// cancellation gate so fuzz mutations cannot wait for an impossible
+			// overflow.
+			err := runCancelLeg(t, budgetStream(shape, delta, data), shape == 0 && delta >= 0)
 			if shape == 0 && delta >= 0 {
 				// Over budget by construction (flood payload ≥ 8 MiB plus
 				// SOI/headers/tail): the budget abort must win over the
-				// canceled ctx (the tee is not ctx-wrapped).
+				// canceled ctx even though DecodeConfig is guarded.
 				if !errors.Is(err, ErrMetadataTooLarge) {
 					t.Fatalf("canceled over-budget stream: err = %v, want ErrMetadataTooLarge", err)
 				}
@@ -174,34 +178,49 @@ func (f *appnFlood) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// runCancelLeg runs GenerateContext over stream with a deterministic
-// cancel-vs-budget handshake (the gatedReader pattern from
-// TestGenerateContextMetadataBudgetWinsOverDeadline): the first read is
-// blocked until the caller cancels the ctx, so the canceled context is
-// guaranteed to precede the config-scan outcome. The DecodeConfig tee is
-// deliberately not ctx-wrapped, so an over-budget stream still trips the
-// budget abort even under the canceled ctx; a cancel that lands after the
-// scan completes surfaces at the post-config boundary check. The goroutine
-// must not call t methods.
-func runCancelLeg(t *testing.T, stream io.Reader) error {
+// runCancelLeg runs GenerateContext with a deterministic cancel-vs-budget
+// handshake. Metadata legs block the source read that crosses the budget;
+// source-cap legs retain the first-read gate. The goroutine must not call t
+// methods, and every gate is released before the result is awaited.
+func runCancelLeg(t *testing.T, stream io.Reader, metadata bool) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	blocked := make(chan struct{})
-	proceed := make(chan struct{})
-	g := &gatedReader{r: stream, blocked: blocked, proceed: proceed}
+	var g io.Reader
+	var blocked <-chan struct{}
+	var release func()
+	if metadata {
+		gate := &metadataOverflowGateReader{
+			r: stream, blocked: make(chan struct{}), release: make(chan struct{}),
+		}
+		g = gate
+		blocked = gate.blocked
+		release = gate.releaseGate
+	} else {
+		gate := &gatedReader{
+			r: stream, blocked: make(chan struct{}), proceed: make(chan struct{}),
+		}
+		g = gate
+		blocked = gate.blocked
+		release = func() { close(gate.proceed) }
+	}
 	done := make(chan error, 1)
 	go func() {
 		_, err := GenerateContext(ctx, g, 64, 64)
 		done <- err
 	}()
 	select {
-	case <-blocked: // first read attempted: slot acquired, config scan started
+	case <-blocked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("GenerateContext never started reading")
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		t.Fatal("GenerateContext did not reach its cancellation gate")
 	}
 	cancel()
-	close(proceed)
+	release()
 	select {
 	case err := <-done:
 		return err

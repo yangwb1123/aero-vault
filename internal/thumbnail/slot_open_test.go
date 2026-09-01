@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"image/jpeg"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,34 +60,69 @@ func countingOpener(data []byte, opens *atomic.Int64) func() (io.ReadCloser, err
 	}
 }
 
+type slotReadyContext struct {
+	context.Context
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (c *slotReadyContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.ready) })
+	return c.Context.Done()
+}
+
+func waitSlotReady(t *testing.T, ready <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GenerateContextWithOpener did not reach slot acquisition")
+	}
+}
+
+func cleanupParkedSlotCall(t *testing.T, cancel func(), done <-chan error, released, joined *bool) {
+	t.Helper()
+	cancel()
+	if !*released {
+		releaseDecodeSlot()
+		*released = true
+	}
+	if !*joined {
+		select {
+		case <-done:
+			*joined = true
+		case <-time.After(2 * time.Second):
+			t.Errorf("parked GenerateContextWithOpener did not exit after cleanup")
+			return
+		}
+	}
+	for i := 0; i < maxConcurrentDecodes-1; i++ {
+		releaseDecodeSlot()
+	}
+	recoverSlots(t)
+}
+
 // TestSlotAcquiredBeforeOpen is the core ordering pin (AC-1): with all 4
 // slots held, the caller parks before the opener runs — the open counter
 // stays 0 while parked — and after one slot frees, the opener runs exactly
 // once and the output decodes.
 func TestSlotAcquiredBeforeOpen(t *testing.T) {
 	slotSaturate()
-	// The parked call takes one of the saturating slots (released below) and
-	// returns it itself, so at cleanup exactly maxConcurrentDecodes-1
-	// saturating slots remain held: drain those, then verify full capacity.
-	defer func() {
-		for i := 0; i < maxConcurrentDecodes-1; i++ {
-			releaseDecodeSlot()
-		}
-		recoverSlots(t)
-	}()
-
 	var opens atomic.Int64
 	var out []byte
+	ctx := &slotReadyContext{Context: context.Background(), ready: make(chan struct{})}
 	done := make(chan error, 1)
+	released, joined := false, false
+	defer func() { cleanupParkedSlotCall(t, func() {}, done, &released, &joined) }()
 	go func() {
 		var err error
-		out, err = GenerateContextWithOpener(context.Background(), 16, 16, countingOpener(makePNG(t, 16, 16), &opens))
+		out, err = GenerateContextWithOpener(ctx, 16, 16, countingOpener(makePNG(t, 16, 16), &opens))
 		done <- err
 	}()
 
 	// Parked window: all 4 slots are held, so the caller is deterministically
 	// parked in acquireDecodeSlotContext's select — the opener is unreachable.
-	time.Sleep(200 * time.Millisecond)
+	waitSlotReady(t, ctx.ready)
 	if n := opens.Load(); n != 0 {
 		t.Fatalf("opener invoked %d times while parked, want 0", n)
 	}
@@ -97,8 +133,10 @@ func TestSlotAcquiredBeforeOpen(t *testing.T) {
 	}
 
 	releaseDecodeSlot() // one slot frees; the parked caller must take it
+	released = true
 	select {
 	case err := <-done:
+		joined = true
 		if err != nil {
 			t.Fatalf("GenerateContextWithOpener: %v", err)
 		}
@@ -121,24 +159,26 @@ func TestSlotAcquiredBeforeOpen(t *testing.T) {
 // the opener is never invoked and the error is ctx.Err().
 func TestSlotParkedCancelNeverOpens(t *testing.T) {
 	slotSaturate()
-	defer releaseAndRecoverSlots(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	baseCtx, cancel := context.WithCancel(context.Background())
+	ctx := &slotReadyContext{Context: baseCtx, ready: make(chan struct{})}
 	var opens atomic.Int64
 	done := make(chan error, 1)
+	released, joined := false, false
+	defer func() { cleanupParkedSlotCall(t, cancel, done, &released, &joined) }()
 	go func() {
 		_, err := GenerateContextWithOpener(ctx, 16, 16, countingOpener(makePNG(t, 16, 16), &opens))
 		done <- err
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	waitSlotReady(t, ctx.ready)
 	if n := opens.Load(); n != 0 {
 		t.Fatalf("opener invoked %d times while parked, want 0", n)
 	}
 	cancel()
 	select {
 	case err := <-done:
+		joined = true
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("err = %v, want context.Canceled", err)
 		}
@@ -156,19 +196,20 @@ func TestSlotParkedCancelNeverOpens(t *testing.T) {
 // a slot.
 func TestSlotDeadlineWhileParkedNeverOpens(t *testing.T) {
 	slotSaturate()
-	defer releaseAndRecoverSlots(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
+	baseCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx := &slotReadyContext{Context: baseCtx, ready: make(chan struct{})}
 	var opens atomic.Int64
 	done := make(chan error, 1)
+	released, joined := false, false
+	defer func() { cleanupParkedSlotCall(t, cancel, done, &released, &joined) }()
 	go func() {
 		_, err := GenerateContextWithOpener(ctx, 16, 16, countingOpener(makePNG(t, 16, 16), &opens))
 		done <- err
 	}()
 
 	// Still parked (well inside the deadline, all slots held).
-	time.Sleep(50 * time.Millisecond)
+	waitSlotReady(t, ctx.ready)
 	if n := opens.Load(); n != 0 {
 		t.Fatalf("opener invoked %d times while parked, want 0", n)
 	}
@@ -179,6 +220,7 @@ func TestSlotDeadlineWhileParkedNeverOpens(t *testing.T) {
 	}
 	select {
 	case err := <-done:
+		joined = true
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 		}

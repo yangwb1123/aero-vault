@@ -207,9 +207,11 @@ func generateContextWithAdmission(
 // at the same phase boundaries as before and additionally inside
 // scale/applyOrientation (every cancelCheckRows rows), inside jpeg.Encode
 // at every emitted byte via the context-checking encode writer (plus a
-// terminal ctx.Err() check after Encode returns), and inside the decode
-// phase: payload reads through the context-checking reader (ctx_reader.go)
-// abort at the next codec buffer fill. Source-stream read failures (storage
+// terminal ctx.Err() check after Encode returns), and inside every source-read
+// phase: DecodeConfig, PNG orientation, and payload reads pass through the
+// context-checking reader (ctx_reader.go); the cap probe has its own instance.
+// A read already in progress may complete, but the next source read is
+// rejected with the exact context error. Source-stream read failures (storage
 // I/O, on-read verification) surface through the sourceReadMarker as
 // *SourceReadError — a server-side error class — instead of ErrUnsupported;
 // only codec-synthesized errors and EOF/truncation keep classifying as
@@ -231,8 +233,8 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// png ReadFull), and the sites below classify marked errors as
 	// *SourceReadError instead of ErrUnsupported. The marker sits INSIDE the
 	// LimitReader so the limit's synthesized EOF is never marked, and
-	// outside the ctxReader so the payload path's raw ctx.Err() aborts
-	// unmarked. errMetadataBudgetExceeded is synthesized by limitedBuffer
+	// beneath the shared ctxReader so raw context errors abort unmarked.
+	// errMetadataBudgetExceeded is synthesized by limitedBuffer
 	// (the tee write side), never by the source — unaffected.
 	r = &sourceReadMarker{r: r}
 	capSrc := r // marker-wrapped source: the cap probe reads through it
@@ -245,7 +247,10 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// capped → ErrSourceTooLarge (a server budget rejection), distinct from
 	// ErrUnsupported (truncated/corrupt input).
 	rec := &sourceCapRecorder{r: r, src: &ctxReader{ctx: ctx, r: capSrc}}
-	r = rec
+	// One outer guard covers DecodeConfig, PNG orientation, and payload
+	// decoding. The cap probe keeps its separate guard above because it
+	// intentionally bypasses the LimitReader.
+	guardedSource := &ctxReader{ctx: ctx, r: rec}
 
 	// Header-only dimension pre-check: no pixel buffer is ever allocated for
 	// oversized sources. image.DecodeConfig consumes from the stream, and each
@@ -253,16 +258,17 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// drains it — so sharing a single buffered reader between DecodeConfig and
 	// Decode would lose the header bytes for small inputs. Instead, tee what
 	// DecodeConfig consumes into head, replay that exact prefix for Decode,
-	// and continue from the raw stream r (not the tee): replaying head then r
-	// is byte-exact and keeps Decode streaming (the payload is read live from
-	// r, never buffered). head is capped at MaxMetadataBytes: image/jpeg's
+	// and continue from guardedSource (not the tee): replaying head then the
+	// guarded stream is byte-exact and keeps Decode streaming (the payload is
+	// read live, never buffered). head is capped at MaxMetadataBytes:
+	// image/jpeg's
 	// config scan reads every pre-SOF segment (APPn/COM/DHT/DQT/DRI) in full
 	// and the segment count is attacker-controlled, so without the cap head
 	// would grow with the payload (bounded only by MaxSourceBytes); exceeding
 	// the budget aborts the config scan with ErrMetadataTooLarge before the
 	// payload is read further or any pixel buffer is allocated.
 	head := &limitedBuffer{remaining: MaxMetadataBytes}
-	cfgR := io.TeeReader(r, head)
+	cfgR := io.TeeReader(guardedSource, head)
 	cfg, format, err := image.DecodeConfig(cfgR)
 	if err != nil {
 		if errors.Is(err, errMetadataBudgetExceeded) {
@@ -338,24 +344,24 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// PNG eXIf orientation: unlike JPEG (whose APP1 DecodeConfig consumed
 	// into head), a PNG's eXIf chunk sits mid-stream, so the walk must run
 	// HERE — before Decode consumes the stream — reading pre-IDAT chunks
-	// from head[33:] and then r through the replay tee. Every byte the walk
-	// reads from the stream is replayed to Decode (byte-identical frame);
-	// the walk is bounded by MaxMetadataBytes (head + replay ≤ budget, the
-	// same expression both sides) and stops at IDAT (compressed data is
-	// never scanned). Errors classify with the exact Decode-site block.
+	// from head[33:] and then the guarded stream through the replay tee.
+	// Every byte the walk reads from the stream is replayed to Decode
+	// (byte-identical frame); the walk is bounded by MaxMetadataBytes (head +
+	// replay ≤ budget, the same expression both sides) and stops at IDAT
+	// (compressed data is never scanned). Errors classify with the exact
+	// Decode-site block.
 	// decodeR replays the exact prefix DecodeConfig (and, for PNG, the
-	// orientation walk) consumed, then continues from the raw stream r
-	// through the context-checking payload reader: mid-decode cancellation
-	// aborts at the next codec buffer fill instead of running the decode to
-	// completion (see ctx_reader.go). The tee paths above are intentionally
-	// NOT wrapped — the config-scan budget and its budget-wins-over-ctx
-	// ordering are pinned by TestGenerateContextMetadataBudgetWinsOverDeadline.
-	payloadR := &ctxReader{ctx: ctx, r: r}
+	// orientation walk) consumed, then continues from the same guarded stream.
+	// The four live-source phases are therefore context-guarded: DecodeConfig,
+	// PNG orientation, payload Decode, and the recorder's separate cap probe.
+	// A read already in progress may complete; the pre-delegation guard stops
+	// the next source read without changing metadata-budget precedence.
+	payloadR := guardedSource
 	pngOrient := 1
 	decodeR := io.MultiReader(bytes.NewReader(head.buf.Bytes()), payloadR)
 	if format == "png" {
 		replay := &limitedBuffer{remaining: MaxMetadataBytes - len(head.buf.Bytes())}
-		pngOrient, err = pngOrientation(ctx, head.buf.Bytes(), io.TeeReader(r, replay))
+		pngOrient, err = pngOrientation(ctx, head.buf.Bytes(), io.TeeReader(guardedSource, replay))
 		if err != nil {
 			if errors.Is(err, errMetadataBudgetExceeded) {
 				return nil, ErrMetadataTooLarge

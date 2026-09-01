@@ -28,9 +28,11 @@ import (
 // them against the r-budget (readN already charges only r-bytes).
 func (c *pngChunkCursor) headAvail() int { return max(0, len(c.head)-c.off) }
 
-// In generateLocked the walk's r is io.TeeReader(stream, replay), so every
-// byte served from the stream also lands in the replay buffer and Decode
-// re-reads the identical byte stream (FR-4). Chunk headers/data straddling
+// In generateLocked the walk's r is a context-guarded
+// io.TeeReader(stream, replay), so every byte served from the stream also
+// lands in the replay buffer and Decode re-reads the identical byte stream
+// (FR-4). The guard checks before each delegated Read; it cannot interrupt an
+// arbitrary Read already in progress. Chunk headers/data straddling
 // the head/r seam are stitched uniformly: the head portion is copied, the
 // r-portion is read through the tee.
 type pngChunkCursor struct {
@@ -79,7 +81,9 @@ func (c *pngChunkCursor) skipN(n int) error {
 // eXIf chunk of a PNG whose header (8-byte signature + 25-byte IHDR chunk)
 // was validated by DecodeConfig and is in head. It walks the chunk stream
 // from byte 33 — in memory over head[33:] first (already counted against
-// MaxMetadataBytes), then over r through generateLocked's replay tee.
+// MaxMetadataBytes), then over the context-guarded r through generateLocked's
+// replay tee. A context error is returned raw for the caller's exact-sentinel
+// classification; malformed/truncated non-context reads retain their fallback.
 //
 // Bounded: head + walk ≤ MaxMetadataBytes (budget = MaxMetadataBytes −
 // len(head); checked before every read from r using the declared 4-byte BE

@@ -262,9 +262,11 @@ func Generate(r io.Reader, maxW, maxH int) ([]byte, error) {
 // non-nil context. Cancellation is honored at acquisition (returns ctx.Err()
 // without reading the stream or consuming a slot) and mid-decode: a stream
 // failure caused by the context's deadline or cancellation is surfaced as
-// the context error, never reclassified as ErrUnsupported. Mid-decode
-// cancellation aborts payload reads at the next codec buffer fill (≤ 4 KiB
-// over-read) via the context-checking reader (ctx_reader.go), and a decode
+// the context error, never reclassified as ErrUnsupported. Every live source-read phase
+// — DecodeConfig, PNG pre-IDAT orientation, payload Decode, and the separate
+// MaxSourceBytes cap probe — passes through a context-checking reader
+// (ctx_reader.go). Cancellation aborts the next delegated read without
+// draining the source; a read already in progress may complete. A decode
 // whose stream is fully read still aborts at the next phase boundary
 // (post-config, post-decode, pre-encode) — and, inside the scale and
 // rotation phases, within cancelCheckRows rows of pixel work, and inside

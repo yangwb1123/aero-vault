@@ -108,7 +108,12 @@ func TestGenerateContextPreservesCancelMidDecode(t *testing.T) {
 		_, err := GenerateContext(ctx, reader, 32, 32)
 		done <- err
 	}()
-	<-blocked // reader is parked in the pre-Decode orientation walk
+	select {
+	case <-blocked: // reader is parked in the pre-Decode orientation walk
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("reader did not reach the mid-decode read")
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -204,16 +209,21 @@ func (r *errAfterDataReader) Read(p []byte) (int, error) {
 // path) or flattened to ErrUnsupported fails the instance equality
 // assertion.
 func TestGenerateContextPreservesWrappedErrorMidDecodeConfig(t *testing.T) {
+	png := makePNG(t, 64, 64)
+	jpeg := makeJPEG(t, 64, 64)
 	for _, tc := range []struct {
 		name     string
 		sentinel error
+		prefix   []byte
 	}{
-		{"DeadlineExceeded", context.DeadlineExceeded},
-		{"Canceled", context.Canceled},
+		{"DeadlineExceeded/PNG", context.DeadlineExceeded, png[:8]},
+		{"Canceled/PNG", context.Canceled, png[:8]},
+		{"DeadlineExceeded/JPEG", context.DeadlineExceeded, jpeg[:2]},
+		{"Canceled/JPEG", context.Canceled, jpeg[:2]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := fmt.Errorf("wrapped: %w", tc.sentinel)
-			reader := &errAfterDataReader{data: makePNG(t, 64, 64)[:8], err: want}
+			reader := &errAfterDataReader{data: tc.prefix, err: want}
 			_, err := GenerateContext(context.Background(), reader, 32, 32)
 			if err != want {
 				t.Fatalf("err = %v, want the same wrapped instance %v", err, want)
@@ -278,36 +288,41 @@ func (g *gatedReader) Read(p []byte) (int, error) {
 // the DecodeConfig site (QA-4): when the metadata budget overflows at the
 // same time the request deadline has already fired, ErrMetadataTooLarge must
 // win — the budget abort is an internal contract distinct from request
-// lifecycle, and its priority predates this fix. The gate makes the overlap
-// deterministic: the reader refuses to serve the 9 MiB APP1-padded fixture
-// until the deadline has fired, so ctx.Err() is guaranteed non-nil when the
-// tee overflows at MaxMetadataBytes. A reordering that checked ctx before
-// the budget would return the deadline error and fail this test.
+// lifecycle, and its priority predates this fix. The gate blocks the source
+// read that crosses the 9 MiB APP1-padded fixture's metadata budget, so the
+// context is guaranteed done while that already-started read is completing.
+// A reordering that checked ctx before the tee budget would return the
+// deadline error and fail this test.
 func TestGenerateContextMetadataBudgetWinsOverDeadline(t *testing.T) {
 	payload := appnPaddedJPEG(t, MaxMetadataBytes+1<<20)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	blocked := make(chan struct{})
-	proceed := make(chan struct{})
-	reader := &gatedReader{r: bytes.NewReader(payload), blocked: blocked, proceed: proceed}
+	ctx := newCancelTestContext()
+	reader := &metadataOverflowGateReader{
+		r: bytes.NewReader(payload), blocked: make(chan struct{}), release: make(chan struct{}),
+	}
 	done := make(chan error, 1)
+	finished := make(chan struct{})
+	var joined atomic.Bool
+	t.Cleanup(func() { cleanupGeneration(t, reader.releaseGate, finished, &joined) })
 	go func() {
 		_, err := GenerateContext(ctx, reader, 100, 100)
 		done <- err
+		close(finished)
 	}()
 	select {
-	case <-blocked: // first read attempted: slot acquired, config scan started
-	case <-time.After(5 * time.Second):
-		t.Fatal("GenerateContext never started reading (acquire did not return)")
+	case <-reader.blocked: // the overflowing config read is in flight
+	case <-time.After(phaseCancellationTimeout):
+		reader.releaseGate()
+		t.Fatal("GenerateContext never reached the overflowing metadata read")
 	}
-	<-ctx.Done() // let the deadline fire while the reader is gated
-	close(proceed)
+	ctx.finish(context.DeadlineExceeded)
+	reader.releaseGate()
 	select {
 	case err := <-done:
+		joined.Store(true)
 		if !errors.Is(err, ErrMetadataTooLarge) {
 			t.Fatalf("err = %v, want ErrMetadataTooLarge (budget wins over the expired deadline)", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(phaseCancellationTimeout):
 		t.Fatal("GenerateContext did not return after budget overflow")
 	}
 }
