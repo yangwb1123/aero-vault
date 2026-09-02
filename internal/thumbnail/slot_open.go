@@ -22,43 +22,6 @@ func (e *OpenError) Error() string { return "thumbnail: open object stream: " + 
 
 func (e *OpenError) Unwrap() error { return e.Err }
 
-// SourceReadError wraps an error returned by the caller-supplied source
-// stream while reading or closing. It lets callers distinguish storage/
-// verification failures (local FS I/O, S3/OSS/COS network errors, an on-read
-// or close-time ETagVerifier checksum mismatch) from codec-synthesized decode
-// errors. Decode-site context errors stay unwrapped; close-time context errors
-// use this wrapper while preserving errors.Is. The sets are disjoint at each
-// boundary, so errors.As on *SourceReadError is exact (same contract as
-// OpenError).
-type SourceReadError struct{ Err error }
-
-func (e *SourceReadError) Error() string {
-	return "thumbnail: reading image source stream: " + e.Err.Error()
-}
-
-func (e *SourceReadError) Unwrap() error { return e.Err }
-
-// sourceReadMarker marks non-EOF, non-context errors returned by the source
-// stream so the decode sites can classify them as *SourceReadError instead
-// of flattening them into ErrUnsupported. io.EOF passes through unmarked
-// (truncated/corrupt objects keep classifying as ErrUnsupported → 400), as
-// do errors matching context.DeadlineExceeded/Canceled via errors.Is
-// (wrapped-SDK context errors keep their exact-instance contract at the
-// decode sites). A partial read carrying an error keeps its n; a (0,nil)
-// read passes through (no busy-loop synthesis).
-type sourceReadMarker struct{ r io.Reader }
-
-func (m *sourceReadMarker) Read(p []byte) (int, error) {
-	n, err := m.r.Read(p)
-	if err == nil || errors.Is(err, io.EOF) {
-		return n, err
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return n, err
-	}
-	return n, &SourceReadError{Err: err}
-}
-
 // probeCapBytes bounds the single probe read sourceCapRecorder performs to
 // decide whether the MaxSourceBytes budget was exhausted mid-stream. It is
 // the only permitted over-read past the cap (pinned by the read-count
@@ -236,9 +199,9 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// beneath the shared ctxReader so raw context errors abort unmarked.
 	// errMetadataBudgetExceeded is synthesized by limitedBuffer
 	// (the tee write side), never by the source — unaffected.
-	r = &sourceReadMarker{r: r}
-	capSrc := r // marker-wrapped source: the cap probe reads through it
-	r = io.LimitReader(r, MaxSourceBytes)
+	marker := &sourceReadMarker{r: r}
+	capSrc := marker // marker-wrapped source: the cap probe reads through it
+	r = io.LimitReader(marker, MaxSourceBytes)
 	// The cap recorder wraps the LimitReader OUTPUT (the marker stays inside
 	// the limit): it records whether the limit's synthesized EOF cut a source
 	// stream that still carried data. The probe reads through the marker, so
@@ -341,6 +304,9 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	if cerr := ctx.Err(); cerr != nil {
 		return nil, cerr
 	}
+	if sourceErr := marker.firstSourceError(); sourceErr != nil {
+		return nil, sourceErr
+	}
 	// PNG eXIf orientation: unlike JPEG (whose APP1 DecodeConfig consumed
 	// into head), a PNG's eXIf chunk sits mid-stream, so the walk must run
 	// HERE — before Decode consumes the stream — reading pre-IDAT chunks
@@ -424,6 +390,9 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		return nil, cerr
+	}
+	if sourceErr := marker.firstSourceError(); sourceErr != nil {
+		return nil, sourceErr
 	}
 	// EXIF orientation (JPEG APP1 + PNG eXIf): the JPEG tag lives in the
 	// APP1 segment that DecodeConfig consumed into head (its config scan
