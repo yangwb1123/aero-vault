@@ -44,6 +44,24 @@ func TestGenerateRejectsCompletePayloadWithSourceError(t *testing.T) {
 	}
 }
 
+func TestGenerateRejectsCompletePayloadSourceErrorForEveryCodec(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload func(testing.TB) []byte
+	}{
+		{name: "JPEG", payload: func(t testing.TB) []byte { return makeJPEG(t, 8, 8) }},
+		{name: "PNG", payload: func(t testing.TB) []byte { return makePNG(t, 8, 8) }},
+		{name: "GIF", payload: func(t testing.TB) []byte { return makeGIF(t) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			injected := errors.New("source failed after complete payload")
+			source := &completePayloadErrorReader{payload: tc.payload(t), err: injected}
+			img, err := GenerateContext(context.Background(), source, 32, 32)
+			assertSourceReadFailure(t, img, err, injected)
+		})
+	}
+}
+
 // stagedPayloadErrorReader keeps the DecodeConfig prefix separate from the
 // remaining complete JPEG. DecodeConfig succeeds after the first read; the
 // payload decoder then receives the rest of the image and a source error in

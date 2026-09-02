@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"image"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -244,6 +245,133 @@ func TestThumbnailCloseErrorRESTClassificationAndHeaders(t *testing.T) {
 			}
 			if cache.Len() != 0 || cache.Bytes() != 0 {
 				t.Fatalf("failed thumbnail populated cache: len=%d bytes=%d", cache.Len(), cache.Bytes())
+			}
+		})
+	}
+}
+
+// completePayloadErrorStore returns a valid complete image and a source error
+// from the same Read. It deliberately does not expose generation-bound reads,
+// keeping this test at the storage reader seam used by the REST fallback path.
+type completePayloadErrorStore struct {
+	storage.Storage
+	payload []byte
+	err     error
+	gets    atomic.Int64
+	closes  atomic.Int64
+}
+
+func (s *completePayloadErrorStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.ObjectInfo, error) {
+	rc, info, err := s.Storage.Get(ctx, key)
+	if err != nil {
+		return nil, info, err
+	}
+	s.gets.Add(1)
+	return &completePayloadErrorReadCloser{
+		ReadCloser: rc, payload: s.payload, err: s.err, closes: &s.closes,
+	}, info, nil
+}
+
+type completePayloadErrorReadCloser struct {
+	io.ReadCloser
+	payload []byte
+	err     error
+	closes  *atomic.Int64
+	off     int
+	fired   bool
+}
+
+func (r *completePayloadErrorReadCloser) Read(p []byte) (int, error) {
+	if r.off >= len(r.payload) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.payload[r.off:])
+	r.off += n
+	if r.off == len(r.payload) && !r.fired {
+		r.fired = true
+		return n, r.err
+	}
+	return n, nil
+}
+
+func (r *completePayloadErrorReadCloser) Close() error {
+	r.closes.Add(1)
+	return r.ReadCloser.Close()
+}
+
+func newCompletePayloadErrorREST(t *testing.T, payload []byte, sourceErr error) (*httptest.Server, *Handler, *completePayloadErrorStore) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "thumbnail.db"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	if err := repo.Migrate(ctx); err != nil {
+		t.Fatalf("migrate repository: %v", err)
+	}
+	realStore, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	store := &completePayloadErrorStore{Storage: realStore, payload: payload, err: sourceErr}
+	h := NewHandler(service.NewFileService(store, repo, nil).WithDeleteFailOpen(true), nil).
+		WithThumbnailCache(thumbnail.NewCache(1<<20, 0))
+	r := chi.NewRouter()
+	r.Put("/v1/files/*", h.putKey)
+	r.Get("/v1/files/*", h.getKey)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() {
+		srv.Close()
+		_ = repo.Close()
+	})
+	return srv, h, store
+}
+
+func TestThumbnailCompletePayloadSourceErrorREST(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "storage IO", err: errors.New("source failed after complete PNG"), wantStatus: http.StatusInternalServerError, wantCode: "InternalError"},
+		{name: "object corrupt", err: errors.Join(service.ErrObjectCorrupt, errors.New("checksum mismatch")), wantStatus: http.StatusGone, wantCode: "ObjectCorrupt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := pngBytes(t, 8, 8)
+			srv, h, store := newCompletePayloadErrorREST(t, payload, tc.err)
+			u := srv.URL + "/v1/files/source.png"
+			if resp, _ := req(t, "PUT", u, payload, map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
+				t.Fatalf("PUT status = %d, want %d", resp.StatusCode, http.StatusCreated)
+			}
+
+			resp, body := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, nil)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%q)", resp.StatusCode, tc.wantStatus, body)
+			}
+			if !bytes.Contains(body, []byte(`"code":"`+tc.wantCode+`"`)) {
+				t.Fatalf("body = %s, want code %s", body, tc.wantCode)
+			}
+			if resp.Header.Get("Content-Type") == "image/jpeg" {
+				t.Fatalf("failure response advertised image/jpeg")
+			}
+			if img, format, decodeErr := image.Decode(bytes.NewReader(body)); decodeErr == nil && format == "jpeg" {
+				t.Fatalf("failure response contained a generated JPEG: bounds=%s", img.Bounds())
+			}
+			for _, header := range []string{"ETag", "Cache-Control", "Last-Modified"} {
+				if got := resp.Header.Get(header); got != "" {
+					t.Fatalf("failure response emitted %s=%q", header, got)
+				}
+			}
+			if h.thumbnailCache.Len() != 0 || h.thumbnailCache.Bytes() != 0 {
+				t.Fatalf("failed generation populated cache: len=%d bytes=%d", h.thumbnailCache.Len(), h.thumbnailCache.Bytes())
+			}
+			if got := store.gets.Load(); got != 1 {
+				t.Fatalf("storage Get count = %d, want one", got)
+			}
+			if got := store.closes.Load(); got != 1 {
+				t.Fatalf("source Close count = %d, want exactly one", got)
 			}
 		})
 	}

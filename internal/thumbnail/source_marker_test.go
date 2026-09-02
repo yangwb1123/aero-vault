@@ -47,19 +47,24 @@ func TestSourceReadMarkerDoesNotDoubleWrap(t *testing.T) {
 }
 
 func TestSourceReadMarkerDoesNotRetainContextOrEOF(t *testing.T) {
-	wrappedContext := fmt.Errorf("wrapped: %w", context.Canceled)
+	wrappedCanceled := fmt.Errorf("wrapped: %w", context.Canceled)
+	wrappedDeadline := fmt.Errorf("wrapped: %w", context.DeadlineExceeded)
 	for _, tc := range []struct {
-		name string
-		err  error
+		name  string
+		input stubReadResult
 	}{
-		{name: "EOF", err: io.EOF},
-		{name: "context", err: wrappedContext},
+		{name: "partial EOF", input: stubReadResult{n: 2, err: io.EOF}},
+		{name: "partial canceled", input: stubReadResult{n: 3, err: wrappedCanceled}},
+		{name: "partial deadline", input: stubReadResult{n: 4, err: wrappedDeadline}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			marker := &sourceReadMarker{r: &stubReader{results: []stubReadResult{{err: tc.err}}}}
-			_, got := marker.Read(make([]byte, 1))
-			if got != tc.err {
-				t.Fatalf("error = %v, want original error %v", got, tc.err)
+			marker := &sourceReadMarker{r: &stubReader{results: []stubReadResult{tc.input}}}
+			n, got := marker.Read(make([]byte, 8))
+			if n != tc.input.n {
+				t.Fatalf("n = %d, want %d", n, tc.input.n)
+			}
+			if got != tc.input.err {
+				t.Fatalf("error = %v, want original error %v", got, tc.input.err)
 			}
 			if marker.firstSourceError() != nil {
 				t.Fatalf("retained error = %v, want nil", marker.firstSourceError())
