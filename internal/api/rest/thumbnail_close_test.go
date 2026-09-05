@@ -180,7 +180,7 @@ func TestThumbnailCloseErrorRESTClassificationAndHeaders(t *testing.T) {
 	}{
 		{
 			name:       "generic close",
-			closeErr:   errors.New("backend close failed"),
+			closeErr:   errors.New("provider=https://objects.example.test bucket=private request-token=close-abc"),
 			wantStatus: http.StatusInternalServerError,
 			wantCode:   "InternalError",
 			wantReason: "source_error",
@@ -228,6 +228,24 @@ func TestThumbnailCloseErrorRESTClassificationAndHeaders(t *testing.T) {
 					}
 					if !bytes.Contains(body, []byte(`"code":"`+tc.wantCode+`"`)) {
 						t.Fatalf("request %d body = %s, want %s", i+1, body, tc.wantCode)
+					}
+					if tc.name == "generic close" {
+						if !bytes.Contains(body, []byte(`"message":"internal server error"`)) {
+							t.Fatalf("request %d generic close message = %s", i+1, body)
+						}
+						for _, detail := range []string{"objects.example.test", "private", "close-abc"} {
+							if bytes.Contains(body, []byte(detail)) {
+								t.Fatalf("request %d leaked close detail %q: %s", i+1, detail, body)
+							}
+						}
+					}
+					if tc.name == "decode and close" {
+						if !bytes.Contains(body, []byte("thumbnail: unsupported or invalid image")) {
+							t.Fatalf("request %d decode message = %s", i+1, body)
+						}
+						if bytes.Contains(body, []byte("close after decode failure")) {
+							t.Fatalf("request %d leaked joined close detail: %s", i+1, body)
+						}
 					}
 				}
 				for _, header := range []string{"ETag", "Cache-Control", "Last-Modified"} {
@@ -335,7 +353,7 @@ func TestThumbnailCompletePayloadSourceErrorREST(t *testing.T) {
 		wantStatus int
 		wantCode   string
 	}{
-		{name: "storage IO", err: errors.New("source failed after complete PNG"), wantStatus: http.StatusInternalServerError, wantCode: "InternalError"},
+		{name: "storage IO", err: errors.New("provider=https://objects.example.test/bucket/source request-token=read-xyz"), wantStatus: http.StatusInternalServerError, wantCode: "InternalError"},
 		{name: "object corrupt", err: errors.Join(service.ErrObjectCorrupt, errors.New("checksum mismatch")), wantStatus: http.StatusGone, wantCode: "ObjectCorrupt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -352,6 +370,16 @@ func TestThumbnailCompletePayloadSourceErrorREST(t *testing.T) {
 			}
 			if !bytes.Contains(body, []byte(`"code":"`+tc.wantCode+`"`)) {
 				t.Fatalf("body = %s, want code %s", body, tc.wantCode)
+			}
+			if tc.name == "storage IO" {
+				if !bytes.Contains(body, []byte(`"message":"internal server error"`)) {
+					t.Fatalf("body = %s, want stable generic message", body)
+				}
+				for _, detail := range []string{"objects.example.test", "bucket", "source", "read-xyz"} {
+					if bytes.Contains(body, []byte(detail)) {
+						t.Fatalf("provider detail %q leaked into body: %s", detail, body)
+					}
+				}
 			}
 			if resp.Header.Get("Content-Type") == "image/jpeg" {
 				t.Fatalf("failure response advertised image/jpeg")

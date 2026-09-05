@@ -64,6 +64,12 @@ Errors use a consistent envelope:
 | 507 | `QuotaExceeded` | Tenant byte/object quota exceeded. |
 | 500 | `InternalError` | Unexpected error. |
 
+Thumbnail generation uses the stable message `internal server error` for
+unknown opener, source-read, and source-close failures. Provider diagnostics
+are logged server-side and are not returned to REST clients; known thumbnail
+classifications such as `NotFound`, `Timeout`, `ObjectCorrupt`, and decode
+errors retain their normal status and message.
+
 In the examples below, `$BASE` is the server URL and `$KEY`/`$TOKEN` are
 placeholders. Set `-H "Authorization: Bearer $TOKEN"` and
 `-H "X-Aero-Tenant: acme"` as needed.

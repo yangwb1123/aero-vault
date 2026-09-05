@@ -6,6 +6,10 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ## 2026-08-16
 
+### Fixed
+- **Thumbnail REST: redact arbitrary storage diagnostics from generation errors** (`internal/api/rest/handler_helpers.go`)
+  - Unknown opener, source-read, and source-close failures retain `500 InternalError` but return the stable message `internal server error`; provider details remain available in server logs and are never serialized to the client. Known `NotFound`, timeout, corruption, and decode classifications are unchanged, including joined decode-plus-close failures. No migration, configuration, dependency, or OpenAPI change.
+
 ### Changed
 - **Thumbnail: TTL-expired cache reads distinguished from genuine misses in hit-ratio metrics** (`internal/thumbnail/cache.go`, `internal/thumbnail/cache_entry.go`, `internal/telemetry/thumbnail.go`, `internal/telemetry/metrics.go`)
   - `Cache.Get` now returns a tri-state outcome (`GetHit`/`GetMiss`/`GetExpired`): a TTL-expired read is removed and classified as its own class — **not** a miss — so `Cache.Stats` (now `hits, misses, evictions, expired`) and the new `thumbnail_cache_expired_total` counter (dotted `thumbnail.cache.expired_total`) account for it separately. `lookupCached` routes the outcome to `IncThumbnailCacheExpired`; an expired read still returns `(nil, false)` upstream, so the miss body runs and re-stores with a fresh expiry — served behavior is byte-identical.

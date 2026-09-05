@@ -1695,8 +1695,15 @@ func TestThumbnailMidDecodeStorageError(t *testing.T) {
 				if cc := resp.Header.Get("Cache-Control"); cc != "" {
 					t.Fatalf("%s path emitted Cache-Control %q", tc.wantCode, cc)
 				}
-				if tc.wantCode == "InternalError" && !bytes.Contains(body, []byte("s3 read failed")) {
-					t.Fatalf("expected the injected error message in the body, got: %s", body)
+				if tc.wantCode == "InternalError" {
+					if !bytes.Contains(body, []byte(`"message":"internal server error"`)) {
+						t.Fatalf("expected stable generic message, got: %s", body)
+					}
+					for _, detail := range []string{"s3 read failed", "i/o error"} {
+						if bytes.Contains(body, []byte(detail)) {
+							t.Fatalf("provider detail %q leaked into the body: %s", detail, body)
+						}
+					}
 				}
 			}
 		})
@@ -3327,6 +3334,30 @@ func TestThumbnailOpenErrorAfterStatRace404(t *testing.T) {
 	}
 	if !bytes.Contains(rec2.Body.Bytes(), []byte(`"code":"InternalError"`)) {
 		t.Fatalf("canceled open: expected JSON error body, got %q", rec2.Body.String())
+	}
+
+	// Unknown provider failures keep the source_error classification but must
+	// not expose backend details at the REST boundary.
+	fs.err = errors.New("provider=https://objects.example.test bucket=private request-token=open-xyz")
+	rq3 := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil)
+	rec3 := httptest.NewRecorder()
+	r.ServeHTTP(rec3, rq3)
+	if rec3.Code != http.StatusInternalServerError {
+		t.Fatalf("unknown open: status=%d want 500 (body=%q)", rec3.Code, rec3.Body.String())
+	}
+	if !bytes.Contains(rec3.Body.Bytes(), []byte(`"code":"InternalError"`)) ||
+		!bytes.Contains(rec3.Body.Bytes(), []byte(`"message":"internal server error"`)) {
+		t.Fatalf("unknown open: want stable generic error body, got %q", rec3.Body.String())
+	}
+	for _, detail := range []string{"objects.example.test", "private", "open-xyz"} {
+		if bytes.Contains(rec3.Body.Bytes(), []byte(detail)) {
+			t.Fatalf("unknown open: provider detail %q leaked into %q", detail, rec3.Body.String())
+		}
+	}
+	for _, header := range []string{"ETag", "Last-Modified", "Cache-Control", "X-Version-Id", "Content-Type"} {
+		if got := rec3.Header().Get(header); got == "image/jpeg" || (header != "Content-Type" && got != "") {
+			t.Fatalf("unknown open emitted success header %s=%q", header, got)
+		}
 	}
 }
 

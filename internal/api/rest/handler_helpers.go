@@ -26,6 +26,29 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 	}})
 }
 
+const thumbnailInternalErrorMessage = "internal server error"
+
+// writeThumbnailSourceError keeps arbitrary storage diagnostics on the server
+// side. Known classifications still use the normal REST response, while an
+// unclassified opener/read/close failure gets a stable message that cannot
+// disclose provider URLs, bucket names, paths, or request tokens.
+func (h *Handler) writeThumbnailSourceError(w http.ResponseWriter, r *http.Request, err error) {
+	code, _, status := classify(err)
+	preserve := errors.Is(err, thumbnail.ErrNilSource) || errors.Is(err, context.Canceled)
+	if code != "InternalError" || status != http.StatusInternalServerError || preserve {
+		h.writeError(w, r, err)
+		return
+	}
+	if h.logger != nil {
+		h.logger.Error("thumbnail source failure", "err", err,
+			"request_id", mw.RequestIDFrom(r.Context()))
+	}
+	writeJSON(w, status, errorBody{Error: errorPayload{
+		Code: code, Message: thumbnailInternalErrorMessage,
+		RequestID: mw.RequestIDFrom(r.Context()),
+	}})
+}
+
 // thumbnailRejectionReason maps a thumbnail derivation error to exactly one
 // rejection reason label, or ("", true) when the failure is silent (client
 // disconnect — no response is emitted, so no counter). Branch order mirrors
@@ -113,7 +136,7 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 	}
 	var oe *thumbnail.OpenError
 	if errors.As(err, &oe) {
-		h.writeError(w, r, oe.Err)
+		h.writeThumbnailSourceError(w, r, oe.Err)
 		return
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -147,10 +170,9 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 	}
 	if errors.Is(err, thumbnail.ErrUnsupported) {
 		// Preserve the existing 400 decode classification when a decode error
-		// is joined with a source-close failure. Without this branch the
-		// SourceReadError arm below would incorrectly let the secondary close
-		// error decide the wire status (typically 500).
-		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
+		// is joined with a source-close failure. Use only the safe decode
+		// sentinel; stringifying err would expose the secondary close error.
+		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, thumbnail.ErrUnsupported))
 		return
 	}
 	// Source-stream read or close failures (storage I/O, on-read or close-time
@@ -162,7 +184,7 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 	// branch above).
 	var sre *thumbnail.SourceReadError
 	if errors.As(err, &sre) {
-		h.writeError(w, r, sre.Err)
+		h.writeThumbnailSourceError(w, r, sre.Err)
 		return
 	}
 	h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, err))
