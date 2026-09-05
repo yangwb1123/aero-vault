@@ -97,6 +97,21 @@ func TestWriteThumbnailSourceErrorPreservesKnownErrors(t *testing.T) {
 	}
 }
 
+func TestWriteThumbnailGenerateErrorPreservesServiceTimeout(t *testing.T) {
+	const detail = "provider timeout endpoint=https://objects.example.test token=timeout-456"
+	h := &Handler{}
+	r := httptest.NewRequest(http.MethodGet, "/v1/files/photo.png/thumbnail", nil)
+	rec := httptest.NewRecorder()
+	h.writeThumbnailGenerateError(rec, r, fmt.Errorf("%s: %w", detail, service.ErrTimeout))
+	payload := decodeThumbnailError(t, rec)
+	if rec.Code != http.StatusGatewayTimeout || payload.Code != "Timeout" || payload.Message != "request timed out" {
+		t.Fatalf("response=(%d,%q,%q), want (504,Timeout,%q)", rec.Code, payload.Code, payload.Message, "request timed out")
+	}
+	if strings.Contains(rec.Body.String(), detail) || strings.Contains(rec.Body.String(), "pipeline") {
+		t.Fatalf("timeout detail leaked into response: %q", rec.Body.String())
+	}
+}
+
 func decodeThumbnailError(t *testing.T, rec *httptest.ResponseRecorder) errorPayload {
 	t.Helper()
 	var body errorBody
@@ -191,13 +206,14 @@ func TestThumbnailGenericMIMEPrefixErrorIsRedactedAtREST(t *testing.T) {
 				t.Fatalf("PUT status = %d, want %d", resp.StatusCode, http.StatusCreated)
 			}
 			pre := snapshotThumbCounters(t)
-			requestID := "generic-prefix-request"
+			requestID := "generic-redaction-request"
 			resp, body := req(t, http.MethodGet, u+"/thumbnail", nil, map[string]string{"X-Request-ID": requestID})
 			payload := decodeThumbnailErrorBytes(t, body)
 			if resp.StatusCode != http.StatusInternalServerError || payload.Code != "InternalError" || payload.Message != thumbnailInternalErrorMessage {
 				t.Fatalf("response=(%d,%q,%q), want (500,InternalError,%q); body=%q", resp.StatusCode, payload.Code, payload.Message, thumbnailInternalErrorMessage, body)
 			}
-			assertRedactedThumbnailFailure(t, resp, body, detail)
+			assertRedactedThumbnailFailure(t, resp, body,
+				"objects.example.test", "bucket", "prefix", "prefix-789")
 			assertThumbDeltas(t, pre, "source_error", 0)
 			if got := store.gets.Load(); got != 1 {
 				t.Fatalf("storage Get count = %d, want 1", got)

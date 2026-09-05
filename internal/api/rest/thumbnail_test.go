@@ -3453,7 +3453,7 @@ func TestThumbnailDeadlineWhileParkedIs504(t *testing.T) {
 
 // TestThumbnailMetadataTooLargeClassifySeam pins the classify() seam for the
 // metadata-budget sentinel: the raw sentinel maps to 413 MetadataTooLarge
-// (RFC 9110 §15.5.17 Payload Too Large — the request's declared metadata
+// (RFC 9110 §15.5.14 Content Too Large — the request's declared metadata
 // exceeds the server's processing budget), while a wrapped ErrInvalidArgs
 // stays 400 InvalidArgument — the two classes must not blur.
 func TestThumbnailMetadataTooLargeClassifySeam(t *testing.T) {
@@ -3488,7 +3488,7 @@ func TestThumbnailMetadataTooLargeClassifySeam(t *testing.T) {
 
 // TestThumbnailSourceTooLargeClassifySeam pins the classify() seam for the
 // source-budget sentinel: the raw sentinel maps to 413 SourceTooLarge (RFC
-// 9110 §15.5.17 Payload Too Large — the request's source image payload
+// 9110 §15.5.14 Content Too Large — the request's source image payload
 // exceeds the server's 128 MiB compressed-input processing budget), while a
 // wrapped ErrInvalidArgs stays 400 InvalidArgument — the two classes must not
 // blur (cap-hit = server budget error vs. corrupt input = client argument
@@ -5759,7 +5759,14 @@ func TestThumbnailRejectionReasonUnit(t *testing.T) {
 		{"unsupported", thumbnail.ErrUnsupported, "unsupported", false},
 		{"invalid args", service.ErrInvalidArgs, "invalid_argument", false},
 		{"deadline exceeded", context.DeadlineExceeded, "timeout", false},
+		{"service timeout", service.ErrTimeout, "timeout", false},
+		{"open service timeout", &thumbnail.OpenError{Err: service.ErrTimeout}, "timeout", false},
+		{"source service timeout", &thumbnail.SourceReadError{Err: service.ErrTimeout}, "timeout", false},
 		{"canceled silent", context.Canceled, "", true},
+		{"open exact cancellation remains silent", &thumbnail.OpenError{Err: context.Canceled}, "", true},
+		{"open wrapped cancellation is visible", &thumbnail.OpenError{
+			Err: fmt.Errorf("provider token: %w", context.Canceled),
+		}, "source_error", false},
 		{"open error declared unsupported", &thumbnail.OpenError{
 			Err: fmt.Errorf("%w: unsupported image format %q", thumbnail.ErrUnsupportedFormat, "webp"),
 		}, "unsupported_format", false},

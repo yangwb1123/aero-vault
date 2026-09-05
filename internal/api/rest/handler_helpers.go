@@ -43,28 +43,26 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 // visible 500 response without a rejection counter; a wrapped cancellation is
 // an observable source_error and is redacted by writeThumbnailSourceError.
 func thumbnailRejectionReason(err error) (reason string, silent bool) {
-	var oe *thumbnail.OpenError
-	if errors.As(err, &oe) && oe.Err != context.Canceled && errors.Is(oe.Err, context.Canceled) {
-		// An opener that wraps cancellation with provider diagnostics is still
-		// a visible source failure (the OpenError branch emits a 500). Keep it
-		// observable as source_error rather than silently treating it as a
-		// client disconnect; only the exact cancellation sentinel retains the
-		// legacy silent behavior.
-		return "source_error", false
-	}
 	if errors.Is(err, thumbnail.ErrUnsupported) {
 		return "unsupported", false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, service.ErrTimeout) {
 		return "timeout", false
 	}
 	if errors.Is(err, context.Canceled) {
+		var oe *thumbnail.OpenError
+		if errors.As(err, &oe) {
+			if oe.Err == context.Canceled {
+				return "", true
+			}
+			return "source_error", false
+		}
 		var sre *thumbnail.SourceReadError
 		if errors.As(err, &sre) {
-			if sre.Err != context.Canceled && errors.Is(sre.Err, context.Canceled) {
-				return "source_error", false
+			if sre.Err == context.Canceled {
+				return "", true
 			}
-			return "", true
+			return "source_error", false
 		}
 		if err != context.Canceled {
 			return "source_error", false
@@ -92,6 +90,7 @@ func thumbnailRejectionReason(err error) (reason string, silent bool) {
 	if errors.Is(err, service.ErrInvalidArgs) {
 		return "invalid_argument", false
 	}
+	var oe *thumbnail.OpenError
 	var sre *thumbnail.SourceReadError
 	if errors.As(err, &oe) || errors.As(err, &sre) {
 		return "source_error", false
@@ -141,7 +140,7 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, thumbnail.ErrUnsupported))
 		return
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, service.ErrTimeout) {
 		h.writeError(w, r, service.ErrTimeout)
 		return
 	}
@@ -240,8 +239,8 @@ func classify(err error) (string, string, int) {
 		// defense), and errors.Is on the raw sentinel never matches
 		// ErrInvalidArgs — without this case the raw sentinel would fall
 		// through to default → 500 InternalError. The class is 413 per RFC
-		// 9110 §15.5.17 (Payload Too Large): the request's declared
-		// image metadata exceeds the server's processing budget (8 MiB),
+		// 9110 §15.5.14 (Content Too Large): the request's declared image
+		// metadata exceeds the server's processing budget (8 MiB),
 		// before any pixel buffer is allocated.
 		return "MetadataTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, thumbnail.ErrSourceTooLarge):
@@ -250,8 +249,7 @@ func classify(err error) (string, string, int) {
 		// defense), and errors.Is on the raw sentinel never matches
 		// ErrInvalidArgs — without this case the raw sentinel would fall
 		// through to default → 500 InternalError. The class is 413 per RFC
-		// 9110 §15.5.17 (Content Too Large — the RFC 9110 successor to the
-		// RFC 7231 "Payload Too Large" title): the request's source image
+		// 9110 §15.5.14 (Content Too Large): the request's source image
 		// payload exceeds the server's 128 MiB compressed-input processing
 		// budget (MaxSourceBytes) and was cut mid-decode by the read cap.
 		return "SourceTooLarge", err.Error(), http.StatusRequestEntityTooLarge
