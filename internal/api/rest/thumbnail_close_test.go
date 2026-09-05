@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"net/http"
@@ -66,6 +67,7 @@ func TestThumbnailCloseVerificationFailureIsGoneAndNotCached(t *testing.T) {
 		if !bytes.Contains(body, []byte(`"code":"ObjectCorrupt"`)) {
 			t.Fatalf("request %d body = %s, want ObjectCorrupt", i+1, body)
 		}
+		assertRedactedThumbnailFailure(t, resp, body)
 		if got := resp.Header.Get("ETag"); got != "" {
 			t.Fatalf("request %d emitted success ETag %q", i+1, got)
 		}
@@ -199,8 +201,23 @@ func TestThumbnailCloseErrorRESTClassificationAndHeaders(t *testing.T) {
 			silent:     true,
 		},
 		{
+			name:       "wrapped canceled close",
+			closeErr:   fmt.Errorf("provider=https://objects.example.test/bucket token=close-canceled: %w", context.Canceled),
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "InternalError",
+			wantReason: "source_error",
+		},
+		{
 			name:       "decode and close",
 			closeErr:   errors.New("close after decode failure"),
+			truncateAt: dataLen / 2,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "InvalidArgument",
+			wantReason: "unsupported",
+		},
+		{
+			name:       "decode and deadline close",
+			closeErr:   context.DeadlineExceeded,
 			truncateAt: dataLen / 2,
 			wantStatus: http.StatusBadRequest,
 			wantCode:   "InvalidArgument",
@@ -229,11 +246,11 @@ func TestThumbnailCloseErrorRESTClassificationAndHeaders(t *testing.T) {
 					if !bytes.Contains(body, []byte(`"code":"`+tc.wantCode+`"`)) {
 						t.Fatalf("request %d body = %s, want %s", i+1, body, tc.wantCode)
 					}
-					if tc.name == "generic close" {
+					if tc.name == "generic close" || tc.name == "wrapped canceled close" {
 						if !bytes.Contains(body, []byte(`"message":"internal server error"`)) {
 							t.Fatalf("request %d generic close message = %s", i+1, body)
 						}
-						for _, detail := range []string{"objects.example.test", "private", "close-abc"} {
+						for _, detail := range []string{"objects.example.test", "private", "close-abc", "close-canceled"} {
 							if bytes.Contains(body, []byte(detail)) {
 								t.Fatalf("request %d leaked close detail %q: %s", i+1, detail, body)
 							}
@@ -247,6 +264,7 @@ func TestThumbnailCloseErrorRESTClassificationAndHeaders(t *testing.T) {
 							t.Fatalf("request %d leaked joined close detail: %s", i+1, body)
 						}
 					}
+					assertRedactedThumbnailFailure(t, resp, body)
 				}
 				for _, header := range []string{"ETag", "Cache-Control", "Last-Modified"} {
 					if got := resp.Header.Get(header); got != "" {
@@ -352,9 +370,10 @@ func TestThumbnailCompletePayloadSourceErrorREST(t *testing.T) {
 		err        error
 		wantStatus int
 		wantCode   string
+		wantReason string
 	}{
-		{name: "storage IO", err: errors.New("provider=https://objects.example.test/bucket/source request-token=read-xyz"), wantStatus: http.StatusInternalServerError, wantCode: "InternalError"},
-		{name: "object corrupt", err: errors.Join(service.ErrObjectCorrupt, errors.New("checksum mismatch")), wantStatus: http.StatusGone, wantCode: "ObjectCorrupt"},
+		{name: "storage IO", err: errors.New("provider=https://objects.example.test/bucket/source request-token=read-xyz"), wantStatus: http.StatusInternalServerError, wantCode: "InternalError", wantReason: "source_error"},
+		{name: "object corrupt", err: errors.Join(service.ErrObjectCorrupt, errors.New("checksum mismatch")), wantStatus: http.StatusGone, wantCode: "ObjectCorrupt", wantReason: "source_error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			payload := pngBytes(t, 8, 8)
@@ -364,12 +383,18 @@ func TestThumbnailCompletePayloadSourceErrorREST(t *testing.T) {
 				t.Fatalf("PUT status = %d, want %d", resp.StatusCode, http.StatusCreated)
 			}
 
+			pre := snapshotThumbCounters(t)
 			resp, body := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, nil)
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("status = %d, want %d (body=%q)", resp.StatusCode, tc.wantStatus, body)
 			}
 			if !bytes.Contains(body, []byte(`"code":"`+tc.wantCode+`"`)) {
 				t.Fatalf("body = %s, want code %s", body, tc.wantCode)
+			}
+			assertThumbDeltas(t, pre, tc.wantReason, 0)
+			assertRedactedThumbnailFailure(t, resp, body)
+			if tc.name == "object corrupt" && !bytes.Contains(body, []byte(`"message":"object is marked as corrupt"`)) {
+				t.Fatalf("body = %s, want canonical corruption message", body)
 			}
 			if tc.name == "storage IO" {
 				if !bytes.Contains(body, []byte(`"message":"internal server error"`)) {

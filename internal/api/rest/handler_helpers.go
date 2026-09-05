@@ -26,29 +26,6 @@ func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) 
 	}})
 }
 
-const thumbnailInternalErrorMessage = "internal server error"
-
-// writeThumbnailSourceError keeps arbitrary storage diagnostics on the server
-// side. Known classifications still use the normal REST response, while an
-// unclassified opener/read/close failure gets a stable message that cannot
-// disclose provider URLs, bucket names, paths, or request tokens.
-func (h *Handler) writeThumbnailSourceError(w http.ResponseWriter, r *http.Request, err error) {
-	code, _, status := classify(err)
-	preserve := errors.Is(err, thumbnail.ErrNilSource) || errors.Is(err, context.Canceled)
-	if code != "InternalError" || status != http.StatusInternalServerError || preserve {
-		h.writeError(w, r, err)
-		return
-	}
-	if h.logger != nil {
-		h.logger.Error("thumbnail source failure", "err", err,
-			"request_id", mw.RequestIDFrom(r.Context()))
-	}
-	writeJSON(w, status, errorBody{Error: errorPayload{
-		Code: code, Message: thumbnailInternalErrorMessage,
-		RequestID: mw.RequestIDFrom(r.Context()),
-	}})
-}
-
 // thumbnailRejectionReason maps a thumbnail derivation error to exactly one
 // rejection reason label, or ("", true) when the failure is silent (client
 // disconnect — no response is emitted, so no counter). Branch order mirrors
@@ -61,16 +38,37 @@ func (h *Handler) writeThumbnailSourceError(w http.ResponseWriter, r *http.Reque
 //
 // The catch-all returns invalid_argument: writeThumbnailGenerateError's generic
 // wrap (fmt.Errorf("%w: %v", service.ErrInvalidArgs, err)) classifies every
-// unknown error as 400 InvalidArgument, so the label matches the wire outcome.
-// Known edge: an *OpenError whose inner error is context.Canceled races the
-// client-disconnect check (the pipeline fast-fails before the opener observes
-// the cancel) and wires as 500 while the reason is silent — a sub-millisecond
-// window, pre-existing wire behavior (OpenError is unwrapped first), accepted.
+// unknown non-source error as 400 InvalidArgument, so the label matches the
+// wire outcome. An opener's exact context.Canceled sentinel retains the legacy
+// visible 500 response without a rejection counter; a wrapped cancellation is
+// an observable source_error and is redacted by writeThumbnailSourceError.
 func thumbnailRejectionReason(err error) (reason string, silent bool) {
+	var oe *thumbnail.OpenError
+	if errors.As(err, &oe) && oe.Err != context.Canceled && errors.Is(oe.Err, context.Canceled) {
+		// An opener that wraps cancellation with provider diagnostics is still
+		// a visible source failure (the OpenError branch emits a 500). Keep it
+		// observable as source_error rather than silently treating it as a
+		// client disconnect; only the exact cancellation sentinel retains the
+		// legacy silent behavior.
+		return "source_error", false
+	}
+	if errors.Is(err, thumbnail.ErrUnsupported) {
+		return "unsupported", false
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout", false
 	}
 	if errors.Is(err, context.Canceled) {
+		var sre *thumbnail.SourceReadError
+		if errors.As(err, &sre) {
+			if sre.Err != context.Canceled && errors.Is(sre.Err, context.Canceled) {
+				return "source_error", false
+			}
+			return "", true
+		}
+		if err != context.Canceled {
+			return "source_error", false
+		}
 		return "", true
 	}
 	if errors.Is(err, thumbnail.ErrImageTooLarge) {
@@ -88,16 +86,12 @@ func thumbnailRejectionReason(err error) (reason string, silent bool) {
 	if errors.Is(err, thumbnail.ErrNotAnImage) {
 		return "not_an_image", false
 	}
-	if errors.Is(err, thumbnail.ErrUnsupported) {
-		return "unsupported", false
-	}
 	if errors.Is(err, thumbnail.ErrNilSource) {
 		return "source_error", false
 	}
 	if errors.Is(err, service.ErrInvalidArgs) {
 		return "invalid_argument", false
 	}
-	var oe *thumbnail.OpenError
 	var sre *thumbnail.SourceReadError
 	if errors.As(err, &oe) || errors.As(err, &sre) {
 		return "source_error", false
@@ -122,11 +116,12 @@ func (h *Handler) writeThumbnailError(w http.ResponseWriter, r *http.Request, er
 // load-bearing error branch, extracted verbatim from thumbnail.go (which sits
 // at the 500-line gate; any further error-branch additions must land here).
 // Ordering is pinned by tests and MUST NOT be reordered: the OpenError unwrap
-// first (a Get-path failure classifies via writeError → classify, never as a
-// silent return), then the server-side deadline (504), then client disconnect
-// (silent), then the thumbnail decode sentinels — each unwrapped RAW so
-// classify() sees the exact instance (the generic wrap below stringifies via
-// %v, destroying the errors.Is chain) — then the marked source-stream failure,
+// first (a Get-path failure uses the thumbnail source allowlist, never a
+// silent return), then a joined decode sentinel (which wins over any close
+// error), then the server-side deadline (504), then client disconnect (silent),
+// then the remaining thumbnail sentinels — each unwrapped RAW so classify()
+// sees the exact instance (the generic wrap below stringifies via %v,
+// destroying the errors.Is chain) — then the marked source-stream failure,
 // then the catch-all.
 func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Request, err error) {
 	// Outcome observability: count the rejection class up front. Silent client
@@ -139,11 +134,33 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 		h.writeThumbnailSourceError(w, r, oe.Err)
 		return
 	}
+	if errors.Is(err, thumbnail.ErrUnsupported) {
+		// Decode is the primary failure when the source Close also fails. It
+		// must win even if the subordinate close error is a deadline or
+		// cancellation, and only its fixed message is safe to serialize.
+		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, thumbnail.ErrUnsupported))
+		return
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		h.writeError(w, r, service.ErrTimeout)
 		return
 	}
 	if errors.Is(err, context.Canceled) {
+		var sre *thumbnail.SourceReadError
+		if errors.As(err, &sre) {
+			if sre.Err == context.Canceled {
+				return
+			}
+			h.writeThumbnailSourceError(w, r, sre.Err)
+			return
+		}
+		if err == context.Canceled {
+			return
+		}
+		// A non-exact, unmarked cancellation is a source/provider wrapper
+		// from a codec read. Treat it like every other unknown source error;
+		// silently returning would discard both the response and telemetry.
+		h.writeThumbnailSourceError(w, r, err)
 		return
 	}
 	if errors.Is(err, thumbnail.ErrImageTooLarge) {
@@ -168,18 +185,11 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 		h.writeError(w, r, thumbnail.ErrNilSource)
 		return
 	}
-	if errors.Is(err, thumbnail.ErrUnsupported) {
-		// Preserve the existing 400 decode classification when a decode error
-		// is joined with a source-close failure. Use only the safe decode
-		// sentinel; stringifying err would expose the secondary close error.
-		h.writeError(w, r, fmt.Errorf("%w: %v", service.ErrInvalidArgs, thumbnail.ErrUnsupported))
-		return
-	}
 	// Source-stream read or close failures (storage I/O, on-read or close-time
-	// verification) are marked by the thumbnail module: classify the underlying
-	// error raw — default → 500 InternalError; an ETagVerifier mismatch wraps
-	// service.ErrObjectCorrupt → 410 — never 400 InvalidArgument. MUST precede
-	// the catch-all: its %v stringify
+	// verification) are marked by the thumbnail module: the source allowlist
+	// maps the underlying error — default → 500 InternalError; an ETagVerifier
+	// mismatch wraps service.ErrObjectCorrupt → 410 — never 400
+	// InvalidArgument. MUST precede the catch-all: its %v stringify
 	// would destroy the chain (same trap as the ErrMetadataTooLarge
 	// branch above).
 	var sre *thumbnail.SourceReadError

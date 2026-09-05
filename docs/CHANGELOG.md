@@ -8,7 +8,7 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 
 ### Fixed
 - **Thumbnail REST: redact arbitrary storage diagnostics from generation errors** (`internal/api/rest/handler_helpers.go`)
-  - Unknown opener, source-read, and source-close failures retain `500 InternalError` but return the stable message `internal server error`; provider details remain available in server logs and are never serialized to the client. Known `NotFound`, timeout, corruption, and decode classifications are unchanged, including joined decode-plus-close failures. No migration, configuration, dependency, or OpenAPI change.
+  - Unknown opener, source-read, and source-close failures retain `500 InternalError` but return the stable message `internal server error`; raw provider details are neither logged nor serialized, with a non-reversible fingerprint and request ID retained for correlation. Known `NotFound`, timeout, corruption, and decode classifications are unchanged, including joined decode-plus-close failures. No migration, configuration, dependency, or OpenAPI change.
 
 ### Changed
 - **Thumbnail: TTL-expired cache reads distinguished from genuine misses in hit-ratio metrics** (`internal/thumbnail/cache.go`, `internal/thumbnail/cache_entry.go`, `internal/telemetry/thumbnail.go`, `internal/telemetry/metrics.go`)

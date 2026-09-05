@@ -1627,24 +1627,35 @@ func TestThumbnailMidDecodeStorageError(t *testing.T) {
 		err        error
 		wantStatus int
 		wantCode   string
+		wantReason string
 	}{
 		{
 			name:       "storage IO failure",
 			err:        fmt.Errorf("s3 read failed: %w", errors.New("i/o error")),
 			wantStatus: http.StatusInternalServerError,
 			wantCode:   "InternalError",
+			wantReason: "source_error",
 		},
 		{
 			name:       "on-read verification mismatch",
 			err:        fmt.Errorf("%w: expected abc, computed xyz", service.ErrObjectCorrupt),
 			wantStatus: http.StatusGone,
 			wantCode:   "ObjectCorrupt",
+			wantReason: "source_error",
+		},
+		{
+			name:       "wrapped cancellation source failure",
+			err:        fmt.Errorf("provider=https://objects.example.test/bucket token=mid-cancel: %w", context.Canceled),
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "InternalError",
+			wantReason: "source_error",
 		},
 		{
 			name:       "truncation control",
 			err:        io.EOF,
 			wantStatus: http.StatusBadRequest,
 			wantCode:   "InvalidArgument",
+			wantReason: "unsupported",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1673,6 +1684,7 @@ func TestThumbnailMidDecodeStorageError(t *testing.T) {
 			if resp, _ := req(t, "PUT", u, png, map[string]string{"Content-Type": "image/png"}); resp.StatusCode != http.StatusCreated {
 				t.Fatalf("PUT img.png: %d", resp.StatusCode)
 			}
+			pre := snapshotThumbCounters(t)
 			resp, body := req(t, "GET", u+"/thumbnail?w=32&h=32", nil, nil)
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("mid-decode storage error: status=%d want %d (body=%q)", resp.StatusCode, tc.wantStatus, body)
@@ -1680,6 +1692,8 @@ func TestThumbnailMidDecodeStorageError(t *testing.T) {
 			if !bytes.Contains(body, []byte(`"code":"`+tc.wantCode+`"`)) {
 				t.Fatalf("expected code %s, body: %s", tc.wantCode, body)
 			}
+			assertRedactedThumbnailFailure(t, resp, body)
+			assertThumbDeltas(t, pre, tc.wantReason, 0)
 			if tc.wantCode != "InvalidArgument" {
 				// The whole point of the change: server-side failures never
 				// masquerade as client argument errors.
@@ -1699,7 +1713,7 @@ func TestThumbnailMidDecodeStorageError(t *testing.T) {
 					if !bytes.Contains(body, []byte(`"message":"internal server error"`)) {
 						t.Fatalf("expected stable generic message, got: %s", body)
 					}
-					for _, detail := range []string{"s3 read failed", "i/o error"} {
+					for _, detail := range []string{"s3 read failed", "i/o error", "objects.example.test", "mid-cancel"} {
 						if bytes.Contains(body, []byte(detail)) {
 							t.Fatalf("provider detail %q leaked into the body: %s", detail, body)
 						}
@@ -3311,6 +3325,7 @@ func TestThumbnailOpenErrorAfterStatRace404(t *testing.T) {
 	putReq.Header.Set("Content-Type", "image/png")
 	r.ServeHTTP(httptest.NewRecorder(), putReq)
 
+	pre404 := snapshotThumbCounters(t)
 	rq := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, rq)
@@ -3320,12 +3335,14 @@ func TestThumbnailOpenErrorAfterStatRace404(t *testing.T) {
 	if !bytes.Contains(rec.Body.Bytes(), []byte(`"code":"NotFound"`)) {
 		t.Fatalf("open failure after Stat: expected NotFound body, got %q", rec.Body.String())
 	}
+	assertThumbDeltas(t, pre404, "source_error", 0)
 
 	// Open-time context error (e.g. a backend aborting with the request
 	// context's Canceled): must still be writeError-classified (500 default),
 	// never a silent return and never reclassified as an image error —
 	// pins the OpenError-first ordering at the HTTP level.
 	fs.err = fmt.Errorf("%w: storage read aborted", context.Canceled)
+	pre2 := snapshotThumbCounters(t)
 	rq2 := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil)
 	rec2 := httptest.NewRecorder()
 	r.ServeHTTP(rec2, rq2)
@@ -3335,10 +3352,17 @@ func TestThumbnailOpenErrorAfterStatRace404(t *testing.T) {
 	if !bytes.Contains(rec2.Body.Bytes(), []byte(`"code":"InternalError"`)) {
 		t.Fatalf("canceled open: expected JSON error body, got %q", rec2.Body.String())
 	}
+	if !bytes.Contains(rec2.Body.Bytes(), []byte(`"message":"internal server error"`)) ||
+		bytes.Contains(rec2.Body.Bytes(), []byte("storage read aborted")) {
+		t.Fatalf("wrapped canceled open was not safely redacted: %q", rec2.Body.String())
+	}
+	assertRedactedThumbnailFailure(t, &http.Response{Header: rec2.Header()}, rec2.Body.Bytes(), "storage read aborted")
+	assertThumbDeltas(t, pre2, "source_error", 0)
 
 	// Unknown provider failures keep the source_error classification but must
 	// not expose backend details at the REST boundary.
 	fs.err = errors.New("provider=https://objects.example.test bucket=private request-token=open-xyz")
+	pre3 := snapshotThumbCounters(t)
 	rq3 := httptest.NewRequest("GET", "/v1/files/img.png/thumbnail?w=32&h=32", nil)
 	rec3 := httptest.NewRecorder()
 	r.ServeHTTP(rec3, rq3)
@@ -3354,11 +3378,8 @@ func TestThumbnailOpenErrorAfterStatRace404(t *testing.T) {
 			t.Fatalf("unknown open: provider detail %q leaked into %q", detail, rec3.Body.String())
 		}
 	}
-	for _, header := range []string{"ETag", "Last-Modified", "Cache-Control", "X-Version-Id", "Content-Type"} {
-		if got := rec3.Header().Get(header); got == "image/jpeg" || (header != "Content-Type" && got != "") {
-			t.Fatalf("unknown open emitted success header %s=%q", header, got)
-		}
-	}
+	assertRedactedThumbnailFailure(t, &http.Response{Header: rec3.Header()}, rec3.Body.Bytes(), "objects.example.test", "private", "open-xyz")
+	assertThumbDeltas(t, pre3, "source_error", 0)
 }
 
 // TestThumbnailDeadlineWhileParkedIs504 pins C1: with all 4 decode slots held
