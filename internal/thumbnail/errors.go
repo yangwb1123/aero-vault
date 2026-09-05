@@ -13,6 +13,12 @@ import "errors"
 // byte-level failures (corrupt or non-image input).
 var ErrUnsupportedFormat = errors.New("thumbnail: unsupported image format")
 
+// ErrNilSource identifies a missing object stream at the thumbnail opener
+// boundary. It is distinct from decode and magic-classification errors so
+// protocol adapters can report a server-side failure without exposing the
+// implementation detail or treating it as invalid image content.
+var ErrNilSource = errors.New("thumbnail: nil source reader")
+
 // ErrNotAnImage is returned by AdmitByMagic when the magic bytes match no
 // known image format (or the head is too short to contain one): the object
 // bytes are not a supported image, the client-argument class (REST maps it

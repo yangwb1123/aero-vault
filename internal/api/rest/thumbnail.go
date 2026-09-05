@@ -1,7 +1,6 @@
 package rest
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -408,23 +407,11 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 			if !sniffBytes {
 				return rc, openedSource, nil
 			}
-			head := make([]byte, sniffHeadLen)
-			n, rerr := io.ReadFull(rc, head)
-			if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
-				_ = rc.Close()
-				return nil, thumbnail.OpenedSource{}, rerr
+			sniffed, err := sniffThumbnailSource(r.Context(), rc)
+			if err != nil {
+				return nil, thumbnail.OpenedSource{}, err
 			}
-			head = head[:n]
-			replay, aerr := thumbnail.AdmitByMagic(head)
-			if aerr != nil {
-				_ = rc.Close()
-				if errors.Is(aerr, thumbnail.ErrUnsupportedFormat) {
-					return nil, thumbnail.OpenedSource{}, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
-						thumbnail.ErrUnsupportedFormat, "webp")
-				}
-				return nil, thumbnail.OpenedSource{}, fmt.Errorf("%w: %w", service.ErrInvalidArgs, aerr)
-			}
-			return &sniffedStream{Reader: io.MultiReader(bytes.NewReader(replay), rc), rc: rc}, openedSource, nil
+			return sniffed, openedSource, nil
 		})
 	if err != nil {
 		h.writeThumbnailGenerateError(w, r, err)

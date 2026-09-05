@@ -1,11 +1,14 @@
 package rest
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -28,7 +31,52 @@ const thumbFreshnessMaxAge = 300
 // sniffHeadLen is the longest magic signature Sniff recognizes: RIFF(4) +
 // size(4) + WEBP(4) = 12 bytes. Bucket-3 openers read exactly this many
 // bytes from the object stream to classify it.
-const sniffHeadLen = 12
+const sniffHeadLen = thumbnail.MagicPrefixLen
+
+// sniffThumbnailSource classifies a generic-MIME source and returns a stream
+// that replays the exact prefix before continuing with the live source. It
+// owns cleanup on every rejection path; accepted cleanup is forwarded by
+// sniffedStream to the caller's existing deferred close.
+func sniffThumbnailSource(ctx context.Context, rc io.ReadCloser) (io.ReadCloser, error) {
+	head, readErr := thumbnail.ReadMagicPrefix(ctx, rc)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		closeSniffSource(rc)
+		return nil, readErr
+	}
+	replay, admitErr := thumbnail.AdmitByMagic(head)
+	if admitErr != nil {
+		closeSniffSource(rc)
+		if errors.Is(admitErr, thumbnail.ErrUnsupportedFormat) {
+			return nil, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
+				thumbnail.ErrUnsupportedFormat, "webp")
+		}
+		return nil, fmt.Errorf("%w: %w", service.ErrInvalidArgs, admitErr)
+	}
+	return &sniffedStream{
+		Reader: io.MultiReader(bytes.NewReader(replay), rc),
+		rc:     rc,
+	}, nil
+}
+
+func closeSniffSource(rc io.ReadCloser) {
+	if isNilReadCloser(rc) {
+		return
+	}
+	_ = rc.Close()
+}
+
+func isNilReadCloser(rc io.ReadCloser) bool {
+	if rc == nil {
+		return true
+	}
+	value := reflect.ValueOf(rc)
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
 
 // sniffedStream replays the sniffed magic head in front of the live object
 // stream (io.MultiReader) and forwards Close to the underlying stream, which

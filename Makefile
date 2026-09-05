@@ -157,7 +157,7 @@ test-race-thumbnail:
 # suite by scoping to the cache, revalidation, and close-lifecycle test names.
 test-race-rest-cache:
 	@echo "[check] data race detection (REST thumbnail cache path) ..."
-	go test -race -count=1 -timeout 300s -run 'ThumbnailCache|ThumbnailClose|Thumbnail.*(Cache|Revalid)' ./internal/api/rest/
+	go test -race -count=1 -timeout 300s -run 'ThumbnailCache|ThumbnailClose|Thumbnail.*(Cache|Revalid)|TestSniffThumbnailSource|TestClassifyNilThumbnailSource|TestThumbnailGeneric' ./internal/api/rest/
 	@echo "  OK (no races detected)"
 
 .PHONY: test-race-rest-cache

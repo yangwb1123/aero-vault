@@ -68,6 +68,9 @@ func thumbnailRejectionReason(err error) (reason string, silent bool) {
 	if errors.Is(err, thumbnail.ErrUnsupported) {
 		return "unsupported", false
 	}
+	if errors.Is(err, thumbnail.ErrNilSource) {
+		return "source_error", false
+	}
 	if errors.Is(err, service.ErrInvalidArgs) {
 		return "invalid_argument", false
 	}
@@ -136,6 +139,10 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 		// wrap below stringifies it via %v, so errors.Is would never match
 		// downstream. Same unwrap pattern as ErrImageTooLarge/MetadataTooLarge.
 		h.writeError(w, r, thumbnail.ErrSourceTooLarge)
+		return
+	}
+	if errors.Is(err, thumbnail.ErrNilSource) {
+		h.writeError(w, r, thumbnail.ErrNilSource)
 		return
 	}
 	if errors.Is(err, thumbnail.ErrUnsupported) {
@@ -216,6 +223,8 @@ func classify(err error) (string, string, int) {
 		// payload exceeds the server's 128 MiB compressed-input processing
 		// budget (MaxSourceBytes) and was cut mid-decode by the read cap.
 		return "SourceTooLarge", err.Error(), http.StatusRequestEntityTooLarge
+	case errors.Is(err, thumbnail.ErrNilSource):
+		return "InternalError", "thumbnail source unavailable", http.StatusInternalServerError
 	case errors.Is(err, service.ErrInvalidArgs):
 		return "InvalidArgument", err.Error(), http.StatusBadRequest
 	case errors.Is(err, service.ErrBadDigest):

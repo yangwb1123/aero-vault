@@ -6,12 +6,12 @@ import (
 )
 
 // ctxReader is the shared cancellation boundary for every live source-read
-// phase in generateLocked: DecodeConfig, the PNG pre-IDAT orientation walk,
-// payload Decode, and the source-cap probe (the probe has its own instance
-// because it bypasses the LimitReader). While the context is alive this is a
-// pure pass-through, preserving the underlying n and error exactly. Once the
-// context is done, the next Read returns the exact ctx.Err() without
-// consulting the source.
+// phase in ReadMagicPrefix and generateLocked: DecodeConfig, the PNG pre-IDAT
+// orientation walk, payload Decode, and the source-cap probe (the probe has
+// its own instance because it bypasses the LimitReader). While the context is
+// alive this is a pure pass-through, preserving the underlying n and error
+// exactly. Once the context is done, the next Read returns the exact ctx.Err()
+// without consulting the source.
 //
 // The check is necessarily pre-delegation. A generic io.Reader cannot be
 // forcibly interrupted after its Read method has started, so bytes and an
