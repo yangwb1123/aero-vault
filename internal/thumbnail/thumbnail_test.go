@@ -54,13 +54,13 @@ func makeJPEG(t testing.TB, w, h int) []byte {
 // headerOnlyPNG builds a PNG containing only the signature + IHDR chunk
 // (valid CRC) — no IDAT/IEND — so no pixel buffer is ever allocated. The
 // declared dimensions, IHDR bit depth and color type are attacker-controlled.
-func headerOnlyPNG(t testing.TB, w, h int, bitDepth, colorType byte) []byte {
+func headerOnlyPNG(t testing.TB, w, h uint32, bitDepth, colorType byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	buf.Write([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}) // signature
 	ihdr := make([]byte, 13)
-	binary.BigEndian.PutUint32(ihdr[0:4], uint32(w))
-	binary.BigEndian.PutUint32(ihdr[4:8], uint32(h))
+	binary.BigEndian.PutUint32(ihdr[0:4], w)
+	binary.BigEndian.PutUint32(ihdr[4:8], h)
 	// bit depth / color type at IHDR bytes 8/9 (compression 0, filter 0,
 	// interlace 0 follow).
 	ihdr[8], ihdr[9], ihdr[10], ihdr[11], ihdr[12] = bitDepth, colorType, 0, 0, 0

@@ -1,6 +1,7 @@
 package thumbnail
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -214,6 +215,21 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// decoding. The cap probe keeps its separate guard above because it
 	// intentionally bypasses the LimitReader.
 	guardedSource := &ctxReader{ctx: ctx, r: rec}
+	// Keep the preflight and decoder on one buffered stream. Peek is
+	// non-consuming, so the standard decoder still receives every byte even
+	// when the outer reader has read ahead to inspect a PNG IHDR.
+	sourceR := bufio.NewReader(guardedSource)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix, _ := sourceR.Peek(pngIHDRPrefixLen)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if width, height, ok := pngIHDRDimensions(prefix); ok &&
+		(width > uint32(MaxSourceDim) || height > uint32(MaxSourceDim)) {
+		return nil, ErrImageTooLarge
+	}
 
 	// Header-only dimension pre-check: no pixel buffer is ever allocated for
 	// oversized sources. image.DecodeConfig consumes from the stream, and each
@@ -221,8 +237,8 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// drains it — so sharing a single buffered reader between DecodeConfig and
 	// Decode would lose the header bytes for small inputs. Instead, tee what
 	// DecodeConfig consumes into head, replay that exact prefix for Decode,
-	// and continue from guardedSource (not the tee): replaying head then the
-	// guarded stream is byte-exact and keeps Decode streaming (the payload is
+	// and continue from sourceR (not the tee): replaying head then the
+	// buffered stream is byte-exact and keeps Decode streaming (the payload is
 	// read live, never buffered). head is capped at MaxMetadataBytes:
 	// image/jpeg's
 	// config scan reads every pre-SOF segment (APPn/COM/DHT/DQT/DRI) in full
@@ -231,7 +247,7 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// the budget aborts the config scan with ErrMetadataTooLarge before the
 	// payload is read further or any pixel buffer is allocated.
 	head := &limitedBuffer{remaining: MaxMetadataBytes}
-	cfgR := io.TeeReader(guardedSource, head)
+	cfgR := io.TeeReader(sourceR, head)
 	cfg, format, err := image.DecodeConfig(cfgR)
 	if err != nil {
 		if errors.Is(err, errMetadataBudgetExceeded) {
@@ -317,17 +333,18 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	// (compressed data is never scanned). Errors classify with the exact
 	// Decode-site block.
 	// decodeR replays the exact prefix DecodeConfig (and, for PNG, the
-	// orientation walk) consumed, then continues from the same guarded stream.
-	// The four live-source phases are therefore context-guarded: DecodeConfig,
-	// PNG orientation, payload Decode, and the recorder's separate cap probe.
+	// orientation walk) consumed, then continues from the same buffered source
+	// stream. The four live-source phases are therefore context-guarded:
+	// DecodeConfig, PNG orientation, payload Decode, and the recorder's
+	// separate cap probe.
 	// A read already in progress may complete; the pre-delegation guard stops
 	// the next source read without changing metadata-budget precedence.
-	payloadR := guardedSource
+	payloadR := sourceR
 	pngOrient := 1
 	decodeR := io.MultiReader(bytes.NewReader(head.buf.Bytes()), payloadR)
 	if format == "png" {
 		replay := &limitedBuffer{remaining: MaxMetadataBytes - len(head.buf.Bytes())}
-		pngOrient, err = pngOrientation(ctx, head.buf.Bytes(), io.TeeReader(guardedSource, replay))
+		pngOrient, err = pngOrientation(ctx, head.buf.Bytes(), io.TeeReader(sourceR, replay))
 		if err != nil {
 			if errors.Is(err, errMetadataBudgetExceeded) {
 				return nil, ErrMetadataTooLarge
