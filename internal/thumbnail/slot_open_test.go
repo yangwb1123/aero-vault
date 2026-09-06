@@ -325,6 +325,25 @@ func TestSlotDecodeSentinelsPreserved(t *testing.T) {
 	assertSlotsReleased(t)
 }
 
+func TestSlotOversizedRawDimensionClosesAndReleases(t *testing.T) {
+	source := &countingCloser{rc: io.NopCloser(bytes.NewReader(
+		headerOnlyPNG(t, 0x80000000, 1, 8, 6),
+	))}
+	img, err := GenerateContextWithOpener(context.Background(), 16, 16, func() (io.ReadCloser, error) {
+		return source, nil
+	})
+	if !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("err = %v, want ErrImageTooLarge", err)
+	}
+	if img != nil {
+		t.Fatalf("oversized rejection returned %d image bytes", len(img))
+	}
+	if got := source.closed.Load(); got != 1 {
+		t.Fatalf("source closed %d times, want exactly once", got)
+	}
+	assertSlotsReleased(t)
+}
+
 // TestSlotOutputParityWithGenerateContext pins NFR-3: the new API runs the
 // exact decode pipeline, so output is byte-identical to GenerateContext for
 // the same input — including the clamp paths (zero and oversized dims).

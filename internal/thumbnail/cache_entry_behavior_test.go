@@ -16,7 +16,7 @@ func TestCacheGenerateErrorNeverCached(t *testing.T) {
 	c := NewCache(1<<20, 0)
 	ctx := context.Background()
 
-	bomb := headerOnlyPNG(t, 8193, 8, 8, 6) // declared width > MaxSourceDim
+	bomb := headerOnlyPNG(t, 0x80000000, 1, 8, 6) // raw width above int32 and MaxSourceDim
 	var opens atomic.Int64
 	_, _, err := GenerateContextWithOpenerCached(ctx, c, testIdentity("t1"), etagA, 32, 32, countingOpener3(bomb, etagA, &opens))
 	if !errors.Is(err, ErrImageTooLarge) {

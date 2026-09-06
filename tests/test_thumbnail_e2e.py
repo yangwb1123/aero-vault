@@ -15,6 +15,9 @@ API_KEY = os.environ.get("E2E_API_KEY", "")
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAG0lEQVR4nGL6z8DA8J+BiZHh/38GBkAAAAD//x0hBAKGdL17AAAAAElFTkSuQmCC"
 )
+OVERSIZED_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgABhqAAAYagCAYAAACoUgvI"
+)
 
 
 def request(method, path, body=None, headers=None):
@@ -64,7 +67,20 @@ def test_thumbnail_smoke():
         request("DELETE", f"/v1/files/{key}?hard=1")
 
 
-ALL_TESTS = [("Thumbnail", [test_thumbnail_smoke])]
+def test_thumbnail_oversized():
+    key = "e2e-thumb/oversized.png"
+    try:
+        status, _, _ = request("PUT", f"/v1/files/{key}", OVERSIZED_PNG, {"Content-Type": "image/png"})
+        assert status in (200, 201), f"PUT oversized source: got {status}"
+        status, body, _ = request("GET", f"/v1/files/{key}/thumbnail")
+        assert status == 413, f"GET oversized thumbnail: got {status}"
+        assert b'"code":"ImageTooLarge"' in body, body
+        print(f"  ✅ GET /v1/files/{key}/thumbnail -> 413 ImageTooLarge")
+    finally:
+        request("DELETE", f"/v1/files/{key}?hard=1")
+
+
+ALL_TESTS = [("Thumbnail", [test_thumbnail_smoke, test_thumbnail_oversized])]
 
 
 def run_tests():

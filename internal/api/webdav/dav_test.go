@@ -320,7 +320,7 @@ func TestMoveLargeFile(t *testing.T) {
 	const size = 9 << 20
 	want := make([]byte, size)
 	for i := range want {
-		want[i] = byte((i*2654435761 + 1013904223) >> 13)
+		want[i] = byte((uint64(i)*2654435761 + 1013904223) >> 13)
 	}
 
 	resp, _ := do(t, srv, http.MethodPut, "/webdav/big-src.bin", want, nil)
@@ -538,7 +538,7 @@ func TestSpillFileRoundTrip(t *testing.T) {
 	const size = 9 << 20
 	want := make([]byte, size)
 	for i := range want {
-		want[i] = byte((i*2654435761 + 1013904223) >> 13)
+		want[i] = byte((uint64(i)*2654435761 + 1013904223) >> 13)
 	}
 
 	resp, _ := do(t, srv, http.MethodPut, "/webdav/spill.bin", want, nil)

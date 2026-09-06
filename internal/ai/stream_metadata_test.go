@@ -206,10 +206,10 @@ func TestTokenAccountingDoesNotOverflow(t *testing.T) {
 	if got := costMicros(-1, 1, 2_000_000, 6_000_000); got != 0 {
 		t.Fatalf("negative cost = %d, want 0", got)
 	}
-	if got := costMicros(math.MaxInt, 1, 2_000_000, 6_000_000); got != 0 {
+	if got := costMicros(math.MaxInt, 1, math.MaxInt64, 6_000_000); got != 0 {
 		t.Fatalf("overflowing cost = %d, want 0", got)
 	}
-	if got := costMicros(math.MaxInt, math.MaxInt, 1_000, 1_000); got != 0 {
+	if got := costMicros(math.MaxInt, math.MaxInt, math.MaxInt64, math.MaxInt64); got != 0 {
 		t.Fatalf("overflowing cost sum = %d, want 0", got)
 	}
 }

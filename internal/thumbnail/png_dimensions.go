@@ -1,6 +1,7 @@
 package thumbnail
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
@@ -9,6 +10,19 @@ import (
 const pngIHDRPrefixLen = 33
 
 var pngSignature = [...]byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+
+// peekPNGHeader avoids reading beyond the signature for non-PNG inputs. The
+// second peek is needed only after an exact signature match, so a short or
+// unrelated stream cannot block the decode slot while the PNG preflight waits
+// for bytes that cannot establish dimensions.
+func peekPNGHeader(r *bufio.Reader) []byte {
+	prefix, _ := r.Peek(len(pngSignature))
+	if !bytes.Equal(prefix, pngSignature[:]) {
+		return prefix
+	}
+	prefix, _ = r.Peek(pngIHDRPrefixLen)
+	return prefix
+}
 
 // pngIHDRDimensions returns the raw unsigned dimensions only when prefix is a
 // complete, valid PNG signature plus IHDR chunk. Keeping this check independent

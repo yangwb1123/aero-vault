@@ -222,7 +222,7 @@ func generateLocked(ctx context.Context, r io.Reader, maxW, maxH int) ([]byte, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	prefix, _ := sourceR.Peek(pngIHDRPrefixLen)
+	prefix := peekPNGHeader(sourceR)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

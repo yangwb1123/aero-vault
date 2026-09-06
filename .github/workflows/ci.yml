@@ -117,10 +117,24 @@ jobs:
       - name: E2E tests (with server)
         run: |
           go build -o /tmp/av-e2e ./cmd/server
-          APP_ADDR=:9199 /tmp/av-e2e &
-          sleep 2
+          APP_ADDR=:9199 /tmp/av-e2e >/tmp/av-e2e.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          python3 - <<'PY'
+          import time
+          import urllib.request
+
+          for _ in range(30):
+              try:
+                  with urllib.request.urlopen("http://localhost:9199/healthz", timeout=1) as response:
+                      if response.status == 200:
+                          break
+              except Exception:
+                  time.sleep(0.5)
+          else:
+              raise SystemExit("server did not become healthy")
+          PY
           BASE_URL=http://localhost:9199 python3 tests/run_all.py
-          kill %1 2>/dev/null || true
 
   fuzz-thumbnail:
     name: fuzz (thumbnail — bounded fuzztime, 5 targets)
@@ -172,3 +186,32 @@ jobs:
           name: thumbnail-fuzz-corpus
           path: internal/thumbnail/testdata/fuzz/
           if-no-files-found: ignore
+
+  arch-386:
+    name: 386 compatibility · thumbnail · REST · build · vet · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Thumbnail regression tests
+        run: GOARCH=386 go test ./internal/thumbnail -count=1
+
+      - name: REST thumbnail 413 mapping
+        run: GOARCH=386 go test ./internal/api/rest -run '^TestThumbnailOversizedImage$' -count=1
+
+      - name: Full 386 test suite
+        run: GOARCH=386 go test ./... -count=1
+
+      - name: 386 build
+        run: GOARCH=386 go build ./...
+
+      - name: 386 vet (including integration-tagged tests)
+        run: GOARCH=386 go vet -tags=integration ./...
