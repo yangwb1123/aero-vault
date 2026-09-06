@@ -306,6 +306,51 @@ func TestThumbnailContentEncodingStopsCacheAndAdmission(t *testing.T) {
 	})
 }
 
+func TestThumbnailContentEncodingPinnedMetadataReverseOrder(t *testing.T) {
+	srv, repo := newRESTTestWithRepo(t)
+	enableVersioningForCoexistence(t, repo)
+	u := srv.URL + "/v1/files/reverse-pinned.jpg"
+	jpeg := jpegBytesForThumbnailTest(t, 32, 16)
+	encoded := gzipThumbnailSource(t, jpeg)
+	if resp, _ := req(t, http.MethodPut, u, encoded, map[string]string{
+		"Content-Type": "image/jpeg", "Content-Encoding": "gzip",
+	}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT encoded version: status=%d", resp.StatusCode)
+	}
+	versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "reverse-pinned.jpg")
+	if err != nil || len(versions) == 0 {
+		t.Fatalf("list encoded version: %v", err)
+	}
+	encodedVersion := versions[0].VersionID
+	if resp, _ := req(t, http.MethodPut, u, jpeg, map[string]string{"Content-Type": "image/jpeg"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT unencoded version: status=%d", resp.StatusCode)
+	}
+	versions, err = repo.ListObjectVersions(context.Background(), "default", "default", "reverse-pinned.jpg")
+	if err != nil || len(versions) < 2 {
+		t.Fatalf("list versions: %v (n=%d)", err, len(versions))
+	}
+	unencodedVersion := versions[0].VersionID
+
+	resp, body := req(t, http.MethodGet, u+"/thumbnail", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("current unencoded version: status=%d body=%s", resp.StatusCode, body)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(body)); err != nil || format != "jpeg" {
+		t.Fatalf("current unencoded body: format=%q err=%v", format, err)
+	}
+	resp, body = req(t, http.MethodGet, u+"/thumbnail?version="+encodedVersion, nil, nil)
+	if resp.StatusCode != http.StatusUnsupportedMediaType || !bytes.Contains(body, []byte("gzip")) {
+		t.Fatalf("pinned encoded version: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp, body = req(t, http.MethodGet, u+"/thumbnail?version="+unencodedVersion, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pinned unencoded version: status=%d body=%s", resp.StatusCode, body)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(body)); err != nil || format != "jpeg" {
+		t.Fatalf("pinned unencoded body: format=%q err=%v", format, err)
+	}
+}
+
 func TestThumbnailContentEncodingPinnedMetadata(t *testing.T) {
 	srv, repo := newRESTTestWithRepo(t)
 	enableVersioningForCoexistence(t, repo)

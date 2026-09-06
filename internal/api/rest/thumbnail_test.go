@@ -5933,7 +5933,7 @@ func TestThumbnailExactKeyPreservesContentEncoding(t *testing.T) {
 		if err != nil || len(versions) == 0 {
 			t.Fatalf("list %s version: %v", enc, err)
 		}
-		versionURL := uFull + "?version=" + versions[0].VersionID
+		versionURL := uFull + "?version=" + versions[0].VersionID + "&w=invalid&h=-1"
 		versionHeaders := map[string]string{"Authorization": tok, "Accept-Encoding": "identity"}
 		versionResp, versionBody := req(t, "GET", versionURL, nil, versionHeaders)
 		if versionResp.StatusCode != http.StatusOK || !bytes.Equal(versionBody, []byte("encoded object bytes")) {
