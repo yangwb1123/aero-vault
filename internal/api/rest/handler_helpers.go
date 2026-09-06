@@ -78,6 +78,9 @@ func thumbnailRejectionReason(err error) (reason string, silent bool) {
 	if errors.Is(err, thumbnail.ErrSourceTooLarge) {
 		return "source_too_large", false
 	}
+	if errors.Is(err, thumbnail.ErrUnsupportedContentEncoding) {
+		return "content_encoding", false
+	}
 	if errors.Is(err, thumbnail.ErrUnsupportedFormat) {
 		return "unsupported_format", false
 	}
@@ -100,8 +103,9 @@ func thumbnailRejectionReason(err error) (reason string, silent bool) {
 
 // writeThumbnailError counts a derivation-phase rejection (unless silent) and
 // delegates to writeError for the wire response. It is the counting seam for
-// the four gate paths in thumbnailDerive that bypass writeThumbnailGenerateError
-// (declared non-image 400, declared unsupported 415, ?w=/?h= dims 400) so every
+// the five gate paths in thumbnailDerive that bypass writeThumbnailGenerateError
+// (encoded source, declared non-image 400, declared unsupported 415,
+// ?w=/?h= dims 400) so every
 // derivation rejection is observed at the boundary, not just pipeline errors.
 func (h *Handler) writeThumbnailError(w http.ResponseWriter, r *http.Request, err error) {
 	if reason, silent := thumbnailRejectionReason(err); !silent {
@@ -227,6 +231,8 @@ func classify(err error) (string, string, int) {
 		// hypothetical wrapped ErrInvalidArgs %w ErrImageTooLarge from a
 		// future call site.
 		return "ImageTooLarge", err.Error(), http.StatusRequestEntityTooLarge
+	case errors.Is(err, thumbnail.ErrUnsupportedContentEncoding):
+		return "UnsupportedMediaType", err.Error(), http.StatusUnsupportedMediaType
 	case errors.Is(err, thumbnail.ErrUnsupportedFormat):
 		// Defensive ordering (not load-bearing), mirroring ErrImageTooLarge:
 		// the thumbnail handler wraps only ErrUnsupportedFormat (never
@@ -398,6 +404,10 @@ func writeContentResponseHeaders(w http.ResponseWriter, meta map[string]string) 
 	if v, ok := meta["_aero_content_disposition"]; ok && v != "" {
 		w.Header().Set("Content-Disposition", v)
 	}
+	writeContentEncodingHeader(w, meta)
+}
+
+func writeContentEncodingHeader(w http.ResponseWriter, meta map[string]string) {
 	if v, ok := meta["_aero_content_encoding"]; ok && v != "" {
 		w.Header().Set("Content-Encoding", v)
 	}

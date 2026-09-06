@@ -2569,8 +2569,8 @@ func TestThumbnailOpenAPIDocuments415(t *testing.T) {
 		t.Fatalf("thumbnail route must document 415, responses=%v", resps)
 	}
 	desc, _ := r415["description"].(string)
-	if desc == "" || !strings.Contains(desc, "image/jpeg") {
-		t.Fatalf("thumbnail 415 description=%q want a non-empty supported-types message", desc)
+	if desc == "" || !strings.Contains(desc, "image/jpeg") || !strings.Contains(desc, "Content-Encoding") {
+		t.Fatalf("thumbnail 415 description=%q want supported-types and Content-Encoding text", desc)
 	}
 
 	// Unrelated routes must not gain a 415 key (nil-map isolation).
@@ -5560,7 +5560,7 @@ func TestThumbnailLastModifiedDerivedFromOpenedObjectVersioned(t *testing.T) {
 var thumbRejectionReasons = []string{
 	"image_too_large", "metadata_too_large", "source_too_large",
 	"unsupported_format", "not_an_image", "unsupported",
-	"invalid_argument", "source_error", "timeout",
+	"invalid_argument", "source_error", "timeout", "content_encoding",
 }
 
 // snapshotThumbCounters records the current value of the success counter and
@@ -5754,6 +5754,7 @@ func TestThumbnailRejectionReasonUnit(t *testing.T) {
 		{"image too large", thumbnail.ErrImageTooLarge, "image_too_large", false},
 		{"metadata too large", thumbnail.ErrMetadataTooLarge, "metadata_too_large", false},
 		{"source too large", thumbnail.ErrSourceTooLarge, "source_too_large", false},
+		{"unsupported content encoding", thumbnail.ErrUnsupportedContentEncoding, "content_encoding", false},
 		{"unsupported format", thumbnail.ErrUnsupportedFormat, "unsupported_format", false},
 		{"not an image", thumbnail.ErrNotAnImage, "not_an_image", false},
 		{"unsupported", thumbnail.ErrUnsupported, "unsupported", false},
@@ -5889,10 +5890,10 @@ func pngChunkHeaderBytes(t *testing.T, chunkType string, length uint32) []byte {
 // metadata round-trip is byte-transparent; the derivation arm, which serves
 // generated JPEG bytes, never carries the source's encoding).
 //
-// Ledger (corrected from the design doc's drift — the five non-test sites
-// are: service/file_crud.go:317 store, service/file_copy.go:39 copy
-// preservation, rest/handler_helpers.go:354 re-emit, s3compat/handler.go:369
-// re-emit, webdav/dav.go:172 copy preservation).
+// Ledger: the non-test sites are service/file_crud.go:storeContentHeaders,
+// service/file_copy.go copy preservation, rest/handler_helpers.go:
+// writeContentResponseHeaders, rest/management.go:GetSpecificVersion,
+// s3compat/handler.go:writeObjectHeaders, and webdav/dav.go:davFS.Rename.
 func TestThumbnailExactKeyPreservesContentEncoding(t *testing.T) {
 	s, tok, repo := newAuthRESTTestWithRepo(t)
 	enableVersioningForCoexistence(t, repo)
@@ -5928,13 +5929,47 @@ func TestThumbnailExactKeyPreservesContentEncoding(t *testing.T) {
 		if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
 			t.Fatalf("GET %s: content-type=%q want text/plain", enc, ct)
 		}
+		versions, err := repo.ListObjectVersions(context.Background(), "default", "default", "dir/thumbnail")
+		if err != nil || len(versions) == 0 {
+			t.Fatalf("list %s version: %v", enc, err)
+		}
+		versionURL := uFull + "?version=" + versions[0].VersionID
+		versionHeaders := map[string]string{"Authorization": tok, "Accept-Encoding": "identity"}
+		versionResp, versionBody := req(t, "GET", versionURL, nil, versionHeaders)
+		if versionResp.StatusCode != http.StatusOK || !bytes.Equal(versionBody, []byte("encoded object bytes")) {
+			t.Fatalf("GET pinned %s: status=%d body=%q", enc, versionResp.StatusCode, versionBody)
+		}
+		if got := versionResp.Header.Get("Content-Encoding"); got != enc {
+			t.Fatalf("GET pinned %s: Content-Encoding=%q want %q", enc, got, enc)
+		}
+		if got := versionResp.Header.Get("Content-Length"); got != strconv.Itoa(len(versionBody)) {
+			t.Fatalf("GET pinned %s: Content-Length=%q want %d", enc, got, len(versionBody))
+		}
+		headResp, headBody := req(t, "HEAD", versionURL, nil, versionHeaders)
+		if headResp.StatusCode != http.StatusOK || len(headBody) != 0 {
+			t.Fatalf("HEAD pinned %s: status=%d body=%d", enc, headResp.StatusCode, len(headBody))
+		}
+		if got := headResp.Header.Get("Content-Encoding"); got != enc {
+			t.Fatalf("HEAD pinned %s: Content-Encoding=%q want %q", enc, got, enc)
+		}
+		conditionalHeaders := map[string]string{
+			"Authorization": tok, "Accept-Encoding": "identity",
+			"If-None-Match": versionResp.Header.Get("ETag"),
+		}
+		notModified, _ := req(t, "GET", versionURL, nil, conditionalHeaders)
+		if notModified.StatusCode != http.StatusNotModified {
+			t.Fatalf("GET pinned %s conditional: status=%d want 304", enc, notModified.StatusCode)
+		}
+		if got := notModified.Header.Get("Content-Encoding"); got != enc {
+			t.Fatalf("GET pinned %s conditional: Content-Encoding=%q want %q", enc, got, enc)
+		}
 	}
-	// Control: an encoded SOURCE object at the TRIMMED key derives a JPEG —
-	// the derivation response carries the generated image, never the source's
-	// encoding (the derived bytes are not gzip).
+	// Control: an unencoded SOURCE object at the TRIMMED key derives a JPEG.
+	// Encoded sources are rejected before derivation; this control preserves
+	// the successful path without asserting the old unsupported behavior.
 	uSrc := s.URL + "/v1/files/photo"
 	if resp, _ := req(t, "PUT", uSrc, pngBytes(t, 64, 64), map[string]string{
-		"Content-Type": "image/png", "Content-Encoding": "gzip", "Authorization": tok,
+		"Content-Type": "image/png", "Authorization": tok,
 	}); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("PUT photo: %d", resp.StatusCode)
 	}
@@ -5943,7 +5978,7 @@ func TestThumbnailExactKeyPreservesContentEncoding(t *testing.T) {
 		t.Fatalf("derived thumbnail: %d", resp.StatusCode)
 	}
 	if got := resp.Header.Get("Content-Encoding"); got != "" {
-		t.Fatalf("derived thumbnail Content-Encoding=%q, want absent (the JPEG is not the source's encoding)", got)
+		t.Fatalf("derived thumbnail Content-Encoding=%q, want absent", got)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
 		t.Fatalf("derived thumbnail content-type=%q want image/jpeg", ct)

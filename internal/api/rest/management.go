@@ -103,6 +103,7 @@ func (h *Handler) GetSpecificVersion(w http.ResponseWriter, r *http.Request, key
 		w.Header().Set("ETag", `"`+obj.ETag+`"`)
 		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 		w.Header().Set("X-Version-Id", obj.VersionID)
+		writeContentEncodingHeader(w, obj.Metadata)
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -114,6 +115,7 @@ func (h *Handler) GetSpecificVersion(w http.ResponseWriter, r *http.Request, key
 	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	writeMetadataHeaders(w, obj.Metadata)
+	writeContentEncodingHeader(w, obj.Metadata)
 	_, _ = io.Copy(w, rc)
 }
 

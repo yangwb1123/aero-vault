@@ -163,9 +163,21 @@ func IncThumbnailGenerationSuccess(ctx context.Context) {
 // with exactly one reason label (the closed set produced by the REST boundary's
 // thumbnailRejectionReason: image_too_large | metadata_too_large |
 // source_too_large | unsupported_format | not_an_image | unsupported |
-// invalid_argument | source_error | timeout). Silent client disconnects are not
-// counted — no response is emitted for them.
+// invalid_argument | source_error | timeout | content_encoding). Unknown values
+// fold into invalid_argument; silent client disconnects are not counted.
 func IncThumbnailGenerationRejection(ctx context.Context, reason string) {
 	initDomain()
+	reason = normalizeThumbnailRejectionReason(reason)
 	mThumbnailGenerationRejections.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+}
+
+func normalizeThumbnailRejectionReason(reason string) string {
+	switch reason {
+	case "image_too_large", "metadata_too_large", "source_too_large",
+		"unsupported_format", "not_an_image", "unsupported", "invalid_argument",
+		"source_error", "timeout", "content_encoding":
+		return reason
+	default:
+		return "invalid_argument"
+	}
 }

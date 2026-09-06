@@ -13,6 +13,11 @@ import "errors"
 // byte-level failures (corrupt or non-image input).
 var ErrUnsupportedFormat = errors.New("thumbnail: unsupported image format")
 
+// ErrUnsupportedContentEncoding identifies an object whose stored bytes are
+// declared with Content-Encoding. Thumbnail derivation only accepts the
+// opaque, already-decodable representation; raw object reads remain allowed.
+var ErrUnsupportedContentEncoding = errors.New("thumbnail: unsupported content encoding")
+
 // ErrNilSource identifies a missing object stream at the thumbnail opener
 // boundary. It is distinct from decode and magic-classification errors so
 // protocol adapters can report a server-side failure without exposing the

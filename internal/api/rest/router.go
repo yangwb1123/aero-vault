@@ -61,7 +61,7 @@ func init() {
 				{Name: "h", Description: "Thumbnail height in pixels. Omitted or 0 selects the default (256); empty, non-integer, negative, or non-representable values are rejected with 400. Values above 2048 are clamped to 2048. Aspect ratio is preserved and the image is never upscaled.", Type: "integer"},
 			},
 			Responses: map[int]string{
-				http.StatusUnsupportedMediaType:  "Object content-type is not one of the supported image formats (image/jpeg, image/png, image/gif)",
+				http.StatusUnsupportedMediaType:  "Object content-type is unsupported, or the object carries a non-empty Content-Encoding declaration that is not decoded for thumbnail derivation (supported image formats: image/jpeg, image/png, image/gif)",
 				http.StatusGone:                  "Object is marked as corrupt (scrub) — the corrupt-state error is surfaced verbatim, never flattened to a 400 invalid-image error",
 				http.StatusRequestEntityTooLarge: "Source dimensions exceed the decode caps (MaxSourceDim / MaxProgressiveSourceDim / Max16BitSourceDim), the image metadata exceeds the 8 MiB budget, or the compressed source exceeds the 128 MiB processing cap (MaxSourceBytes)",
 			}},

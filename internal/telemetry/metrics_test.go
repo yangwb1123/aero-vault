@@ -391,6 +391,7 @@ func TestThumbnailGenerationCountersSurface(t *testing.T) {
 	for _, r := range []string{
 		"image_too_large", "metadata_too_large", "source_too_large",
 		"unsupported", "unsupported_format", "not_an_image",
+		"invalid_argument", "source_error", "timeout", "content_encoding",
 	} {
 		IncThumbnailGenerationRejection(ctx, r)
 	}
@@ -404,11 +405,23 @@ func TestThumbnailGenerationCountersSurface(t *testing.T) {
 	for _, r := range []string{
 		"image_too_large", "metadata_too_large", "source_too_large",
 		"unsupported", "unsupported_format", "not_an_image",
+		"invalid_argument", "source_error", "timeout", "content_encoding",
 	} {
 		v, ok := scrapeValueLabel(body, "thumbnail_generation_rejections_total", "reason", r)
 		if !ok || v != 1 {
 			t.Errorf("thumbnail_generation_rejections_total{reason=%q} = %v (ok=%v), want 1", r, v, ok)
 		}
+	}
+
+	// Arbitrary values must use the bounded fallback rather than becoming a
+	// label. This also guards against leaking a raw Content-Encoding value.
+	IncThumbnailGenerationRejection(ctx, "gzip")
+	body = scrapeShared(t)
+	if v, ok := scrapeValueLabel(body, "thumbnail_generation_rejections_total", "reason", "invalid_argument"); !ok || v != 2 {
+		t.Errorf("fallback invalid_argument = %v (ok=%v), want 2", v, ok)
+	}
+	if _, ok := scrapeValueLabel(body, "thumbnail_generation_rejections_total", "reason", "gzip"); ok {
+		t.Fatal("unexpected unbounded gzip rejection label")
 	}
 }
 

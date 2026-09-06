@@ -305,4 +305,4 @@ groups:
           severity: warning
         annotations:
           summary: "Thumbnail generation rejections > 100/s for 10m (reason={{ $labels.reason }})"
-          description: "{{ $labels.reason }} thumbnail rejections sustained above 100/s for 10m. image_too_large/metadata_too_large/source_too_large: oversized or metadata-flooded uploads (memory-DoS defenses engaged); unsupported_format: undeclared WebP or other unsupported uploads; timeout: check REQUEST_TIMEOUT_SECONDS and decode-slot saturation."
+          description: "{{ $labels.reason }} thumbnail rejections sustained above 100/s for 10m. image_too_large/metadata_too_large/source_too_large: oversized or metadata-flooded uploads (memory-DoS defenses engaged); unsupported_format: undeclared WebP or other unsupported uploads; content_encoding: source declares an encoding that thumbnail derivation does not decode; timeout: check REQUEST_TIMEOUT_SECONDS and decode-slot saturation."

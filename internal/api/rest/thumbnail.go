@@ -155,6 +155,10 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		h.writeError(w, r, err)
 		return
 	}
+	if encoding := obj.Metadata["_aero_content_encoding"]; encoding != "" {
+		h.writeThumbnailError(w, r, unsupportedThumbnailContentEncodingError(encoding))
+		return
+	}
 	// Media-type gate, four-bucket partition of the normalized declared
 	// Content-Type (RFC 9110 §8.3.1: case-insensitive, parameters stripped —
 	// so "Image/JPEG" and "image/jpeg; charset=utf-8" both normalize to

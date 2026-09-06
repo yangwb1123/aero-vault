@@ -206,3 +206,7 @@ func (h *Handler) bucketVersioning(ctx context.Context, tenant string) bool {
 	cfg, err := h.svc.GetBucketConfig(ctx, tenant, service.DefaultBucket)
 	return err == nil && cfg.Versioning
 }
+
+func unsupportedThumbnailContentEncodingError(encoding string) error {
+	return fmt.Errorf("%w: declared Content-Encoding %q cannot be decoded for thumbnail derivation", thumbnail.ErrUnsupportedContentEncoding, encoding)
+}

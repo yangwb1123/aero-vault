@@ -61,6 +61,9 @@ func thumbnailSafeMessage(code string, err error) (string, bool) {
 	case "ImageTooLarge":
 		return thumbnail.ErrImageTooLarge.Error(), true
 	case "UnsupportedMediaType":
+		if errors.Is(err, thumbnail.ErrUnsupportedContentEncoding) {
+			return err.Error(), true
+		}
 		if err == thumbnail.ErrUnsupportedFormat {
 			return err.Error(), true
 		}
