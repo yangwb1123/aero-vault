@@ -72,6 +72,7 @@ func TestWriteThumbnailSourceErrorPreservesKnownErrors(t *testing.T) {
 		{"corrupt", fmt.Errorf("%s: %w", detail, service.ErrObjectCorrupt), http.StatusGone, "ObjectCorrupt", "object is marked as corrupt"},
 		{"decode", errors.Join(thumbnail.ErrUnsupported, errors.New(detail)), http.StatusBadRequest, "InvalidArgument", "invalid arguments: thumbnail: unsupported or invalid image"},
 		{"format", fmt.Errorf("%s: %w", detail, thumbnail.ErrUnsupportedFormat), http.StatusUnsupportedMediaType, "UnsupportedMediaType", `thumbnail: unsupported image format "webp" (supported: image/jpeg, image/png, image/gif)`},
+		{"wrapped content encoding", &thumbnail.OpenError{Err: fmt.Errorf("%s: %w", detail, thumbnail.ErrUnsupportedContentEncoding)}, http.StatusUnsupportedMediaType, "UnsupportedMediaType", thumbnail.ErrUnsupportedContentEncoding.Error()},
 		{"image size", fmt.Errorf("%s: %w", detail, thumbnail.ErrImageTooLarge), http.StatusRequestEntityTooLarge, "ImageTooLarge", thumbnail.ErrImageTooLarge.Error()},
 		{"metadata size", fmt.Errorf("%s: %w", detail, thumbnail.ErrMetadataTooLarge), http.StatusRequestEntityTooLarge, "MetadataTooLarge", thumbnail.ErrMetadataTooLarge.Error()},
 		{"source size", fmt.Errorf("%s: %w", detail, thumbnail.ErrSourceTooLarge), http.StatusRequestEntityTooLarge, "SourceTooLarge", thumbnail.ErrSourceTooLarge.Error()},

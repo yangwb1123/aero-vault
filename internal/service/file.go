@@ -205,6 +205,30 @@ func (s *FileService) WithReadVerification(cfg ReadVerificationConfig) *FileServ
 	return s
 }
 
+// MaxContentEncodingLen bounds the opaque Content-Encoding declaration before
+// it is copied into object metadata or reflected by a raw adapter.
+const MaxContentEncodingLen = 256
+
+// ValidateContentEncoding validates the safe field-value envelope while
+// intentionally leaving coding semantics opaque. This preserves declarations
+// such as "identity", compound codings, and legacy whitespace for the
+// thumbnail gate, which rejects every non-empty value during derivation.
+func ValidateContentEncoding(value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > MaxContentEncodingLen {
+		return fmt.Errorf("%w: Content-Encoding exceeds %d bytes", ErrInvalidArgs, MaxContentEncodingLen)
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\r' || value[i] == '\n' || value[i] == 0x7f ||
+			(value[i] < 0x20 && value[i] != '\t') {
+			return fmt.Errorf("%w: invalid Content-Encoding value", ErrInvalidArgs)
+		}
+	}
+	return nil
+}
+
 // validateMetadata checks user metadata. The _aero_ namespace is reserved for
 // service-owned integrity, encryption, retention, and multipart state.
 func validateMetadata(meta map[string]string) error {

@@ -155,6 +155,10 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		h.writeError(w, r, err)
 		return
 	}
+	// Derivation responses vary by the request credentials/tenant. Set this
+	// before every derivation rejection, including the metadata-derived 415,
+	// so an intermediary cannot reuse one tenant's result for another.
+	addThumbnailVary(w)
 	if encoding := obj.Metadata["_aero_content_encoding"]; encoding != "" {
 		h.writeThumbnailError(w, r, unsupportedThumbnailContentEncodingError(encoding))
 		return
@@ -239,7 +243,6 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	if auth.IsAnonymous(r.Context()) {
 		cacheControl = fmt.Sprintf("public, max-age=%d, must-revalidate", thumbFreshnessMaxAge)
 	}
-	addThumbnailVary(w)
 	// Unpinned X-Version-Id emission needs the bucket versioning gate (S3 parity).
 	versioning := version != "" || h.bucketVersioning(r.Context(), tenant)
 	// Conditional re-observation gate: an INM match (including wildcard) OR

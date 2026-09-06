@@ -26,7 +26,9 @@ func (s *FileService) InitMultipart(ctx context.Context, tenant, bucket, key str
 	if err := validateMetadata(opts.Metadata); err != nil {
 		return repository.Upload{}, err
 	}
-	storeContentHeaders(&opts)
+	if err := storeContentHeaders(&opts); err != nil {
+		return repository.Upload{}, err
+	}
 	accessMetadata, err := s.preparePutAccess(ctx, tenant, bucket, key, opts.Metadata)
 	if err != nil {
 		return repository.Upload{}, err

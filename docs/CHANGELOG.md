@@ -9,7 +9,8 @@ All functional changes, in reverse-chronological order. Dates are UTC.
 ### Changed
 - **Thumbnail REST: reject encoded derivation sources before thumbnail work**
   - Objects with a non-empty `Content-Encoding` declaration now return `415 UnsupportedMediaType` with the declared value in the safe error message. The rejection occurs before dimension parsing, conditional evaluation, cache lookup, decode admission, and source opening; `identity` and compound encodings are rejected as well.
-  - Rejections expose the bounded `thumbnail_generation_rejections_total{reason="content_encoding"}` metric. Raw GETs, including exact-key `/thumbnail` objects and version-pinned raw reads, remain opaque and re-emit stored `Content-Encoding` headers.
+  - Rejections expose the bounded `thumbnail_generation_rejections_total{reason="content_encoding"}` metric. Raw GETs, including exact-key `/thumbnail` objects and version-pinned raw reads, remain opaque and re-emit stored `Content-Encoding` headers when the declaration is safe to reflect.
+  - New Content-Encoding declarations are bounded to 256 bytes and reject control characters before persistence; opaque declarations such as `identity`, compound codings, and legacy whitespace remain eligible for the thumbnail gate.
 
 ---
 

@@ -93,7 +93,9 @@ func (s *FileService) Put(ctx context.Context, tenant, bucket, key string, r io.
 	if err := validateMetadata(opts.Metadata); err != nil {
 		return repository.Object{}, err
 	}
-	storeContentHeaders(&opts)
+	if err := storeContentHeaders(&opts); err != nil {
+		return repository.Object{}, err
+	}
 	accessMetadata, err := s.preparePutAccess(ctx, tenant, bucket, key, opts.Metadata)
 	if err != nil {
 		return repository.Object{}, err
@@ -309,9 +311,12 @@ func storeContentMD5(opts *PutOptions) {
 	}
 }
 
-func storeContentHeaders(opts *PutOptions) {
+func storeContentHeaders(opts *PutOptions) error {
+	if err := ValidateContentEncoding(opts.ContentEncoding); err != nil {
+		return err
+	}
 	if opts.ContentDisposition == "" && opts.ContentEncoding == "" {
-		return
+		return nil
 	}
 	opts.Metadata = cloneMetadata(opts.Metadata)
 	if opts.ContentDisposition != "" {
@@ -320,6 +325,7 @@ func storeContentHeaders(opts *PutOptions) {
 	if opts.ContentEncoding != "" {
 		opts.Metadata["_aero_content_encoding"] = opts.ContentEncoding
 	}
+	return nil
 }
 
 // md5WrapReader wraps an io.Reader with inline MD5 computation.

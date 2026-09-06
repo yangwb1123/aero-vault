@@ -207,6 +207,36 @@ func (h *Handler) bucketVersioning(ctx context.Context, tenant string) bool {
 	return err == nil && cfg.Versioning
 }
 
+const maxThumbnailEncodingMessageBytes = 256
+
+type thumbnailContentEncodingError struct {
+	encoding string
+}
+
+func (e *thumbnailContentEncodingError) Error() string {
+	return fmt.Sprintf("%s: declared Content-Encoding %q cannot be decoded for thumbnail derivation",
+		thumbnail.ErrUnsupportedContentEncoding, e.encoding)
+}
+
+func (e *thumbnailContentEncodingError) Unwrap() error {
+	return thumbnail.ErrUnsupportedContentEncoding
+}
+
 func unsupportedThumbnailContentEncodingError(encoding string) error {
-	return fmt.Errorf("%w: declared Content-Encoding %q cannot be decoded for thumbnail derivation", thumbnail.ErrUnsupportedContentEncoding, encoding)
+	return &thumbnailContentEncodingError{encoding: boundedThumbnailEncoding(encoding)}
+}
+
+func thumbnailContentEncodingMessage(err error) string {
+	var typed *thumbnailContentEncodingError
+	if errors.As(err, &typed) {
+		return typed.Error()
+	}
+	return thumbnail.ErrUnsupportedContentEncoding.Error()
+}
+
+func boundedThumbnailEncoding(encoding string) string {
+	if len(encoding) <= maxThumbnailEncodingMessageBytes {
+		return encoding
+	}
+	return encoding[:maxThumbnailEncodingMessageBytes] + "..."
 }

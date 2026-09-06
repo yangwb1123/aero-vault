@@ -366,7 +366,7 @@ func writeObjectHeaders(w http.ResponseWriter, contentType string, size int64, e
 	if v, ok := meta["_aero_content_disposition"]; ok && v != "" {
 		w.Header().Set("Content-Disposition", v)
 	}
-	if v, ok := meta["_aero_content_encoding"]; ok && v != "" {
+	if v, ok := meta["_aero_content_encoding"]; ok && v != "" && service.ValidateContentEncoding(v) == nil {
 		w.Header().Set("Content-Encoding", v)
 	}
 }

@@ -232,7 +232,7 @@ func classify(err error) (string, string, int) {
 		// future call site.
 		return "ImageTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, thumbnail.ErrUnsupportedContentEncoding):
-		return "UnsupportedMediaType", err.Error(), http.StatusUnsupportedMediaType
+		return "UnsupportedMediaType", thumbnailContentEncodingMessage(err), http.StatusUnsupportedMediaType
 	case errors.Is(err, thumbnail.ErrUnsupportedFormat):
 		// Defensive ordering (not load-bearing), mirroring ErrImageTooLarge:
 		// the thumbnail handler wraps only ErrUnsupportedFormat (never
@@ -408,7 +408,7 @@ func writeContentResponseHeaders(w http.ResponseWriter, meta map[string]string) 
 }
 
 func writeContentEncodingHeader(w http.ResponseWriter, meta map[string]string) {
-	if v, ok := meta["_aero_content_encoding"]; ok && v != "" {
+	if v, ok := meta["_aero_content_encoding"]; ok && v != "" && service.ValidateContentEncoding(v) == nil {
 		w.Header().Set("Content-Encoding", v)
 	}
 }

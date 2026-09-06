@@ -230,8 +230,11 @@ func redirectWebUI(w http.ResponseWriter, r *http.Request) {
 
 func runServer(ctx context.Context, handler http.Handler, cfg *config.Config, logger *slog.Logger, bus *events.Bus, shutdownOtel func(context.Context) error) error {
 	srv := &http.Server{
-		Addr:              cfg.App.Addr,
-		Handler:           handler,
+		Addr:    cfg.App.Addr,
+		Handler: handler,
+		// Keep the aggregate request-header ceiling explicit; individual
+		// representation declarations are bounded at the FileService edge.
+		MaxHeaderBytes:    1 << 20,
 		ReadHeaderTimeout: 15 * time.Second,
 		WriteTimeout:      time.Duration(cfg.App.WriteTimeoutSec) * time.Second,
 		IdleTimeout:       time.Duration(cfg.App.IdleTimeoutSec) * time.Second,

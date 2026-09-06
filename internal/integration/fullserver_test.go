@@ -2,10 +2,15 @@ package integration
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"log/slog"
 	"net/http"
@@ -555,6 +560,157 @@ func TestFullServer_CORS(t *testing.T) {
 	if got := resp.Header.Get("Vary"); got != "Origin" {
 		t.Fatalf("GET Vary: got %q, want %q", got, "Origin")
 	}
+}
+
+func TestFullServer_S3EncodedSourceRejectsRESTThumbnail(t *testing.T) {
+	ts := startFullServer(t)
+	img := image.NewRGBA(image.Rect(0, 0, 32, 16))
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 32; x++ {
+			img.Set(x, y, color.RGBA{uint8(x), uint8(y), 180, 255})
+		}
+	}
+	var jpegBody bytes.Buffer
+	if err := jpeg.Encode(&jpegBody, img, nil); err != nil {
+		t.Fatalf("encode JPEG: %v", err)
+	}
+	var encoded bytes.Buffer
+	zw := gzip.NewWriter(&encoded)
+	if _, err := zw.Write(jpegBody.Bytes()); err != nil {
+		t.Fatalf("gzip JPEG: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close gzip JPEG: %v", err)
+	}
+
+	key := "interop/encoded.jpg"
+	s3Req, err := http.NewRequest(http.MethodPut, ts.URL+"/s3/default/"+key, bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		t.Fatalf("S3 request: %v", err)
+	}
+	s3Req.Header.Set("Content-Type", "image/jpeg")
+	s3Req.Header.Set("Content-Encoding", "gzip")
+	putResp, err := http.DefaultClient.Do(s3Req)
+	if err != nil {
+		t.Fatalf("S3 PUT: %v", err)
+	}
+	putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		t.Fatalf("S3 PUT: got %d, want 200", putResp.StatusCode)
+	}
+
+	thumbResp, err := http.Get(ts.URL + "/v1/files/" + key + "/thumbnail?w=invalid")
+	if err != nil {
+		t.Fatalf("REST thumbnail: %v", err)
+	}
+	body, _ := io.ReadAll(thumbResp.Body)
+	thumbResp.Body.Close()
+	if thumbResp.StatusCode != http.StatusUnsupportedMediaType || !bytes.Contains(body, []byte("UnsupportedMediaType")) || !bytes.Contains(body, []byte("gzip")) {
+		t.Fatalf("REST thumbnail: status=%d body=%s, want 415 naming gzip", thumbResp.StatusCode, body)
+	}
+}
+
+func TestFullServer_S3MultipartEncodedSourceRejectsRESTThumbnail(t *testing.T) {
+	ts := startFullServer(t)
+	key := "interop/multipart-encoded.jpg"
+	jpegBody := makeIntegrationJPEG(t, 32, 16)
+	var encoded bytes.Buffer
+	zw := gzip.NewWriter(&encoded)
+	if _, err := zw.Write(jpegBody); err != nil {
+		t.Fatalf("gzip JPEG: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close gzip JPEG: %v", err)
+	}
+	base := ts.URL + "/s3/default/" + key
+	initReq, err := http.NewRequest(http.MethodPost, base+"?uploads", nil)
+	if err != nil {
+		t.Fatalf("init request: %v", err)
+	}
+	initReq.Header.Set("Content-Type", "image/jpeg")
+	initReq.Header.Set("Content-Encoding", "gzip")
+	initResp, err := http.DefaultClient.Do(initReq)
+	if err != nil {
+		t.Fatalf("init multipart: %v", err)
+	}
+	var initBody struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.NewDecoder(initResp.Body).Decode(&initBody); err != nil {
+		initResp.Body.Close()
+		t.Fatalf("decode init: %v", err)
+	}
+	initResp.Body.Close()
+	if initResp.StatusCode != http.StatusOK || initBody.UploadID == "" {
+		t.Fatalf("init multipart: status=%d upload_id=%q", initResp.StatusCode, initBody.UploadID)
+	}
+
+	partReq, err := http.NewRequest(http.MethodPut, base+"?partNumber=1&uploadId="+initBody.UploadID, bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		t.Fatalf("part request: %v", err)
+	}
+	partResp, err := http.DefaultClient.Do(partReq)
+	if err != nil {
+		t.Fatalf("upload part: %v", err)
+	}
+	partETag := partResp.Header.Get("ETag")
+	partResp.Body.Close()
+	if partResp.StatusCode != http.StatusOK || partETag == "" {
+		t.Fatalf("upload part: status=%d etag=%q", partResp.StatusCode, partETag)
+	}
+
+	manifest := struct {
+		XMLName xml.Name `xml:"CompleteMultipartUpload"`
+		Parts   []struct {
+			PartNumber int32  `xml:"PartNumber"`
+			ETag       string `xml:"ETag"`
+		} `xml:"Part"`
+	}{Parts: []struct {
+		PartNumber int32  `xml:"PartNumber"`
+		ETag       string `xml:"ETag"`
+	}{{PartNumber: 1, ETag: partETag}}}
+	manifestBody, err := xml.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	completeReq, err := http.NewRequest(http.MethodPost, base+"?uploadId="+initBody.UploadID, bytes.NewReader(manifestBody))
+	if err != nil {
+		t.Fatalf("complete request: %v", err)
+	}
+	completeReq.Header.Set("Content-Type", "application/xml")
+	completeResp, err := http.DefaultClient.Do(completeReq)
+	if err != nil {
+		t.Fatalf("complete multipart: %v", err)
+	}
+	completeResp.Body.Close()
+	if completeResp.StatusCode != http.StatusOK {
+		t.Fatalf("complete multipart: status=%d", completeResp.StatusCode)
+	}
+
+	thumbResp, err := http.Get(ts.URL + "/v1/files/" + key + "/thumbnail?w=invalid")
+	if err != nil {
+		t.Fatalf("REST thumbnail: %v", err)
+	}
+	body, _ := io.ReadAll(thumbResp.Body)
+	thumbResp.Body.Close()
+	if thumbResp.StatusCode != http.StatusUnsupportedMediaType || !bytes.Contains(body, []byte("gzip")) {
+		t.Fatalf("REST multipart thumbnail: status=%d body=%s, want 415 naming gzip", thumbResp.StatusCode, body)
+	}
+}
+
+func makeIntegrationJPEG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{uint8(x), uint8(y), 180, 255})
+		}
+	}
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, img, nil); err != nil {
+		t.Fatalf("encode JPEG: %v", err)
+	}
+	return out.Bytes()
 }
 
 func TestFullServer_ProtocolInterop(t *testing.T) {
