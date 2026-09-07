@@ -15,7 +15,8 @@ type cacheFlight struct {
 }
 
 // maxPendingFlights bounds distinct entries in one Cache's in-flight registry.
-// It deliberately shares the decode capacity's small fixed bound: leaders
+// It deliberately shares the decode capacity's small fixed bound (currently
+// four): leaders
 // waiting for admission, active leaders, and completed flights awaiting map
 // removal all count, while followers do not. A full registry does not evict or
 // cancel existing work; a new key bypasses coalescing and uses direct
