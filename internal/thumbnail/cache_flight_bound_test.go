@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"runtime"
 	"strconv"
 	"sync"
@@ -131,6 +132,29 @@ func TestBeginFlightBoundAndOverflow(t *testing.T) {
 	if got := pendingFlightCount(cache); got != maxPendingFlights {
 		t.Fatalf("overflow generation changed pending flights=%d, want %d", got, maxPendingFlights)
 	}
+	assertSlotsReleased(t)
+
+	sentinel := errors.New("overflow opener failure")
+	_, err = GenerateContextWithOpenerCachedWithAdmissionResult(
+		context.Background(), cache, nil, identity, etagA, 72, 72,
+		func() (io.ReadCloser, OpenedSource, error) {
+			return nil, OpenedSource{}, sentinel
+		},
+	)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("overflow opener error=%v, want sentinel", err)
+	}
+	_, err = GenerateContextWithOpenerCachedWithAdmissionResult(
+		context.Background(), cache, nil, identity, etagA, 80, 80,
+		countingOpener3([]byte("not an image"), etagA, &opens, identity),
+	)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("overflow decode error=%v, want ErrUnsupported", err)
+	}
+	if got := pendingFlightCount(cache); got != maxPendingFlights {
+		t.Fatalf("overflow errors changed pending flights=%d, want %d", got, maxPendingFlights)
+	}
+	assertSlotsReleased(t)
 }
 
 func TestBeginFlightBypassPathsDoNotAllocate(t *testing.T) {
@@ -157,13 +181,52 @@ func TestBeginFlightBypassPathsDoNotAllocate(t *testing.T) {
 			}
 		})
 	}
+
+	data := makePNG(t, 32, 32)
+	for _, tc := range []struct {
+		name  string
+		cache *Cache
+		id    SourceIdentity
+		etag  string
+	}{
+		{name: "public nil cache", cache: nil, id: complete, etag: etagA},
+		{name: "public disabled cache", cache: NewCache(0, 0), id: complete, etag: etagA},
+		{name: "public incomplete identity", cache: NewCache(1<<20, 0), id: incomplete, etag: etagA},
+		{name: "public non-MD5 etag", cache: NewCache(1<<20, 0), id: complete, etag: "e1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var opens atomic.Int64
+			result, err := GenerateContextWithOpenerCachedWithAdmissionResult(
+				context.Background(), tc.cache, nil, tc.id, tc.etag, 32, 32,
+				countingOpener3(data, tc.etag, &opens, tc.id),
+			)
+			if err != nil || result.FromCache || len(result.Image) == 0 {
+				t.Fatalf("bypass result=%+v err=%v", result, err)
+			}
+			if opens.Load() != 1 {
+				t.Fatalf("bypass opener calls=%d, want 1", opens.Load())
+			}
+			if got := pendingFlightCount(tc.cache); got != 0 {
+				t.Fatalf("public bypass allocated %d flights", got)
+			}
+			if tc.cache != nil {
+				tc.cache.flightMu.Lock()
+				initialized := tc.cache.flights != nil
+				count := len(tc.cache.flights)
+				tc.cache.flightMu.Unlock()
+				if initialized || count != 0 {
+					t.Fatalf("public bypass initialized flights=%v count=%d", initialized, count)
+				}
+			}
+			assertSlotsReleased(t)
+		})
+	}
 }
 
 func TestCacheFlightsBoundUnderSaturatedDecodeSlots(t *testing.T) {
 	cache := NewCache(1<<20, 0)
 	data := makePNG(t, 32, 32)
 	slotSaturate()
-	defer releaseAndRecoverSlots(t)
 
 	total := maxPendingFlights + 3
 	start := make(chan struct{})
@@ -171,6 +234,47 @@ func TestCacheFlightsBoundUnderSaturatedDecodeSlots(t *testing.T) {
 	cancels := make([]context.CancelFunc, 0, total)
 	var workers sync.WaitGroup
 	var opens atomic.Int64
+	var maxObserved atomic.Int64
+	observerStop := make(chan struct{})
+	observerDone := make(chan struct{})
+	var stopObserver sync.Once
+	recordMax := func() {
+		got := int64(pendingFlightCount(cache))
+		for {
+			old := maxObserved.Load()
+			if got <= old || maxObserved.CompareAndSwap(old, got) {
+				return
+			}
+		}
+	}
+	go func() {
+		defer close(observerDone)
+		for {
+			select {
+			case <-observerStop:
+				return
+			default:
+				recordMax()
+				runtime.Gosched()
+			}
+		}
+	}()
+	stop := func() {
+		stopObserver.Do(func() { close(observerStop) })
+		<-observerDone
+	}
+	t.Cleanup(func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+		workers.Wait()
+		stop()
+		for i := 0; i < maxConcurrentDecodes; i++ {
+			releaseDecodeSlot()
+		}
+		recoverSlots(t)
+	})
+
 	for i := 0; i < total; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancels = append(cancels, cancel)
@@ -188,11 +292,9 @@ func TestCacheFlightsBoundUnderSaturatedDecodeSlots(t *testing.T) {
 	close(start)
 
 	if !waitForPendingFlightCount(cache, maxPendingFlights) {
-		for _, cancel := range cancels {
-			cancel()
-		}
 		t.Fatalf("pending flights never reached bound; got %d", pendingFlightCount(cache))
 	}
+	recordMax()
 	if got := pendingFlightCount(cache); got > maxPendingFlights {
 		t.Fatalf("pending flights=%d exceeded bound %d", got, maxPendingFlights)
 	}
@@ -208,16 +310,7 @@ func TestCacheFlightsBoundUnderSaturatedDecodeSlots(t *testing.T) {
 	for _, cancel := range cancels {
 		cancel()
 	}
-	workersDone := make(chan struct{})
-	go func() {
-		workers.Wait()
-		close(workersDone)
-	}()
-	select {
-	case <-workersDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("canceled saturated callers did not finish")
-	}
+	workers.Wait()
 	for i := 0; i < total; i++ {
 		select {
 		case err := <-results:
@@ -230,6 +323,44 @@ func TestCacheFlightsBoundUnderSaturatedDecodeSlots(t *testing.T) {
 	}
 	if got := pendingFlightCount(cache); got != 0 {
 		t.Fatalf("canceled callers left %d flights", got)
+	}
+	stop()
+	if got := maxObserved.Load(); got > maxPendingFlights || got < maxPendingFlights {
+		t.Fatalf("observed maximum flights=%d, want exactly %d", got, maxPendingFlights)
+	}
+}
+
+func TestClosedFlightsStillCountTowardBound(t *testing.T) {
+	cache := NewCache(1<<20, 0)
+	identity := testIdentity("closed")
+	keys := make([]CacheKey, 0, maxPendingFlights)
+	defer func() {
+		cache.flightMu.Lock()
+		for _, key := range keys {
+			delete(cache.flights, key)
+		}
+		cache.flightMu.Unlock()
+	}()
+	for i := 0; i < maxPendingFlights; i++ {
+		key := boundTestKey(identity, 16+i)
+		flight, leader := beginFlight(cache, key)
+		if flight == nil || !leader {
+			t.Fatalf("flight %d: got flight=%p leader=%v", i, flight, leader)
+		}
+		keys = append(keys, key)
+	}
+	cache.flightMu.Lock()
+	for _, key := range keys {
+		close(cache.flights[key].done)
+	}
+	cache.flightMu.Unlock()
+
+	overflow := boundTestKey(identity, 64)
+	if flight, leader := beginFlight(cache, overflow); flight != nil || leader {
+		t.Fatalf("closed full registry admitted overflow flight=%p leader=%v", flight, leader)
+	}
+	if got := pendingFlightCount(cache); got != maxPendingFlights {
+		t.Fatalf("closed flights count=%d, want %d", got, maxPendingFlights)
 	}
 }
 

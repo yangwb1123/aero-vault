@@ -229,6 +229,12 @@ func TestCacheGenerateJoinedCallerCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("canceled joiner did not return")
 	}
+	c.flightMu.Lock()
+	_, present := c.flights[key]
+	c.flightMu.Unlock()
+	if !present {
+		t.Fatal("canceled joiner removed the leader flight")
+	}
 	select {
 	case err := <-leaderDone:
 		t.Fatalf("leader finished before release: %v", err)
