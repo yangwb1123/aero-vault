@@ -14,18 +14,31 @@ type cacheFlight struct {
 	joiners int
 }
 
+// maxPendingFlights bounds distinct entries in one Cache's in-flight registry.
+// It deliberately shares the decode capacity's small fixed bound: leaders
+// waiting for admission, active leaders, and completed flights awaiting map
+// removal all count, while followers do not. A full registry does not evict or
+// cancel existing work; a new key bypasses coalescing and uses direct
+// generation. This does not bound followers or the decode-admission queue.
+const maxPendingFlights = maxConcurrentDecodes
+
 func beginFlight(c *Cache, key CacheKey) (*cacheFlight, bool) {
 	if c == nil || c.disabled || !key.Identity.Complete() {
 		return nil, false
 	}
 	c.flightMu.Lock()
 	defer c.flightMu.Unlock()
-	if c.flights == nil {
-		c.flights = make(map[CacheKey]*cacheFlight)
-	}
+	// Existing-key lookup must precede the capacity check so a full registry
+	// still preserves same-key coalescing.
 	if flight, ok := c.flights[key]; ok {
 		flight.joiners++
 		return flight, false
+	}
+	if len(c.flights) >= maxPendingFlights {
+		return nil, false
+	}
+	if c.flights == nil {
+		c.flights = make(map[CacheKey]*cacheFlight)
 	}
 	flight := &cacheFlight{done: make(chan struct{})}
 	c.flights[key] = flight
