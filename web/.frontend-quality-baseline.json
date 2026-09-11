@@ -1,0 +1,188 @@
+{
+  "strict": true,
+  "directory": "web/src",
+  "files_scanned": 85,
+  "violations": [
+    {
+      "file": "web/src/api/access.test.ts",
+      "detail": "web/src/api/access.test.ts: 16 api calls > 5"
+    },
+    {
+      "file": "web/src/api/bucketSecurity.test.ts",
+      "detail": "web/src/api/bucketSecurity.test.ts: 8 api calls > 5"
+    },
+    {
+      "file": "web/src/api/buckets.test.ts",
+      "detail": "web/src/api/buckets.test.ts: 7 api calls > 5"
+    },
+    {
+      "file": "web/src/api/events.ts",
+      "detail": "web/src/api/events.ts: await inside loop body near char 639 (N+1 request risk — batch/Future.wait)"
+    },
+    {
+      "file": "web/src/api/files.test.ts",
+      "detail": "web/src/api/files.test.ts: 6 api calls > 5"
+    },
+    {
+      "file": "web/src/api/objects.test.ts",
+      "detail": "web/src/api/objects.test.ts: 14 api calls > 5"
+    },
+    {
+      "file": "web/src/api/vault.ts",
+      "detail": "web/src/api/vault.ts: 500 lines > 400 (god-file risk)"
+    },
+    {
+      "file": "web/src/api/vault.ts",
+      "detail": "web/src/api/vault.ts: await inside loop body near char 15154 (N+1 request risk — batch/Future.wait)"
+    },
+    {
+      "file": "web/src/pages/FilesPage.tsx",
+      "detail": "web/src/pages/FilesPage.tsx: 10 api calls > 5"
+    },
+    {
+      "file": "web/src/pages/access/ACLPanel.tsx",
+      "detail": "web/src/pages/access/ACLPanel.tsx: 10 event handlers > 8"
+    },
+    {
+      "file": "web/src/pages/access/ACLPanel.tsx",
+      "detail": "web/src/pages/access/ACLPanel.tsx: nesting depth 7 > 4"
+    },
+    {
+      "file": "web/src/pages/access/AssetPanel.tsx",
+      "detail": "web/src/pages/access/AssetPanel.tsx: nesting depth 7 > 4"
+    },
+    {
+      "file": "web/src/pages/access/SharePanel.tsx",
+      "detail": "web/src/pages/access/SharePanel.tsx: 10 event handlers > 8"
+    },
+    {
+      "file": "web/src/pages/buckets/BucketDetailPanel.tsx",
+      "detail": "web/src/pages/buckets/BucketDetailPanel.tsx: 6 api calls > 5"
+    },
+    {
+      "file": "web/src/pages/departments/DepartmentDetailPanel.tsx",
+      "detail": "web/src/pages/departments/DepartmentDetailPanel.tsx: nesting depth 8 > 4"
+    },
+    {
+      "file": "web/src/pages/files/BatchToolbar.tsx",
+      "detail": "web/src/pages/files/BatchToolbar.tsx: nesting depth 5 > 4"
+    },
+    {
+      "file": "web/src/pages/files/FileTable.tsx",
+      "detail": "web/src/pages/files/FileTable.tsx: nesting depth 8 > 4"
+    },
+    {
+      "file": "web/src/pages/files/FolderBrowser.tsx",
+      "detail": "web/src/pages/files/FolderBrowser.tsx: nesting depth 7 > 4"
+    },
+    {
+      "file": "web/src/pages/files/UploadPanel.tsx",
+      "detail": "web/src/pages/files/UploadPanel.tsx: await inside loop body near char 846 (N+1 request risk — batch/Future.wait)"
+    },
+    {
+      "file": "web/src/pages/object/GovernancePanel.tsx",
+      "detail": "web/src/pages/object/GovernancePanel.tsx: 9 event handlers > 8"
+    },
+    {
+      "file": "web/src/pages/object/GovernancePanel.tsx",
+      "detail": "web/src/pages/object/GovernancePanel.tsx: 6 api calls > 5"
+    },
+    {
+      "file": "web/src/pages/object/GovernancePanel.tsx",
+      "detail": "web/src/pages/object/GovernancePanel.tsx: nesting depth 7 > 4"
+    }
+  ],
+  "total": 22,
+  "baseline": false,
+  "new_violations": [
+    {
+      "file": "web/src/api/access.test.ts",
+      "detail": "web/src/api/access.test.ts: 16 api calls > 5"
+    },
+    {
+      "file": "web/src/api/bucketSecurity.test.ts",
+      "detail": "web/src/api/bucketSecurity.test.ts: 8 api calls > 5"
+    },
+    {
+      "file": "web/src/api/buckets.test.ts",
+      "detail": "web/src/api/buckets.test.ts: 7 api calls > 5"
+    },
+    {
+      "file": "web/src/api/events.ts",
+      "detail": "web/src/api/events.ts: await inside loop body near char 639 (N+1 request risk — batch/Future.wait)"
+    },
+    {
+      "file": "web/src/api/files.test.ts",
+      "detail": "web/src/api/files.test.ts: 6 api calls > 5"
+    },
+    {
+      "file": "web/src/api/objects.test.ts",
+      "detail": "web/src/api/objects.test.ts: 14 api calls > 5"
+    },
+    {
+      "file": "web/src/api/vault.ts",
+      "detail": "web/src/api/vault.ts: 500 lines > 400 (god-file risk)"
+    },
+    {
+      "file": "web/src/api/vault.ts",
+      "detail": "web/src/api/vault.ts: await inside loop body near char 15154 (N+1 request risk — batch/Future.wait)"
+    },
+    {
+      "file": "web/src/pages/FilesPage.tsx",
+      "detail": "web/src/pages/FilesPage.tsx: 10 api calls > 5"
+    },
+    {
+      "file": "web/src/pages/access/ACLPanel.tsx",
+      "detail": "web/src/pages/access/ACLPanel.tsx: 10 event handlers > 8"
+    },
+    {
+      "file": "web/src/pages/access/ACLPanel.tsx",
+      "detail": "web/src/pages/access/ACLPanel.tsx: nesting depth 7 > 4"
+    },
+    {
+      "file": "web/src/pages/access/AssetPanel.tsx",
+      "detail": "web/src/pages/access/AssetPanel.tsx: nesting depth 7 > 4"
+    },
+    {
+      "file": "web/src/pages/access/SharePanel.tsx",
+      "detail": "web/src/pages/access/SharePanel.tsx: 10 event handlers > 8"
+    },
+    {
+      "file": "web/src/pages/buckets/BucketDetailPanel.tsx",
+      "detail": "web/src/pages/buckets/BucketDetailPanel.tsx: 6 api calls > 5"
+    },
+    {
+      "file": "web/src/pages/departments/DepartmentDetailPanel.tsx",
+      "detail": "web/src/pages/departments/DepartmentDetailPanel.tsx: nesting depth 8 > 4"
+    },
+    {
+      "file": "web/src/pages/files/BatchToolbar.tsx",
+      "detail": "web/src/pages/files/BatchToolbar.tsx: nesting depth 5 > 4"
+    },
+    {
+      "file": "web/src/pages/files/FileTable.tsx",
+      "detail": "web/src/pages/files/FileTable.tsx: nesting depth 8 > 4"
+    },
+    {
+      "file": "web/src/pages/files/FolderBrowser.tsx",
+      "detail": "web/src/pages/files/FolderBrowser.tsx: nesting depth 7 > 4"
+    },
+    {
+      "file": "web/src/pages/files/UploadPanel.tsx",
+      "detail": "web/src/pages/files/UploadPanel.tsx: await inside loop body near char 846 (N+1 request risk — batch/Future.wait)"
+    },
+    {
+      "file": "web/src/pages/object/GovernancePanel.tsx",
+      "detail": "web/src/pages/object/GovernancePanel.tsx: 9 event handlers > 8"
+    },
+    {
+      "file": "web/src/pages/object/GovernancePanel.tsx",
+      "detail": "web/src/pages/object/GovernancePanel.tsx: 6 api calls > 5"
+    },
+    {
+      "file": "web/src/pages/object/GovernancePanel.tsx",
+      "detail": "web/src/pages/object/GovernancePanel.tsx: nesting depth 7 > 4"
+    }
+  ],
+  "new_total": 22
+}
