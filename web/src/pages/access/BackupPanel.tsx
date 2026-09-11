@@ -3,7 +3,7 @@ import { IrisAlert, IrisButton, IrisCard, IrisInput } from '@iris-ui-kit/react'
 import type { VaultClient } from '../../api/vault'
 import { downloadBlob } from '../../download'
 
-export function BackupPanel({ client }: { client: VaultClient }): React.ReactElement {
+export function BackupPanel({ client, bucket }: { client: VaultClient; bucket: string }): React.ReactElement {
   const [prefix, setPrefix] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState<string>()
@@ -12,7 +12,7 @@ export function BackupPanel({ client }: { client: VaultClient }): React.ReactEle
     setBusy(true)
     setError(undefined)
     try {
-      const archive = await client.exportArchive(prefix.trim())
+      const archive = await client.exportArchive(bucket, prefix.trim())
       downloadBlob(archive, `aero-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '备份导出失败')

@@ -294,8 +294,8 @@ export class VaultClient extends VaultTransport {
     })
   }
 
-  async listShares(key: string): Promise<Share[]> {
-    const query = new URLSearchParams({ bucket: 'default', key })
+  async listShares(bucket: string, key: string): Promise<Share[]> {
+    const query = new URLSearchParams({ bucket, key })
     const result = await this.json<{ shares?: Share[] }>(`/shares?${query}`)
     return result.shares ?? []
   }
@@ -304,11 +304,11 @@ export class VaultClient extends VaultTransport {
     await this.request(`/shares/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
-  async publishAsset(key: string, slug: string): Promise<PublishedAsset> {
+  async publishAsset(bucket: string, key: string, slug: string): Promise<PublishedAsset> {
     return this.json<PublishedAsset>('/assets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key, slug, cache_control: 'public, max-age=86400' }),
+      body: JSON.stringify({ bucket, key, slug, cache_control: 'public, max-age=86400' }),
     })
   }
 
@@ -321,8 +321,8 @@ export class VaultClient extends VaultTransport {
     await this.request(`/assets/${encodeKey(slug)}`, { method: 'DELETE' })
   }
 
-  async listACL(key: string, kind: ResourceKind): Promise<ACLEntry[]> {
-    const query = new URLSearchParams({ bucket: 'default', key, kind })
+  async listACL(bucket: string, key: string, kind: ResourceKind): Promise<ACLEntry[]> {
+    const query = new URLSearchParams({ bucket, key, kind })
     const result = await this.json<{ entries?: ACLEntry[] }>(`/access/acl?${query}`)
     return result.entries ?? []
   }
@@ -340,8 +340,8 @@ export class VaultClient extends VaultTransport {
     await this.request(`/access/acl/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
-  async exportArchive(prefix: string): Promise<Blob> {
-    const query = new URLSearchParams({ bucket: 'default', prefix })
+  async exportArchive(bucket: string, prefix: string): Promise<Blob> {
+    const query = new URLSearchParams({ bucket, prefix })
     const response = await this.request(`/exports/archive?${query}`, {
       headers: { Accept: 'application/gzip' },
     })

@@ -6,19 +6,19 @@ describe('VaultClient access APIs', () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       if (init?.method === 'POST') {
-        expect(JSON.parse(String(init.body))).toMatchObject({ key: 'docs/a.txt', ttl_seconds: 900 })
+        expect(JSON.parse(String(init.body))).toMatchObject({ bucket: 'project', key: 'docs/a.txt', ttl_seconds: 900 })
         return jsonResponse({ share: { id: 's1' }, token: 'secret', url: 'https://vault/share/secret' }, 201)
       }
       if (init?.method === 'DELETE') return new Response(null, { status: 204 })
-      expect(path).toBe('/v1/shares?bucket=default&key=docs%2Fa.txt')
+      expect(path).toBe('/v1/shares?bucket=project&key=docs%2Fa.txt')
       return jsonResponse({ shares: [{ id: 's1' }] })
     })
     const client = new VaultClient('/v1', () => 'token', fetcher as typeof fetch)
 
     await expect(client.createShare({
-      key: 'docs/a.txt', allow_preview: true, allow_download: true, ttl_seconds: 900,
+      bucket: 'project', key: 'docs/a.txt', allow_preview: true, allow_download: true, ttl_seconds: 900,
     })).resolves.toMatchObject({ token: 'secret' })
-    await expect(client.listShares('docs/a.txt')).resolves.toEqual([{ id: 's1' }])
+    await expect(client.listShares('project', 'docs/a.txt')).resolves.toEqual([{ id: 's1' }])
     await client.revokeShare('s1')
     expect(String(fetcher.mock.calls[2][0])).toBe('/v1/shares/s1')
   })
@@ -26,21 +26,30 @@ describe('VaultClient access APIs', () => {
   it('uses encoded resource paths for assets and ACL entries', async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
-      if (path === '/v1/assets' && init?.method === 'POST') return jsonResponse({ asset: { id: 'a1' }, url: '/public/assets/blog/hero.jpg' }, 201)
-      if (path === '/v1/assets') return jsonResponse({ assets: [{ id: 'a1', slug: 'blog/hero.jpg' }] })
+      if (path === '/v1/assets' && init?.method === 'POST') {
+        expect(JSON.parse(String(init.body))).toMatchObject({ bucket: 'project', key: 'images/hero.jpg', slug: 'blog/hero.jpg' })
+        return jsonResponse({ asset: { id: 'a1', bucket: 'project' }, url: '/public/assets/blog/hero.jpg' }, 201)
+      }
+      if (path === '/v1/assets') return jsonResponse({ assets: [{ id: 'a1', bucket: 'project', slug: 'blog/hero.jpg' }] })
       if (path.startsWith('/v1/assets/')) return new Response(null, { status: 204 })
-      if (path.startsWith('/v1/access/acl?')) return jsonResponse({ entries: [{ id: 'acl1' }] })
-      if (path === '/v1/access/acl' && init?.method === 'PUT') return jsonResponse({ entries: [{ id: 'acl2' }] }, 201)
+      if (path.startsWith('/v1/access/acl?')) {
+        expect(path).toBe('/v1/access/acl?bucket=project&key=images%2Fhero.jpg&kind=object')
+        return jsonResponse({ entries: [{ id: 'acl1' }] })
+      }
+      if (path === '/v1/access/acl' && init?.method === 'PUT') {
+        expect(JSON.parse(String(init.body))).toMatchObject({ bucket: 'project', key: 'images/hero.jpg' })
+        return jsonResponse({ entries: [{ id: 'acl2' }] }, 201)
+      }
       return new Response(null, { status: 204 })
     })
     const client = new VaultClient('/v1', () => 'token', fetcher as typeof fetch)
 
-    await client.publishAsset('images/hero.jpg', 'blog/hero.jpg')
-    await expect(client.listAssets()).resolves.toEqual([{ id: 'a1', slug: 'blog/hero.jpg' }])
+    await client.publishAsset('project', 'images/hero.jpg', 'blog/hero.jpg')
+    await expect(client.listAssets()).resolves.toEqual([{ id: 'a1', bucket: 'project', slug: 'blog/hero.jpg' }])
     await client.unpublishAsset('blog/hero.jpg')
-    await expect(client.listACL('images/hero.jpg', 'object')).resolves.toEqual([{ id: 'acl1' }])
+    await expect(client.listACL('project', 'images/hero.jpg', 'object')).resolves.toEqual([{ id: 'acl1' }])
     await client.putACL({
-      key: 'images/hero.jpg', resource_kind: 'object', principal_type: 'user',
+      bucket: 'project', key: 'images/hero.jpg', resource_kind: 'object', principal_type: 'user',
       principal_id: 'alice', actions: ['object:read'], effect: 'allow', inherit: false,
     })
     await client.deleteACL('acl/1')
@@ -54,8 +63,8 @@ describe('VaultClient access APIs', () => {
       return new Response('archive', { status: 200, headers: { 'Content-Type': 'application/gzip' } })
     })
     const client = new VaultClient('/v1', () => 'token', fetcher as typeof fetch)
-    await expect(client.exportArchive('docs/')).resolves.toBeInstanceOf(Blob)
-    expect(String(fetcher.mock.calls[0][0])).toBe('/v1/exports/archive?bucket=default&prefix=docs%2F')
+    await expect(client.exportArchive('project', 'docs/')).resolves.toBeInstanceOf(Blob)
+    expect(String(fetcher.mock.calls[0][0])).toBe('/v1/exports/archive?bucket=project&prefix=docs%2F')
   })
 
   it('manages department hierarchy and Aero ID subject membership', async () => {

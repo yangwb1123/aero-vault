@@ -15,7 +15,7 @@ const effects: Array<SelectOption<AccessEffect>> = [
   { value: 'allow', label: '允许' }, { value: 'deny', label: '拒绝（优先）' },
 ]
 
-export function ACLPanel({ client }: { client: VaultClient }): React.ReactElement {
+export function ACLPanel({ client, bucket }: { client: VaultClient; bucket: string }): React.ReactElement {
   const [key, setKey] = React.useState('')
   const [kind, setKind] = React.useState<ResourceKind>('object')
   const [principal, setPrincipal] = React.useState<PrincipalType>('user')
@@ -27,19 +27,19 @@ export function ACLPanel({ client }: { client: VaultClient }): React.ReactElemen
   const [busy, setBusy] = React.useState('')
   const [error, setError] = React.useState<string>()
 
-  const load = async () => run('list', async () => setEntries(await client.listACL(key.trim(), kind)))
+  const load = async () => run('list', async () => setEntries(await client.listACL(bucket, key.trim(), kind)))
   const grant = async () => run('grant', async () => {
     const values = actions.split(',').map((value) => value.trim()).filter(Boolean)
     if (values.length === 0) throw new Error('至少填写一个授权 action')
     await client.putACL({
-      key: key.trim(), resource_kind: kind, principal_type: principal,
+      bucket, key: key.trim(), resource_kind: kind, principal_type: principal,
       principal_id: principalID.trim(), actions: values, effect, inherit,
     })
-    setEntries(await client.listACL(key.trim(), kind))
+    setEntries(await client.listACL(bucket, key.trim(), kind))
   })
   const remove = async (id: string) => run(`delete:${id}`, async () => {
     await client.deleteACL(id)
-    setEntries(await client.listACL(key.trim(), kind))
+    setEntries(await client.listACL(bucket, key.trim(), kind))
   })
   const run = async (label: string, action: () => Promise<void>) => {
     setBusy(label)

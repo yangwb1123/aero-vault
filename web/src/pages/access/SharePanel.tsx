@@ -12,7 +12,7 @@ import {
 import type { Share } from '../../api/access'
 import type { VaultClient } from '../../api/vault'
 
-export function SharePanel({ client }: { client: VaultClient }): React.ReactElement {
+export function SharePanel({ client, bucket }: { client: VaultClient; bucket: string }): React.ReactElement {
   const [key, setKey] = React.useState('')
   const [name, setName] = React.useState('')
   const [password, setPassword] = React.useState('')
@@ -27,7 +27,7 @@ export function SharePanel({ client }: { client: VaultClient }): React.ReactElem
 
   const load = async () => {
     if (!key.trim()) return
-    await run('list', async () => setShares(await client.listShares(key.trim())))
+    await run('list', async () => setShares(await client.listShares(bucket, key.trim())))
   }
 
   const create = async () => {
@@ -35,6 +35,7 @@ export function SharePanel({ client }: { client: VaultClient }): React.ReactElem
     if (!objectKey) return
     await run('create', async () => {
       const result = await client.createShare({
+        bucket,
         key: objectKey,
         name: name.trim() || undefined,
         password: password || undefined,
@@ -44,7 +45,7 @@ export function SharePanel({ client }: { client: VaultClient }): React.ReactElem
         max_uses: maxUses && maxUses > 0 ? maxUses : undefined,
       })
       setCreatedURL(result.url)
-      setShares(await client.listShares(objectKey))
+      setShares(await client.listShares(bucket, objectKey))
     })
   }
 
@@ -52,7 +53,7 @@ export function SharePanel({ client }: { client: VaultClient }): React.ReactElem
     if (!window.confirm('撤销这个分享链接？撤销后访问会立即失效。')) return
     await run(`revoke:${id}`, async () => {
       await client.revokeShare(id)
-      setShares(await client.listShares(key.trim()))
+      setShares(await client.listShares(bucket, key.trim()))
     })
   }
 

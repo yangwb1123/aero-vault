@@ -5,12 +5,15 @@ import type { VaultClient } from '../../api/vault'
 import { PageError, PageLoading } from '../../components/Page'
 import { useResource } from '../../hooks/useResource'
 
-export function AssetPanel({ client }: { client: VaultClient }): React.ReactElement {
+export function AssetPanel({ client, bucket }: { client: VaultClient; bucket: string }): React.ReactElement {
   const [key, setKey] = React.useState('')
   const [slug, setSlug] = React.useState('')
   const [busy, setBusy] = React.useState('')
   const [message, setMessage] = React.useState<{ tone: 'success' | 'danger'; text: string }>()
-  const load = React.useCallback(() => client.listAssets(), [client])
+  const load = React.useCallback(
+    () => client.listAssets().then((assets) => filterAssetsByBucket(assets, bucket)),
+    [client, bucket],
+  )
   const resource = useResource(load)
 
   const run = async (label: string, action: () => Promise<void>) => {
@@ -32,7 +35,7 @@ export function AssetPanel({ client }: { client: VaultClient }): React.ReactElem
       <IrisCard variant="outline" header="发布稳定公开图片">
         <form className="access-form" onSubmit={(event) => {
           event.preventDefault()
-          if (key.trim() && slug.trim()) void run('publish', () => client.publishAsset(key.trim(), slug.trim()).then(() => undefined))
+          if (key.trim() && slug.trim()) void run('publish', () => client.publishAsset(bucket, key.trim(), slug.trim()).then(() => undefined))
         }}>
           <label className="access-field"><span>图片对象 Key</span><IrisInput required value={key} placeholder="images/hero.jpg" onChange={(event) => setKey(event.target.value)} /></label>
           <label className="access-field"><span>公开 Slug</span><IrisInput required value={slug} placeholder="blog/hero.jpg" onChange={(event) => setSlug(event.target.value)} /></label>
@@ -65,6 +68,10 @@ function AssetTable({ assets, busy, unpublish }: { assets: PublicAsset[]; busy: 
       </table></div>
     </IrisCard>
   )
+}
+
+export function filterAssetsByBucket(assets: PublicAsset[], bucket: string): PublicAsset[] {
+  return assets.filter((asset) => asset.bucket === bucket)
 }
 
 const assetURL = (slug: string): string => `/public/assets/${slug.split('/').map(encodeURIComponent).join('/')}`

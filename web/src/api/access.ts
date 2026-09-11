@@ -18,6 +18,7 @@ export interface Share {
 }
 
 export interface CreateShareInput {
+  bucket: string
   key: string
   name?: string
   password?: string
@@ -63,6 +64,7 @@ export interface ACLEntry {
 }
 
 export interface PutACLInput {
+  bucket: string
   key: string
   resource_kind: ResourceKind
   principal_type: PrincipalType
