@@ -10,6 +10,20 @@ import {
 import type { LegalHold, PresignedLink } from '../../api/objects'
 import type { VaultClient } from '../../api/vault'
 
+interface HoldTarget {
+  key: string
+  versionID: string
+}
+
+interface HoldState {
+  targetKey: string
+  loaded: boolean
+  hold?: LegalHold
+}
+
+const holdTargetKey = (target: HoldTarget): string =>
+  JSON.stringify([target.key, target.versionID])
+
 export function GovernancePanel({
   client,
   objectKey,
@@ -23,13 +37,31 @@ export function GovernancePanel({
 }): React.ReactElement {
   const [versionID, setVersionID] = React.useState('')
   const [reason, setReason] = React.useState('')
-  const [hold, setHold] = React.useState<LegalHold>()
-  const [holdLoaded, setHoldLoaded] = React.useState(false)
+  const [holdState, setHoldState] = React.useState<HoldState>(() => ({
+    targetKey: holdTargetKey({ key: objectKey, versionID: '' }),
+    loaded: false,
+  }))
+  const holdTargetRef = React.useRef<HoldTarget>({ key: objectKey, versionID: '' })
+  const holdRequestRef = React.useRef(0)
+  const currentHoldTargetKey = holdTargetKey({ key: objectKey, versionID: versionID.trim() })
+  const hold = holdState.targetKey === currentHoldTargetKey ? holdState.hold : undefined
+  const holdLoaded = holdState.targetKey === currentHoldTargetKey && holdState.loaded
   const [operation, setOperation] = React.useState<'get' | 'put'>('get')
   const [expires, setExpires] = React.useState<number | null>(900)
   const [signed, setSigned] = React.useState<PresignedLink>()
   const [busy, setBusy] = React.useState('')
   const [message, setMessage] = React.useState<{ tone: 'success' | 'danger'; text: string }>()
+
+  React.useLayoutEffect(() => {
+    if (holdTargetRef.current.key === objectKey) return
+    const target = { key: objectKey, versionID: '' }
+    holdTargetRef.current = target
+    holdRequestRef.current += 1
+    setVersionID('')
+    setHoldState({ targetKey: holdTargetKey(target), loaded: false })
+    setBusy((value) => value.startsWith('hold-') ? '' : value)
+    setMessage(undefined)
+  }, [objectKey])
 
   const run = async (label: string, action: () => Promise<void>) => {
     setBusy(label)
@@ -38,23 +70,54 @@ export function GovernancePanel({
       setMessage({ tone: 'danger', text: reasonValue instanceof Error ? reasonValue.message : '对象治理操作失败' })
     } finally { setBusy('') }
   }
-  const loadHold = () => run('hold-load', async () => {
-    setHold(await client.getLegalHold(objectKey, versionID.trim()))
-    setHoldLoaded(true)
-  })
-  const placeHold = () => run('hold-put', async () => {
-    if (!reason.trim()) throw new Error('设置 Legal Hold 必须填写保留原因')
-    await client.putLegalHold(objectKey, reason.trim(), versionID.trim())
-    setHold(await client.getLegalHold(objectKey, versionID.trim()))
-    setHoldLoaded(true)
-    setMessage({ tone: 'success', text: 'Legal Hold 已设置。' })
-  })
-  const removeHold = () => run('hold-delete', async () => {
-    await client.removeLegalHold(objectKey, versionID.trim())
-    setHold(undefined)
-    setHoldLoaded(true)
-    setMessage({ tone: 'success', text: 'Legal Hold 已移除。' })
-  })
+  const runHold = async (
+    label: string,
+    action: (target: HoldTarget, isCurrent: () => boolean) => Promise<LegalHold | undefined>,
+    successText = '',
+  ) => {
+    const target = { ...holdTargetRef.current }
+    const targetKey = holdTargetKey(target)
+    const requestID = ++holdRequestRef.current
+    const isCurrent = () => holdRequestRef.current === requestID &&
+      holdTargetKey(holdTargetRef.current) === targetKey
+    setBusy(label)
+    setMessage(undefined)
+    try {
+      const nextHold = await action(target, isCurrent)
+      if (!isCurrent()) return
+      setHoldState({ targetKey, hold: nextHold, loaded: true })
+      if (successText) setMessage({ tone: 'success', text: successText })
+    } catch (reasonValue) {
+      if (isCurrent()) {
+        setMessage({ tone: 'danger', text: reasonValue instanceof Error ? reasonValue.message : '对象治理操作失败' })
+      }
+    } finally {
+      if (isCurrent()) setBusy((value) => value === label ? '' : value)
+    }
+  }
+  const changeVersionID = (value: string) => {
+    const target = { key: objectKey, versionID: value.trim() }
+    holdTargetRef.current = target
+    holdRequestRef.current += 1
+    setVersionID(value)
+    setHoldState({ targetKey: holdTargetKey(target), loaded: false })
+    setBusy((current) => current.startsWith('hold-') ? '' : current)
+    setMessage(undefined)
+  }
+  const loadHold = () => runHold('hold-load', (target) =>
+    client.getLegalHold(target.key, target.versionID))
+  const placeHold = () => runHold('hold-put', async (target, isCurrent) => {
+    const holdReason = reason.trim()
+    if (!holdReason) throw new Error('设置 Legal Hold 必须填写保留原因')
+    await client.putLegalHold(target.key, holdReason, target.versionID)
+    if (!isCurrent()) return undefined
+    return client.getLegalHold(target.key, target.versionID)
+  }, 'Legal Hold 已设置。')
+  const removeHold = () => runHold('hold-delete', async (target) => {
+    await client.removeLegalHold(target.key, target.versionID)
+    return undefined
+  }, 'Legal Hold 已移除。')
+  const holdBusy = busy.startsWith('hold-')
   const presign = () => run('presign', async () => {
     const result = await client.presignObject(objectKey, operation, expires && expires > 0 ? expires : 300)
     setSigned(result)
@@ -68,13 +131,13 @@ export function GovernancePanel({
     <div className="object-grid">
       <IrisCard variant="outline" header="Legal Hold">
         <div className="governance-form">
-          <label className="access-field"><span>Version ID（空为当前对象）</span><IrisInput value={versionID} onChange={(event) => { setVersionID(event.target.value); setHoldLoaded(false) }} /></label>
+          <label className="access-field"><span>Version ID（空为当前对象）</span><IrisInput value={versionID} onChange={(event) => changeVersionID(event.target.value)} /></label>
           <label className="access-field"><span>保留原因</span><IrisInput value={reason} placeholder="case-42" onChange={(event) => setReason(event.target.value)} /></label>
           <div className="access-actions">
-            <IrisButton variant="outline" loading={busy === 'hold-load'} onClick={() => void loadHold()}>查询</IrisButton>
-            {hold ? <IrisButton variant="outline" loading={busy === 'hold-delete'} onClick={() => {
+            <IrisButton variant="outline" loading={busy === 'hold-load'} disabled={holdBusy && busy !== 'hold-load'} onClick={() => void loadHold()}>查询</IrisButton>
+            {hold ? <IrisButton variant="outline" loading={busy === 'hold-delete'} disabled={holdBusy && busy !== 'hold-delete'} onClick={() => {
               if (window.confirm('移除 Legal Hold？移除后对象可能被永久删除。')) void removeHold()
-            }}>移除 Hold</IrisButton> : <IrisButton loading={busy === 'hold-put'} onClick={() => void placeHold()}>设置 Hold</IrisButton>}
+            }}>移除 Hold</IrisButton> : <IrisButton loading={busy === 'hold-put'} disabled={holdBusy && busy !== 'hold-put'} onClick={() => void placeHold()}>设置 Hold</IrisButton>}
           </div>
           {holdLoaded ? <HoldStatus hold={hold} /> : null}
         </div>
