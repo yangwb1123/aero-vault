@@ -1,9 +1,21 @@
 # Architecture
 
+> See also: `docs/DEVELOPER_GUIDE.md` for workflow, `AGENTS.md` for engineering constraints.
+
 aero-vault is a single Go binary (`cmd/server`) that wires a set of layered,
 loosely-coupled subsystems around one shared `FileService`. Every protocol
 gateway (REST, S3, WebDAV, MCP) is a thin adapter over that service, so an object
 written through one protocol is immediately visible through all others.
+
+## Key design decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Single binary | Easy deployment, no external dependencies for MVP |
+| SQLite default | Zero configuration, embedded |
+| Opt-in AI | AI pipeline disabled by default; no vector DB dependency |
+| Storage-first writes | Storage blob committed before metadata row (orphan blobs handled by reconcile) |
+| EventBus non-blocking | `Publish` never blocks the caller; dropped events are acceptable |
 
 ## Layered overview
 
@@ -270,6 +282,8 @@ to a single physical storage key:
 func storageKey(tenant, bucket, key string) string {
     return path.Join(tenant, bucket, key)
 }
+// versioned objects: storageKey(tenant, bucket, key) + "@v" + versionID
+// (see internal/service/file_multipart.go)
 ```
 
 So an object the user knows as bucket `docs`, key `reports/q1.pdf` for tenant
@@ -290,3 +304,12 @@ against symlink/`..` escapes outside the root.
 
 MCP exposes objects as resource URIs of the form
 `aero-vault://{tenant}/{bucket}/{key}`, mirroring the same three-part identity.
+
+## Testing layers
+
+1. **Go unit tests** — `go test ./...` (27 packages under `internal/`)
+2. **Python checks** — `python3 -m pytest checks/` (architecture, complexity,
+   invariants, ADR compliance, coverage, config, build)
+3. **E2E tests** — `make test-e2e` (`python3 tests/run_all.py --manage`) against a real server
+4. **Race detection** — `go test -race ./internal/...`
+5. **Engineering gates** — `python3 cli.py accept`
