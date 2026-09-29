@@ -85,7 +85,6 @@ root_policy:
     - "Dockerfile"
     - "engineering.yaml"
     - "cli.py"
-    - "pi-batch.py"
     - "docker-compose.yml"
     - ".env"
     - ".env.example"
@@ -95,10 +94,6 @@ root_policy:
     - ".air.toml"
     - "server"
     - "pyproject.toml"
-    - "pi-batch.yaml"
-    - "quality.py"
-    - "pi-batch-campaign.yaml"
-    - "pi-batch-campaign-pipeline.yaml"
   banned_patterns:
     - "*_handler.go"
     - "*_service.go"

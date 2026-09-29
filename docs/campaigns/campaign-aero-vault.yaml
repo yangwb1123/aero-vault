@@ -11,11 +11,8 @@
 #   4. 授权接入：vault.file.delete 权限 → snaplink authorization-check
 #      （fail_closed，无权限 403）
 #
-# 用法（aero-vault 仓库内，先 dry-run）：
-#   python3 pi-batch.py campaign --config examples/snaplink-platform/campaigns/campaign-aero-vault.yaml --dry-run
-#   python3 pi-batch.py campaign --config examples/snaplink-platform/campaigns/campaign-aero-vault.yaml \
-#     --jobs 4 --max-directions 2 --validate gobuild,gotest,pyquality
-
+# 运行（引擎与配置在 ai-batch-runner 仓内，cwd 必须是本仓）：
+#   bash ~/ai-batch-runner/projects/aero-vault/run-campaign.sh --dry-run
 name: aero-vault-compose-2026-017
 
 discovery:
