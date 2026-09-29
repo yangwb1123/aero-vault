@@ -10,18 +10,43 @@ export function SearchPage({ client }: { client: VaultClient }): React.ReactElem
   const [hits, setHits] = React.useState<SearchHit[]>()
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string>()
+  const requestRef = React.useRef(0)
+
+  const invalidateSearch = () => {
+    requestRef.current += 1
+    setHits(undefined)
+    setLoading(false)
+    setError(undefined)
+  }
+
+  React.useLayoutEffect(() => {
+    invalidateSearch()
+  }, [client])
+  React.useEffect(() => () => { requestRef.current += 1 }, [])
 
   const search = async () => {
+    const requestID = ++requestRef.current
     const value = query.trim()
-    if (!value) return
+    if (!value) {
+      setHits(undefined)
+      setLoading(false)
+      setError(undefined)
+      return
+    }
+    const requestClient = client
+    const requestMode = mode
     setLoading(true)
+    setHits(undefined)
     setError(undefined)
     try {
-      setHits(await client.search(value, mode))
+      const nextHits = await requestClient.search(value, requestMode)
+      if (requestRef.current === requestID) setHits(nextHits)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '搜索失败')
+      if (requestRef.current === requestID) {
+        setError(reason instanceof Error ? reason.message : '搜索失败')
+      }
     } finally {
-      setLoading(false)
+      if (requestRef.current === requestID) setLoading(false)
     }
   }
 
@@ -33,9 +58,15 @@ export function SearchPage({ client }: { client: VaultClient }): React.ReactElem
           <IrisInput
             value={query}
             placeholder="输入要查找的内容"
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              setQuery(event.target.value)
+              invalidateSearch()
+            }}
           />
-          <SearchModeField value={mode} onChange={setMode} />
+          <SearchModeField value={mode} onChange={(value) => {
+            setMode(value)
+            invalidateSearch()
+          }} />
           <IrisButton type="submit" loading={loading}>搜索</IrisButton>
         </form>
       </IrisCard>

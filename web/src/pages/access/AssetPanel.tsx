@@ -10,23 +10,41 @@ export function AssetPanel({ client, bucket }: { client: VaultClient; bucket: st
   const [slug, setSlug] = React.useState('')
   const [busy, setBusy] = React.useState('')
   const [message, setMessage] = React.useState<{ tone: 'success' | 'danger'; text: string }>()
+  const scopeRef = React.useRef({ client, bucket })
+  const requestRef = React.useRef(0)
   const load = React.useCallback(
     () => client.listAssets().then((assets) => filterAssetsByBucket(assets, bucket)),
     [client, bucket],
   )
   const resource = useResource(load)
 
+  React.useLayoutEffect(() => {
+    if (scopeRef.current.client === client && scopeRef.current.bucket === bucket) return
+    scopeRef.current = { client, bucket }
+    requestRef.current += 1
+    setBusy('')
+    setKey('')
+    setSlug('')
+    setMessage(undefined)
+  }, [bucket, client])
+  React.useEffect(() => () => { requestRef.current += 1 }, [])
+
   const run = async (label: string, action: () => Promise<void>) => {
+    const requestID = ++requestRef.current
+    const isCurrent = () => requestRef.current === requestID &&
+      scopeRef.current.client === client && scopeRef.current.bucket === bucket
     setBusy(label)
     setMessage(undefined)
     try {
       await action()
-      setMessage({ tone: 'success', text: '公开资源配置已更新。' })
-      resource.reload()
+      if (isCurrent()) {
+        setMessage({ tone: 'success', text: '公开资源配置已更新。' })
+        resource.reload()
+      }
     } catch (reason) {
-      setMessage({ tone: 'danger', text: reason instanceof Error ? reason.message : '公开资源操作失败' })
+      if (isCurrent()) setMessage({ tone: 'danger', text: reason instanceof Error ? reason.message : '公开资源操作失败' })
     } finally {
-      setBusy('')
+      if (isCurrent()) setBusy('')
     }
   }
 
@@ -39,7 +57,7 @@ export function AssetPanel({ client, bucket }: { client: VaultClient; bucket: st
         }}>
           <label className="access-field"><span>图片对象 Key</span><IrisInput required value={key} placeholder="images/hero.jpg" onChange={(event) => setKey(event.target.value)} /></label>
           <label className="access-field"><span>公开 Slug</span><IrisInput required value={slug} placeholder="blog/hero.jpg" onChange={(event) => setSlug(event.target.value)} /></label>
-          <div className="access-actions access-wide"><IrisButton type="submit" loading={busy === 'publish'}>发布图片</IrisButton></div>
+          <div className="access-actions access-wide"><IrisButton type="submit" disabled={Boolean(busy)} loading={busy === 'publish'}>发布图片</IrisButton></div>
         </form>
       </IrisCard>
       {message ? <IrisAlert tone={message.tone}>{message.text}</IrisAlert> : null}

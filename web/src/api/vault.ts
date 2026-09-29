@@ -151,19 +151,19 @@ export class VaultClient extends VaultTransport {
     await this.putBucketJSON(bucket, 'lifecycle', input)
   }
 
-  listFiles(prefix = '', deleted = false): Promise<FilePage> {
-    const query = new URLSearchParams({ limit: '200' })
+  listFiles(prefix = '', deleted = false, marker = ''): Promise<FilePage> {
+    const query = new URLSearchParams({ limit: '200', ...(marker ? { marker } : {}) })
     if (prefix) query.set('prefix', prefix)
     if (deleted) query.set('deleted', 'true')
     return this.json<FilePage>(`/files?${query}`)
   }
 
-  async upload(key: string, file: File): Promise<void> {
-    await this.request(`/files/${encodeKey(key)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': file.type || 'application/octet-stream' },
-      body: file,
-    })
+  async upload(key: string, file: File, idempotencyKey?: string, signal?: AbortSignal): Promise<void> {
+    const headers = {
+      'Content-Type': file.type || 'application/octet-stream',
+      ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+    }
+    await this.request(`/files/${encodeKey(key)}`, { method: 'PUT', headers, body: file, signal })
   }
 
   async deleteFile(key: string): Promise<void> {
@@ -447,7 +447,7 @@ export class VaultClient extends VaultTransport {
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     const frames = new SSEDecoder()
-    let completed: ChatResponse | undefined
+    let completed: ChatResponse | undefined // intentional sequential reads preserve SSE frame ordering.
     for (;;) {
       const part = await reader.read()
       const text = decoder.decode(part.value, { stream: !part.done })

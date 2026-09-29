@@ -13,11 +13,34 @@ export function ChatPage({ client }: { client: VaultClient }): React.ReactElemen
   const [loading, setLoading] = React.useState(false)
   const abortRef = React.useRef<AbortController>()
 
+  const stop = () => {
+    const active = abortRef.current
+    if (!active) return
+    abortRef.current = undefined
+    active.abort()
+    setLoading(false)
+  }
+  const clearConversation = () => {
+    stop()
+    setAnswer('')
+    setResult(undefined)
+    setError(undefined)
+  }
+
+  React.useLayoutEffect(() => clearConversation(), [client])
   React.useEffect(() => () => abortRef.current?.abort(), [])
+
+  const appendToken = (abort: AbortController, token: string) => {
+    if (abortRef.current !== abort || abort.signal.aborted) return
+    setAnswer((current) => current + token)
+  }
 
   const ask = async () => {
     const value = query.trim()
-    if (!value) return
+    if (!value) {
+      clearConversation()
+      return
+    }
     abortRef.current?.abort()
     const abort = new AbortController()
     abortRef.current = abort
@@ -29,13 +52,16 @@ export function ChatPage({ client }: { client: VaultClient }): React.ReactElemen
       const completed = await client.streamChat(
         value,
         mode,
-        (token) => setAnswer((current) => current + token),
+        (token) => appendToken(abort, token),
         abort.signal,
       )
+      if (abortRef.current !== abort || abort.signal.aborted) return
       setResult(completed)
       setAnswer((current) => current || completed.answer)
     } catch (reason) {
-      if (!abort.signal.aborted) setError(reason instanceof Error ? reason.message : 'Chat 失败')
+      if (abortRef.current === abort && !abort.signal.aborted) {
+        setError(reason instanceof Error ? reason.message : 'Chat 失败')
+      }
     } finally {
       if (abortRef.current === abort) {
         abortRef.current = undefined
@@ -53,11 +79,17 @@ export function ChatPage({ client }: { client: VaultClient }): React.ReactElemen
             value={query}
             rows={4}
             placeholder="询问知识库中的内容"
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              clearConversation()
+              setQuery(event.target.value)
+            }}
           />
           <div className="chat-actions">
-            <SearchModeField value={mode} onChange={setMode} />
-            {loading ? <IrisButton type="button" variant="outline" onClick={() => abortRef.current?.abort()}>停止</IrisButton> : null}
+            <SearchModeField value={mode} onChange={(value) => {
+              clearConversation()
+              setMode(value)
+            }} />
+            {loading ? <IrisButton type="button" variant="outline" onClick={stop}>停止</IrisButton> : null}
             <IrisButton type="submit" loading={loading}>发送</IrisButton>
           </div>
         </form>

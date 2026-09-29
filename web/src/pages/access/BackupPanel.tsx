@@ -7,17 +7,32 @@ export function BackupPanel({ client, bucket }: { client: VaultClient; bucket: s
   const [prefix, setPrefix] = React.useState('')
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState<string>()
+  const requestRef = React.useRef(0)
+
+  React.useLayoutEffect(() => {
+    requestRef.current += 1
+    setBusy(false)
+    setError(undefined)
+  }, [bucket, client, prefix])
+  React.useEffect(() => () => { requestRef.current += 1 }, [])
 
   const download = async () => {
+    const requestID = ++requestRef.current
+    const requestClient = client
+    const requestBucket = bucket
+    const requestPrefix = prefix.trim()
+    const isCurrent = () => requestRef.current === requestID
     setBusy(true)
     setError(undefined)
     try {
-      const archive = await client.exportArchive(bucket, prefix.trim())
-      downloadBlob(archive, `aero-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`)
+      const archive = await requestClient.exportArchive(requestBucket, requestPrefix)
+      if (isCurrent()) {
+        downloadBlob(archive, `aero-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`)
+      }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '备份导出失败')
+      if (isCurrent()) setError(reason instanceof Error ? reason.message : '备份导出失败')
     } finally {
-      setBusy(false)
+      if (isCurrent()) setBusy(false)
     }
   }
 
@@ -26,7 +41,7 @@ export function BackupPanel({ client, bucket }: { client: VaultClient; bucket: s
       <IrisCard variant="outline" header="导出可移植备份">
         <p className="muted">导出当前用户有权访问的对象，压缩包包含 manifest.json、元数据、标签和对象内容。</p>
         <form className="backup-form" onSubmit={(event) => { event.preventDefault(); void download() }}>
-          <label className="access-field"><span>Key 前缀（空为全部）</span><IrisInput value={prefix} placeholder="team/project/" onChange={(event) => setPrefix(event.target.value)} /></label>
+          <label className="access-field"><span>Key 前缀（空为全部）</span><IrisInput value={prefix} placeholder="team/project/" disabled={busy} onChange={(event) => setPrefix(event.target.value)} /></label>
           <IrisButton type="submit" loading={busy}>下载 tar.gz</IrisButton>
         </form>
       </IrisCard>

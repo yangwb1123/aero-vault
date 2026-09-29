@@ -8,7 +8,7 @@ import {
   type IrisFileUploadFile,
 } from '@iris-ui-kit/react'
 import type { VaultClient } from '../../api/vault'
-import { uploadKey } from './uploadKey'
+import { createUploadIdempotencyKeyFactory, uploadKey } from './uploadKey'
 
 export function UploadPanel({
   client,
@@ -23,29 +23,69 @@ export function UploadPanel({
   const [files, setFiles] = React.useState<IrisFileUploadFile[]>([])
   const [busy, setBusy] = React.useState(false)
   const [message, setMessage] = React.useState<{ tone: 'success' | 'danger'; text: string }>()
+  const [idempotencyKeyFor] = React.useState(() => createUploadIdempotencyKeyFactory())
+  const scopeRef = React.useRef({ client, initialPrefix })
+  const requestRef = React.useRef(0)
+  const controllerRef = React.useRef<AbortController>()
+  const busyRef = React.useRef(false)
+
+  React.useLayoutEffect(() => {
+    if (scopeRef.current.client !== client || scopeRef.current.initialPrefix !== initialPrefix) {
+      scopeRef.current = { client, initialPrefix }
+      setPrefix(initialPrefix)
+      setFiles([])
+      setBusy(false)
+      setMessage(undefined)
+    }
+    return () => {
+      requestRef.current += 1
+      controllerRef.current?.abort()
+      controllerRef.current = undefined
+      busyRef.current = false
+    }
+  }, [client, initialPrefix])
 
   const upload = async () => {
-    if (files.length === 0) return
+    if (files.length === 0 || busyRef.current) return
+    const queued = [...files]
+    const targetPrefix = prefix
+    const targetClient = client
+    const targetInitialPrefix = initialPrefix
+    const requestID = ++requestRef.current
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const isCurrent = () => requestRef.current === requestID &&
+      scopeRef.current.client === targetClient && scopeRef.current.initialPrefix === targetInitialPrefix
+    busyRef.current = true
     setBusy(true)
     setMessage(undefined)
     let completed = 0
     try {
-      for (const entry of files) {
-        await client.upload(uploadKey(prefix, entry.name), entry.file)
+      // intentional sequential uploads: retries reuse each file's idempotency key
+      for (const entry of queued) {
+        if (!isCurrent()) return
+        const key = uploadKey(targetPrefix, entry.name)
+        await targetClient.upload(key, entry.file, idempotencyKeyFor(entry.file, key), controller.signal)
         completed++
       }
+      if (!isCurrent()) return
       setFiles([])
       setMessage({ tone: 'success', text: `已上传 ${completed} 个文件。` })
       onUploaded()
     } catch (reason) {
-      setFiles(files.slice(completed))
+      if (!isCurrent()) return
+      setFiles(queued.slice(completed))
       setMessage({
         tone: 'danger',
-        text: `已完成 ${completed}/${files.length}：${reason instanceof Error ? reason.message : '上传失败'}`,
+        text: `已完成 ${completed}/${queued.length}：${reason instanceof Error ? reason.message : '上传失败'}`,
       })
       if (completed > 0) onUploaded()
     } finally {
-      setBusy(false)
+      if (isCurrent()) {
+        controllerRef.current = undefined
+        busyRef.current = false
+        setBusy(false)
+      }
     }
   }
 

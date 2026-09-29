@@ -23,6 +23,17 @@ export function useVaultEvents(client: VaultClient, enabled: boolean): {
   const [lastEventID, setLastEventID] = React.useState(0)
   const [revision, setRevision] = React.useState(0)
   const lastID = React.useRef(0)
+  const clientRef = React.useRef(client)
+
+  React.useLayoutEffect(() => {
+    if (clientRef.current === client) return
+    clientRef.current = client
+    lastID.current = 0
+    setEvents([])
+    setLastEventID(0)
+    setError(undefined)
+    setStatus(enabled ? 'connecting' : 'paused')
+  }, [client, enabled])
 
   React.useEffect(() => {
     if (!enabled) {
@@ -36,29 +47,31 @@ export function useVaultEvents(client: VaultClient, enabled: boolean): {
     let retryDelay = 1000
 
     const schedule = (message: string) => {
-      if (stopped) return
+      if (stopped || clientRef.current !== client) return
       setStatus('retrying')
       setError(message)
       retryTimer = window.setTimeout(() => void connect(), retryDelay)
       retryDelay = Math.min(retryDelay * 2, 15_000)
     }
     const accept = (event: VaultEvent) => {
+      if (stopped || clientRef.current !== client) return
       lastID.current = Math.max(lastID.current, event.id)
       setLastEventID(lastID.current)
       setEvents((current) => addVaultEvent(current, event))
     }
     async function connect() {
+      if (stopped || clientRef.current !== client) return
       setStatus('connecting')
       try {
         const response = await client.openEventStream(lastID.current, controller.signal)
-        if (stopped) return
+        if (stopped || clientRef.current !== client) return
         retryDelay = 1000
         setStatus('connected')
         setError(undefined)
         await consumeEventStream(response, accept)
         schedule('事件连接已结束，正在重连。')
       } catch (reason) {
-        if (stopped || controller.signal.aborted) return
+        if (stopped || clientRef.current !== client || controller.signal.aborted) return
         schedule(reason instanceof Error ? reason.message : '事件连接失败')
       }
     }
@@ -70,11 +83,12 @@ export function useVaultEvents(client: VaultClient, enabled: boolean): {
     }
   }, [client, enabled, revision])
 
+  const sameClient = clientRef.current === client
   return {
-    events,
-    status,
-    error,
-    lastEventID,
+    events: sameClient ? events : [],
+    status: sameClient ? status : enabled ? 'connecting' : 'paused',
+    error: sameClient ? error : undefined,
+    lastEventID: sameClient ? lastEventID : 0,
     clear: () => setEvents([]),
     reconnect: () => setRevision((value) => value + 1),
   }

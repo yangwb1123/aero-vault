@@ -7,17 +7,28 @@ export function useResource<T>(load: () => Promise<T>): {
   reload(): void
 } {
   const [revision, setRevision] = React.useState(0)
-  const [state, setState] = React.useState<{ data?: T; error?: Error; loading: boolean }>({
-    loading: true,
-  })
+  const requestRef = React.useRef(0)
+  const [state, setState] = React.useState<{
+    load: typeof load
+    revision: number
+    data?: T
+    error?: Error
+    loading: boolean
+  }>({ load, revision, loading: true })
   React.useEffect(() => {
+    const requestID = ++requestRef.current
     let active = true
-    setState((value) => ({ ...value, error: undefined, loading: true }))
+    setState((current) => current.load === load && current.revision === revision
+      ? { ...current, error: undefined, loading: true }
+      : { load, revision, loading: true })
     load().then(
-      (data) => active && setState({ data, loading: false }),
+      (data) => active && requestRef.current === requestID && setState({ load, revision, data, loading: false }),
       (reason: unknown) =>
         active &&
+        requestRef.current === requestID &&
         setState({
+          load,
+          revision,
           error: reason instanceof Error ? reason : new Error('读取失败'),
           loading: false,
         }),
@@ -26,5 +37,11 @@ export function useResource<T>(load: () => Promise<T>): {
       active = false
     }
   }, [load, revision])
-  return { ...state, reload: () => setRevision((value) => value + 1) }
+  const matchesRequest = state.load === load && state.revision === revision
+  return {
+    data: matchesRequest ? state.data : undefined,
+    error: matchesRequest ? state.error : undefined,
+    loading: matchesRequest ? state.loading : true,
+    reload: () => setRevision((value) => value + 1),
+  }
 }

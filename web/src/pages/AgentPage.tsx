@@ -11,11 +11,28 @@ export function AgentPage({ client }: { client: VaultClient }): React.ReactEleme
   const [loading, setLoading] = React.useState(false)
   const abortRef = React.useRef<AbortController>()
 
+  const stop = () => {
+    const active = abortRef.current
+    if (!active) return
+    abortRef.current = undefined
+    active.abort()
+    setLoading(false)
+  }
+  const clearResult = () => {
+    stop()
+    setResult(undefined)
+    setError(undefined)
+  }
+
+  React.useLayoutEffect(() => clearResult(), [client])
   React.useEffect(() => () => abortRef.current?.abort(), [])
 
   const run = async () => {
     const value = query.trim()
-    if (!value) return
+    if (!value) {
+      clearResult()
+      return
+    }
     abortRef.current?.abort()
     const abort = new AbortController()
     abortRef.current = abort
@@ -23,9 +40,12 @@ export function AgentPage({ client }: { client: VaultClient }): React.ReactEleme
     setError(undefined)
     setLoading(true)
     try {
-      setResult(await client.runAgent(value, abort.signal))
+      const nextResult = await client.runAgent(value, abort.signal)
+      if (abortRef.current === abort && !abort.signal.aborted) setResult(nextResult)
     } catch (reason) {
-      if (!abort.signal.aborted) setError(reason instanceof Error ? reason.message : 'Agent 执行失败')
+      if (abortRef.current === abort && !abort.signal.aborted) {
+        setError(reason instanceof Error ? reason.message : 'Agent 执行失败')
+      }
     } finally {
       if (abortRef.current === abort) {
         abortRef.current = undefined
@@ -42,11 +62,14 @@ export function AgentPage({ client }: { client: VaultClient }): React.ReactEleme
       </IrisAlert>
       <IrisCard variant="outline">
         <form className="agent-form" onSubmit={(event) => { event.preventDefault(); void run() }}>
-          <IrisTextarea value={query} rows={4} placeholder="例如：查找本周项目文档并总结关键风险" onChange={(event) => setQuery(event.target.value)} />
+          <IrisTextarea value={query} rows={4} placeholder="例如：查找本周项目文档并总结关键风险" onChange={(event) => {
+            clearResult()
+            setQuery(event.target.value)
+          }} />
           <div className="agent-actions">
             <span className="muted">可用工具：list_files · read_file · search (hybrid)</span>
             <div className="row-actions">
-              {loading ? <IrisButton type="button" variant="outline" onClick={() => abortRef.current?.abort()}>停止</IrisButton> : null}
+              {loading ? <IrisButton type="button" variant="outline" onClick={stop}>停止</IrisButton> : null}
               <IrisButton type="submit" loading={loading} disabled={!query.trim()}>运行 Agent</IrisButton>
             </div>
           </div>

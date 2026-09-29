@@ -21,6 +21,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: make web-install
+
+      - name: Test and build frontend
+        run: make web-check
+
+      - name: Verify embedded frontend is current
+        run: |
+          if [ -n "$(git status --porcelain -- internal/webui/static/app)" ]; then
+            echo "::error::Embedded frontend assets are stale; regenerate and commit them."
+            git status --short -- internal/webui/static/app
+            exit 1
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

@@ -37,7 +37,7 @@ export function ActivityPage({ client, onOpenObject }: { client: VaultClient; on
   )
 }
 
-function ActivityTable({ events, open }: { events: VaultEvent[]; open(key: string, deleted: boolean): void }): React.ReactElement {
+export function ActivityTable({ events, open }: { events: VaultEvent[]; open(key: string, deleted: boolean): void }): React.ReactElement {
   return (
     <div className="table-scroll"><table className="vault-table">
       <thead><tr><th>ID</th><th>时间</th><th>动作</th><th>对象</th><th>Object ID</th><th>操作</th></tr></thead>
@@ -45,10 +45,19 @@ function ActivityTable({ events, open }: { events: VaultEvent[]; open(key: strin
         <td>{event.id}</td><td>{new Date(event.created_at).toLocaleString('zh-CN')}</td>
         <td><IrisBadge tone={eventTone(event.type)}>{eventLabel(event.type)}</IrisBadge></td>
         <td><strong>{event.key}</strong><div className="muted">{event.bucket}</div></td><td>{event.object_id ?? '—'}</td>
-        <td><IrisButton size="sm" variant="ghost" onClick={() => open(event.key, event.type === 'deleted')}>查看对象</IrisButton></td>
+        <td><IrisButton
+          size="sm"
+          variant="ghost"
+          disabled={event.bucket !== 'default'}
+          onClick={() => openEventObject(event, open)}
+        >{event.bucket === 'default' ? '查看对象' : '跨桶暂不可查'}</IrisButton></td>
       </tr>)}</tbody>
     </table></div>
   )
+}
+
+function openEventObject(event: VaultEvent, open: (key: string, deleted: boolean) => void): void {
+  if (event.bucket === 'default') open(event.key, event.type === 'deleted')
 }
 
 function statusTone(status: EventStreamStatus): IrisBadgeTone {

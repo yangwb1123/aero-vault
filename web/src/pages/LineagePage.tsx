@@ -10,17 +10,39 @@ export function LineagePage({ client }: { client: VaultClient }): React.ReactEle
   const [result, setResult] = React.useState<LineageResponse>()
   const [error, setError] = React.useState<string>()
   const [loading, setLoading] = React.useState(false)
+  const requestRef = React.useRef(0)
+
+  const invalidate = () => {
+    requestRef.current += 1
+    setResult(undefined)
+    setError(undefined)
+    setLoading(false)
+  }
+
+  React.useLayoutEffect(() => invalidate(), [client])
+  React.useEffect(() => () => { requestRef.current += 1 }, [])
 
   const load = async () => {
-    if (!objectId || objectId < 1) return
+    const requestID = ++requestRef.current
+    if (!objectId || objectId < 1) {
+      setResult(undefined)
+      setError(undefined)
+      setLoading(false)
+      return
+    }
+    const targetID = objectId
     setLoading(true)
     setError(undefined)
+    setResult(undefined)
     try {
-      setResult(await client.getLineage(objectId))
+      const nextResult = await client.getLineage(targetID)
+      if (requestRef.current === requestID) setResult(nextResult)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '读取血缘失败')
+      if (requestRef.current === requestID) {
+        setError(reason instanceof Error ? reason.message : '读取血缘失败')
+      }
     } finally {
-      setLoading(false)
+      if (requestRef.current === requestID) setLoading(false)
     }
   }
 
@@ -29,7 +51,10 @@ export function LineagePage({ client }: { client: VaultClient }): React.ReactEle
       <PageHeader title="对象血缘" description="查看对象被 Search、Chat 或 Agent 消费的 AI 使用记录。" />
       <IrisCard variant="outline">
         <form className="lineage-form" onSubmit={(event) => { event.preventDefault(); void load() }}>
-          <label><span>Object ID</span><IrisNumberInput min={1} value={objectId ?? undefined} onChange={setObjectId} /></label>
+          <label><span>Object ID</span><IrisNumberInput min={1} value={objectId ?? undefined} onChange={(value) => {
+            invalidate()
+            setObjectId(value)
+          }} /></label>
           <IrisButton type="submit" loading={loading}>读取血缘</IrisButton>
         </form>
       </IrisCard>
