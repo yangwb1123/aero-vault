@@ -41,3 +41,24 @@ pnpm dev
 
 运行配置通过 `/ui/app/runtime-config.js` 的 `window.__AERO_VAULT_WEB_CONFIG__` 注入，字段见
 `public/runtime-config.js` 与 `.env.example`。
+
+## 交付前浏览器冒烟
+
+`pnpm build` 只保证类型与打包通过；真正会炸的是“构建成功但页面白屏”类回归
+（asset hash 漂移、base path 改错、bundle 运行时异常）。因此推送前还有一道
+fail-closed 门禁：
+
+```bash
+make build       # 用刚构建的 UI 重新编译二进制（embed）
+make web-smoke   # 起真实二进制 → 静态 + 无头 Chrome 冒烟
+```
+
+`scripts/web-local-smoke.sh` 在临时目录里以 `env -i` 启动二进制（SQLite + local FS、
+无鉴权、AI 关闭、随机端口），先校验 `/ui/`、`/ui/app/`、`/ui/legacy/`、
+`/favicon.ico`、`runtime-config.js` 与 index.html 引用的每个 assets 均 2xx，再用
+`scripts/web-smoke.mjs` 通过 Chrome DevTools Protocol 加载 `/ui/` 与 `/ui/app/`：
+控制台零 error、零未捕获异常、零失败请求、React 已挂载进 `#root`、
+`__AERO_VAULT_WEB_CONFIG__.apiBase === '/v1'`、样式已生效。
+
+依赖 node ≥ 22（内置 `WebSocket`，不新增 npm 依赖）与 Chrome/Chromium
+（`AERO_SMOKE_CHROME` 可覆盖，缺失即 fail-closed）。详见 `HARNESS.md` §4.1。

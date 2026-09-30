@@ -67,15 +67,39 @@ Agent 在执行过程中，若检测到上述任何规则被违反：
 ## 4. Git Hook 设置
 
 ```bash
-# 安装 pre-commit hook（提交前自动运行 make accept）
+# 安装 pre-commit + pre-push hook
 bash scripts/install-hooks.sh
 ```
 
-安装后每次 `git commit` 会自动执行 `make accept`。若需跳过（紧急修复）：
+安装后：
+
+- 每次 `git commit` 会自动执行 `make accept`。
+- 每次 `git push` 会自动执行前端交付门禁（见 §4.1）。若需跳过（紧急修复）：
 
 ```bash
 git commit --no-verify -m "紧急修复"
+git push --no-verify
 ```
+
+### 4.1 前端交付门禁 (pre-push)
+
+`githooks/pre-push` 是 fail-closed 的前端发布门禁，三步串联：
+
+```bash
+make web-check   # 1. pnpm test + pnpm build（产物写入 internal/webui/static/app）
+make build       # 2. 用刚构建的 UI 重新编译二进制（embed）
+make web-smoke   # 3. scripts/web-local-smoke.sh：起真实二进制做 UI 冒烟
+```
+
+第 3 步分两层，均失败即拒绝推送：
+
+| 层 | 检查 | 典型拦截场景 |
+|----|------|--------------|
+| 静态 | `/` 302、`/ui/` `/ui/app/` `/ui/legacy/` `/favicon.ico` `/ui/app/runtime-config.js` 均 2xx；外壳含 `#root`；index.html 引用的每个 `/ui/app/assets/*` 均 2xx | 构建产物未重新 embed、asset hash 漂移、base path 改错 |
+| 运行时 | 无头 Chrome（CDP，需 node ≥ 22 + Chrome/Chromium）加载 `/ui/` 与 `/ui/app/`：控制台零 error、零未捕获异常、零失败请求、零 ≥400 响应、React 已挂载进 `#root`、`window.__AERO_VAULT_WEB_CONFIG__.apiBase === /v1`、样式已生效 | bundle 运行时异常、React 挂载失败、runtime-config 丢失、样式未加载 |
+
+脚本细节：二进制在 `env -i` + 无 `.env` 的临时目录中启动（SQLite + local FS、无鉴权、AI 关闭），端口随机、退出即清理；`AERO_SMOKE_KEEP=1` 保留临时目录，`AERO_SMOKE_CHROME` / `AERO_SMOKE_TIMEOUT_SEC` 可覆盖浏览器与超时。
+浏览器驱动 `scripts/web-smoke.mjs` 只用 Node 内置 `WebSocket` 直连 CDP，**不引入任何新依赖**（I6）。
 
 ## 5. CI 集成
 
@@ -102,6 +126,7 @@ git commit --no-verify -m "紧急修复"
 - [x] ADR 合规检查 → `python cli.py adr-compliance`
 - [x] 豁免同步检查 → `python cli.py check-exemptions`
 - [x] Git pre-commit hook → `scripts/install-hooks.sh`
+- [x] Git pre-push 前端交付门禁 → `githooks/pre-push` + `make web-smoke`（静态 + 无头浏览器）
 - [x] 覆盖率报告 → `make cover` / `python cli.py coverage`
 - [ ] 集成 `semgrep` 自定义规则
 - [ ] 集成 `dependency-cruiser` 依赖方向检查

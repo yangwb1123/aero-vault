@@ -1,0 +1,37 @@
+#!/bin/bash
+# githooks/pre-push — 前端交付门禁（推送前硬门禁）
+#
+# 每次 git push 前自动执行：
+#   1. make web-check —— 前端单测 + 生产构建（输出落到 internal/webui/static/app）
+#   2. make build     —— 用刚构建的 UI 重新编译二进制
+#   3. scripts/web-local-smoke.sh —— 起真实二进制，静态 + 无头浏览器冒烟
+#      （/ui/ 外壳、runtime-config.js、assets 全部 2xx；控制台无错误、
+#        无未捕获异常、React 已挂载进 #root）
+#
+# 故意 fail-closed：缺少浏览器、资产 404、运行时异常都会拒绝推送。
+# 跳过：git push --no-verify（仅限已记录的应急场景）。
+#
+# 安装：bash scripts/install-hooks.sh（或 git config core.hooksPath githooks）
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+run_check() {
+    echo "==> [pre-push] $1"
+    shift
+    "$@"
+}
+
+if ! run_check "frontend tests and production build" make web-check; then
+    echo "==> [pre-push] ❌ frontend gate 未通过，推送已中止" >&2
+    exit 1
+fi
+if ! run_check "Go build with the current embedded UI" make build; then
+    echo "==> [pre-push] ❌ Go build 未通过，推送已中止" >&2
+    exit 1
+fi
+if ! run_check "browser shell/runtime/asset smoke" scripts/web-local-smoke.sh; then
+    echo "==> [pre-push] ❌ UI browser smoke 未通过，推送已中止" >&2
+    exit 1
+fi
+
+echo "==> [pre-push] ✅ frontend delivery gate 通过"

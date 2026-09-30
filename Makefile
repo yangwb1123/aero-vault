@@ -3,7 +3,7 @@ BIN   := bin/aero-vault
 PKG   := ./cmd/server
 GOBIN := $(shell go env GOPATH)/bin
 
-.PHONY: build run test cover test-integration test-integration-qdrant tidy clean check fmt lint vet vet-integration complexity-lines coverage docker compose-up compose-down web-install web-test web-build web-check
+.PHONY: build run test cover test-integration test-integration-qdrant tidy clean check fmt lint vet vet-integration complexity-lines coverage docker compose-up compose-down web-install web-test web-build web-check web-smoke
 
 AERO_PG_DSN ?= postgres://aero:aero@localhost:55432/aero?sslmode=disable
 
@@ -27,6 +27,15 @@ web-build:
 	cd web && pnpm build
 
 web-check: web-test web-build
+
+# Delivery gate for the embedded UI: boot the freshly built binary in a hermetic
+# temp env and smoke /ui/ over HTTP + headless Chrome (needs node >= 22 and
+# Chrome/Chromium). This is what githooks/pre-push runs after `make build`;
+# it is deliberately outside the zero-network Go `make check` gate.
+# Override the binary under test with: make web-smoke SMOKE_BIN=/tmp/aero-vault
+SMOKE_BIN ?=
+web-smoke:
+	scripts/web-local-smoke.sh $(SMOKE_BIN)
 
 test:
 	go test ./...
