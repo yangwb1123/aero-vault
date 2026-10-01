@@ -15,7 +15,7 @@ export function VersionsPanel({ client, objectKey }: { client: VaultClient; obje
     setError(undefined)
     try {
       const safeVersion = versionID.replaceAll('/', '_')
-      downloadBlob(await client.downloadVersion(objectKey, versionID), `${objectKey.split('/').pop() || 'object'}-${safeVersion}`)
+      await downloadBlob(await client.downloadVersion(objectKey, versionID), `${objectKey.split('/').pop() || 'object'}-${safeVersion}`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '版本下载失败')
     } finally { setBusy('') }

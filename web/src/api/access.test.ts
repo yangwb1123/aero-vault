@@ -63,7 +63,7 @@ describe('VaultClient access APIs', () => {
       return new Response('archive', { status: 200, headers: { 'Content-Type': 'application/gzip' } })
     })
     const client = new VaultClient('/v1', () => 'token', fetcher as typeof fetch)
-    await expect(client.exportArchive('project', 'docs/')).resolves.toBeInstanceOf(Blob)
+    await expect(client.exportArchive('project', 'docs/')).resolves.toBeInstanceOf(Response)
     expect(String(fetcher.mock.calls[0][0])).toBe('/v1/exports/archive?bucket=project&prefix=docs%2F')
   })
 

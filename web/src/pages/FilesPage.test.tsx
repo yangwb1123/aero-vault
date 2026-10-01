@@ -1,8 +1,9 @@
 import * as React from 'react'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { VaultClient, VaultObject } from '../api/vault'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { VaultApiError, VaultClient } from '../api/vault'
+import type { VaultObject } from '../api/vault'
 import { FilesPage } from './FilesPage'
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
@@ -19,7 +20,7 @@ const firstFile: VaultObject = {
 }
 const secondFile: VaultObject = { ...firstFile, key: 'second.txt', etag: 'etag-b' }
 
-function createClient(overrides: Pick<VaultClient, 'listFiles'> & Partial<Pick<VaultClient, 'deleteFile'>>): VaultClient {
+function createClient(overrides: Partial<Pick<VaultClient, 'listFiles' | 'listFolder' | 'download' | 'deleteFile'>>): VaultClient {
   return {
     ...overrides,
     listFolder: async (prefix: string) => ({ prefix, items: [] }),
@@ -62,6 +63,62 @@ async function changeInput(element: HTMLInputElement, value: string): Promise<vo
 }
 
 let mounted: { container: HTMLDivElement; root: Root } | undefined
+
+// jsdom ships neither object URLs nor a click that survives navigation; the
+// object download path needs both to be observable.
+let anchors: HTMLAnchorElement[] = []
+let captured: Blob[] = []
+let revoked: string[] = []
+
+beforeEach(() => {
+  anchors = []
+  captured = []
+  revoked = []
+  let issued = 0
+  Object.defineProperty(URL, 'createObjectURL', {
+    configurable: true,
+    writable: true,
+    value: vi.fn((blob: Blob) => {
+      captured.push(blob)
+      issued += 1
+      return `blob:files/${issued}`
+    }),
+  })
+  Object.defineProperty(URL, 'revokeObjectURL', {
+    configurable: true,
+    writable: true,
+    value: vi.fn((url: string) => { revoked.push(url) }),
+  })
+  Object.defineProperty(HTMLAnchorElement.prototype, 'click', {
+    configurable: true,
+    writable: true,
+    value: vi.fn(function recordClick(this: HTMLAnchorElement) { anchors.push(this) }),
+  })
+})
+
+function blobText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsText(blob)
+  })
+}
+
+function dangerText(container: HTMLElement): string {
+  return container.querySelector('[data-iris-alert-tone="danger"]')?.textContent ?? ''
+}
+
+async function clickAndSettle(element: HTMLButtonElement): Promise<void> {
+  await act(async () => {
+    element.click()
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+  // Delivery releases the object URL on a later macrotask; drain both turns.
+  await flushEffects()
+  await flushEffects()
+}
 
 afterEach(() => {
   if (mounted) act(() => mounted?.root.unmount())
@@ -159,5 +216,62 @@ describe('FilesPage cursor pagination', () => {
     })
     expect(container.textContent).toContain('docs/current.txt')
     expect(container.textContent).not.toContain('second.txt')
+  })
+})
+
+describe('FilesPage object download', () => {
+  const objectFetcher = async (input: RequestInfo | URL): Promise<Response> => {
+    const path = String(input)
+    if (path.endsWith('/files/first.txt')) {
+      return new Response('file bytes', {
+        status: 200,
+        headers: { 'Content-Length': '10', 'Content-Type': 'text/plain' },
+      })
+    }
+    const body = path.includes('/files?') ? { objects: [firstFile], has_more: false } : { prefix: '', items: [] }
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  function renderDownloadPage(client: VaultClient): HTMLDivElement {
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    mounted = { container, root }
+    act(() => root.render(<FilesPage client={client} onOpenObject={() => undefined} />))
+    return container
+  }
+
+  it('delivers an object download through the blob path and releases the object URL', async () => {
+    const client = new VaultClient('/v1', () => 'token', objectFetcher as typeof fetch)
+    const container = renderDownloadPage(client)
+    await flushEffects()
+
+    await clickAndSettle(button(container, '下载'))
+
+    expect(anchors).toHaveLength(1)
+    expect(anchors[0].download).toBe('first.txt')
+    expect(anchors[0].isConnected).toBe(false)
+    expect(await blobText(captured[0])).toBe('file bytes')
+    expect(revoked).toEqual(['blob:files/1'])
+    expect(dangerText(container)).toBe('')
+    expect(container.textContent).toContain('操作已完成')
+  })
+
+  it('renders a danger alert and no success message when the object download fails', async () => {
+    const download = vi.fn(async () => {
+      throw new VaultApiError(404, 'NotFound', '对象不存在', 'req-7')
+    })
+    const listFiles = vi.fn(async () => ({ objects: [firstFile], has_more: false }))
+    const container = renderDownloadPage(createClient({ listFiles, download }))
+    await flushEffects()
+
+    await clickAndSettle(button(container, '下载'))
+
+    expect(download).toHaveBeenCalledWith('first.txt')
+    expect(anchors).toHaveLength(0)
+    expect(captured).toHaveLength(0)
+    expect(dangerText(container)).toContain('对象不存在')
+    expect(container.textContent).not.toContain('操作已完成')
+    expect(container.textContent).toContain('first.txt')
   })
 })

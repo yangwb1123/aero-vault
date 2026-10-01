@@ -340,12 +340,12 @@ export class VaultClient extends VaultTransport {
     await this.request(`/access/acl/${encodeURIComponent(id)}`, { method: 'DELETE' })
   }
 
-  async exportArchive(bucket: string, prefix: string): Promise<Blob> {
+  async exportArchive(bucket: string, prefix: string): Promise<Response> {
     const query = new URLSearchParams({ bucket, prefix })
     const response = await this.request(`/exports/archive?${query}`, {
       headers: { Accept: 'application/gzip' },
     })
-    return response.blob()
+    return response
   }
 
   async listDepartments(): Promise<Department[]> {
