@@ -25,11 +25,22 @@ export function parseObjectRoute(route: string): ObjectRoute | undefined {
   return undefined
 }
 
+// decodeURIComponent throws URIError on malformed percent escapes (e.g. a
+// hand-edited `#/object/100%` or a key containing a literal `%`). Routing must
+// stay total: an undecodable payload falls back instead of unmounting the SPA.
+function decodeHashSegment(raw: string): string | undefined {
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return undefined
+  }
+}
+
 export function routeFromHash(fallback: string): string {
   const hash = window.location.hash
   if (!hash || hash === '#' || hash === prefix) return fallback
   const raw = hash.startsWith(prefix) ? hash.slice(prefix.length) : hash.replace(/^#/, '')
-  return decodeURIComponent(raw).trim() || fallback
+  return decodeHashSegment(raw)?.trim() || fallback
 }
 
 export function useHashRoute(fallback: string): [string, (route: string) => void] {

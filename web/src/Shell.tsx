@@ -11,6 +11,7 @@ import {
 import { VaultClient } from './api/vault'
 import { useAuth } from './auth/AuthProvider'
 import type { WebConfig } from './config'
+import { PageBoundary } from './components/PageBoundary'
 import { ActivityPage } from './pages/ActivityPage'
 import { AgentPage } from './pages/AgentPage'
 import { FilesPage } from './pages/FilesPage'
@@ -116,7 +117,9 @@ export function Shell({ config }: { config: WebConfig }): React.ReactElement {
       }
       footer={<div className="shell-footer">文件由 Aero Vault 管理 · 身份由 Snaplink 验证 · UI 由 Iris UI 构建</div>}
     >
-      <PageHost route={pageRoute} client={client} config={config} navigate={navigate} />
+      <PageBoundary resetKey={pageRoute}>
+        <PageHost route={pageRoute} client={client} config={config} navigate={navigate} />
+      </PageBoundary>
     </IrisAdminLayout>
   )
 }
