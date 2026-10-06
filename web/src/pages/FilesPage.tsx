@@ -7,6 +7,7 @@ import { PageError, PageHeader, PageLoading } from '../components/Page'
 import { downloadBlob } from '../download'
 import { useResource } from '../hooks/useResource'
 import { BatchToolbar } from './files/BatchToolbar'
+import { createFileCommands } from './files/fileCommands'
 import { FileTable } from './files/FileTable'
 import { FolderBrowser } from './files/FolderBrowser'
 import { isDirectFile, normalizeFolderPath } from './files/folderPath'
@@ -28,6 +29,7 @@ interface FilesResourceData {
 }
 
 export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpenObject(key: string, deleted: boolean): void }): React.ReactElement {
+  const commands = React.useMemo(() => createFileCommands(client), [client])
   const [prefix, setPrefix] = React.useState('')
   const [activePrefix, setActivePrefix] = React.useState('')
   const [deleted, setDeleted] = React.useState(false)
@@ -206,9 +208,9 @@ export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpe
       {resource.loading ? <PageLoading /> : null}
       {resource.error ? <PageError error={resource.error} retry={reloadFiles} /> : null}
       {currentData && displayedPage ? <div className="files-stack">
-        {currentData.folders ? <FolderBrowser listing={currentData.folders} path={activePrefix} busy={Boolean(busy)} navigate={navigate} create={(path) => run(`folder-create:${path}`, () => client.createFolder(path))} remove={(path) => run(`folder-delete:${path}`, () => client.deleteFolder(path))} /> : null}
+        {currentData.folders ? <FolderBrowser listing={currentData.folders} path={activePrefix} busy={Boolean(busy)} navigate={navigate} create={(path) => run(`folder-create:${path}`, () => commands.createFolder(path))} remove={(path) => run(`folder-delete:${path}`, () => commands.removeFolder(path))} /> : null}
         {!deleted ? <BatchToolbar keys={[...selected]} busy={Boolean(busy)} clear={() => setSelected(new Set())} applyTags={batchTag} remove={batchDelete} /> : null}
-        <FileTable page={displayedPage} deleted={deleted} selected={selected} busy={Boolean(busy) || resource.loading} loadingMore={loadingMore} select={select} open={(key) => onOpenObject(key, deleted)} download={download} remove={(key) => void run(`delete:${key}`, () => client.deleteFile(key))} restore={(key) => void run(`restore:${key}`, () => client.restoreObject(key))} loadMore={() => void loadMore()} />
+        <FileTable page={displayedPage} deleted={deleted} selected={selected} busy={Boolean(busy) || resource.loading} loadingMore={loadingMore} select={select} open={(key) => onOpenObject(key, deleted)} download={download} remove={(key) => void run(`delete:${key}`, () => commands.removeFile(key))} restore={(key) => void run(`restore:${key}`, () => commands.restoreFile(key))} loadMore={() => void loadMore()} />
       </div> : null}
     </section>
   )

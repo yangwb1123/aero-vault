@@ -9,9 +9,10 @@ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 // React 18 re-renders a throwing child in dev before the boundary gives up, so
 // the crash is gated by a mutable flag instead of an attempt counter.
 let shouldThrow = true
+let failure: unknown = new Error('boom')
 
 function Boom(): React.ReactElement {
-  if (shouldThrow) throw new Error('boom')
+  if (shouldThrow) throw failure
   return <div>页面已恢复</div>
 }
 
@@ -42,6 +43,7 @@ afterEach(() => {
   consoleError.mockRestore()
   window.history.replaceState(null, '', '#/')
   shouldThrow = true
+  failure = new Error('boom')
 })
 
 function renderBoundary(element: React.ReactElement): HTMLElement {
@@ -58,7 +60,8 @@ describe('PageBoundary render recovery', () => {
     const container = renderBoundary(<PageBoundary><Boom /></PageBoundary>)
 
     expect(container.textContent).toContain('页面渲染失败')
-    expect(container.textContent).toContain('boom')
+    expect(container.textContent).toContain('请重试或从菜单打开其他页面')
+    expect(container.textContent).not.toContain('boom')
     expect(container.textContent).not.toContain('页面已恢复')
 
     shouldThrow = false
@@ -77,13 +80,23 @@ describe('PageBoundary render recovery', () => {
     act(() => root.render(
       <PageBoundary resetKey="files"><RouteProbe route="files" /></PageBoundary>,
     ))
-    expect(container.textContent).toContain('files page crashed')
+    expect(container.textContent).toContain('页面渲染失败')
 
     act(() => root.render(
       <PageBoundary resetKey="activity"><RouteProbe route="activity" /></PageBoundary>,
     ))
     expect(container.textContent).toContain('页面 activity')
     expect(container.textContent).not.toContain('files page crashed')
+  })
+
+  it('handles non-Error throws without displaying internal error details', () => {
+    failure = 'sensitive server details'
+    const container = renderBoundary(<PageBoundary><Boom /></PageBoundary>)
+    expect(container.textContent).toContain('页面渲染失败')
+    expect(container.textContent).not.toContain('sensitive server details')
+    shouldThrow = false
+    act(() => button(container, '重试').click())
+    expect(container.textContent).toContain('页面已恢复')
   })
 
   it('logs the render failure once with its message and component stack', () => {

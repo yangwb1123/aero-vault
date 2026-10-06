@@ -104,7 +104,7 @@ describe('Shell resilience to an undecodable route hash', () => {
     document.body.append(container)
     renderShell(container)
 
-    expect(container.innerHTML.length).toBeGreaterThan(0)
+    expect(container.firstElementChild).not.toBeNull()
     expect(container.textContent).toContain('Aero Vault')
 
     await flushEffects()
@@ -112,6 +112,29 @@ describe('Shell resilience to an undecodable route hash', () => {
     // The malformed payload falls back to `overview`, so the overview page —
     // not a crash fallback — is what the user sees.
     expect(container.textContent).toContain('空间概览')
+  })
+
+  it('clears a caught page error when navigating to another page', async () => {
+    responses['/v1/session'] = { authenticated: false, tenant_id: 'default' }
+    window.history.replaceState(null, '', '#/overview')
+    const container = document.createElement('div')
+    document.body.append(container)
+    renderShell(container)
+    await flushEffects()
+    expect(container.textContent).toContain('页面渲染失败')
+    expect(container.textContent).toContain('Aero Vault')
+
+    act(() => {
+      window.location.hash = '#/services'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+    await flushEffects()
+
+    // This is integration coverage for Shell -> PageBoundary.resetKey, not
+    // merely a unit test of the boundary with an explicitly supplied key.
+    expect(container.querySelector('h1')?.textContent).toBe('平台服务')
+    expect(container.textContent).not.toContain('页面渲染失败')
+    expect(container.textContent).toContain('Aero Vault')
   })
 
   it('keeps the layout chrome when a page render throws and recovers on retry', async () => {

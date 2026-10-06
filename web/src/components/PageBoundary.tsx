@@ -7,41 +7,35 @@ interface PageBoundaryProps {
 }
 
 interface PageBoundaryState {
-  error: Error | null
+  failed: boolean
 }
 
-/**
- * PageBoundary keeps a render-time crash inside the current page: the layout
- * chrome stays mounted and the user gets a retry instead of a blank SPA.
- * `resetKey` (the active route) clears a caught error, so navigating away from
- * a crashed page recovers without a reload.
- */
+/** Keep page render errors inside the layout; route changes allow recovery. */
 export class PageBoundary extends React.Component<PageBoundaryProps, PageBoundaryState> {
-  state: PageBoundaryState = { error: null }
+  state: PageBoundaryState = { failed: false }
 
-  static getDerivedStateFromError(error: Error): PageBoundaryState {
-    return { error }
+  static getDerivedStateFromError(): PageBoundaryState {
+    return { failed: true }
   }
 
-  componentDidCatch(error: Error, info: React.ErrorInfo): void {
-    console.error('[web] page render failed', error.message, info.componentStack)
+  componentDidCatch(error: unknown, info: React.ErrorInfo): void {
+    console.error('[web] page render failed', error instanceof Error ? error.message : String(error), info.componentStack)
   }
 
   componentDidUpdate(previous: PageBoundaryProps): void {
-    if (previous.resetKey !== this.props.resetKey && this.state.error) {
-      this.setState({ error: null })
+    if (previous.resetKey !== this.props.resetKey && this.state.failed) {
+      this.setState({ failed: false })
     }
   }
 
-  private readonly reset = (): void => this.setState({ error: null })
+  private readonly reset = (): void => this.setState({ failed: false })
 
   render(): React.ReactNode {
-    const { error } = this.state
-    if (!error) return this.props.children
+    if (!this.state.failed) return this.props.children
     return (
       <IrisAlert tone="danger" title="页面渲染失败">
         <div className="alert-actions">
-          <span>{error.message}</span>
+          <span>页面发生异常，请重试或从菜单打开其他页面。</span>
           <IrisButton size="sm" variant="outline" onClick={this.reset}>
             重试
           </IrisButton>

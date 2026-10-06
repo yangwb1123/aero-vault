@@ -110,6 +110,20 @@ describe('useHashRoute malformed hash recovery', () => {
     expect(probe.current()).toBe('overview')
   })
 
+  it('can navigate away when the current browser hash becomes malformed', async () => {
+    window.history.replaceState(null, '', '#/files')
+    const probe = renderRouteProbe('overview')
+    // history.replaceState changes the browser address without firing the
+    // listener first: navigate itself must safely read this malformed hash.
+    window.history.replaceState(null, '', '#/object/100%')
+    expect(probe.current()).toBe('files')
+
+    expect(() => probe.navigate('activity')).not.toThrow()
+    await nextHashChange()
+    expect(window.location.hash).toBe('#/activity')
+    expect(probe.current()).toBe('activity')
+  })
+
   it('navigates to a percent-literal key and reads it back unchanged', async () => {
     window.history.replaceState(null, '', '#/files')
     const probe = renderRouteProbe('overview')
