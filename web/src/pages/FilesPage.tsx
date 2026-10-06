@@ -210,7 +210,7 @@ export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpe
       {currentData && displayedPage ? <div className="files-stack">
         {currentData.folders ? <FolderBrowser listing={currentData.folders} path={activePrefix} busy={Boolean(busy)} navigate={navigate} create={(path) => run(`folder-create:${path}`, () => commands.createFolder(path))} remove={(path) => run(`folder-delete:${path}`, () => commands.removeFolder(path))} /> : null}
         {!deleted ? <BatchToolbar keys={[...selected]} busy={Boolean(busy)} clear={() => setSelected(new Set())} applyTags={batchTag} remove={batchDelete} /> : null}
-        <FileTable page={displayedPage} deleted={deleted} selected={selected} busy={Boolean(busy) || resource.loading} loadingMore={loadingMore} select={select} open={(key) => onOpenObject(key, deleted)} download={download} remove={(key) => void run(`delete:${key}`, () => commands.removeFile(key))} restore={(key) => void run(`restore:${key}`, () => commands.restoreFile(key))} loadMore={() => void loadMore()} />
+        <FileTable page={displayedPage} deleted={deleted} selected={selected} busy={Boolean(busy) || resource.loading} loadingMore={loadingMore} select={select} open={(key) => onOpenObject(key, deleted)} download={download} remove={(key) => void run(`delete:${key}`, () => commands.removeFile(key))} restore={(key) => void run(`restore:${key}`, () => commands.restoreFile(key))} loadMore={() => void loadMore()} reload={reloadFiles} />
       </div> : null}
     </section>
   )

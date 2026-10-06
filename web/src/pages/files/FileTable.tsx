@@ -4,7 +4,7 @@ import type { FilePage, VaultObject } from '../../api/vault'
 const formatBytes = (value: number): string =>
   new Intl.NumberFormat('zh-CN', { notation: 'compact', style: 'unit', unit: 'byte' }).format(value)
 
-export function FileTable({ page, deleted, selected, busy, loadingMore, select, open, download, remove, restore, loadMore }: {
+export function FileTable({ page, deleted, selected, busy, loadingMore, select, open, download, remove, restore, loadMore, reload }: {
   page: FilePage
   deleted: boolean
   selected: Set<string>
@@ -16,7 +16,10 @@ export function FileTable({ page, deleted, selected, busy, loadingMore, select, 
   remove(key: string): void
   restore(key: string): void
   loadMore(): void
+  reload(): void
 }): React.ReactElement {
+  const emptyMessage = !page.has_more ? '没有匹配文件'
+    : page.next_marker ? '已加载页面中暂无匹配文件，请继续加载。' : '列表尚未加载完整，请重新加载后重试。'
   const keys = page.objects.map((item) => item.key)
   const allSelected = keys.length > 0 && keys.every((key) => selected.has(key))
   return (
@@ -36,17 +39,20 @@ export function FileTable({ page, deleted, selected, busy, loadingMore, select, 
               </>}
             </td>
           </tr>
-        ))}{page.objects.length === 0 ? <tr><td colSpan={6} className="empty-cell">没有匹配文件</td></tr> : null}</tbody>
+        ))}{page.objects.length === 0 ? <tr><td colSpan={6} className="empty-cell">{emptyMessage}</td></tr> : null}</tbody>
       </table></div>
       {page.has_more ? <div className="access-actions table-note">
-        <span>已加载 {page.objects.length} 个对象</span>
+        <span>已加载 {page.objects.length} 个匹配文件（仍有页面未加载）</span>
         {page.next_marker ? <IrisButton
           variant="outline"
           size="sm"
           disabled={busy || loadingMore}
           loading={loadingMore}
           onClick={loadMore}
-        >加载更多</IrisButton> : <span>后续页面游标不可用</span>}
+        >加载更多</IrisButton> : <>
+          <span>后续页面游标不可用</span>
+          <IrisButton variant="outline" size="sm" disabled={busy || loadingMore} onClick={reload}>重新加载</IrisButton>
+        </>}
       </div> : null}
     </IrisCard>
   )
