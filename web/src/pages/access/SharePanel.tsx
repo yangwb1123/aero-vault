@@ -28,13 +28,15 @@ interface ScopedShares {
 interface ScopedURL {
   client: VaultClient
   scopeKey: string
+  id: string
   url: string
 }
 
-const shareScopeKey = (bucket: string, key: string): string => JSON.stringify([bucket, key.trim()])
+const shareScopeKey = (bucket: string, key: string): string => JSON.stringify([bucket, key])
 
-export function SharePanel({ client, bucket }: { client: VaultClient; bucket: string }): React.ReactElement {
-  const [key, setKey] = React.useState('')
+export function SharePanel({ client, bucket, objectKey }: { client: VaultClient; bucket: string; objectKey?: string }): React.ReactElement {
+  const [inputKey, setKey] = React.useState('')
+  const key = objectKey ?? inputKey.trim()
   const [name, setName] = React.useState('')
   const [password, setPassword] = React.useState('')
   const [ttl, setTTL] = React.useState<number | null>(3600)
@@ -63,11 +65,22 @@ export function SharePanel({ client, bucket }: { client: VaultClient; bucket: st
     busyRef.current = false
     setSharesState(undefined)
     setCreatedShare(undefined)
+    setName('')
+    setPassword('')
+    setTTL(3600)
+    setMaxUses(null)
+    setPreview(true)
+    setDownload(true)
     setBusy('')
     setError(undefined)
   }, [client, scopeKey])
 
-  const captureTarget = (): ShareTarget => ({ client, bucket, key: key.trim(), scopeKey })
+  React.useEffect(() => () => {
+    requestRef.current += 1
+    busyRef.current = false
+  }, [])
+
+  const captureTarget = (): ShareTarget => ({ client, bucket, key, scopeKey })
   const isCurrentScope = (target: ShareTarget) =>
     scopeRef.current.client === target.client && scopeRef.current.scopeKey === target.scopeKey
   const run = async (
@@ -102,9 +115,17 @@ export function SharePanel({ client, bucket }: { client: VaultClient; bucket: st
     })
   }
 
+  React.useEffect(() => {
+    if (objectKey !== undefined) void load()
+  }, [client, bucket, scopeKey, objectKey])
+
   const create = () => {
     const target = captureTarget()
     if (!target.key || busyRef.current) return
+    if (!preview && !download) {
+      setError('至少允许预览或下载之一。')
+      return
+    }
     setCreatedShare(undefined)
     return run('create', target, async (isCurrent) => {
       const result = await target.client.createShare({
@@ -118,7 +139,7 @@ export function SharePanel({ client, bucket }: { client: VaultClient; bucket: st
         max_uses: maxUses && maxUses > 0 ? maxUses : undefined,
       })
       if (!isCurrent()) return
-      setCreatedShare({ client: target.client, scopeKey: target.scopeKey, url: result.url })
+      setCreatedShare({ client: target.client, scopeKey: target.scopeKey, id: result.share.id, url: result.url })
       const nextShares = await target.client.listShares(target.bucket, target.key)
       if (isCurrent()) setSharesState({ client: target.client, scopeKey: target.scopeKey, shares: nextShares })
     })
@@ -130,6 +151,7 @@ export function SharePanel({ client, bucket }: { client: VaultClient; bucket: st
     return run(`revoke:${id}`, target, async (isCurrent) => {
       await target.client.revokeShare(id)
       if (!isCurrent()) return
+      setCreatedShare((current) => current?.id === id ? undefined : current)
       const nextShares = await target.client.listShares(target.bucket, target.key)
       if (isCurrent()) setSharesState({ client: target.client, scopeKey: target.scopeKey, shares: nextShares })
     })
@@ -139,7 +161,7 @@ export function SharePanel({ client, bucket }: { client: VaultClient; bucket: st
     <div className="access-stack">
       <IrisCard variant="outline" header="创建对象分享链接">
         <form className="access-form" onSubmit={(event) => { event.preventDefault(); void create() }}>
-          <label className="access-field access-wide"><span>对象 Key</span><IrisInput required disabled={busy === 'create'} value={key} placeholder="docs/report.pdf" onChange={(event) => setKey(event.target.value)} /></label>
+          <label className="access-field access-wide"><span>对象 Key</span><IrisInput required readOnly={objectKey !== undefined} disabled={busy === 'create'} value={objectKey ?? inputKey} placeholder="docs/report.pdf" onChange={(event) => setKey(event.target.value)} /></label>
           <label className="access-field"><span>链接名称</span><IrisInput value={name} placeholder="外部评审" onChange={(event) => setName(event.target.value)} /></label>
           <label className="access-field"><span>访问密码（可选）</span><IrisPasswordInput value={password} onChange={(event) => setPassword(event.target.value)} /></label>
           <label className="access-field"><span>有效期（秒，空为永久）</span><IrisNumberInput min={1} value={ttl} onChange={setTTL} /></label>

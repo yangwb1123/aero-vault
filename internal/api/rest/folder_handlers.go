@@ -3,6 +3,7 @@ package rest
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,13 +27,22 @@ func (h *Handler) ListFolders(w http.ResponseWriter, r *http.Request) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	page, err := h.svc.List(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, "", 1000)
+	if !h.checkBucketPolicy(w, r, "", "s3:ListBucket") {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Add("Vary", "Authorization, X-Api-Key, X-Aero-Tenant")
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	page, err := h.svc.ListWithOptions(
+		r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, r.URL.Query().Get("marker"), limit,
+		service.FileListOptions{View: service.FileListView(r.URL.Query().Get("view"))},
+	)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}
 	seen := map[string]bool{}
-	var items []folderItem
+	items := make([]folderItem, 0, len(page.Objects))
 	for _, obj := range page.Objects {
 		remainder := strings.TrimPrefix(obj.Key, prefix)
 		if remainder == "" {
@@ -52,7 +62,9 @@ func (h *Handler) ListFolders(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"prefix": prefix, "items": items})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"prefix": prefix, "items": items, "has_more": page.HasMore, "next_marker": page.NextMarker,
+	})
 }
 
 // CreateFolder creates a zero-byte directory marker object.
@@ -66,7 +78,7 @@ func (h *Handler) CreateFolder(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasSuffix(folderPath, "/") {
 		folderPath += "/"
 	}
-	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, folderPath, nil, 0, service.PutOptions{
+	obj, err := h.svc.Put(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, folderPath, strings.NewReader(""), 0, service.PutOptions{
 		ContentType: "application/x-directory",
 	})
 	if err != nil {

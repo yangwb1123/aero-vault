@@ -16,7 +16,6 @@ import (
 	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
-	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
@@ -317,17 +316,16 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if !h.checkBucketPolicy(w, r, "", "s3:ListBucket") {
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Add("Vary", "Authorization, X-Api-Key, X-Aero-Tenant")
 	q := r.URL.Query()
 	prefix := q.Get("prefix")
 	marker := q.Get("marker")
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	var page repository.ListPage
-	var err error
-	if q.Get("deleted") == "true" {
-		page, err = h.svc.ListDeleted(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, marker, limit)
-	} else {
-		page, err = h.svc.List(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, marker, limit)
-	}
+	page, err := h.svc.ListWithOptions(
+		r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, prefix, marker, limit,
+		service.FileListOptions{View: service.FileListView(q.Get("view")), Deleted: q.Get("deleted") == "true"},
+	)
 	if err != nil {
 		h.writeError(w, r, err)
 		return

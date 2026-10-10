@@ -21,6 +21,17 @@ describe('object routes', () => {
     expect(parseObjectRoute(objectRoute('trash/a.txt', true))).toEqual({ key: 'trash/a.txt', deleted: true })
   })
 
+  it('preserves whitespace in active and deleted object keys', () => {
+    for (const key of [' docs/100% report.txt ', '  ']) {
+      for (const deleted of [false, true]) {
+        const route = objectRoute(key, deleted)
+        window.history.replaceState(null, '', `#/${encodeURIComponent(route)}`)
+        expect(routeFromHash('files')).toBe(route)
+        expect(parseObjectRoute(routeFromHash('files'))).toEqual({ key, deleted })
+      }
+    }
+  })
+
   it('decodes the single encoded hash payload', () => {
     window.history.replaceState(null, '', '#/object%2Fdocs%2Fa%20b.txt')
     expect(routeFromHash('files')).toBe('object/docs/a b.txt')

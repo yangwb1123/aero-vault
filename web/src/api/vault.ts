@@ -22,7 +22,7 @@ import {
 } from './admin'
 import type { BucketConfig, BucketLifecycleInput, BucketStats } from './buckets'
 import { BucketSecurityClient } from './bucketSecurity'
-import type { BatchDeleteResult, BatchTagResult, FolderListing } from './files'
+import { folderListingPath, type BatchDeleteResult, type BatchTagResult, type FileListView, type FolderListing } from './files'
 import { normalizeAgentResponse, type AgentResponse } from './agent'
 import { VaultApiError, VaultTransport } from './transport'
 
@@ -151,8 +151,8 @@ export class VaultClient extends VaultTransport {
     await this.putBucketJSON(bucket, 'lifecycle', input)
   }
 
-  listFiles(prefix = '', deleted = false, marker = ''): Promise<FilePage> {
-    const query = new URLSearchParams({ limit: '200', ...(marker ? { marker } : {}) })
+  listFiles(prefix = '', deleted = false, marker = '', view: FileListView = 'all'): Promise<FilePage> {
+    const query = new URLSearchParams({ limit: '200', ...(marker ? { marker } : {}), ...(view === 'mine' ? { view } : {}) })
     if (prefix) query.set('prefix', prefix)
     if (deleted) query.set('deleted', 'true')
     return this.json<FilePage>(`/files?${query}`)
@@ -170,11 +170,8 @@ export class VaultClient extends VaultTransport {
     await this.request(`/files/${encodeKey(key)}`, { method: 'DELETE' })
   }
 
-  listFolder(path = ''): Promise<FolderListing> {
-    const query = new URLSearchParams()
-    if (path) query.set('path', path)
-    const suffix = query.size ? `?${query}` : ''
-    return this.json<FolderListing>(`/folders${suffix}`)
+  listFolder(path = '', view: FileListView = 'all', marker = ''): Promise<FolderListing> {
+    return this.json<FolderListing>(folderListingPath(path, view, marker))
   }
 
   async createFolder(path: string): Promise<void> {

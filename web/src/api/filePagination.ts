@@ -1,3 +1,4 @@
+import type { FileListView } from './files'
 import type { FilePage, VaultClient } from './vault'
 
 export function listNextFilePage(
@@ -5,6 +6,9 @@ export function listNextFilePage(
   prefix: string,
   deleted: boolean,
   marker: string,
+  view: FileListView = 'all',
 ): Promise<FilePage> {
-  return client.listFiles(prefix, deleted, marker)
+  return view === 'all'
+    ? client.listFiles(prefix, deleted, marker)
+    : client.listFiles(prefix, deleted, marker, view)
 }

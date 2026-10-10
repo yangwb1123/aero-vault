@@ -35,7 +35,6 @@ func init() {
 		{Method: "GET", Path: "/auth/oidc/logout", Summary: "End the OIDC browser session", Tag: "auth", Public: true, Status: 302},
 
 		// Files CRUD
-		{Method: "GET", Path: "/v1/files", Summary: "List objects", Tag: "files", Status: 200, Response: `{"objects":[{"key":"file.txt","size":100}],"next_marker":""}`},
 		{Method: "GET", Path: "/v1/files/{key}", Summary: "Get object", Tag: "files", Status: 200, Response: `{"key":"file.txt","size":100,"etag":"abc123","content_type":"text/plain"}`},
 		{Method: "HEAD", Path: "/v1/files/{key}", Summary: "Head object", Tag: "files", Status: 200},
 		{Method: "PUT", Path: "/v1/files/{key}", Summary: "Upload object", Tag: "files", Body: `"file content"`, Status: 201, Response: `{"key":"file.txt","etag":"abc123"}`},
@@ -148,7 +147,6 @@ func init() {
 		{Method: "DELETE", Path: "/v1/legal-hold", Summary: "Remove legal hold", Tag: "legal-hold", Status: 204},
 
 		// Folders
-		{Method: "GET", Path: "/v1/folders", Summary: "List folders", Tag: "files", Status: 200, Response: `{"folders":["docs/","images/"]}`},
 		{Method: "POST", Path: "/v1/folders/{key}", Summary: "Create folder", Tag: "files", Status: 201},
 		{Method: "DELETE", Path: "/v1/folders/{key}", Summary: "Delete folder recursively", Tag: "files", Status: 200, Response: `{"deleted":3,"failed":0}`},
 

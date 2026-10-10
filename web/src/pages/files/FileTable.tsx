@@ -4,7 +4,7 @@ import type { FilePage, VaultObject } from '../../api/vault'
 const formatBytes = (value: number): string =>
   new Intl.NumberFormat('zh-CN', { notation: 'compact', style: 'unit', unit: 'byte' }).format(value)
 
-export function FileTable({ page, deleted, selected, busy, loadingMore, select, open, download, remove, restore, loadMore, reload }: {
+export function FileTable({ page, deleted, selected, busy, loadingMore, select, open, download, share, remove, restore, loadMore, reload }: {
   page: FilePage
   deleted: boolean
   selected: Set<string>
@@ -13,6 +13,7 @@ export function FileTable({ page, deleted, selected, busy, loadingMore, select, 
   select(keys: string[], checked: boolean): void
   open(key: string): void
   download(item: VaultObject): void
+  share?(item: VaultObject): void
   remove(key: string): void
   restore(key: string): void
   loadMore(): void
@@ -25,16 +26,17 @@ export function FileTable({ page, deleted, selected, busy, loadingMore, select, 
   return (
     <IrisCard variant="outline">
       <div className="table-scroll"><table className="vault-table">
-        <thead><tr><th className="selection-cell">{!deleted ? <IrisCheckbox aria-label="选择已加载对象" checked={allSelected} onChange={(checked) => select(keys, checked)} /> : null}</th><th>Key</th><th>大小</th><th>类型</th><th>更新时间</th><th>操作</th></tr></thead>
+        <thead><tr><th className="selection-cell"><IrisCheckbox aria-label="选择已加载对象" checked={allSelected} disabled={busy} onChange={(checked) => select(keys, checked)} /></th><th>Key</th><th>大小</th><th>类型</th><th>更新时间</th><th>操作</th></tr></thead>
         <tbody>{page.objects.map((item) => (
           <tr key={`${item.bucket}:${item.key}`}>
-            <td className="selection-cell">{!deleted ? <IrisCheckbox aria-label={`选择 ${item.key}`} checked={selected.has(item.key)} onChange={(checked) => select([item.key], checked)} /> : null}</td>
+            <td className="selection-cell"><IrisCheckbox aria-label={`选择 ${item.key}`} checked={selected.has(item.key)} disabled={busy} onChange={(checked) => select([item.key], checked)} /></td>
             <td><strong>{item.key}</strong><div className="muted">{item.bucket}</div></td>
             <td>{formatBytes(item.size)}</td><td>{item.content_type || 'application/octet-stream'}</td>
             <td>{new Date(item.updated_at).toLocaleString('zh-CN')}</td>
             <td className="row-actions"><IrisButton size="sm" variant="ghost" disabled={busy} onClick={() => open(item.key)}>详情</IrisButton>
               {deleted ? <IrisButton size="sm" variant="ghost" disabled={busy} onClick={() => restore(item.key)}>恢复</IrisButton> : <>
                 <IrisButton size="sm" variant="ghost" disabled={busy} onClick={() => download(item)}>下载</IrisButton>
+                {share ? <IrisButton size="sm" variant="ghost" disabled={busy} onClick={() => share(item)}>分享</IrisButton> : null}
                 <IrisButton size="sm" variant="ghost" disabled={busy} onClick={() => { if (window.confirm(`软删除 ${item.key}？`)) remove(item.key) }}>删除</IrisButton>
               </>}
             </td>

@@ -165,6 +165,34 @@ List response:
   "next_marker": "", "has_more": false }
 ```
 
+### Owned file view
+
+`GET /v1/files` and `GET /v1/folders` accept `view=all|mine` (omitted or empty
+means `all`; other values return 400). `mine` uses the current authenticated
+user/service's trusted owner identity and **still applies read authorization**.
+Anonymous/capability-only identities and tenant mismatches return 403. Legacy
+objects without an owner are excluded; this does not create a private space or
+change upload/share permissions.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/files?view=mine&prefix=docs/"
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/files?view=mine&deleted=true"
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/folders?view=mine&path=docs/"
+```
+
+File pagination and `deleted=true` use the same view; reset `marker` when
+switching views. Folder discovery accepts `marker` and `limit` too, and returns
+`has_more`/`next_marker` alongside `prefix`/`items`. The default/maximum 1000 limit
+counts **visible objects per page**, not unique direct entries: a subdirectory
+may repeat on multiple pages, so merge by item type and name. An empty page is
+not terminal when `has_more` is true. Continue with the returned marker and the
+same path/view; refresh from an empty marker when the scope changes. Listings
+are not snapshots of concurrent changes.
+
+See [the owned-view contract](requirements/owned-file-view-v1.spec.md) and
+[folder pagination](requirements/folder-pagination-v1.spec.md) for security rules
+and limitations.
+
 ### Presigned URLs
 
 ```bash

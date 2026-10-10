@@ -40,7 +40,9 @@ export function routeFromHash(fallback: string): string {
   const hash = window.location.hash
   if (!hash || hash === '#' || hash === prefix) return fallback
   const raw = hash.startsWith(prefix) ? hash.slice(prefix.length) : hash.replace(/^#/, '')
-  return decodeHashSegment(raw)?.trim() || fallback
+  const decoded = decodeHashSegment(raw)
+  // An object Key is opaque: trimming a route can address a different file.
+  return decoded && parseObjectRoute(decoded) ? decoded : decoded?.trim() || fallback
 }
 
 export function useHashRoute(fallback: string): [string, (route: string) => void] {

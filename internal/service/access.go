@@ -213,17 +213,27 @@ func (s *FileService) listAuthorizedObjects(
 	limit int,
 	fetch objectPageFetcher,
 ) (repository.ListPage, error) {
+	return s.listObjectsMatching(ctx, tenant, bucket, prefix, marker, limit, fetch, nil)
+}
+
+func (s *FileService) listObjectsMatching(
+	ctx context.Context,
+	tenant, bucket, prefix, marker string,
+	limit int,
+	fetch objectPageFetcher,
+	matches func(repository.Object) bool,
+) (repository.ListPage, error) {
 	if err := s.requireActiveTenant(ctx, tenant); err != nil {
 		return repository.ListPage{}, err
 	}
-	if s.authorizer == nil {
+	if s.authorizer == nil && matches == nil {
 		return fetch(ctx, tenant, bucket, prefix, marker, limit)
 	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
 	objects, err := s.collectAuthorizedObjects(
-		ctx, tenant, bucket, prefix, marker, limit+1, fetch,
+		ctx, tenant, bucket, prefix, marker, limit+1, fetch, matches,
 	)
 	if err != nil {
 		return repository.ListPage{}, err
@@ -242,6 +252,7 @@ func (s *FileService) collectAuthorizedObjects(
 	tenant, bucket, prefix, marker string,
 	wanted int,
 	fetch objectPageFetcher,
+	matches func(repository.Object) bool,
 ) ([]repository.Object, error) {
 	objects := make([]repository.Object, 0, wanted)
 	cursor := marker
@@ -251,6 +262,9 @@ func (s *FileService) collectAuthorizedObjects(
 			return nil, err
 		}
 		for _, obj := range page.Objects {
+			if matches != nil && !matches(obj) {
+				continue
+			}
 			if err := s.appendAuthorizedObject(ctx, obj, &objects); err != nil {
 				return nil, err
 			}
