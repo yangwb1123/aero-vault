@@ -79,7 +79,7 @@ func (s *forcedThumbnailETagStore) GetGenerationBound(ctx context.Context, key s
 
 func newThumbnailIdentityREST(t *testing.T, store storage.Storage, withCache bool) (*httptest.Server, repository.Repository) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "thumb.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "thumb.db"))
 	if err != nil {
 		t.Fatalf("repository.Open: %v", err)

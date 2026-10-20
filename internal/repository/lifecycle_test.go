@@ -11,14 +11,23 @@ import (
 func openTestSQLite(t *testing.T) *sqlStore {
 	t.Helper()
 	dsn := "file:" + filepath.Join(t.TempDir(), "lc.db")
+	started := time.Now()
 	repo, err := Open(context.Background(), "sqlite", dsn)
+	t.Logf("lifecycle-fixture phase=open elapsed=%s", time.Since(started))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := repo.Migrate(context.Background()); err != nil {
+	t.Cleanup(func() {
+		started := time.Now()
+		defer func() { t.Logf("lifecycle-fixture phase=close elapsed=%s", time.Since(started)) }()
+		_ = repo.Close()
+	})
+	started = time.Now()
+	err = repo.Migrate(context.Background())
+	t.Logf("lifecycle-fixture phase=migrate-all elapsed=%s", time.Since(started))
+	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	t.Cleanup(func() { _ = repo.Close() })
 	s, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("expected *sqlStore")

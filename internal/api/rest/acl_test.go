@@ -20,7 +20,7 @@ import (
 // anonymous-public-read enabled) around the object routes.
 func newAuthRESTTest(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "acl.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "acl.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)

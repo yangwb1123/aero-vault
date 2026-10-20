@@ -15,7 +15,7 @@ import (
 
 func testAdminHandler(t *testing.T) *AdminHandler {
 	t.Helper()
-	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(t.TempDir(), "admin.db"))
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(restFixtureSchemaDir(t, context.Background(), "admin.db"), "admin.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

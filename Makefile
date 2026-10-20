@@ -21,6 +21,7 @@ web-install:
 	cd web && pnpm install --frozen-lockfile
 
 web-test:
+	node --test scripts/web-smoke-page.test.mjs
 	cd web && pnpm test
 
 web-build:

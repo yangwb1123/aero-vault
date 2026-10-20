@@ -123,6 +123,41 @@ func (h *Handler) statPinned(ctx context.Context, tenant, key, version string) (
 	return h.svc.StatVersionWithOptions(ctx, tenant, service.DefaultBucket, key, version, service.ReadOptions{})
 }
 
+// Revalidation must authorize the new observation before its encoding/media
+// gates. A stale derivable Stat cannot certify 304 for a now-rejected source.
+// Generic declarations remain metadata-only here: never open just to sniff.
+func (h *Handler) revalidateThumbnailSource(w http.ResponseWriter, r *http.Request, tenant, key, version string) (repository.Object, bool) {
+	fresh, err := h.statPinned(r.Context(), tenant, key, version)
+	if err != nil {
+		h.writeError(w, r, err)
+		return repository.Object{}, false
+	}
+	if encoding := fresh.Metadata["_aero_content_encoding"]; encoding != "" {
+		h.writeThumbnailError(w, r, unsupportedThumbnailContentEncodingError(encoding))
+		return repository.Object{}, false
+	}
+	if _, err := thumbnailMediaType(fresh.ContentType); err != nil {
+		h.writeThumbnailError(w, r, err)
+		return repository.Object{}, false
+	}
+	return fresh, true
+}
+
+// The successful opener is a new authorized observation, not the preflight
+// Stat's representation. Reject its encoding before sniff/decode; this helper
+// owns cleanup on rejection, while accepted streams keep the pipeline owner.
+func (h *Handler) openUnencodedThumbnailSource(ctx context.Context, obj repository.Object, version string) (service.ThumbnailSource, error) {
+	source, err := h.svc.OpenThumbnailSource(ctx, obj, version)
+	if err != nil {
+		return service.ThumbnailSource{}, err
+	}
+	if encoding := source.Object.Metadata["_aero_content_encoding"]; encoding != "" {
+		closeSniffSource(source.Reader)
+		return service.ThumbnailSource{}, unsupportedThumbnailContentEncodingError(encoding)
+	}
+	return source, nil
+}
+
 func thumbnailSourceIdentity(obj repository.Object) thumbnail.SourceIdentity {
 	return thumbnail.SourceIdentity{
 		TenantID:  obj.TenantID,

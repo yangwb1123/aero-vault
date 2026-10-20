@@ -51,7 +51,7 @@ func (s *blockingThumbnailStorage) unblock() {
 
 func newThumbnailCoalesceREST(t *testing.T) (*httptest.Server, *countingStore, *service.FileService, repository.Repository, *blockingThumbnailStorage) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "c.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)

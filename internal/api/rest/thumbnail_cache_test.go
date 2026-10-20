@@ -92,7 +92,7 @@ func (r *recordingSink) count(typ repository.EventType) int {
 // isolation).
 func newThumbnailCacheREST(t *testing.T, withCache bool, ttl time.Duration) (*httptest.Server, *countingStore, *service.FileService, *chi.Mux) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "c.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)

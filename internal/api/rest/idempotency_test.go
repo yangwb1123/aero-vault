@@ -22,7 +22,7 @@ import (
 
 func idemTestRepo(t *testing.T) repository.Repository {
 	t.Helper()
-	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(t.TempDir(), "idem.db"))
+	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(restFixtureSchemaDir(t, context.Background(), "idem.db"), "idem.db"))
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
 	}

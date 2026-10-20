@@ -201,9 +201,9 @@ func lookupCached(ctx context.Context, cache *Cache, key CacheKey) ([]byte, bool
 	}
 }
 
-// storeCached requires both the authoritative identity and a storage proof for
-// the opened descriptor. An opener may return bytes normally after a race, but
-// those bytes are never admitted under the pre-open cache key.
+// storeCached requires the authoritative identity, a storage proof for the
+// opened descriptor, and no opened-source policy veto. An opener may return
+// bytes normally after a race without admitting them to resident storage.
 func storeCached(
 	ctx context.Context,
 	cache *Cache,
@@ -215,7 +215,7 @@ func storeCached(
 ) {
 	if cache == nil || cache.disabled || !key.Identity.Complete() ||
 		!key.Identity.Equal(identity) || key.SourceETag != sourceETag ||
-		!opened.Bound || !opened.Identity.Equal(identity) || opened.ETag != sourceETag {
+		!opened.cacheStoreAdmissible(identity, sourceETag) {
 		return
 	}
 	if !cache.PayloadFits(img) {

@@ -35,8 +35,8 @@ func init() {
 		{Method: "GET", Path: "/auth/oidc/logout", Summary: "End the OIDC browser session", Tag: "auth", Public: true, Status: 302},
 
 		// Files CRUD
-		{Method: "GET", Path: "/v1/files/{key}", Summary: "Get object", Tag: "files", Status: 200, Response: `{"key":"file.txt","size":100,"etag":"abc123","content_type":"text/plain"}`},
-		{Method: "HEAD", Path: "/v1/files/{key}", Summary: "Head object", Tag: "files", Status: 200},
+		fileReadRoute(),
+		fileHeadRoute(),
 		{Method: "PUT", Path: "/v1/files/{key}", Summary: "Upload object", Tag: "files", Body: `"file content"`, Status: 201, Response: `{"key":"file.txt","etag":"abc123"}`},
 		{Method: "POST", Path: "/v1/files/{key}", Summary: "Upload via form or presign/lock/restore", Tag: "files", Status: 200},
 		{Method: "PATCH", Path: "/v1/files/{key}", Summary: "Partial update (metadata)", Tag: "files", Status: 200},
@@ -44,7 +44,7 @@ func init() {
 		{Method: "GET", Path: "/v1/files/{key}/tags", Summary: "Get object tags", Tag: "files", Status: 200, Response: `{"tags":{"key":"value"}}`},
 		{Method: "PUT", Path: "/v1/files/{key}/tags", Summary: "Set object tags", Tag: "files", Body: `{"key":"value"}`, Status: 200},
 		{Method: "DELETE", Path: "/v1/files/{key}/tags", Summary: "Delete object tags", Tag: "files", Status: 204},
-		{Method: "GET", Path: "/v1/files/{key}/versions", Summary: "List object versions", Tag: "files", Status: 200, Response: `{"versions":[{"version_id":"v1","size":100}]}`},
+		{Method: "GET", Path: "/v1/files/{key}/versions", Summary: "List object versions", Tag: "files", Status: 200, Response: `{"versions":[{"version_id":"v1","size":100},{"version_id":"marker","size":0,"is_delete_marker":true}]}`},
 		{Method: "GET", Path: "/v1/files/{key}/acl", Summary: "Get object ACL", Tag: "files", Status: 200},
 		{Method: "PUT", Path: "/v1/files/{key}/acl", Summary: "Set object ACL", Tag: "files", Status: 200},
 		{Method: "GET", Path: "/v1/files/{key}/metadata", Summary: "Get object metadata", Tag: "files", Status: 200},
@@ -53,16 +53,19 @@ func init() {
 		{Method: "DELETE", Path: "/v1/files/{key}/metadata", Summary: "Delete metadata key", Tag: "files", Status: 200},
 		{Method: "POST", Path: "/v1/files/{key}/restore", Summary: "Restore soft-deleted object", Tag: "files", Status: 200},
 		{Method: "POST", Path: "/v1/files/{key}/lock", Summary: "Set object retention lock", Tag: "files", Status: 200},
-		{Method: "GET", Path: "/v1/files/{key}/thumbnail", Summary: "Get thumbnail (JPEG)", Tag: "files", Status: 200,
+		{Method: "GET", Path: "/v1/files/{key}/thumbnail", Summary: "Get thumbnail (JPEG) or exact-key content (legacy precedence); thumbnail 200 after conditional re-Stat selects cache/source from the newer authorized observation; opened source encryption metadata can veto resident thumbnail cache storage", Tag: "files", Status: 200, BinaryResponse: true,
 			Query: []apiQueryParameter{
 				{Name: "version", Description: "Historical version ID; when set, the thumbnail is derived from that version of the trimmed key. If the pinned version names an object at the exact key, raw-download semantics apply.", Type: "string"},
 				{Name: "w", Description: "Thumbnail width in pixels. Omitted or 0 selects the default (256); empty, non-integer, negative, or non-representable values are rejected with 400. Values above 2048 are clamped to 2048. Aspect ratio is preserved and the image is never upscaled.", Type: "integer"},
 				{Name: "h", Description: "Thumbnail height in pixels. Omitted or 0 selects the default (256); empty, non-integer, negative, or non-representable values are rejected with 400. Values above 2048 are clamped to 2048. Aspect ratio is preserved and the image is never upscaled.", Type: "integer"},
 			},
 			Responses: map[int]string{
-				http.StatusUnsupportedMediaType:  "Object content-type is unsupported, or the object carries a non-empty Content-Encoding declaration that is not decoded for thumbnail derivation (supported image formats: image/jpeg, image/png, image/gif)",
+				http.StatusNotModified:           "The authorized thumbnail matches an ETag list or the exact wildcard *; empty opaque tags are not wildcards. If-None-Match presence suppresses date fallback",
+				http.StatusBadRequest:            "Invalid thumbnail arguments or a non-image declaration in the opened source Content-Type, rejected before reading; a non-image Content-Type on the second authorized conditional Stat returns 400, not 304",
+				http.StatusUnsupportedMediaType:  "Object content-type is unsupported, or the object carries a non-empty Content-Encoding declaration that is not decoded for thumbnail derivation, including on the second authorized conditional Stat (415, not 304) and the authorized opened source before sniff/decode (supported image formats: image/jpeg, image/png, image/gif). The opened source Content-Type determines declared-format admission or generic-MIME magic sniffing. The second authorized conditional Stat also checks Content-Type declarations (unsupported image formats return 415, not 304)",
 				http.StatusGone:                  "Object is marked as corrupt (scrub) — the corrupt-state error is surfaced verbatim, never flattened to a 400 invalid-image error",
 				http.StatusRequestEntityTooLarge: "Source dimensions exceed the decode caps (MaxSourceDim / MaxProgressiveSourceDim / Max16BitSourceDim), the image metadata exceeds the 8 MiB budget, or the compressed source exceeds the 128 MiB processing cap (MaxSourceBytes)",
+				http.StatusGatewayTimeout:        "Thumbnail request deadline expired, including after a completed shared generation; no success output or follower access event. Client cancellation remains silent",
 			}},
 		{
 			Method: "POST", Path: "/v1/files/{key}/presign",
@@ -436,40 +439,6 @@ func (h *Handler) putKey(w http.ResponseWriter, r *http.Request) {
 		h.PutMetadata(w, r)
 	default:
 		h.Put(w, r)
-	}
-}
-
-// getKey dispatches GET /v1/files/<key>/{tags|versions|acl} vs raw download.
-func (h *Handler) getKey(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case strings.HasSuffix(r.URL.Path, "/tags"):
-		if h.rejectAnonymousSubresource(w, r) {
-			return
-		}
-		h.GetTags(w, r)
-	case strings.HasSuffix(r.URL.Path, "/versions"):
-		if h.rejectAnonymousSubresource(w, r) {
-			return
-		}
-		h.ListVersions(w, r)
-	case strings.HasSuffix(r.URL.Path, "/acl"):
-		if h.rejectAnonymousSubresource(w, r) {
-			return
-		}
-		h.GetObjectACLHandler(w, r)
-	case strings.HasSuffix(r.URL.Path, "/metadata"):
-		if h.rejectAnonymousSubresource(w, r) {
-			return
-		}
-		h.GetMetadata(w, r)
-	case strings.HasSuffix(r.URL.Path, "/thumbnail"):
-		// The derivation branch applies its own server-side bound inside the
-		// handler (thumbnail.go), scoped so delegation arms that raw-download
-		// "/thumbnail"-suffixed keys are never collateralized by the
-		// thumbnail deadline.
-		h.Thumbnail(w, r)
-	default:
-		h.Get(w, r)
 	}
 }
 

@@ -612,7 +612,7 @@ func TestThumbnailAppliesPNGeXIfOrientation(t *testing.T) {
 // bucket versioning directly.
 func newRESTTestWithRepo(t *testing.T) (*httptest.Server, repository.Repository) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "c.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -639,7 +639,7 @@ func newRESTTestWithRepo(t *testing.T) (*httptest.Server, repository.Repository)
 // the auth middleware + anonymous-public-read wiring.
 func newAuthRESTTestWithRepo(t *testing.T) (*httptest.Server, string, repository.Repository) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "acl.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "acl.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -1210,7 +1210,7 @@ func TestThumbnailExactKeyConditionalAndRange(t *testing.T) {
 func newThumbnailAccessHarness(t *testing.T) (*httptest.Server, string, repository.Repository) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "access.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "access.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -2573,10 +2573,15 @@ func TestThumbnailOpenAPIDocuments415(t *testing.T) {
 		t.Fatalf("thumbnail 415 description=%q want supported-types and Content-Encoding text", desc)
 	}
 
-	// Unrelated routes must not gain a 415 key (nil-map isolation).
+	// The explicit representation=thumbnail entry shares this status contract.
 	getObj := paths["/v1/files/{key}"].(map[string]any)["get"].(map[string]any)
-	if _, ok := getObj["responses"].(map[string]any)["415"]; ok {
-		t.Fatalf("GET /v1/files/{key} must not document 415: %v", getObj["responses"])
+	if _, ok := getObj["responses"].(map[string]any)["415"]; !ok {
+		t.Fatalf("explicit thumbnail representation must document 415: %v", getObj["responses"])
+	}
+	// Unrelated routes still must not gain 415 (nil-map isolation).
+	list := paths["/v1/files"].(map[string]any)["get"].(map[string]any)
+	if _, ok := list["responses"].(map[string]any)["415"]; ok {
+		t.Fatalf("file listing must not document 415: %v", list["responses"])
 	}
 }
 
@@ -3277,7 +3282,7 @@ func (s *failingGetStore) Get(ctx context.Context, key string) (io.ReadCloser, s
 // for the source_error counter arm.
 func newThumbnailFailingGetServer(t *testing.T) (*httptest.Server, *failingGetStore, *service.FileService, *chi.Mux) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "fg.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "fg.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -4219,7 +4224,7 @@ type thumbnail304Harness struct {
 
 func newThumbnail304Harness(t *testing.T) *thumbnail304Harness {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "c.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -4985,7 +4990,7 @@ func TestThumbnailHeadParityExactKey(t *testing.T) {
 
 // TestThumbnailHeadParityEmptyExactKey pins protocol-expert F2: a 0-byte
 // object literally named "{key}/thumbnail" is served through
-// handleRangeOrFull, which must emit "Content-Length: 0" on HEAD exactly as
+// the raw content path, which must emit "Content-Length: 0" on HEAD exactly as
 // GET does (RFC 9110 §9.3.2). net/http auto-emits CL only when a body was
 // written (server.go:1327) — GET gets auto-0, HEAD would get no CL header at
 // all without the explicit unconditional set (mirroring Head, handler.go:249).

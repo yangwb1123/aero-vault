@@ -69,12 +69,16 @@ func TenantStatusVerified(ctx context.Context, tenant string) bool {
 	return verified != "" && verified == tenant
 }
 
-// Recoverer turns panics into 500s and logs the stack.
+// Recoverer turns application panics into 500s and logs the stack.
+// Preserve net/http's exact abort sentinel without appending an error response.
 func Recoverer(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
+					if rec == http.ErrAbortHandler {
+						panic(rec)
+					}
 					logger.Error("panic",
 						"panic", rec,
 						"path", r.URL.Path,

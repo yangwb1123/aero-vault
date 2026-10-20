@@ -9,15 +9,16 @@ import (
 
 // apiRoute describes one REST endpoint for spec generation.
 type apiRoute struct {
-	Method      string
-	Path        string
-	Summary     string
-	Tag         string
-	Query       []apiQueryParameter
-	Body        string // example JSON body for request, or "" for no body
-	Status      int    // success HTTP status
-	Response    string // example JSON response, or "" for empty
-	Response200 string // example 200 response when Status != 200
+	Method         string
+	Path           string
+	Summary        string
+	Tag            string
+	Query          []apiQueryParameter
+	Body           string // example JSON body for request, or "" for no body
+	Status         int    // success HTTP status
+	Response       string // example JSON response, or "" for empty
+	Response200    string // example 200 response when Status != 200
+	BinaryResponse bool   // success body is a stream, not the example JSON DTO
 	// Responses documents additional (non-success) response statuses for this
 	// route, keyed by numeric status, value = human description. Keys must not
 	// collide with the success status (the map is emitted under strconv.Itoa
@@ -215,50 +216,19 @@ func pathParameterNames(path string) []string {
 }
 
 func (s *specBuilder) responses(r apiRoute, sch map[string]any) map[string]any {
-	status := r.Status
-	resps := map[string]any{}
-	code := fmtStatus(status)
-
-	resp := map[string]any{
-		"description": "Success",
+	resps := map[string]any{
+		fmtStatus(r.Status): routeSuccessResponse(r),
+		"default":           routeErrorResponse(),
 	}
-	if r.Response != "" {
-		resp["content"] = map[string]any{
-			"application/json": map[string]any{
-				"schema":  map[string]any{"type": "object"},
-				"example": json.RawMessage(r.Response),
-			},
-		}
-	}
-	resps[code] = resp
-
-	// Additional documented statuses (e.g. 415 for the thumbnail route),
-	// description-only: the default entry already carries the error schema.
-	// strconv.Itoa is load-bearing — fmtStatus collapses unrecognized codes
-	// to "200" and would emit a bogus duplicate success key.
+	// strconv.Itoa is load-bearing: fmtStatus collapses unknown codes to 200.
+	// Only streamed 206s carry content; validators/HEAD/errors remain bodyless
+	// here, with the existing error schema supplied by the default entry.
 	for status, desc := range r.Responses {
-		resps[strconv.Itoa(status)] = map[string]any{"description": desc}
-	}
-
-	// Add default error response.
-	resps["default"] = map[string]any{
-		"description": "Error response",
-		"content": map[string]any{
-			"application/json": map[string]any{
-				"schema": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"error": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"code":    map[string]any{"type": "string"},
-								"message": map[string]any{"type": "string"},
-							},
-						},
-					},
-				},
-			},
-		},
+		response := map[string]any{"description": desc}
+		if r.BinaryResponse && status == 206 {
+			response["content"] = binaryReadContent()
+		}
+		resps[strconv.Itoa(status)] = response
 	}
 	return resps
 }

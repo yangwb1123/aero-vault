@@ -34,10 +34,14 @@ func setupTestWith(t *testing.T, opts ...func(*Handler)) (*service.FileService, 
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
+	if err := sharedRESTFixtureSchema.seed(ctx, filepath.Join(dir, "x.db")); err != nil {
+		t.Fatalf("seed fixture schema: %v", err)
+	}
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "x.db"))
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
 	}
+	t.Cleanup(func() { _ = repo.Close() })
 	if err := repo.Migrate(ctx); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -49,7 +53,7 @@ func setupTestWith(t *testing.T, opts ...func(*Handler)) (*service.FileService, 
 	router := NewRouter(svc, repo, nil, nil, nil, nil, nil, slog.Default(), false, nil, nil, 0, false, opts...)
 
 	ts := httptest.NewServer(router)
-	t.Cleanup(func() { ts.Close(); _ = repo.Close() })
+	t.Cleanup(ts.Close)
 	return svc, repo, ts
 }
 

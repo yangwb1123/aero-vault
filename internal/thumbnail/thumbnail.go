@@ -164,8 +164,10 @@ func EffectiveDims(maxW, maxH int) (int, int) {
 // 1.125 GiB (8-bit PNG RGBA); ≈ 4 × 128 MiB ≈ 512 MiB (depth-16 PNG at
 // Max16BitSourceDim); ≈ 4 × ~275 MiB ≈ 1.1 GiB (progressive JPEG at
 // MaxProgressiveSourceDim) — all inside the 2 GiB absolute ceiling
-// pinned in semaphore_test.go, regardless of MAX_INFLIGHT_REQUESTS /
-// PER_TENANT_CONCURRENCY_MAX / rate limits. Waiters hold no stream at
+// pinned in semaphore_memory_test.go, regardless of MAX_INFLIGHT_REQUESTS /
+// PER_TENANT_CONCURRENCY_MAX / rate limits. This bounds in-flight pipeline
+// allocations, not process HeapAlloc/RSS: retired frames awaiting GC, caches
+// and other requests are outside that bound. Waiters hold no stream at
 // all: the REST thumbnail path acquires the slot before opening the
 // object stream (GenerateContextWithOpener), so the semaphore also bounds
 // concurrently open object streams / in-flight storage GETs to

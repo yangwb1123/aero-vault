@@ -22,6 +22,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
+import { navigateAndLoad } from './web-smoke-page.mjs'
 
 const USAGE = 'usage: web-smoke.mjs --base-url <origin> --chrome <path> [--path /ui/] [--timeout ms] [--settle ms]'
 
@@ -132,6 +133,9 @@ class CDP {
 function launchChrome(bin, profileDir) {
   const args = [
     '--headless=new',
+    // This fresh, disposable profile never receives credentials. Avoid desktop
+    // keyring initialization blocking its first HTTP request in headless CI.
+    '--password-store=basic',
     '--remote-debugging-port=0',
     `--user-data-dir=${profileDir}`,
     '--no-first-run',
@@ -223,11 +227,8 @@ async function waitForMount(cdp, sessionId, timeoutMs) {
 // ── Smoke run ──────────────────────────────────────────────────────────────
 
 async function checkPage(cdp, sessionId, url, opts) {
-  const loadEvent = cdp.once('Page.loadEventFired', sessionId, opts.timeoutMs)
-  const navigate = cdp.send('Page.navigate', { url }, sessionId)
-  await navigate
   try {
-    await loadEvent
+    await navigateAndLoad(cdp, sessionId, url, opts.timeoutMs)
   } catch (error) {
     return { url, ok: false, failures: [`load event never fired (${error.message})`] }
   }

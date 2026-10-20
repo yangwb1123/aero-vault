@@ -26,7 +26,7 @@ import (
 func newEnterpriseRESTTest(t *testing.T) (*httptest.Server, string, string, repository.Repository) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "enterprise.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "enterprise.db"))
 	if err != nil {
 		t.Fatal(err)

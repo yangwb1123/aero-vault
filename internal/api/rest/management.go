@@ -92,7 +92,8 @@ func (h *Handler) GetSpecificVersion(w http.ResponseWriter, r *http.Request, key
 		h.writeError(w, r, err)
 		return
 	}
-	defer rc.Close()
+	reader := &objectContentReader{ctx: r.Context(), source: rc}
+	defer reader.Close()
 	if readPreconditionFailed(r, obj) {
 		h.writeError(w, r, service.ErrPreconditionFailed)
 		return
@@ -100,23 +101,10 @@ func (h *Handler) GetSpecificVersion(w http.ResponseWriter, r *http.Request, key
 	// Honour conditional GETs on versioned downloads too: a cache-aware client
 	// must be able to receive 304 Not Modified (matches the non-versioned Get).
 	if notModified(r, obj) {
-		w.Header().Set("ETag", `"`+obj.ETag+`"`)
-		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-		w.Header().Set("X-Version-Id", obj.VersionID)
-		writeContentEncodingHeader(w, obj.Metadata)
-		w.WriteHeader(http.StatusNotModified)
+		writeContentNotModified(w, obj, true)
 		return
 	}
-	w.Header().Set("ETag", `"`+obj.ETag+`"`)
-	if obj.ContentType != "" {
-		w.Header().Set("Content-Type", obj.ContentType)
-	}
-	w.Header().Set("X-Version-Id", obj.VersionID)
-	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
-	writeMetadataHeaders(w, obj.Metadata)
-	writeContentEncodingHeader(w, obj.Metadata)
-	_, _ = io.Copy(w, rc)
+	h.serveOpenedContent(w, r, reader, obj, true)
 }
 
 // POST /v1/files/*/lock  body: {"seconds": 3600}  — apply per-object retention.
@@ -195,13 +183,14 @@ func (h *Handler) PutBucketLock(w http.ResponseWriter, r *http.Request) {
 }
 
 type versionDTO struct {
-	VersionID   string     `json:"version_id"`
-	Size        int64      `json:"size"`
-	ETag        string     `json:"etag"`
-	ContentType string     `json:"content_type,omitempty"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
-	LockedUntil *time.Time `json:"locked_until,omitempty"`
+	VersionID      string     `json:"version_id"`
+	Size           int64      `json:"size"`
+	ETag           string     `json:"etag"`
+	ContentType    string     `json:"content_type,omitempty"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+	LockedUntil    *time.Time `json:"locked_until,omitempty"`
+	IsDeleteMarker bool       `json:"is_delete_marker,omitempty"`
 }
 
 type bucketConfigDTO struct {
@@ -219,6 +208,7 @@ func toVersionDTO(o repository.Object) versionDTO {
 		VersionID: o.VersionID, Size: o.Size, ETag: o.ETag,
 		ContentType: o.ContentType, UpdatedAt: o.UpdatedAt,
 		DeletedAt: o.DeletedAt, LockedUntil: o.LockedUntil,
+		IsDeleteMarker: service.IsDeleteMarker(o),
 	}
 }
 

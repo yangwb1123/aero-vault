@@ -154,7 +154,7 @@ func (r *prefixErrorReadCloser) Close() error {
 func newPrefixErrorThumbnailREST(t *testing.T, sourceErr error) (*httptest.Server, *Handler, *prefixErrorStorage, *bytes.Buffer, repository.Repository) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "prefix-error.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "prefix-error.db"))
 	if err != nil {
 		t.Fatalf("open repository: %v", err)

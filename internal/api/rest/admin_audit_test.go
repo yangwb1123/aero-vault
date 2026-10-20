@@ -19,7 +19,7 @@ import (
 // directly over HTTP.
 func newAdminAuditTest(t *testing.T) *httptest.Server {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "audit.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "audit.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)

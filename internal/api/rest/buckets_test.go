@@ -21,7 +21,7 @@ import (
 func newBucketTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "b.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "b.db"))
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
@@ -55,7 +55,7 @@ func newBucketTestServer(t *testing.T) *httptest.Server {
 func newBucketQuotaAuthTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "quota-auth.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "quota-auth.db"))
 	if err != nil {
 		t.Fatalf("open repo: %v", err)

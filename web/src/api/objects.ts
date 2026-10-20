@@ -5,6 +5,7 @@ export interface ObjectVersion {
   content_type?: string
   updated_at: string
   deleted_at?: string
+  is_delete_marker?: boolean
   locked_until?: string
 }
 

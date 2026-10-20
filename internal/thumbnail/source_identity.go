@@ -20,15 +20,29 @@ type SourceIdentity struct {
 
 // OpenedSource describes the source actually opened by a cached generation.
 // Bound is a storage-generation proof, not merely a repository metadata echo.
+// CacheStoreBlocked independently vetoes resident storage (e.g. encryption
+// policy observed at open). It does not revoke proof or alter in-flight sharing.
+// Its zero value preserves the existing opener admission rules.
 type OpenedSource struct {
-	Identity  SourceIdentity
-	ETag      string
-	Bound     bool
-	UpdatedAt time.Time // response metadata for coalesced adapter callers
+	Identity          SourceIdentity
+	ETag              string
+	Bound             bool
+	CacheStoreBlocked bool
+	UpdatedAt         time.Time // response metadata for coalesced adapter callers
+	// Opened-source metadata for adapter access attribution. These scalar fields
+	// are not cache identity or proof and are never stored in resident entries.
+	ObjectID    int64
+	Backend     string
+	Size        int64
+	ContentType string
+}
+
+func (source OpenedSource) cacheStoreAdmissible(identity SourceIdentity, etag string) bool {
+	return !source.CacheStoreBlocked && source.Bound && source.Identity.Equal(identity) && source.ETag == etag
 }
 
 // Opener opens one source stream and reports the identity and ETag observed for
-// that stream. Cached generation stores bytes only when Bound is true.
+// that stream. Resident storage requires Bound and no CacheStoreBlocked veto.
 type Opener func() (io.ReadCloser, OpenedSource, error)
 
 // Complete reports whether the identity is safe for cache lookup, storage, or

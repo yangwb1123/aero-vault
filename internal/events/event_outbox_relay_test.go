@@ -456,6 +456,77 @@ func seedDeletedFact(t *testing.T, repo repository.Repository, obj repository.Ob
 	}
 }
 
+// relayTestFactState is the read-only proof of one exact outbox fact. A fact
+// is delivered only when both event_outbox and event_outbox_delivered agree;
+// an empty claim alone can also mean pending retry, live lease, or failed.
+type relayTestFactState struct {
+	ID            int64
+	Status        string
+	Attempts      int
+	AvailableAtNS int64
+	DeliveredAtNS int64
+	DeliveredRows int64
+}
+
+func relayTestDeliveryProven(state relayTestFactState) bool {
+	return state.Status == "delivered" && state.DeliveredAtNS > 0 && state.DeliveredRows == 1
+}
+
+func readRelayTestFactState(t *testing.T, dsn string, originID int64) (relayTestFactState, time.Duration) {
+	t.Helper()
+	started := time.Now()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open relay fact state: %v", err)
+	}
+	defer db.Close()
+	var state relayTestFactState
+	err = db.QueryRowContext(context.Background(), `SELECT id,status,attempts,available_at_ns,delivered_at_ns
+FROM event_outbox WHERE origin_id=$1 AND event_type=$2 ORDER BY id DESC LIMIT 1`,
+		originID, string(repository.EventTypeFileDeleted11)).
+		Scan(&state.ID, &state.Status, &state.Attempts, &state.AvailableAtNS, &state.DeliveredAtNS)
+	if err != nil {
+		t.Fatalf("read relay fact state: %v", err)
+	}
+	err = db.QueryRowContext(context.Background(),
+		`SELECT COUNT(1) FROM event_outbox_delivered WHERE outbox_id=$1`, state.ID).Scan(&state.DeliveredRows)
+	if err != nil {
+		t.Fatalf("read relay delivered record: %v", err)
+	}
+	return state, time.Since(started)
+}
+
+func logRelayTestFactState(t *testing.T, label string, state relayTestFactState, elapsed time.Duration) {
+	t.Helper()
+	t.Logf("%s id=%d status=%s attempts=%d available_at_ns=%d delivered_at_ns=%d delivered_rows=%d read=%s",
+		label, state.ID, state.Status, state.Attempts, state.AvailableAtNS, state.DeliveredAtNS,
+		state.DeliveredRows, elapsed)
+}
+
+func requireRelayTestPending(t *testing.T, label string, state relayTestFactState) {
+	t.Helper()
+	if state.Status != "pending" || state.Attempts < 1 || state.DeliveredAtNS != 0 || state.DeliveredRows != 0 {
+		t.Fatalf("%s: want pending without delivery record, got status=%s attempts=%d delivered_at_ns=%d delivered_rows=%d",
+			label, state.Status, state.Attempts, state.DeliveredAtNS, state.DeliveredRows)
+	}
+}
+
+func requireRelayTestNotDelivered(t *testing.T, label string, state relayTestFactState) {
+	t.Helper()
+	if relayTestDeliveryProven(state) || state.DeliveredAtNS != 0 || state.DeliveredRows != 0 {
+		t.Fatalf("%s: fact must not be delivered, got status=%s delivered_at_ns=%d delivered_rows=%d",
+			label, state.Status, state.DeliveredAtNS, state.DeliveredRows)
+	}
+}
+
+func requireRelayTestDelivered(t *testing.T, label string, state relayTestFactState) {
+	t.Helper()
+	if !relayTestDeliveryProven(state) {
+		t.Fatalf("%s: want delivered plus one event_outbox_delivered row, got status=%s attempts=%d delivered_at_ns=%d delivered_rows=%d",
+			label, state.Status, state.Attempts, state.DeliveredAtNS, state.DeliveredRows)
+	}
+}
+
 // ── AC-2: claim → L2 publish (verbatim + echo) → complete ───────────────────
 
 func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
@@ -528,16 +599,20 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 	})
 
 	t.Run("500 response schedules backoff retry and eventual delivery", func(t *testing.T) {
-		repo := openRelayTestRepo(t)
+		dsn := "file:" + filepath.Join(t.TempDir(), "l2-5xx.db")
+		repo := openRelayTestRepoAt(t, dsn)
 		obj := seedRelayObject(t, repo, "l2/5xx.txt")
 		seedDeletedFact(t, repo, obj, fixedDeletedPayload(obj))
 		target := &l2SinkTarget{echo: true}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if target.count() == 0 {
-				target.mu.Lock()
+			first := target.count() == 0
+			target.mu.Lock()
+			if first {
 				target.status = http.StatusInternalServerError
-				target.mu.Unlock()
+			} else {
+				target.status = 0 // request #2 restores 2xx + echo
 			}
+			target.mu.Unlock()
 			target.handler(w, r)
 		}))
 		defer srv.Close()
@@ -549,21 +624,34 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 			PollInterval: time.Hour, BatchSize: 32, ClaimTTL: 30 * time.Second, MaxAttempts: 3, AuditSink: sink,
 		})
 
+		firstBatch := time.Now()
 		relay.deliverBatch(ctx)
 		waitForTarget(t, target, 1, 5*time.Second)
+		t.Logf("500 first batch elapsed=%s", time.Since(firstBatch))
+		state, read := readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "500 after first response", state, read)
+		requireRelayTestPending(t, "500 first response", state)
 		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token", 10, time.Minute); err != nil || len(pending) != 0 {
 			t.Fatalf("5xx fact immediately reclaimable: len=%d err=%v", len(pending), err)
 		}
+		backoff := time.Now()
 		time.Sleep(1300 * time.Millisecond)
+		t.Logf("500 backoff wait elapsed=%s", time.Since(backoff))
+		secondBatch := time.Now()
 		relay.deliverBatch(ctx)
 		waitForTarget(t, target, 2, 5*time.Second)
+		t.Logf("500 retry batch elapsed=%s", time.Since(secondBatch))
+		state, read = readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "500 after retry response", state, read)
+		requireRelayTestDelivered(t, "500 retry", state)
 		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token-2", 10, time.Minute); err != nil || len(pending) != 0 {
 			t.Fatalf("fact not completed after 5xx retry: len=%d err=%v", len(pending), err)
 		}
 	})
 
 	t.Run("lease-expiry re-claim re-delivers the same fact (at-least-once)", func(t *testing.T) {
-		repo := openRelayTestRepo(t)
+		dsn := "file:" + filepath.Join(t.TempDir(), "l2-reclaim.db")
+		repo := openRelayTestRepoAt(t, dsn)
 		obj := seedRelayObject(t, repo, "l2/reclaim.txt")
 		payload := fixedDeletedPayload(obj)
 		seedDeletedFact(t, repo, obj, payload)
@@ -574,13 +662,24 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 		defer srv.Close()
 		target.delay = 100 * time.Millisecond // first POST crosses the lease boundary
 
+		firstBatch := time.Now()
 		relay.deliverBatch(ctx)
 		waitForTarget(t, target, 1, 5*time.Second)
+		t.Logf("lease-expiry first batch elapsed=%s", time.Since(firstBatch))
+		state, read := readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "lease-expiry after first POST", state, read)
+		requireRelayTestNotDelivered(t, "lease-expiry first POST", state)
+		if state.Status != "inflight" || state.Attempts != 1 {
+			t.Fatalf("lease-expiry first POST: want inflight attempts=1, got status=%s attempts=%d",
+				state.Status, state.Attempts)
+		}
 		target.delay = 0
 		// Claim-lost on complete: the fact stays inflight with an expired lease;
 		// the next batch reclaims and re-POSTs (designed at-least-once).
+		secondBatch := time.Now()
 		relay.deliverBatch(ctx)
 		waitForTarget(t, target, 2, 5*time.Second)
+		t.Logf("lease-expiry re-claim batch elapsed=%s", time.Since(secondBatch))
 		bodies, factIDs, _ := target.snapshot()
 		if string(bodies[0]) != string(bodies[1]) {
 			t.Errorf("re-delivery changed the payload bytes (verbatim violated)")
@@ -588,6 +687,9 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 		if factIDs[0] != factIDs[1] {
 			t.Errorf("re-delivery changed X-Audit-Fact-Id: %q vs %q (dedupe key must be stable)", factIDs[0], factIDs[1])
 		}
+		state, read = readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "lease-expiry after re-claim", state, read)
+		requireRelayTestDelivered(t, "lease-expiry re-claim", state)
 		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token", 10, time.Minute); err != nil || len(pending) != 0 {
 			t.Fatalf("fact not delivered after re-claim: len=%d err=%v", len(pending), err)
 		}
@@ -598,14 +700,16 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 		// EVERY 2xx, including re-POSTs after lease loss. A receiver that
 		// echoes only the first POST silently drops the at-least-once window —
 		// this test pins that the relay requires the echo on the re-POST too.
-		repo := openRelayTestRepo(t)
+		dsn := "file:" + filepath.Join(t.TempDir(), "l2-receipt-contract.db")
+		repo := openRelayTestRepoAt(t, dsn)
 		obj := seedRelayObject(t, repo, "l2/receipt-contract.txt")
 		payload := fixedDeletedPayload(obj)
 		seedDeletedFact(t, repo, obj, payload)
 		target := &l2SinkTarget{echo: true}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// First POST echoes; every later 2xx (the lease-loss re-POST) does not.
-			if target.count() >= 1 {
+			// Request #1 echoes; only request #2 (the lease-loss re-POST)
+			// suppresses echo. Request #3 keeps the explicitly restored echo.
+			if target.count() == 1 {
 				target.mu.Lock()
 				target.echo = false
 				target.mu.Unlock()
@@ -623,16 +727,33 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 		})
 		target.delay = 100 * time.Millisecond // first POST crosses the lease
 
+		firstBatch := time.Now()
 		relay.deliverBatch(ctx)
 		waitForTarget(t, target, 1, 5*time.Second)
+		t.Logf("receiver first batch elapsed=%s", time.Since(firstBatch))
+		state, read := readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "receiver after first POST", state, read)
+		requireRelayTestNotDelivered(t, "receiver first POST", state)
+		if state.Status != "inflight" || state.Attempts != 1 {
+			t.Fatalf("receiver first POST: want inflight attempts=1, got status=%s attempts=%d",
+				state.Status, state.Attempts)
+		}
 		target.delay = 0
 		// Lease-loss re-POST arrives as 2xx WITHOUT echo → must NOT complete;
 		// backoff is scheduled (not immediately reclaimable).
+		secondBatch := time.Now()
 		relay.deliverBatch(ctx)
 		waitForTarget(t, target, 2, 5*time.Second)
+		t.Logf("receiver echo-less re-POST batch elapsed=%s", time.Since(secondBatch))
 		bodies, factIDs, _ := target.snapshot()
 		if string(bodies[0]) != string(bodies[1]) || factIDs[0] != factIDs[1] {
 			t.Errorf("re-POST changed payload or X-Audit-Fact-Id (dedupe key must be stable)")
+		}
+		state, read = readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "receiver after echo-less re-POST", state, read)
+		requireRelayTestPending(t, "receiver echo-less re-POST", state)
+		if state.Attempts != 2 {
+			t.Fatalf("receiver echo-less re-POST: want attempts=2, got %d", state.Attempts)
 		}
 		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token", 10, time.Minute); err != nil || len(pending) != 0 {
 			t.Fatalf("echo-less re-POST completed the fact: len=%d err=%v", len(pending), err)
@@ -641,9 +762,16 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 		target.mu.Lock()
 		target.echo = true
 		target.mu.Unlock()
+		backoff := time.Now()
 		time.Sleep(2600 * time.Millisecond) // attempt 2 backoff = 2s ± jitter
+		t.Logf("receiver restored-echo backoff elapsed=%s", time.Since(backoff))
+		thirdBatch := time.Now()
 		relay.deliverBatch(ctx)
 		waitForTarget(t, target, 3, 5*time.Second)
+		t.Logf("receiver restored-echo batch elapsed=%s", time.Since(thirdBatch))
+		state, read = readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "receiver after restored echo", state, read)
+		requireRelayTestDelivered(t, "receiver restored echo", state)
 		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token-2", 10, time.Minute); err != nil || len(pending) != 0 {
 			t.Fatalf("fact not completed once echo returned on re-POST: len=%d err=%v", len(pending), err)
 		}
@@ -685,6 +813,66 @@ func TestOutboxRelay_DeliversDeletedFactToL2(t *testing.T) {
 		}
 		if pending, err := repo.ClaimEventOutbox(ctx, "observer", "token", 10, time.Minute); err != nil || len(pending) != 0 {
 			t.Fatalf("old fixture not completed: len=%d err=%v", len(pending), err)
+		}
+	})
+}
+
+func TestFixtureBoundaryOutboxRelayL2DeliveryProof(t *testing.T) {
+	ctx := context.Background()
+	t.Run("always-500 leaves only a pending retry", func(t *testing.T) {
+		dsn := "file:" + filepath.Join(t.TempDir(), "boundary-always-500.db")
+		repo := openRelayTestRepoAt(t, dsn)
+		obj := seedRelayObject(t, repo, "boundary/always-500.txt")
+		seedDeletedFact(t, repo, obj, fixedDeletedPayload(obj))
+		target := &l2SinkTarget{status: http.StatusInternalServerError, echo: true}
+		relay, srv := newL2Relay(repo, target, map[string]string{"default": l2TestToken}, EventOutboxRelayOptions{})
+		defer srv.Close()
+
+		relay.deliverBatch(ctx)
+		waitForTarget(t, target, 1, 5*time.Second)
+		state, read := readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "always-500 after one POST", state, read)
+		requireRelayTestPending(t, "always-500", state)
+		if got := target.count(); got != 1 {
+			t.Fatalf("always-500 POSTs = %d, want 1", got)
+		}
+	})
+
+	t.Run("never-echo leaves only a pending retry", func(t *testing.T) {
+		dsn := "file:" + filepath.Join(t.TempDir(), "boundary-never-echo.db")
+		repo := openRelayTestRepoAt(t, dsn)
+		obj := seedRelayObject(t, repo, "boundary/never-echo.txt")
+		seedDeletedFact(t, repo, obj, fixedDeletedPayload(obj))
+		target := &l2SinkTarget{echo: false}
+		relay, srv := newL2Relay(repo, target, map[string]string{"default": l2TestToken}, EventOutboxRelayOptions{})
+		defer srv.Close()
+
+		relay.deliverBatch(ctx)
+		waitForTarget(t, target, 1, 5*time.Second)
+		state, read := readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "never-echo after one POST", state, read)
+		requireRelayTestPending(t, "never-echo", state)
+		if got := target.count(); got != 1 {
+			t.Fatalf("never-echo POSTs = %d, want 1", got)
+		}
+	})
+
+	t.Run("constant echo persists delivered and the completion record", func(t *testing.T) {
+		dsn := "file:" + filepath.Join(t.TempDir(), "boundary-echo.db")
+		repo := openRelayTestRepoAt(t, dsn)
+		obj := seedRelayObject(t, repo, "boundary/echo.txt")
+		seedDeletedFact(t, repo, obj, fixedDeletedPayload(obj))
+		target := &l2SinkTarget{echo: true}
+		relay, srv := newL2Relay(repo, target, map[string]string{"default": l2TestToken}, EventOutboxRelayOptions{})
+		defer srv.Close()
+
+		relay.deliverBatch(ctx)
+		waitForTarget(t, target, 1, 5*time.Second)
+		state, read := readRelayTestFactState(t, dsn, obj.ID)
+		logRelayTestFactState(t, "constant echo after one POST", state, read)
+		requireRelayTestDelivered(t, "constant echo", state)
+		if got := target.count(); got != 1 {
+			t.Fatalf("constant echo POSTs = %d, want 1", got)
 		}
 	})
 }

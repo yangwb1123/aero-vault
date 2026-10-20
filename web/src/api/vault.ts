@@ -13,6 +13,8 @@ import type {
   Share,
 } from './access'
 import type { LegalHold, ObjectPreview, ObjectVersion, PresignedLink } from './objects'
+import { readObjectPreview } from './objectPreview'
+import { objectReadPath } from './objectReadPath'
 import {
   normalizeWebhookFailure,
   type AdminJobsResponse,
@@ -195,27 +197,17 @@ export class VaultClient extends VaultTransport {
     return result.results
   }
 
-  async download(key: string): Promise<Blob> {
-    const response = await this.request(`/files/${encodeKey(key)}`)
+  async download(key: string, signal?: AbortSignal): Promise<Blob> {
+    const response = await this.request(objectReadPath(key, 'content'), { signal })
     return response.blob()
   }
 
-  async previewObject(key: string): Promise<ObjectPreview> {
-    const response = await this.request(`/files/${encodeKey(key)}`, {
-      headers: { Accept: '*/*', Range: 'bytes=0-4095' },
-    })
-    const contentType = response.headers.get('Content-Type')?.split(';')[0] ?? ''
-    if (contentType === 'image/jpeg') {
-      const thumbnail = await this.request(`/files/${encodeKey(key)}/thumbnail?w=1280&h=960`, {
-        headers: { Accept: 'image/jpeg' },
-      })
-      return { body: await thumbnail.blob(), contentType: 'image/jpeg', partial: false }
-    }
-    return {
-      body: await response.blob(),
-      contentType,
-      partial: response.status === 206,
-    }
+  previewObject(key: string, signal?: AbortSignal): Promise<ObjectPreview> {
+    return readObjectPreview(this.request.bind(this), key, undefined, signal)
+  }
+
+  previewVersion(key: string, versionID: string, signal?: AbortSignal): Promise<ObjectPreview> {
+    return readObjectPreview(this.request.bind(this), key, versionID, signal)
   }
 
   async getTags(key: string): Promise<Record<string, string>> {
@@ -244,9 +236,9 @@ export class VaultClient extends VaultTransport {
     return result.versions ?? []
   }
 
-  async downloadVersion(key: string, versionID: string): Promise<Blob> {
-    const query = new URLSearchParams({ version: versionID })
-    const response = await this.request(`/files/${encodeKey(key)}?${query}`)
+  async downloadVersion(key: string, versionID: string, signal?: AbortSignal): Promise<Blob> {
+    if (!versionID) throw new Error('历史下载必须指定 Version ID')
+    const response = await this.request(objectReadPath(key, 'content', versionID), { signal })
     return response.blob()
   }
 

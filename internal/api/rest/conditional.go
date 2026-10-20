@@ -144,10 +144,10 @@ func currentETagValue(etag string) (string, bool) {
 // notModified evaluates a conditional GET/HEAD. If-None-Match takes
 // precedence over If-Modified-Since.
 func notModified(r *http.Request, obj repository.Object) bool {
-	if inm := r.Header.Get("If-None-Match"); inm != "" {
+	if inm, present := readETagCondition(r, "If-None-Match"); present {
 		return etagListMatches(inm, obj.ETag)
 	}
-	return dateNotModified(r.Header.Get("If-Modified-Since"), obj.UpdatedAt)
+	return dateNotModified(singleReadCondition(r, "If-Modified-Since"), obj.UpdatedAt)
 }
 
 // readPreconditionFailed evaluates raw-object GET/HEAD preconditions.
@@ -156,12 +156,12 @@ func readPreconditionFailed(r *http.Request, obj repository.Object) bool {
 }
 
 func readPreconditionFailedForETag(r *http.Request, obj repository.Object, etag string) bool {
-	if match := r.Header.Get("If-Match"); match != "" {
+	if match, present := readETagCondition(r, "If-Match"); present {
 		// RFC 9110 evaluates If-Match before If-Unmodified-Since; a
 		// successful If-Match therefore suppresses the date condition.
 		return !etagListMatchesStrong(match, etag)
 	}
-	if unmodified := r.Header.Get("If-Unmodified-Since"); unmodified != "" {
+	if unmodified := singleReadCondition(r, "If-Unmodified-Since"); unmodified != "" {
 		if t, err := http.ParseTime(unmodified); err == nil {
 			return obj.UpdatedAt.Truncate(time.Second).After(t)
 		}
@@ -178,12 +178,12 @@ func dateNotModified(value string, updated time.Time) bool {
 }
 
 func hasConditional(r *http.Request) bool {
-	h := r.Header
-	return h.Get("If-Match") != "" ||
-		h.Get("If-Unmodified-Since") != "" ||
-		h.Get("If-None-Match") != "" ||
-		h.Get("If-Modified-Since") != "" ||
-		h.Get("Range") != ""
+	for _, name := range []string{"If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since", "Range"} {
+		if len(r.Header.Values(name)) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // checkWritePreconditions enforces strong If-Match and weak If-None-Match.

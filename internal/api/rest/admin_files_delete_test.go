@@ -44,7 +44,7 @@ type adminDeleteEnv struct {
 func newAdminDeleteEnv(t *testing.T, authKeys string, manager *access.Manager, store storage.Storage, providers ...AuthorizationProvider) *adminDeleteEnv {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "admin-delete.db")
 	dsn := "file:" + filepath.Join(dir, "admin-delete.db")
 	repo, err := repository.Open(ctx, "sqlite", dsn)
 	if err != nil {
@@ -490,7 +490,7 @@ func TestAdminDeleteFile_ErrorMapping(t *testing.T) {
 func envRepo(t *testing.T) repository.Repository {
 	t.Helper()
 	ctx := context.Background()
-	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "mgr.db"))
+	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(restFixtureSchemaDir(t, ctx, "mgr.db"), "mgr.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

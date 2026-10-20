@@ -138,7 +138,7 @@ func (r *closeErrorReadCloser) Close() error {
 func newCloseErrorThumbnailREST(t *testing.T, closeErr error, truncateAt int) (*httptest.Server, *closeErrorStore, *thumbnail.Cache) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "close-errors.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "close-errors.db"))
 	if err != nil {
 		t.Fatalf("open repository: %v", err)
@@ -338,7 +338,7 @@ func (r *completePayloadErrorReadCloser) Close() error {
 func newCompletePayloadErrorREST(t *testing.T, payload []byte, sourceErr error) (*httptest.Server, *Handler, *completePayloadErrorStore) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "thumbnail.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "thumbnail.db"))
 	if err != nil {
 		t.Fatalf("open repository: %v", err)

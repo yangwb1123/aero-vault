@@ -20,7 +20,7 @@ import (
 // directly over HTTP.
 func newAdminTenantTest(t *testing.T) (*httptest.Server, repository.Repository) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "tenants.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "tenants.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)

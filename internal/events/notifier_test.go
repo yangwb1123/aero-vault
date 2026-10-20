@@ -126,39 +126,71 @@ func TestArnToHTTP(t *testing.T) {
 	}
 }
 
-func TestNotifierDelivery(t *testing.T) {
-	// Start a test HTTP server to receive the notification.
+// notifierTestReceiver starts the real httptest receiver used by the delivery
+// fixtures. The buffered channel keeps the handler non-blocking for one POST.
+func notifierTestReceiver(t *testing.T) (<-chan struct{}, *httptest.Server) {
+	t.Helper()
 	received := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		received <- struct{}{}
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer srv.Close()
+	return received, srv
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// notifierTestPreparationContext bounds repository preparation with the
+// testing.T context and the package -timeout deadline, so a hung Open, Migrate
+// or rule write is canceled instead of hiding behind a liveness-free context.
+func notifierTestPreparationContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx := t.Context()
+	if deadline, ok := t.Deadline(); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		t.Cleanup(cancel)
+	}
+	return ctx
+}
 
-	// Create repo with notification rules.
+// notifierTestPrepare performs the real on-disk SQLite Open, the full Migrate
+// and the notification rule write. setupDelay is a test-only controlled
+// preparation barrier for the timer-boundary regression; zero keeps the
+// normal fixture unchanged.
+func notifierTestPrepare(t *testing.T, endpointURL string, setupDelay time.Duration) repository.Repository {
+	t.Helper()
+	prepCtx := notifierTestPreparationContext(t)
+	prepStart := time.Now()
+
 	dbPath := t.TempDir() + "/test.db"
-	repo, err := repository.Open(ctx, "sqlite", "file:"+dbPath)
+	repo, err := repository.Open(prepCtx, "sqlite", "file:"+dbPath)
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
 	}
-	defer repo.Close()
-	if err := repo.Migrate(ctx); err != nil {
+	t.Cleanup(func() { repo.Close() })
+	if err := repo.Migrate(prepCtx); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-
-	// Set up notification rule with EndpointURL.
-	err = repo.SetBucketNotifications(ctx, "default", "default", []repository.NotificationRule{{
+	err = repo.SetBucketNotifications(prepCtx, "default", "default", []repository.NotificationRule{{
 		ID:          "test-rule",
 		Events:      []string{"s3:ObjectCreated:*"},
-		EndpointURL: srv.URL,
+		EndpointURL: endpointURL,
 	}})
 	if err != nil {
 		t.Fatalf("set notifications: %v", err)
 	}
+	if setupDelay > 0 {
+		time.Sleep(setupDelay)
+	}
+	if elapsed := time.Since(prepStart); setupDelay > 0 && elapsed <= 5*time.Second {
+		t.Fatalf("preparation elapsed %v; boundary regression requires > 5s", elapsed)
+	}
+	return repo
+}
 
+// notifierTestDeliver runs the actual Notifier against the prepared repository
+// under the supplied delivery context and waits for the original event.
+func notifierTestDeliver(t *testing.T, repo repository.Repository, received <-chan struct{}, ctx context.Context) {
+	t.Helper()
 	n := NewNotifier(repo, nil)
 	sub := make(chan repository.Event, 1)
 	go n.Run(ctx, sub)
@@ -178,6 +210,40 @@ func TestNotifierDelivery(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timeout waiting for notification delivery")
 	}
+}
+
+// notifierTestDelivery defines the shared fixture: preparation runs first
+// under the test context/deadline, and only after it succeeds does a fresh 5s
+// window start for the real Notifier run, rule read, HTTP POST and assertions.
+func notifierTestDelivery(t *testing.T, setupDelay time.Duration) {
+	t.Helper()
+	received, srv := notifierTestReceiver(t)
+	defer srv.Close()
+
+	repo := notifierTestPrepare(t, srv.URL, setupDelay)
+	defer repo.Close()
+
+	deliveryStart := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	notifierTestDeliver(t, repo, received, ctx)
+
+	if setupDelay > 0 {
+		if elapsed := time.Since(deliveryStart); elapsed >= 5*time.Second {
+			t.Fatalf("delivery elapsed %v after %v preparation; window was consumed", elapsed, setupDelay)
+		}
+	}
+}
+
+func TestNotifierDelivery(t *testing.T) {
+	notifierTestDelivery(t, 0)
+}
+
+// TestNotifierDeliverySlowSetup is the discriminating regression for the
+// setup/delivery timer boundary: a preparation longer than the original 5s
+// delivery window must not consume that window.
+func TestNotifierDeliverySlowSetup(t *testing.T) {
+	notifierTestDelivery(t, 5*time.Second+200*time.Millisecond)
 }
 
 func contains(s, substr string) bool {

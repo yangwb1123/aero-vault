@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
@@ -293,82 +291,18 @@ func classify(err error) (string, string, int) {
 
 // ── Conditional & Range handling ───────────────────────────────────────────────
 
-// handleConditional checks read preconditions, cache validators, and Range
-// against the stat'd object. It returns true when the request was fully handled.
+// handleConditional evaluates metadata-only preconditions/validators at the
+// caller's observation. Body ranges are handled only on the opened source.
 func (h *Handler) handleConditional(w http.ResponseWriter, r *http.Request, obj repository.Object) bool {
 	if readPreconditionFailed(r, obj) {
 		h.writeError(w, r, service.ErrPreconditionFailed)
 		return true
 	}
 	if notModified(r, obj) {
-		w.Header().Set("ETag", `"`+obj.ETag+`"`)
-		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-		if obj.ContentType != "" {
-			w.Header().Set("Content-Type", obj.ContentType)
-		}
-		writeMetadataHeaders(w, obj.Metadata)
-		writeContentMD5(w, obj.Metadata)
-		writeContentResponseHeaders(w, obj.Metadata)
-		writeStorageClass(w, obj.StorageClass)
-		w.WriteHeader(http.StatusNotModified)
+		writeContentNotModified(w, obj, false)
 		return true
 	}
-	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
-		off, length, ok, unsat := service.ParseByteRange(rangeHdr, obj.Size)
-		if unsat {
-			w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(obj.Size, 10))
-			h.writeError(w, r, service.ErrRangeNotSatisfiable)
-			return true
-		}
-		if ok {
-			h.serveRange(w, r, mw.TenantFrom(r.Context()), keyFromPath(r), obj, off, length)
-			return true
-		}
-	}
 	return false
-}
-
-func (h *Handler) handleRangeOrFull(w http.ResponseWriter, r *http.Request, rc io.ReadCloser, obj repository.Object) {
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("ETag", `"`+obj.ETag+`"`)
-	if obj.ContentType != "" {
-		w.Header().Set("Content-Type", obj.ContentType)
-	}
-	// Content-Length is unconditional (mirrors Head, handler.go:249): net/http
-	// auto-emits CL only for a written body (server.go:1327), so a 0-byte
-	// object would get "Content-Length: 0" on GET but no CL on HEAD — an
-	// RFC 9110 §9.3.2 header-set divergence on the exact-key /?version= arms.
-	// The explicit "0" is wire-identical to GET's auto-0.
-	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
-	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	writeMetadataHeaders(w, obj.Metadata)
-	writeContentMD5(w, obj.Metadata)
-	writeContentResponseHeaders(w, obj.Metadata)
-	writeStorageClass(w, obj.StorageClass)
-	_, _ = io.Copy(w, rc)
-}
-
-func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, tenant, key string, obj repository.Object, off, length int64) {
-	rc, _, err := h.svc.GetRange(r.Context(), tenant, service.DefaultBucket, key, off, length)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	defer rc.Close()
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("ETag", `"`+obj.ETag+`"`)
-	if obj.ContentType != "" {
-		w.Header().Set("Content-Type", obj.ContentType)
-	}
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+length-1, obj.Size))
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	writeMetadataHeaders(w, obj.Metadata)
-	writeContentMD5(w, obj.Metadata)
-	writeContentResponseHeaders(w, obj.Metadata)
-	writeStorageClass(w, obj.StorageClass)
-	w.WriteHeader(http.StatusPartialContent)
-	_, _ = io.Copy(w, rc)
 }
 
 // ── JSON & Header helpers ──────────────────────────────────────────────────────

@@ -20,6 +20,25 @@ AI 与企业访问页面遵循后端 opt-in 开关；能力未启用时会直接
 详细契约见 [`owned-file-view-v1.spec.md`](../docs/requirements/owned-file-view-v1.spec.md) 与
 [`folder-pagination-v1.spec.md`](../docs/requirements/folder-pagination-v1.spec.md)。
 
+## 上传队列取消
+
+上传面板展示已收到成功响应的文件数量，并可“取消上传”以中止当前客户端请求、停止发送后续文件。
+停止期间保持队列锁定；停止后移除确认成功项，保留未确认/未发送项，并刷新列表供用户核对。
+取消不等于服务端回滚，已发送对象可能已保存。显式重试沿用同一 File/Key 的幂等键，但处理中记录可能返回 409，
+不承诺取消后的 exactly-once；也不提供字节级进度、刷新后续传或新的后台上传任务。
+切换身份/初始目录或卸载会隔离旧队列回调。详细契约见
+[`upload-queue-cancel-v1.spec.md`](../docs/requirements/upload-queue-cancel-v1.spec.md)。
+
+## 文件下载准备与取消
+
+普通下载与历史版本下载复用同一请求隔离组件，开始时固定完整 Key/Version ID，并同步防重复点击。
+两者使用 `representation=content` 明确读取完整 Key；`tags`、`metadata` 等后缀不再被猜作子资源。
+工作台可“取消下载准备”；请求尚未结束时保持锁定，即使 transport 忽略 abort，取消后的迟到内容也不会交给浏览器。
+切换目录、all/mine、回收站或身份，以及卸载时会隔离旧下载；普通下载不再自动刷新文件列表。
+成功只提示文件已交给浏览器处理，不证明已保存到本地；交付后不能撤回，取消也不保证服务端未读取或记录访问。
+依然使用 Blob，不承诺大文件端到端有界内存或刷新续传。详细契约见
+[`object-download-scope-v1.spec.md`](../docs/requirements/object-download-scope-v1.spec.md)。
+
 ## 回收站批量恢复
 
 回收站可勾选已加载文件并“恢复所选”，确认后逐项串行调用既有恢复接口。
@@ -35,6 +54,30 @@ AI 与企业访问页面遵循后端 opt-in 开关；能力未启用时会直接
 可复制链接只在本次创建后保存在组件内存，关闭、切换目标/身份或刷新文件列表后清除；列表不能找回 token。
 已发送请求仍可能执行，关闭面板不等于撤销；撤销本次新建链接后清除复制入口。
 详细契约见 [`object-share-workbench-v1.spec.md`](../docs/requirements/object-share-workbench-v1.spec.md)。
+
+## 对象直接权限规则
+
+活动对象详情提供“权限规则”页签，固定完整 Key 与 object 类型，打开时读取直接 ACL，
+并复用已有接口添加/更新和删除规则。此列表不含完整的上级继承或有效权限；空列表不代表公开或无访问限制。
+读取文件不等于管理 ACL，拒绝规则需确认其优先级及自锁风险，删除规则也可能扩大访问权限。
+多 action 沿用逐项写入语义，失败或刷新失败后可能已有变更，应重新读取确认而非自动回滚/重试。
+切换对象、身份或页签会隔离旧响应，但已发送请求仍可能执行。回收站不提供该页签。
+详细契约见 [`object-acl-workbench-v1.spec.md`](../docs/requirements/object-acl-workbench-v1.spec.md)。
+
+## 历史版本预览
+
+对象详情的“对象版本”页签可选择具体 Version ID 预览文本或 JPEG 缩略图，关闭预览及刷新列表。
+内容和缩略图均固定到同一历史版本；失败不回退到最新对象，也不恢复或覆盖当前文件。
+首读用 `representation=content`，JPEG 派生用同一 Key 的 `representation=thumbnail`，不读取同名相邻对象。
+普通对象预览也使用这两种显式表示；旧子资源路由、上传/删除分派及 SDK 未改。
+真正删除标记不提供读取入口，普通软删除版本与锁定版本仍由后端按既有授权处理。
+下载同步防重入，切换对象/身份或退出页签后，迟到 Blob 不会触发浏览器下载。
+取消后的 JPEG 首读不会再启动缩略图请求；未消费的迟到响应体尽力释放。
+历史 Range 的前缀跳过和完整版本读取在每次 Read 前后检查取消，但不能中断已阻塞的底层 Read。
+文本范围响应不等于所有存储/加密链路都具有有界内存；已交给浏览器的文件无法靠关闭页签撤回。
+详细契约见 [`object-version-preview-v1.spec.md`](../docs/requirements/object-version-preview-v1.spec.md) 与
+[`read-cancellation-boundaries-v1.spec.md`](../docs/requirements/read-cancellation-boundaries-v1.spec.md)；
+无歧义读取见 [`object-content-selection-v1.spec.md`](../docs/requirements/object-content-selection-v1.spec.md)。
 
 ## 安装与运行
 
@@ -88,4 +131,7 @@ make web-smoke   # 起真实二进制 → 静态 + 无头 Chrome 冒烟
 `__AERO_VAULT_WEB_CONFIG__.apiBase === '/v1'`、样式已生效。
 
 依赖 node ≥ 22（内置 `WebSocket`，不新增 npm 依赖）与 Chrome/Chromium
-（`AERO_SMOKE_CHROME` 可覆盖，缺失即 fail-closed）。详见 `HARNESS.md` §4.1。
+（`AERO_SMOKE_CHROME` 可覆盖，缺失即 fail-closed）。测试浏览器使用无凭据、用后删除的独立 profile，
+以 `--password-store=basic` 避免桌面密钥环初始化阻塞首次请求；不改应用 token 或用户浏览器设置。
+导航/加载事件联合等待，超时仍失败并清理；原生 Node 回归随 `make web-test` 运行。
+详见 `HARNESS.md` §4.1。

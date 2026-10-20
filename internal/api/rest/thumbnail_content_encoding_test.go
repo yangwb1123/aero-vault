@@ -36,7 +36,7 @@ func gzipThumbnailSource(t *testing.T, source []byte) []byte {
 
 func newContentEncodingHarness(t *testing.T, cacheEnabled bool, admission *thumbnail.DecodeAdmission) (*httptest.Server, *countingStore, *service.FileService, *thumbnail.Cache) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "encoding.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "encoding.db"))
 	if err != nil {
 		t.Fatalf("open repo: %v", err)

@@ -4,11 +4,12 @@ import { listNextFilePage } from '../api/filePagination'
 import type { FileListView, FolderListing } from '../api/files'
 import type { FilePage, VaultClient, VaultObject } from '../api/vault'
 import { PageError, PageHeader, PageLoading } from '../components/Page'
-import { downloadBlob } from '../download'
+import { useObjectDownload } from '../hooks/useObjectDownload'
 import { useFolderPagination } from '../hooks/useFolderPagination'
 import { useResource } from '../hooks/useResource'
 import { BatchToolbar } from './files/BatchToolbar'
 import { createFileCommands } from './files/fileCommands'
+import { FileDownloadNotice } from './files/FileDownloadNotice'
 import { FileSharePanel } from './files/FileSharePanel'
 import { FileTable } from './files/FileTable'
 import { FolderBrowser } from './files/FolderBrowser'
@@ -40,9 +41,11 @@ export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpe
   const [view, setView] = React.useState<FileListView>('all')
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
   const [shareTarget, setShareTarget] = React.useState<{ client: VaultClient; scopeKey: string; object: VaultObject }>()
-  const [busy, setBusy] = React.useState('')
+  const [actionBusy, setBusy] = React.useState('')
   const [message, setMessage] = React.useState<{ tone: 'success' | 'danger'; text: string }>()
   const scopeKey = JSON.stringify([activePrefix, deleted, view])
+  const fileDownload = useObjectDownload(client, scopeKey)
+  const busy = actionBusy || (fileDownload.pending ? 'download' : '')
   const [continuation, setContinuation] = React.useState<FileContinuation>()
   const [loadingMore, setLoadingMore] = React.useState(false)
   const loadingMoreRef = React.useRef(false)
@@ -167,8 +170,11 @@ export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpe
     keys.forEach((key) => checked ? next.add(key) : next.delete(key))
     return next
   })
-  const download = (item: VaultObject) => void run(`download:${item.key}`, async () =>
-    downloadBlob(await client.download(item.key), item.key.split('/').pop() || 'download'))
+  const download = (item: VaultObject) => {
+    if (deleted || actionBusy || resource.loading) return
+    setMessage(undefined)
+    void fileDownload.download({ key: item.key })
+  }
 
   const batchDelete = async () => {
     const keys = [...selected]
@@ -246,6 +252,7 @@ export function FilesPage({ client, onOpenObject }: { client: VaultClient; onOpe
         close={() => setShareTarget(undefined)}
       /> : null}
       {message ? <IrisAlert tone={message.tone}>{message.text}</IrisAlert> : null}
+      <FileDownloadNotice transfer={fileDownload} />
       {resource.loading ? <PageLoading /> : null}
       {resource.error ? <PageError error={resource.error} retry={reloadFiles} /> : null}
       {currentData && displayedPage ? <div className="files-stack">

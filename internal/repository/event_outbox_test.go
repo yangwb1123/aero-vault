@@ -16,19 +16,41 @@ import (
 func openEventOutboxTestStore(t *testing.T) Repository {
 	t.Helper()
 	ctx := context.Background()
+	finish := outboxTestPhase(t, "open")
 	repo, err := Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "outbox.db"))
+	finish()
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
 	}
-	t.Cleanup(func() { _ = repo.Close() })
-	if err := repo.Migrate(ctx); err != nil {
+	t.Cleanup(func() {
+		defer outboxTestPhase(t, "close")()
+		_ = repo.Close()
+	})
+	finish = outboxTestPhase(t, "migrate-all")
+	err = repo.Migrate(ctx)
+	finish()
+	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	// LIFO ends the body measurement before the separate Close measurement.
+	t.Cleanup(outboxTestPhase(t, "body-seed-transactions-queries-assertions"))
 	return repo
+}
+
+// outboxTestPhase captures only the start now; its returned closure measures
+// elapsed time when the real phase ends (including deferred rows.Close calls).
+func outboxTestPhase(t *testing.T, phase string) func() {
+	t.Helper()
+	started := time.Now()
+	return func() {
+		t.Helper()
+		t.Logf("event-outbox phase=%s elapsed=%s", phase, time.Since(started))
+	}
 }
 
 func seedOutboxObject(t *testing.T, repo Repository, tenant, bucket, key string) Object {
 	t.Helper()
+	defer outboxTestPhase(t, "seed-object")()
 	obj, err := repo.UpsertObject(context.Background(), Object{
 		TenantID:    tenant,
 		Bucket:      bucket,
@@ -575,6 +597,7 @@ func assertOutboxRows(t *testing.T, repo Repository, want int) {
 // entry's ID/fields are ignored for the zero-row case.
 func assertAuditRows(t *testing.T, repo Repository, want AuditEntry) {
 	t.Helper()
+	defer outboxTestPhase(t, "audit-query-rows-assertions")()
 	rows, err := repo.ListAudit(context.Background(), 100)
 	if err != nil {
 		t.Fatal(err)
@@ -602,6 +625,7 @@ func assertAuditRows(t *testing.T, repo Repository, want AuditEntry) {
 // payload with schema_version 1.1 and object_id == obj.ID (AC-1/AC-4).
 func assertDeletedFactPayload(t *testing.T, repo Repository, obj Object) {
 	t.Helper()
+	defer outboxTestPhase(t, "deleted-payload-query-scan-assertions")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)
@@ -638,6 +662,7 @@ type outboxRowMeta struct {
 
 func listEventOutbox(t *testing.T, repo Repository) ([]outboxRowMeta, error) {
 	t.Helper()
+	defer outboxTestPhase(t, "outbox-query-rows-close")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)
@@ -663,6 +688,7 @@ func listEventOutbox(t *testing.T, repo Repository) ([]outboxRowMeta, error) {
 
 func eventOutboxStatuses(t *testing.T, repo Repository) ([]string, error) {
 	t.Helper()
+	defer outboxTestPhase(t, "statuses-query-rows-close")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)
@@ -685,6 +711,7 @@ func eventOutboxStatuses(t *testing.T, repo Repository) ([]string, error) {
 
 func backdateEventOutbox(t *testing.T, repo Repository, when time.Time) error {
 	t.Helper()
+	defer outboxTestPhase(t, "backdate-pending")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)
@@ -696,6 +723,7 @@ func backdateEventOutbox(t *testing.T, repo Repository, when time.Time) error {
 
 func backdateEventOutboxDelivered(t *testing.T, repo Repository) error {
 	t.Helper()
+	defer outboxTestPhase(t, "backdate-delivered")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)
@@ -707,6 +735,7 @@ func backdateEventOutboxDelivered(t *testing.T, repo Repository) error {
 
 func assertDeliveredRows(t *testing.T, repo Repository, want int) {
 	t.Helper()
+	defer outboxTestPhase(t, "delivered-count-query-scan-assertions")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)
@@ -727,6 +756,7 @@ func assertDeliveredRows(t *testing.T, repo Repository, want int) {
 // read-only count — HasEventOutboxFact is bool-only).
 func countEventOutboxByType(t *testing.T, repo Repository, originID int64, eventType OutboxEventType) int {
 	t.Helper()
+	defer outboxTestPhase(t, "count-by-type-query-scan")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)
@@ -743,6 +773,7 @@ func countEventOutboxByType(t *testing.T, repo Repository, originID int64, event
 // outboxPayloadByType returns the newest payload for one origin + event type.
 func outboxPayloadByType(t *testing.T, repo Repository, originID int64, eventType OutboxEventType) string {
 	t.Helper()
+	defer outboxTestPhase(t, "payload-by-type-query-scan")()
 	store, ok := repo.(*sqlStore)
 	if !ok {
 		t.Fatalf("repo is %T, want *sqlStore", repo)

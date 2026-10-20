@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
+	"math"
 	"strings"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -21,7 +21,9 @@ var errUnsatisfiable = errors.New("unsatisfiable")
 //   - ok=true                       → serve [offset, offset+length) as 206.
 //
 // Only the first range of a multi-range header is honoured (sufficient for the
-// common video-seek / resumable-download cases).
+// common video-seek / resumable-download cases). Numeric components are unsigned
+// ASCII decimal; oversized valid coordinates clamp against the int64 object
+// size instead of being mistaken for malformed syntax.
 func ParseByteRange(header string, size int64) (offset, length int64, ok, unsatisfiable bool) {
 	const p = "bytes="
 	if size < 0 || !strings.HasPrefix(header, p) {
@@ -56,14 +58,14 @@ func parseRangeSpec(spec string) (start, end int64, err error) {
 	endStr := strings.TrimSpace(spec[dash+1:])
 
 	if startStr == "" {
-		n, parseErr := strconv.ParseInt(endStr, 10, 64)
+		n, parseErr := parseRangeDecimal(endStr)
 		if parseErr != nil || n <= 0 {
 			return 0, 0, fmt.Errorf("invalid suffix range")
 		}
 		return -n, 0, nil
 	}
 
-	start, parseErr := strconv.ParseInt(startStr, 10, 64)
+	start, parseErr := parseRangeDecimal(startStr)
 	if parseErr != nil || start < 0 {
 		return 0, 0, fmt.Errorf("invalid start")
 	}
@@ -72,11 +74,33 @@ func parseRangeSpec(spec string) (start, end int64, err error) {
 		return start, -1, nil
 	}
 
-	end, parseErr = strconv.ParseInt(endStr, 10, 64)
+	end, parseErr = parseRangeDecimal(endStr)
 	if parseErr != nil {
 		return 0, 0, fmt.Errorf("invalid end")
 	}
 	return start, end, nil
+}
+
+// HTTP range numbers are unsigned decimal, not Go signed integers. Saturate
+// large coordinates: every object size fits int64, so larger starts are outside
+// it and larger ends/suffixes clamp to EOF. Still validate every trailing digit.
+func parseRangeDecimal(value string) (int64, error) {
+	if value == "" {
+		return 0, fmt.Errorf("empty range number")
+	}
+	var number int64
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, fmt.Errorf("invalid range number")
+		}
+		digit := int64(value[i] - '0')
+		if number > (math.MaxInt64-digit)/10 {
+			number = math.MaxInt64
+		} else {
+			number = number*10 + digit
+		}
+	}
+	return number, nil
 }
 
 // clampRange validates and clamps a parsed range against the object size.

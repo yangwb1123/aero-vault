@@ -126,8 +126,8 @@ curl -s -X PUT --data-binary @report.pdf \
   "$BASE/v1/files/docs/report.pdf"
 # -> 201 { "bucket":"default","key":"docs/report.pdf","size":…,"etag":"…", … }
 
-# Download
-curl -s "$BASE/v1/files/docs/report.pdf" -o report.pdf
+# Download the complete opaque Key (even when it ends in a subresource name)
+curl -s "$BASE/v1/files/docs/report.pdf?representation=content" -o report.pdf
 
 # Conditional GET (304 when ETag matches) and Range (206 Partial Content)
 curl -s -H 'If-None-Match: "<etag>"' "$BASE/v1/files/docs/report.pdf" -D -
@@ -137,6 +137,156 @@ curl -s -H 'Range: bytes=0-1023'      "$BASE/v1/files/docs/report.pdf" -D -
 curl -s -X PUT --data-binary @v2.pdf -H 'If-Match: "<etag>"'        "$BASE/v1/files/docs/report.pdf"
 curl -s -X PUT --data-binary @new.pdf -H 'If-None-Match: *'         "$BASE/v1/files/docs/new.pdf"   # create-only
 ```
+
+### Explicit content and thumbnail selection
+
+For unambiguous reads use `GET`/`HEAD /v1/files/{key}?representation=content`.
+The complete decoded Key identifies the object; suffixes such as `/tags`,
+`/metadata`, `/versions`, `/acl` and `/thumbnail` are not stripped. A missing,
+unreadable, deleted or corrupt full key never falls back to a parent resource.
+
+`representation=thumbnail` derives JPEG from that same complete source Key,
+without probing a neighbouring `{key}/thumbnail` object. Both representations
+accept `version=ID`; historical content HEAD uses the exact version's metadata
+without opening its Blob, including 304 responses with `X-Version-Id`.
+Legacy `/thumbnail` HEAD also uses metadata when it selects an exact object;
+derived thumbnail HEAD can still decode a source image to produce GET-equivalent
+headers/status, with no response body. Content HEAD ignores Range.
+
+Raw current/historical content responses retain the selected object's stored
+Content-Disposition/Content-Encoding, user metadata, X-Content-MD5 and non-default
+X-Storage-Class consistently across GET, HEAD and 304. A 206 uses the selected
+span's Content-Length; X-Content-MD5 remains the full object's stored digest, not
+a newly computed range digest or proof that this read passed verification.
+Only a non-empty historical pin adds X-Version-Id. Reserved `_aero_*` metadata
+is not exposed as user metadata.
+
+For current content GET with conditions or Range, a failed Stat is terminal:
+Deny/provider errors are not retried through an unconditional Get. A successful
+Stat does not bypass FileService authorization when opening the selected content.
+In legacy `/thumbnail` exact-object dispatch, an authenticated caller's failed
+read authorization is also terminal; only anonymous pre-capability lookup can
+proceed through full-key public-read admission and subsequent authorization.
+Metadata-only preflight 304/412 decisions can finish without opening a Blob.
+When a stream is needed, conditions are checked again against the object returned
+by FileService.Get; Range is sliced from that same opened stream, and its headers
+and size come from that object rather than the earlier Stat. `If-Range` must match
+a single strong ETag or exact Last-Modified date; otherwise Range is ignored and
+the full selected stream is returned. No second GetRange lookup selects another
+current object. This is not an atomic database/Blob snapshot for non-versioned
+concurrent overwrites.
+
+For `/v1/files` GET/HEAD, repeated If-Match/If-None-Match fields are combined as
+one ETag list before strong/weak comparison. Invalid lists do not use just the
+first member; If-None-Match presence suppresses If-Modified-Since even when empty.
+Duplicate date conditions are ignored. Repeated Range or repeated/empty/invalid
+If-Range fields do not select a first value: Range is ignored and the full
+selected content is returned. A single Range field retains first-range-only
+compatibility; this does not add multipart/byteranges. Thumbnail ETag/date reads
+use the same field handling, without changing their revalidation/cache gates.
+For derived thumbnails, only the combined If-None-Match value equal to `*`
+after HTTP space/tab trimming is the wildcard. Empty opaque tags (`""`, `W/""`) and lists containing
+them still require an actual matching derived ETag; they do not imply existence
+or enable date fallback. A genuinely matching strong/weak list still yields 304.
+For derived thumbnail conditional revalidation, a non-empty Content-Encoding
+on the second authorized Stat still returns 415, never 304. That rejection
+opens no Blob and emits no content validator, version or cache declaration;
+authorization failures remain prior to the encoding check. An unencoded
+historical pin is evaluated independently of the current version's encoding.
+The second authorized conditional Stat also applies the existing Content-Type
+declaration gate: unsupported image declarations return 415, other non-generic
+non-image declarations return 400, not 304. Authorization/object-state errors and
+Content-Encoding rejection retain precedence; media rejection emits no validator,
+version, cache declaration or derived body. Supported JPEG/PNG/GIF and generic
+(empty, truly unparseable, or application/octet-stream) declarations retain the
+metadata-only path: no source open, magic read or decode admission is added.
+Such a generic 304 is not proof that the current Blob is healthy or decodable.
+A historical pin is checked against its own declaration, not the current row's.
+If the second authorized conditional Stat does not yield 304, the subsequent
+thumbnail 200 selects its cache/source from that newer observation, including
+its generation and encryption eligibility. It never falls back to an entry for
+the earlier observation: a newer cached JPEG avoids opening, while a miss still
+reauthorizes through the existing opener. Historical entries remain usable for
+their exact pins. This adds no further Stat or atomic latest-at-response guarantee;
+ordinary hits without a second conditional observation are unchanged.
+When generation needs an opened source, its newly authorized Content-Encoding
+is also checked before sniff/decode: any non-empty declaration returns 415,
+even if the preflight source was unencoded. The already opened stream is closed
+once without reading/draining it; cleanup errors do not replace that rejection.
+No content validator, version claim, cache directive or derived body is emitted.
+The existing access-attempt event from opening the source is not rolled back.
+This does not re-observe encoding on a resident cache hit or provide an atomic
+metadata/Blob snapshot.
+
+The opened source's own Content-Type also selects the existing media gate and
+sniff path, rather than reusing the preflight declaration. JPEG/PNG/GIF declarations
+use the decoder; other image declarations return 415, and other non-generic
+non-image declarations return 400, before any source Read. Empty, truly
+unparseable, or application/octet-stream declarations use bounded magic sniffing
+on that same stream. Case/parameter normalization and decoder error statuses are
+unchanged. A declared-type rejection closes once without reading/draining, does
+not let cleanup errors replace 400/415, and emits no success validator/version,
+cache declaration or derived body. Authorization/open and Content-Encoding
+failures retain precedence. This does not change resident cache hits, raw
+content or other protocols.
+
+Resident thumbnail cache storage also checks the authorized opened source's own
+encryption metadata, independently of generation proof and the earlier Stat.
+SSE-C/SSE-KMS cache exclusions cannot be lost merely because identity and ETag
+still match. A readable source excluded from resident storage retains its normal
+response and safe generation-bound validator; AES256 remains cache-admissible.
+This does not re-observe resident hits or change sharing within an already-started
+in-flight generation, and is not a new encryption or atomic-snapshot guarantee.
+
+A successful coalesced thumbnail follower attributes its existing access-attempt
+event to the shared opened source (object ID, source ETag/size/type/backend),
+not an older preflight Stat; the event retains the follower's own request ID.
+Resident hits still use their authorized cache-key Stat, and leader misses keep
+the FileService open-path event without a second emission. This remains a
+best-effort access attempt, not proof of successful download or client storage.
+No additional object lookup or event-schema change is involved.
+After thumbnail generation returns successfully, REST checks the request context
+again before response preconditions, a follower access event, or success output.
+A completed flight result does not override an already observed client cancellation
+(silent) or deadline (504); generation failures retain their existing precedence.
+This does not cancel the leader, remove its valid cache entry, retract prior
+access attempts, or make cancellation atomic with later response writes.
+
+The shared byte-range parser used by raw content, shares/public assets and S3
+accepts only unsigned ASCII decimal coordinates. Signed numbers such as
+`bytes=+1-3` or `bytes=0--1` are malformed and ignored, not interpreted as spans.
+Very large valid decimal numbers do not overflow into syntax errors: end/suffix
+values clamp to the object size, while a start beyond it returns 416 (including
+on empty objects). This does not add multi-range bodies or larger object sizes.
+
+Raw content streaming handles reported read/write errors by aborting the HTTP
+response, never by appending JSON/text to file bytes or retrying another source.
+After a successful body copy it also checks the same source's Close result;
+body completion and deferred cleanup close the underlying stream only once.
+Metadata-only/early error outcomes are not replaced by cleanup Close failures.
+A Read that reports a non-EOF failure does not deliver that same call's bytes.
+Failure while discarding a Range prefix occurs before content headers: it keeps
+the normal error code/status with a fixed `object content read failed` message,
+not provider diagnostics. Stream errors are not a new HTTP error status after
+headers have been sent. Already delivered bytes cannot be retracted; a client
+that received all Content-Length bytes may not observe a late verification
+failure, even when reported by Close. This is not pre-download integrity
+validation or full-object verification of a partial Range; closing does not
+read/drain the remaining source or interrupt a blocked backend operation.
+
+```bash
+curl -s "$BASE/v1/files/docs/tags?representation=content" -o literal-tags
+curl -s "$BASE/v1/files/images/hero.jpg?representation=thumbnail&w=1280&h=960" -o preview.jpg
+curl -sI "$BASE/v1/files/docs/tags?representation=content&version=<id>"
+```
+
+Only one non-empty `content` or `thumbnail` selector is accepted. Invalid or
+repeated representation parameters and malformed read queries return `400`.
+Omitting the selector preserves legacy subresource dispatch and `/thumbnail`
+exact-object-first semantics. Auth-verified presigned GET/HEAD capabilities read
+their signed full object path without adding a selector; their strict query
+allowlist and signature format remain unchanged. The selector is not an auth
+bypass. This change does not alter legacy PUT/DELETE suffix dispatch or SDKs.
 
 ### Multipart-form upload
 
@@ -228,7 +378,23 @@ curl -s -X DELETE "$BASE/v1/files/docs/report.pdf/tags"     # clear
 ```bash
 curl -s "$BASE/v1/files/docs/report.pdf/versions"          # list historical versions
 curl -s "$BASE/v1/files/docs/report.pdf?version=<id>" -o old.pdf   # fetch a version
+curl -s -H 'Range: bytes=0-4095' "$BASE/v1/files/docs/report.pdf?version=<id>" # first 4 KiB of that version
 ```
+
+Historical GET honors single byte ranges (including suffix/open ranges) on the
+selected version, returning `206` with `Content-Range` and `X-Version-Id`.
+An unsatisfiable range returns `416`; read preconditions and `304` take precedence.
+`If-Range` must match that version's strong ETag or exact Last-Modified date;
+a mismatch returns the full **selected version**, not the latest object.
+Unknown non-empty IDs return `404` without fallback; an empty `version` retains
+current-object semantics. Version listings include `is_delete_marker: true` for
+actual delete markers; `deleted_at` alone may denote a readable soft-deleted version.
+The Web version tab pins both content and JPEG thumbnail requests to the chosen ID.
+Historical content reads check request cancellation before and after each source
+Read, including discarded range prefixes; a Read already in progress may finish.
+Cancellation does not undo an opened/audited read or revoke bytes already delivered,
+and does not guarantee interruption of a blocked storage Read or eager decryption.
+This is preview/download, not historical-version restore or rollback.
 
 ### Object lock (WORM)
 

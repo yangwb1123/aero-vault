@@ -1,15 +1,11 @@
 package rest
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/aero-vault/aero-vault/internal/auth"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
@@ -17,129 +13,6 @@ import (
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
 )
-
-// GET /v1/files/<key>/thumbnail?w=&h=&version=
-// Generates a JPEG thumbnail of an image object on demand. The response carries
-// a safe identity-bound derived ETag so repeat requests are cacheable (304 via
-// If-None-Match).
-//
-// Dispatch precedence: object keys ending in "/thumbnail" are legal. When an
-// object exists at the exact requested key, raw-download semantics win (FR-1)
-// and the subresource interpretation applies only when no object exists at
-// the full key (FR-2). A ?version= pin requests a specific historical
-// version: when the pinned version names a readable object at the full key,
-// raw-download semantics win there too (a version-pinned read must never be
-// shadowed by derived content of a different key); otherwise the thumbnail is
-// derived from the pinned version of the trimmed key.
-func (h *Handler) Thumbnail(w http.ResponseWriter, r *http.Request) {
-	fullKey := keyFromPath(r)
-	version := ""
-	if r.URL.Query().Has("version") {
-		// Pinned arm: the discriminator is a pinned-version lookup at the
-		// FULL key — never a current-object Stat. A soft-deleted full key
-		// returns ErrNotFound from a current Stat while its pre-delete
-		// versions remain readable, and a version-pinned read of such an
-		// object must serve its own raw bytes. The lookup is a repo read plus
-		// an authorization decision (StatVersionWithOptions runs
-		// authorizeObject — the E7 discriminator is an authz decision, not a
-		// pure repo read) — no stream, no decode slot — run on the original
-		// request context, before the thumbnail deadline scope (F1 parity).
-		version = r.URL.Query().Get("version") // "" resolves the current object (Get parity)
-		_, err := h.svc.StatVersionWithOptions(r.Context(), mw.TenantFrom(r.Context()),
-			service.DefaultBucket, fullKey, version, service.ReadOptions{})
-		switch {
-		case err == nil:
-			// The pin names a readable object at the full key: delegate to
-			// Get, which re-resolves ?version= via GetSpecificVersion with
-			// full raw-download semantics (policy → anonymous → conditional
-			// → Range → X-Version-Id).
-			h.Get(w, r)
-			return
-		case errors.Is(err, service.ErrForbidden):
-			// Re-delegate: Get re-authorizes after allowAnonymous injects
-			// the canned-public-read capability, so anonymous reads of
-			// public exact-key pinned versions keep working.
-			h.Get(w, r)
-			return
-		case errors.Is(err, service.ErrNotFound):
-			// The pin names nothing at the full key: fall through to the
-			// version-pinned derivation on the trimmed key.
-		case errors.Is(err, service.ErrInvalidArgs) && len(fullKey) > service.MaxKeyLen:
-			// Key-length dispatch artifact: a legal image key whose
-			// "/thumbnail" suffix exceeds the key-length cap is a dispatch
-			// artifact, not an object-state error — fall through (mirrors
-			// the unpinned ErrInvalidArgs arm). Any other ErrInvalidArgs
-			// (e.g. an SSE-C object read without its key) lands in default:
-			// the pin names a real but unreadable object, and deriving a
-			// different key's content would shadow it.
-		default:
-			// The pinned full-key version exists in a real but unreadable
-			// state (corrupt → 410, SSE-C without key → 400): never fall
-			// back to derived content of a different key (FR-3).
-			h.writeError(w, r, err)
-			return
-		}
-	} else {
-		_, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, fullKey)
-		switch {
-		case err == nil:
-			// The exact key names a real object: raw download wins with full
-			// Get semantics (bucket policy, anonymous gate on the full key,
-			// conditional requests, Range, ?version=).
-			h.Get(w, r)
-			return
-		case errors.Is(err, service.ErrNotFound):
-			// No object at the full key: fall through to the subresource
-			// interpretation below.
-		case errors.Is(err, service.ErrForbidden):
-			// The full key names an existing object the caller cannot read with
-			// the pre-capability principal. Delegate to Get, which re-authorizes
-			// after allowAnonymous injects the canned-public-read capability, so
-			// anonymous reads of public objects keep working in access-enabled
-			// deployments; literal propagation would regress them to 403.
-			h.Get(w, r)
-			return
-		case errors.Is(err, service.ErrInvalidArgs):
-			// A legal object key suffixed with "/thumbnail" can exceed the
-			// key-length cap (e.g. a 191-char image key + 10-char suffix). That
-			// is a dispatch artifact, not an object-state error: fall through to
-			// the subresource interpretation, which works on the trimmed
-			// (legal) key.
-		default:
-			// The key names a real object; propagate corrupt/other errors instead
-			// of falling back to derived content of a different key (FR-3).
-			h.writeError(w, r, err)
-			return
-		}
-	}
-	key := strings.TrimSuffix(fullKey, "/thumbnail")
-	// Bucket-policy gate on the derivation path, mirroring Get's ordering
-	// (policy → anonymous): a policy denying s3:GetObject on the trimmed key
-	// must not be bypassable by requesting its derived thumbnail (which
-	// returns near-lossless image bytes of the same object). Fail-closed like
-	// every other object read surface — a version-pinned URL cannot bypass it
-	// either. Run before the deadline scope: the gates are cheap and
-	// fail-closed either way.
-	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
-		return
-	}
-	if !h.allowAnonymous(w, r, key) {
-		return
-	}
-	// Server-side bound on the derivation pipeline, including the decode-slot
-	// park: REQUEST_TIMEOUT_SECONDS (same knob as the AI group) cancels a
-	// scoped context that GenerateContext honors while parked. Scoped HERE —
-	// after the delegation checks and gates — so the arms above that
-	// raw-download "/thumbnail"-suffixed keys (?version= pin, exact-key,
-	// ErrForbidden) are never collateralized by the thumbnail deadline (F1).
-	// No-op at 0.
-	if h.thumbnailTimeout > 0 {
-		ctx, cancel := context.WithTimeout(r.Context(), h.thumbnailTimeout)
-		defer cancel()
-		r = r.WithContext(ctx)
-	}
-	h.thumbnailDerive(w, r, key, version)
-}
 
 // thumbnailDerive is the shared derivation body for both dispatch arms,
 // parameterized by the source key and the optional version pin ("" = the
@@ -177,20 +50,9 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	// only bucket 3 changes — the curl -T / S3-SDK upload norm stores an
 	// empty or generic declaration on perfectly decodable JPEG/PNG/GIF
 	// bytes, which the pipeline can classify from magic at open time.
-	mediaType, _, perr := mime.ParseMediaType(obj.ContentType)
-	sniffBytes := perr != nil || mediaType == "application/octet-stream"
-	if !sniffBytes && !strings.HasPrefix(mediaType, "image/") {
-		h.writeThumbnailError(w, r, fmt.Errorf("%w: object is not an image (content-type %q)", service.ErrInvalidArgs, obj.ContentType))
+	if _, err := thumbnailMediaType(obj.ContentType); err != nil {
+		h.writeThumbnailError(w, r, err)
 		return
-	}
-	if !sniffBytes {
-		switch mediaType {
-		case "image/jpeg", "image/png", "image/gif":
-		default:
-			h.writeThumbnailError(w, r, fmt.Errorf("%w: unsupported image format %q (supported: image/jpeg, image/png, image/gif)",
-				thumbnail.ErrUnsupportedFormat, obj.ContentType))
-			return
-		}
 	}
 	// Validate ?w=/?h= before the ETag derivation, the If-None-Match/304
 	// branch, the object-stream open, and the decode pipeline: garbage
@@ -250,10 +112,11 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	// conditions remain meaningful when a backend cannot provide a reusable
 	// derived ETag: the current representation still exists and
 	// Last-Modified is still an applicable validator (RFC 9110 §13).
-	inm := r.Header.Get("If-None-Match")
+	inm, inmPresent := readETagCondition(r, "If-None-Match")
 	inmHit := statETag != "" && etagListMatches(inm, statETag)
-	inmWildcard := inm != "" && etagListMatches(inm, "")
-	imsOnly := inm == "" && r.Header.Get("If-Modified-Since") != ""
+	// Wildcard is grammar, not weak comparison against an empty opaque tag.
+	inmWildcard := strings.Trim(inm, " \t") == "*"
+	imsOnly := !inmPresent && singleReadCondition(r, "If-Modified-Since") != ""
 	if inmHit || inmWildcard || imsOnly {
 		// Re-observe the object before certifying Not Modified. The pre-open
 		// Stat above and this emission are separate moments: a concurrent PUT
@@ -270,20 +133,15 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		// against the current validator). For pinned requests the re-Stat is
 		// deterministic (version rows are immutable) but the shared path is
 		// kept, not special-cased.
-		fresh, err := h.statPinned(r.Context(), tenant, key, version)
-		if err != nil {
-			// Deleted between the Stats (ErrNotFound → 404) or corrupt (→ 410):
-			// never certify Not Modified for a state we could not observe. Same
-			// writeError classification as the pre-check Stat.
-			h.writeError(w, r, err)
+		fresh, ok := h.revalidateThumbnailSource(w, r, tenant, key, version)
+		if !ok {
 			return
 		}
 		freshIdentity := thumbnailSourceIdentity(fresh)
 		freshETag := ""
-		// Generation proof gates both reusable caching and validators. An
-		// unsupported backend cannot safely certify a 304 because its bytes
-		// are not bound to the repository generation.
-		if sourceBound && freshIdentity.Complete() && h.svc.ThumbnailSourceCacheBound(fresh) {
+		// Bind eligibility to this observation, not the earlier source.
+		freshBound := freshIdentity.Complete() && h.svc.ThumbnailSourceCacheBound(fresh)
+		if freshBound {
 			freshETag = thumbValidatorETag(thumbnail.CacheKeyVersion, freshIdentity, fresh.ETag, effW, effH)
 		}
 		if readPreconditionFailedForETag(r, fresh, freshETag) {
@@ -299,14 +157,7 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 			// reusable ETag is emitted for the opened bytes.
 			inmHit = inmWildcard
 		}
-		imsHit := false
-		if inm == "" {
-			if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-				if t, perr := http.ParseTime(ims); perr == nil {
-					imsHit = !fresh.UpdatedAt.Truncate(time.Second).After(t)
-				}
-			}
-		}
+		imsHit := !inmPresent && dateNotModified(singleReadCondition(r, "If-Modified-Since"), fresh.UpdatedAt)
 		if inmHit || imsHit {
 			if freshETag != "" && (version != "" || versioning) && fresh.VersionID != "" {
 				w.Header().Set("X-Version-Id", fresh.VersionID)
@@ -340,10 +191,10 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		// The object changed between the two Stats (the fresh validator no
-		// longer matches the client's If-None-Match): fall through to the 200
-		// path, which re-derives the validator from the opened object and
-		// serves the current bytes — never a stale-validator 304.
+		// Continue from the newer authorized observation. Otherwise a resident
+		// A entry could serve stale bytes after the re-Stat already observed B.
+		// Misses still reauthorize and bind the response to the opened source.
+		obj, identity, sourceBound, statETag = fresh, freshIdentity, freshBound, freshETag
 	}
 
 	// The decode slot is acquired BEFORE the object stream opens —
@@ -388,7 +239,7 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	// The 200-path validator must describe the bytes actually decoded, so
 	// the opened object is captured here and read after the pipeline
 	// succeeds. Same capture-then-serve ordering the Get handler uses
-	// (handler.go -> handleRangeOrFull): the pre-open Stat validator serves
+	// (handler.go -> serveOpenedContent): the pre-open Stat validator serves
 	// only the 304 fast path, never the 200. The opener also reports the
 	// opened object's ETag so the cache's store rule can verify content
 	// identity before caching (a PUT between the Stat and the open never
@@ -399,28 +250,26 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 	generated, err := thumbnail.GenerateContextWithOpenerCachedWithAdmissionResult(
 		r.Context(), cache, h.thumbnailAdmission, identity, obj.ETag, maxW, maxH,
 		func() (io.ReadCloser, thumbnail.OpenedSource, error) {
-			source, err := h.svc.OpenThumbnailSource(r.Context(), obj, version)
+			source, err := h.openThumbnailSource(r.Context(), obj, version)
 			if err != nil {
 				return nil, thumbnail.OpenedSource{}, err
 			}
-			openedSource := thumbnail.OpenedSource{
-				Identity:  thumbnailSourceIdentity(source.Object),
-				ETag:      source.Object.ETag,
-				Bound:     source.Bound,
-				UpdatedAt: source.Object.UpdatedAt,
-			}
+			// Encryption policy is independent of the generation proof and can
+			// differ from preflight even when identity and ETag still match.
+			reason := thumbnailCacheBypassReason(source.Object)
+			recordThumbnailCacheBypass(r.Context(), cache, reason)
+			openedSource := thumbnailOpenedSource(source, reason != "")
 			opened = &openedSource
-			rc := source.Reader
-			if !sniffBytes {
-				return rc, openedSource, nil
-			}
-			sniffed, err := sniffThumbnailSource(r.Context(), rc)
-			if err != nil {
-				return nil, thumbnail.OpenedSource{}, err
-			}
-			return sniffed, openedSource, nil
+			return source.Reader, openedSource, nil
 		})
 	if err != nil {
+		h.writeThumbnailGenerateError(w, r, err)
+		return
+	}
+	// A completed flight intentionally wins the library's wait race. The HTTP
+	// caller must still honor its own cancellation before emitting a response
+	// or a follower access event; generation errors above retain precedence.
+	if err := r.Context().Err(); err != nil {
 		h.writeThumbnailGenerateError(w, r, err)
 		return
 	}
@@ -448,9 +297,9 @@ func (h *Handler) thumbnailDerive(w http.ResponseWriter, r *http.Request, key, v
 		// covers resident hits and successful coalesced-flight joiners. Both
 		// bypass the stream, so the handler emits the one access event that
 		// the service emits on a leader miss (best-effort like every other
-		// event emission). For a pinned request the event names the pinned
-		// object.
-		h.svc.EmitAccessed(r.Context(), obj)
+		// event emission). Joiners name the shared opened source, which may
+		// differ from their preflight Stat; resident hits still name that Stat.
+		h.svc.EmitAccessed(r.Context(), thumbnailAccessObject(obj, opened))
 	}
 	// A complete authoritative identity still has a safe opaque validator when
 	// cache admission was bypassed. On a miss, however, never fall back to the

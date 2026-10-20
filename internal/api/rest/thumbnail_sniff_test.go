@@ -183,7 +183,7 @@ func (s *nilThumbnailStorage) Get(context.Context, string) (io.ReadCloser, stora
 func newNilThumbnailSourceREST(t *testing.T, reader io.ReadCloser) (*httptest.Server, *Handler, *nilThumbnailStorage, *thumbnail.Cache) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "nil-source.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "nil-source.db"))
 	if err != nil {
 		t.Fatalf("open repository: %v", err)
@@ -303,7 +303,7 @@ func (s *deadlineSniffStorage) GetGenerationBound(ctx context.Context, _ string,
 func newDeadlineSniffREST(t *testing.T, payload []byte) (*httptest.Server, *Handler, *deadlineSniffStorage, *thumbnail.Cache) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "deadline-sniff.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "deadline-sniff.db"))
 	if err != nil {
 		t.Fatalf("open repository: %v", err)

@@ -34,7 +34,7 @@ describe('VaultClient object management APIs', () => {
 
     await expect(client.listVersions('docs/a.txt')).resolves.toEqual([{ version_id: 'v/1' }])
     await expect(client.downloadVersion('docs/a.txt', 'v/1')).resolves.toBeInstanceOf(Blob)
-    expect(String(fetcher.mock.calls[1][0])).toBe('/v1/files/docs/a.txt?version=v%2F1')
+    expect(String(fetcher.mock.calls[1][0])).toBe('/v1/files/docs/a.txt?representation=content&version=v%2F1')
   })
 
   it('requests only the first 4 KiB for a safe object preview', async () => {
@@ -49,7 +49,7 @@ describe('VaultClient object management APIs', () => {
     await expect(client.previewObject('docs/a.txt')).resolves.toMatchObject({
       contentType: 'text/plain', partial: true,
     })
-    expect(String(fetcher.mock.calls[0][0])).toBe('/v1/files/docs/a.txt')
+    expect(String(fetcher.mock.calls[0][0])).toBe('/v1/files/docs/a.txt?representation=content')
   })
 
   it('uses the bounded thumbnail endpoint for JPEG previews', async () => {
@@ -64,7 +64,7 @@ describe('VaultClient object management APIs', () => {
     await expect(client.previewObject('images/hero.jpg')).resolves.toMatchObject({
       contentType: 'image/jpeg', partial: false,
     })
-    expect(String(fetcher.mock.calls[1][0])).toBe('/v1/files/images/hero.jpg/thumbnail?w=1280&h=960')
+    expect(String(fetcher.mock.calls[1][0])).toBe('/v1/files/images/hero.jpg?representation=thumbnail&w=1280&h=960')
   })
 
   it('manages restore, presign, and legal hold operations', async () => {

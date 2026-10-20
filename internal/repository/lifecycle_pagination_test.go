@@ -8,7 +8,11 @@ import (
 
 func TestListExpiredPaginatesPastFreshCandidates(t *testing.T) {
 	ctx := context.Background()
+	phase, started := "prepare", time.Now()
+	defer func() { t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started)) }()
 	s := openTestSQLite(t)
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "policy-and-seed", time.Now()
 	const tenant, bucket = "default", "expiry-page"
 
 	if err := s.SetBucketLifecycle(ctx, tenant, bucket, 1, "soft_delete"); err != nil {
@@ -23,7 +27,11 @@ func TestListExpiredPaginatesPastFreshCandidates(t *testing.T) {
 	}
 	backdateObject(t, s, ctx, old.ID, time.Now().UTC().Add(-72*time.Hour))
 
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "query-and-rows", time.Now()
 	got, err := s.ListExpired(ctx, 1)
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "result-checks", time.Now()
 	if err != nil {
 		t.Fatalf("list expired: %v", err)
 	}
@@ -34,7 +42,11 @@ func TestListExpiredPaginatesPastFreshCandidates(t *testing.T) {
 
 func TestListTransitionablePaginatesPastFreshCandidates(t *testing.T) {
 	ctx := context.Background()
+	phase, started := "prepare", time.Now()
+	defer func() { t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started)) }()
 	s := openTestSQLite(t)
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "policy-and-seed", time.Now()
 	const tenant, bucket = "default", "transition-page"
 
 	if err := s.SetBucketLifecycleFull(ctx, tenant, bucket, LifecycleConfig{
@@ -51,7 +63,11 @@ func TestListTransitionablePaginatesPastFreshCandidates(t *testing.T) {
 	}
 	backdateObject(t, s, ctx, old.ID, time.Now().UTC().Add(-72*time.Hour))
 
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "query-and-rows", time.Now()
 	got, err := s.ListTransitionable(ctx, 1)
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "result-checks", time.Now()
 	if err != nil {
 		t.Fatalf("list transitionable: %v", err)
 	}
@@ -65,7 +81,11 @@ func TestListTransitionablePaginatesPastFreshCandidates(t *testing.T) {
 
 func TestListExpiredNonCurrentVersionsPaginatesPastFreshCandidates(t *testing.T) {
 	ctx := context.Background()
+	phase, started := "prepare", time.Now()
+	defer func() { t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started)) }()
 	s := openTestSQLite(t)
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "policy-and-seed", time.Now()
 	const tenant, bucket = "default", "noncurrent-page"
 
 	if err := s.SetBucketNoncurrentVersionLifecycle(ctx, tenant, bucket, 1, 0); err != nil {
@@ -87,7 +107,11 @@ func TestListExpiredNonCurrentVersionsPaginatesPastFreshCandidates(t *testing.T)
 	}
 	backdateObject(t, s, ctx, old.ID, time.Now().UTC().Add(-72*time.Hour))
 
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "query-and-rows", time.Now()
 	got, err := s.ListExpiredNonCurrentVersions(ctx, 1)
+	t.Logf("lifecycle-page phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "result-checks", time.Now()
 	if err != nil {
 		t.Fatalf("list expired noncurrent versions: %v", err)
 	}

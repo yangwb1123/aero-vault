@@ -19,7 +19,7 @@ import (
 
 func newRESTTest(t *testing.T) *httptest.Server {
 	t.Helper()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, context.Background(), "c.db")
 	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "c.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)

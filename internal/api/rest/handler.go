@@ -226,10 +226,15 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	tenant := mw.TenantFrom(r.Context())
 	if hasConditional(r) {
-		if obj, err := h.svc.Stat(r.Context(), tenant, service.DefaultBucket, key); err == nil {
-			if h.handleConditional(w, r, obj) {
-				return
-			}
+		obj, err := h.svc.Stat(r.Context(), tenant, service.DefaultBucket, key)
+		if err != nil {
+			// A denied/failed metadata read is terminal for this request, not a
+			// reason to retry authorization through an unconditional Get.
+			h.writeError(w, r, err)
+			return
+		}
+		if h.handleConditional(w, r, obj) {
+			return
 		}
 	}
 	rc, obj, err := h.svc.Get(r.Context(), tenant, service.DefaultBucket, key)
@@ -237,63 +242,34 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	defer rc.Close()
-	h.handleRangeOrFull(w, r, rc, obj)
+	reader := &objectContentReader{ctx: r.Context(), source: rc}
+	defer reader.Close()
+	// Preconditions must also describe the source selected by Get, not just
+	// the earlier metadata observation. Opening still performs authorization.
+	if h.handleConditional(w, r, obj) {
+		return
+	}
+	h.serveOpenedContent(w, r, reader, obj, false)
 }
 
-// HEAD /v1/files/*key
+// HEAD /v1/files/*key. net/http suppresses bodies on the derived paths while
+// preserving GET status/headers; their gates must run on the selected source,
+// not on an accidentally suffixed object ARN.
 func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
-	// HEAD on the /thumbnail subresource must mirror GET on the same URL
-	// (RFC 9110 §9.3.2: identical status and headers, body suppressed):
-	// dispatch to the same decision tree getKey uses for its /thumbnail
-	// branch (router.go) instead of stat-ing the un-trimmed
-	// "{key}/thumbnail" full key, which names no object and would 404 while
-	// GET 200s. This MUST precede Head's own full-key gates — the thumbnail
-	// derivation path gates on the TRIMMED key (checkBucketPolicy +
-	// allowAnonymous in thumbnail.go), so gating the full key first would
-	// 403 anonymous public reads and evaluate bucket policy against the
-	// wrong ARN. net/http suppresses the response body for HEAD while
-	// preserving explicitly-set status and headers (Content-Type, ETag,
-	// Content-Length, Cache-Control), so reusing Thumbnail verbatim yields
-	// exact GET parity on every arm.
-	if strings.HasSuffix(r.URL.Path, "/thumbnail") {
-		h.Thumbnail(w, r)
-		return
-	}
-	key := keyFromPath(r)
-	if !h.checkBucketPolicy(w, r, key, "s3:GetObject") {
-		return
-	}
-	if !h.allowAnonymous(w, r, key) {
-		return
-	}
-	obj, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key)
+	representation, err := fileRepresentation(r)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}
-	if readPreconditionFailed(r, obj) {
-		h.writeError(w, r, service.ErrPreconditionFailed)
+	if representation == "thumbnail" {
+		h.serveFileThumbnail(w, r, keyFromPath(r), r.URL.Query().Get("version"))
 		return
 	}
-	if notModified(r, obj) {
-		w.Header().Set("ETag", `"`+obj.ETag+`"`)
-		w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-		w.WriteHeader(http.StatusNotModified)
+	if representation == "" && strings.HasSuffix(r.URL.Path, "/thumbnail") {
+		h.Thumbnail(w, r)
 		return
 	}
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("ETag", `"`+obj.ETag+`"`)
-	if obj.ContentType != "" {
-		w.Header().Set("Content-Type", obj.ContentType)
-	}
-	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
-	w.Header().Set("Last-Modified", obj.UpdatedAt.UTC().Format(http.TimeFormat))
-	writeMetadataHeaders(w, obj.Metadata)
-	writeContentMD5(w, obj.Metadata)
-	writeContentResponseHeaders(w, obj.Metadata)
-	writeStorageClass(w, obj.StorageClass)
-	w.WriteHeader(http.StatusOK)
+	h.headFileContent(w, r)
 }
 
 // DELETE /v1/files/*key

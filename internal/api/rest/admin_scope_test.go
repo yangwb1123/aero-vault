@@ -22,7 +22,7 @@ import (
 func newAdminScopeTestServer(t *testing.T) (*httptest.Server, *auth.Registry) {
 	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := restFixtureSchemaDir(t, ctx, "scope.db")
 	repo, err := repository.Open(ctx, "sqlite", "file:"+filepath.Join(dir, "scope.db"))
 	if err != nil {
 		t.Fatalf("open repo: %v", err)

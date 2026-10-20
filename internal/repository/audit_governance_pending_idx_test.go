@@ -111,25 +111,57 @@ FROM cnt;`,
 func openPendingIdxStore(t *testing.T) (*sqlStore, *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
+	started := time.Now()
 	repo, err := Open(ctx, "sqlite", "file:"+filepath.Join(t.TempDir(), "pending-idx.db"))
+	t.Logf("pending-index phase=open elapsed=%s", time.Since(started))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.Migrate(ctx); err != nil {
+	// Cleanup is LIFO: observe the closed handle only after Close has run.
+	t.Cleanup(func() { assertPendingIdxClosed(t, repo) })
+	t.Cleanup(func() {
+		started := time.Now()
+		defer func() { t.Logf("pending-index phase=close elapsed=%s", time.Since(started)) }()
+		_ = repo.Close()
+	})
+	started = time.Now()
+	err = repo.Migrate(ctx)
+	t.Logf("pending-index phase=migrate-all elapsed=%s", time.Since(started))
+	if err != nil {
 		t.Fatal(err)
 	}
 	store := repo.(*sqlStore)
 	return store, store.db.DB
 }
 
+func assertPendingIdxClosed(t *testing.T, repo Repository) {
+	t.Helper()
+	started := time.Now()
+	defer func() { t.Logf("pending-index phase=observe-closed elapsed=%s", time.Since(started)) }()
+	raw := repo.(*sqlStore).db.DB
+	// t.Context is canceled before Cleanup; use a live context so cancellation
+	// cannot masquerade as closure. database/sql has no exported DB-closed error.
+	err := raw.PingContext(context.Background())
+	open := raw.Stats().OpenConnections
+	t.Logf("pending-index cleanup observed ping=%v open_connections=%d", err, open)
+	if err == nil || err.Error() != "sql: database is closed" || open != 0 {
+		t.Errorf("pending-index cleanup did not close database: ping=%v open_connections=%d", err, open)
+		_ = repo.Close() // Release the fixture even when the Close counterexample fails.
+	}
+}
+
 func seedPendingIdx(t *testing.T, raw *sql.DB) {
 	t.Helper()
+	phase, started := "seed", time.Now()
+	defer func() { t.Logf("pending-index phase=%s elapsed=%s", phase, time.Since(started)) }()
 	ctx := context.Background()
 	for _, stmt := range pendingIdxSeed {
 		if _, err := raw.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
+	t.Logf("pending-index phase=%s elapsed=%s", phase, time.Since(started))
+	phase, started = "ANALYZE", time.Now()
 	// REQUIRED: without sqlite_stat1 the planner picks due_idx + temp b-tree
 	// and the pending_claim_idx assertion fails (see pendingIdxSeed guidance).
 	if _, err := raw.ExecContext(ctx, "ANALYZE"); err != nil {
@@ -143,6 +175,8 @@ func seedPendingIdx(t *testing.T, raw *sql.DB) {
 // any forbid string.
 func assertPlan(t *testing.T, raw *sql.DB, query string, args []any, want string, forbids ...string) {
 	t.Helper()
+	started := time.Now()
+	defer func() { t.Logf("pending-index phase=plan-query-rows-assertions elapsed=%s", time.Since(started)) }()
 	ctx := context.Background()
 	rows, err := raw.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, args...)
 	if err != nil {
@@ -213,6 +247,8 @@ func TestAuditGovernanceFailedFactReadsBackOneAttempt(t *testing.T) {
 	// of failed_at_ns, and both land on the same row.
 	ctx := context.Background()
 	store, raw := openPendingIdxStore(t)
+	started := time.Now()
+	defer func() { t.Logf("pending-index phase=failed-fact-business elapsed=%s", time.Since(started)) }()
 	if err := store.ApplyAuditGovernanceBindings(ctx, 1, "probe-digest", []AuditGovernanceBindingState{
 		{TenantID: "acme", State: AuditGovernanceBindingActive},
 	}); err != nil {
@@ -235,9 +271,12 @@ func TestAuditGovernanceFailedFactReadsBackOneAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var failedAtNs, attempts int64
-	if err := raw.QueryRowContext(ctx,
+	readStarted := time.Now()
+	err = raw.QueryRowContext(ctx,
 		`SELECT failed_at_ns, attempts FROM audit_governance_outbox WHERE id = ?`,
-		claimed[0].ID).Scan(&failedAtNs, &attempts); err != nil {
+		claimed[0].ID).Scan(&failedAtNs, &attempts)
+	t.Logf("pending-index phase=failed-fact-query-scan elapsed=%s", time.Since(readStarted))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if failedAtNs <= 0 {

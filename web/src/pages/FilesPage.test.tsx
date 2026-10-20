@@ -222,7 +222,7 @@ describe('FilesPage cursor pagination', () => {
 describe('FilesPage object download', () => {
   const objectFetcher = async (input: RequestInfo | URL): Promise<Response> => {
     const path = String(input)
-    if (path.endsWith('/files/first.txt')) {
+    if (path.endsWith('/files/first.txt?representation=content')) {
       return new Response('file bytes', {
         status: 200,
         headers: { 'Content-Length': '10', 'Content-Type': 'text/plain' },
@@ -254,7 +254,7 @@ describe('FilesPage object download', () => {
     expect(await blobText(captured[0])).toBe('file bytes')
     expect(revoked).toEqual(['blob:files/1'])
     expect(dangerText(container)).toBe('')
-    expect(container.textContent).toContain('操作已完成')
+    expect(container.textContent).toContain('文件已交给浏览器处理')
   })
 
   it('renders a danger alert and no success message when the object download fails', async () => {
@@ -267,11 +267,12 @@ describe('FilesPage object download', () => {
 
     await clickAndSettle(button(container, '下载'))
 
-    expect(download).toHaveBeenCalledWith('first.txt')
+    expect(download).toHaveBeenCalledWith('first.txt', expect.any(AbortSignal))
     expect(anchors).toHaveLength(0)
     expect(captured).toHaveLength(0)
     expect(dangerText(container)).toContain('对象不存在')
     expect(container.textContent).not.toContain('操作已完成')
+    expect(container.textContent).not.toContain('文件已交给浏览器处理')
     expect(container.textContent).toContain('first.txt')
   })
 })
