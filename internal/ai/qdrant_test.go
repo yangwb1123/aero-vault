@@ -15,8 +15,9 @@ import (
 
 // Compile-time conformance: QdrantIndex must satisfy BOTH seams.
 var (
-	_ VectorIndex = (*QdrantIndex)(nil)
-	_ ChunkSink   = (*QdrantIndex)(nil)
+	_ VectorIndex     = (*QdrantIndex)(nil)
+	_ ChunkSink       = (*QdrantIndex)(nil)
+	_ ScopedChunkSink = (*QdrantIndex)(nil)
 )
 
 func TestQdrantSearchVectors(t *testing.T) {
@@ -139,12 +140,13 @@ func TestQdrantUpsertObjectChunks(t *testing.T) {
 	defer srv.Close()
 
 	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL, Collection: "chunks", APIKey: "tok"})
+	ref := qdrantTestRef("acme", "docs", "f.txt", 9)
 	chunks := []repository.Chunk{
 		{ID: 1, ObjectID: 9, TenantID: "acme", Bucket: "docs", ObjectKey: "f.txt", Seq: 0, Content: "alpha", Dim: 2, EmbedModel: "m", Embedding: []float32{0.1, 0.2}},
 		{ID: 2, ObjectID: 9, TenantID: "acme", Bucket: "docs", ObjectKey: "f.txt", Seq: 1, Content: "no-embed", Dim: 0, EmbedModel: "m"}, // empty embedding -> skipped
 		{ID: 3, ObjectID: 9, TenantID: "acme", Bucket: "docs", ObjectKey: "f.txt", Seq: 2, Content: "beta", Dim: 2, EmbedModel: "m", Embedding: []float32{0.3, 0.4}},
 	}
-	if err := qi.UpsertObjectChunks(context.Background(), 9, chunks); err != nil {
+	if err := qi.UpsertScopedObjectChunks(context.Background(), ref, chunks); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -154,7 +156,7 @@ func TestQdrantUpsertObjectChunks(t *testing.T) {
 		t.Fatalf("want 2 calls (delete then upsert), got %d: %+v", len(calls), calls)
 	}
 
-	// 1st call: delete-by-object_id filter.
+	// 1st call: delete-by-scoped-filter.
 	del := calls[0]
 	if del.path != "/collections/chunks/points/delete" {
 		t.Errorf("first call should be delete, got path %q", del.path)
@@ -162,7 +164,10 @@ func TestQdrantUpsertObjectChunks(t *testing.T) {
 	if del.apiKey != "tok" {
 		t.Errorf("api-key not sent on delete: %q", del.apiKey)
 	}
+	mustHaveFilterMatch(t, del.body, "tenant_id", "acme")
+	mustHaveFilterMatch(t, del.body, "bucket", "docs")
 	mustHaveFilterMatch(t, del.body, "object_id", float64(9))
+	mustHaveFilterMatch(t, del.body, "object_key", "f.txt")
 
 	// 2nd call: upsert points with ?wait=true.
 	up := calls[1]
@@ -204,7 +209,8 @@ func TestQdrantUpsertNoChunksStillDeletes(t *testing.T) {
 
 	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL})
 	// Re-index that produced no chunks must still purge stale points.
-	if err := qi.UpsertObjectChunks(context.Background(), 9, nil); err != nil {
+	ref := qdrantTestRef("acme", "docs", "f.txt", 9)
+	if err := qi.UpsertScopedObjectChunks(context.Background(), ref, nil); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	if len(paths) != 1 || !strings.HasSuffix(paths[0], "/points/delete") {
@@ -223,7 +229,8 @@ func TestQdrantDeleteObjectChunks(t *testing.T) {
 	defer srv.Close()
 
 	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL, Collection: "chunks"})
-	if err := qi.DeleteObjectChunks(context.Background(), 42); err != nil {
+	ref := qdrantTestRef("acme", "docs", "f.txt", 42)
+	if err := qi.DeleteScopedObjectChunks(context.Background(), ref); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if gotPath != "/collections/chunks/points/delete" {
@@ -232,7 +239,10 @@ func TestQdrantDeleteObjectChunks(t *testing.T) {
 	if gotMethod != http.MethodPost {
 		t.Errorf("method: got %q", gotMethod)
 	}
+	mustHaveFilterMatch(t, gotBody, "tenant_id", "acme")
+	mustHaveFilterMatch(t, gotBody, "bucket", "docs")
 	mustHaveFilterMatch(t, gotBody, "object_id", float64(42))
+	mustHaveFilterMatch(t, gotBody, "object_key", "f.txt")
 }
 
 func TestQdrantTrailingSlashTrimmed(t *testing.T) {
@@ -255,11 +265,15 @@ func TestQdrantHTTPErrorsSurface(t *testing.T) {
 	if _, err := qi.SearchVectors(context.Background(), "acme", "", []float32{1}, 3); err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
 		t.Errorf("search error: %v", err)
 	}
-	chunks := []repository.Chunk{{ID: 1, ObjectID: 9, Embedding: []float32{1}}}
-	if err := qi.UpsertObjectChunks(context.Background(), 9, chunks); err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
+	chunks := []repository.Chunk{{
+		ID: 1, ObjectID: 9, TenantID: "acme", Bucket: "docs", ObjectKey: "f.txt",
+		Embedding: []float32{1}, Dim: 1,
+	}}
+	ref := qdrantTestRef("acme", "docs", "f.txt", 9)
+	if err := qi.UpsertScopedObjectChunks(context.Background(), ref, chunks); err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
 		t.Errorf("upsert error: %v", err)
 	}
-	if err := qi.DeleteObjectChunks(context.Background(), 9); err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
+	if err := qi.DeleteScopedObjectChunks(context.Background(), ref); err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
 		t.Errorf("delete error: %v", err)
 	}
 }
@@ -281,8 +295,11 @@ func TestQdrantUpsertPutErrorSurfaces(t *testing.T) {
 	defer srv.Close()
 	qi := NewQdrantIndex(QdrantOptions{BaseURL: srv.URL, Collection: "chunks"})
 
-	chunks := []repository.Chunk{{ID: 1, ObjectID: 9, Embedding: []float32{1}}}
-	err := qi.UpsertObjectChunks(context.Background(), 9, chunks)
+	chunks := []repository.Chunk{{
+		ID: 1, ObjectID: 9, TenantID: "acme", Bucket: "docs", ObjectKey: "f.txt",
+		Embedding: []float32{1}, Dim: 1,
+	}}
+	err := qi.UpsertScopedObjectChunks(context.Background(), qdrantTestRef("acme", "docs", "f.txt", 9), chunks)
 	if err == nil || !strings.Contains(err.Error(), "qdrant http 500") {
 		t.Fatalf("upsert PUT error not surfaced: %v", err)
 	}

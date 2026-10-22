@@ -43,7 +43,9 @@ func (f *fakeChunkRepo) ListObjects(_ context.Context, tenant, bucket, _, _ stri
 		}
 		if !seen[c.ObjectID] {
 			seen[c.ObjectID] = true
-			objs = append(objs, repository.Object{ID: c.ObjectID})
+			objs = append(objs, repository.Object{
+				ID: c.ObjectID, TenantID: c.TenantID, Bucket: c.Bucket, Key: c.ObjectKey,
+			})
 		}
 	}
 	return repository.ListPage{Objects: objs}, nil

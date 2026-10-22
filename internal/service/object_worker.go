@@ -70,8 +70,13 @@ func (s *FileService) QuarantineObjectByID(ctx context.Context, objectID int64, 
 	if err := s.preflightQuota(ctx, obj.TenantID, 0, 0); err != nil {
 		return err
 	}
-	if s.chunkCleaner != nil && !IsDeleteMarker(obj) {
-		if err := s.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
+	return s.quarantineLoadedObject(ctx, obj, objectID, signature)
+}
+
+func (s *FileService) quarantineLoadedObject(ctx context.Context, obj repository.Object, objectID int64, signature string) error {
+	if !IsDeleteMarker(obj) {
+		ref := access.ChunkRef{TenantID: obj.TenantID, Bucket: obj.Bucket, Key: obj.Key, ObjectID: objectID}
+		if err := s.cleanObjectChunks(ctx, obj, ref); err != nil {
 			s.logger.Warn("chunk cleanup on quarantine failed", "object_id", obj.ID, "err", err)
 		}
 	}

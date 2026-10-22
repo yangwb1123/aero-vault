@@ -9,6 +9,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
@@ -59,12 +60,13 @@ func TestQdrantIntegration(t *testing.T) {
 	}
 
 	// 2. Upsert two chunks with known embeddings.
+	ref := access.ChunkRef{TenantID: "default", Bucket: "default", Key: "a.txt", ObjectID: 42}
 	chunks := []repository.Chunk{
 		{ID: 1, ObjectID: 42, TenantID: "default", Bucket: "default", ObjectKey: "a.txt", Seq: 0, Content: "near", Embedding: []float32{1, 0, 0}, Dim: dim, EmbedModel: "test"},
 		{ID: 2, ObjectID: 42, TenantID: "default", Bucket: "default", ObjectKey: "a.txt", Seq: 1, Content: "far", Embedding: []float32{0, 1, 0}, Dim: dim, EmbedModel: "test"},
 	}
-	if err := idx.UpsertObjectChunks(ctx, 42, chunks); err != nil {
-		t.Fatalf("UpsertObjectChunks: %v", err)
+	if err := idx.UpsertScopedObjectChunks(ctx, ref, chunks); err != nil {
+		t.Fatalf("UpsertScopedObjectChunks: %v", err)
 	}
 
 	// 3. Search: query close to [1,0,0] should rank "near" first.
@@ -80,8 +82,8 @@ func TestQdrantIntegration(t *testing.T) {
 	}
 
 	// 4. Delete chunks for object 42 and verify search returns nothing.
-	if err := idx.DeleteObjectChunks(ctx, 42); err != nil {
-		t.Fatalf("DeleteObjectChunks: %v", err)
+	if err := idx.DeleteScopedObjectChunks(ctx, ref); err != nil {
+		t.Fatalf("DeleteScopedObjectChunks: %v", err)
 	}
 	hits2, err := idx.SearchVectors(ctx, "default", "default", []float32{1, 0, 0}, 5)
 	if err != nil {

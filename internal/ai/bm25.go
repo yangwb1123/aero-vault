@@ -12,8 +12,8 @@ import (
 
 // BM25 is an in-memory BM25 index over chunks. It is seeded once from the
 // repository (BuildFromRepo) and then maintained incrementally as the indexer
-// fans out per-object chunk changes through the ChunkSink seam — no periodic
-// full-corpus rebuild. The index can be saved to and restored from an
+// fans out exact-scope per-object chunk changes through the ScopedChunkSink
+// seam — no periodic full-corpus rebuild. The index can be saved to and restored from an
 // external storage backend via Save / Load, so a cold start does not require
 // a full repository scan.
 //
@@ -69,47 +69,14 @@ func tokenize(text string) []string {
 }
 
 // BuildFromRepo refreshes the index from every chunk in the repository for the
-// given tenant. It replaces only that tenant's documents, preserving documents
-// already warmed for other tenants. It iterates all buckets the tenant owns and
-// paginates through all objects — not just the first 1000 in the "default"
-// bucket. Subsequent writes are kept current via the ChunkSink.
+// given tenant. It validates complete object/chunk facts, page scope and
+// pagination progress before replacing only that tenant's documents. Other
+// tenants are preserved; empty TenantIDs are rejected, never filled in.
 func (b *BM25) BuildFromRepo(ctx context.Context, repo repository.Repository, tenant string) error {
-	buckets, err := repo.ListBuckets(ctx, tenant)
+	all, err := collectTenantChunks(ctx, repo, tenant)
 	if err != nil {
 		return err
 	}
-	// Collect all chunks before taking the write lock so the index is
-	// unavailable for as short a window as possible.
-	const pageSize = 500
-	var all []repository.Chunk
-	for _, bucket := range buckets {
-		marker := ""
-		for {
-			page, err := repo.ListObjects(ctx, tenant, bucket, "", marker, pageSize)
-			if err != nil {
-				return err
-			}
-			for _, o := range page.Objects {
-				chunks, err := repo.ListChunksForObject(ctx, o.ID)
-				if err != nil {
-					return err
-				}
-				for _, chunk := range chunks {
-					if chunk.TenantID == "" {
-						chunk.TenantID = tenant
-					}
-					if chunk.TenantID == tenant {
-						all = append(all, chunk)
-					}
-				}
-			}
-			if !page.HasMore {
-				break
-			}
-			marker = page.NextMarker
-		}
-	}
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.removeTenantLocked(tenant)

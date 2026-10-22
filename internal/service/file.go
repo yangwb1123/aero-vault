@@ -66,10 +66,10 @@ type EventSink interface {
 	Publish(ctx context.Context, e repository.Event)
 }
 
-// ChunkCleaner is an optional hook called synchronously on hard delete, before
-// the repository row is removed, to clean up any secondary chunk index entries
-// (BM25, vector store, etc.). Non-fatal: a failure is logged but the hard
-// delete proceeds.
+// ChunkCleaner is the source-compatible registration hook for synchronous
+// cleanup before deleting object metadata. Configured cleaners must also
+// implement access.ScopedChunkCleaner; ID-only cleanup is never dispatched.
+// Failures are logged without blocking the object deletion.
 type ChunkCleaner interface {
 	DeleteObjectChunks(ctx context.Context, objectID int64) error
 }
@@ -176,13 +176,10 @@ func (s *FileService) WithEventSink(sink EventSink) *FileService {
 	return s
 }
 
-// WithChunkCleaner attaches a synchronous chunk-cleanup hook for hard deletes.
+// WithChunkCleaner attaches a synchronous chunk-cleanup hook. A true nil
+// clears it; incompatible or typed-nil configurations fault at scoped dispatch.
 func (s *FileService) WithChunkCleaner(cc ChunkCleaner) *FileService {
-	if cc == nil {
-		s.chunkCleaner = nil
-	} else {
-		s.chunkCleaner = cc
-	}
+	s.chunkCleaner = cc
 	return s
 }
 

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/storage"
 	"github.com/aero-vault/aero-vault/internal/telemetry"
@@ -15,7 +16,7 @@ import (
 
 // Job types emitted by the indexer's event bridge. Handlers for these are
 // registered against the jobs.Pool in main; see EncodeObjectID/DecodeObjectID
-// for the payload contract.
+// for the legacy payload contract.
 const (
 	JobIndexObject  = "index_object"
 	JobDeleteChunks = "delete_chunks"
@@ -32,13 +33,13 @@ type objectIDPayload struct {
 	ObjectID int64 `json:"object_id"`
 }
 
-// EncodeObjectID builds a job payload referencing an object.
+// EncodeObjectID builds a legacy job payload referencing an object.
 func EncodeObjectID(id int64) string {
 	b, _ := json.Marshal(objectIDPayload{ObjectID: id})
 	return string(b)
 }
 
-// DecodeObjectID parses an object-id job payload.
+// DecodeObjectID parses a legacy object-id job payload.
 func DecodeObjectID(payload string) (int64, error) {
 	var p objectIDPayload
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
@@ -53,7 +54,7 @@ func DecodeObjectID(payload string) (int64, error) {
 // Indexer turns object lifecycle events into searchable chunks.
 //
 //	created/updated → extract text → chunk → embed → InsertChunks
-//	deleted         → DeleteChunksForObject
+//	deleted         → delete exact-scope chunks
 //
 // It is started once per process; events arrive either from the in-process
 // event bus (immediate) or from a periodic catch-up poll against the
@@ -69,6 +70,8 @@ type Indexer struct {
 	logger    *slog.Logger
 	queue     Enqueuer
 	sinks     []ChunkSink
+	scoped    []ScopedChunkSink
+	sinkFault error
 	tagger    ObjectTagger
 
 	pollEvery time.Duration
@@ -90,10 +93,12 @@ func (ix *Indexer) WithQueue(q Enqueuer) *Indexer {
 }
 
 // WithChunkSink registers a write-through sink that is notified after the
-// repository's chunk rows change. May be called multiple times; every
-// registered sink receives every upsert/delete.
+// repository's chunk rows change. May be called multiple times; every valid
+// scoped sink receives every upsert/delete. Invalid registrations latch a
+// configuration fault checked by ValidateChunkSinks and before protected work.
 func (ix *Indexer) WithChunkSink(s ChunkSink) *Indexer {
 	ix.sinks = append(ix.sinks, s)
+	ix.registerChunkSink(s)
 	return ix
 }
 
@@ -181,173 +186,126 @@ func (ix *Indexer) handle(ctx context.Context, e repository.Event) {
 	}
 }
 
-func (ix *Indexer) processEvent(ctx context.Context, e repository.Event) error {
-	switch e.Type {
-	case repository.EventCreated:
-		if e.ObjectID == nil {
-			return nil
-		}
-		return ix.dispatch(ctx, JobIndexObject, e.TenantID, *e.ObjectID,
-			func() error { return ix.IndexObjectByID(ctx, *e.ObjectID) })
-	case repository.EventDeleted:
-		if e.ObjectID == nil {
-			return nil
-		}
-		return ix.dispatch(ctx, JobDeleteChunks, e.TenantID, *e.ObjectID,
-			func() error { return ix.DeleteObjectChunks(ctx, *e.ObjectID) })
-	case repository.EventAccessed:
-		// no-op (used only for audit)
-	}
-	return nil
-}
-
-// dispatch enqueues a job for the worker pool when a queue is configured,
-// otherwise runs the work inline (original behavior). The dedupe key collapses
-// repeated events for the same object into a single live job.
-func (ix *Indexer) dispatch(
-	ctx context.Context,
-	jobType, tenant string,
-	objectID int64,
-	inline func() error,
-) error {
-	if ix.queue == nil {
-		return inline()
-	}
-	job := repository.Job{
-		TenantID:  tenant,
-		Type:      jobType,
-		Payload:   EncodeObjectID(objectID),
-		DedupeKey: fmt.Sprintf("%s:%d", jobType, objectID),
-	}
-	if _, _, err := ix.queue.Enqueue(ctx, job); err != nil {
-		return fmt.Errorf("enqueue %s for object %d: %w", jobType, objectID, err)
-	}
-	return nil
-}
-
-// DeleteObjectChunks removes all chunks for an object. Used as the
-// delete_chunks job handler.
-func (ix *Indexer) DeleteObjectChunks(ctx context.Context, objectID int64) error {
-	if err := ix.repo.DeleteChunksForObject(ctx, objectID); err != nil {
-		return err
-	}
-	for _, s := range ix.sinks {
-		if err := s.DeleteObjectChunks(ctx, objectID); err != nil {
-			return fmt.Errorf("sink delete chunks %d: %w", objectID, err)
-		}
-	}
-	return nil
-}
-
 // ReindexStale re-indexes objects whose chunks were embedded by a model other
 // than the current one (e.g. after the embedder was changed), so the corpus
-// stays consistent with the active model. Returns the count re-indexed.
+// stays consistent with the active model. Only genuinely indexed objects are
+// counted; skips do not inflate the result and any fault is returned.
 func (ix *Indexer) ReindexStale(ctx context.Context, tenant string, limit int) (int, error) {
 	if ix.embedder == nil {
 		return 0, fmt.Errorf("reindex: no embedder configured")
+	}
+	if err := ix.ValidateChunkSinks(); err != nil {
+		return 0, err
 	}
 	ids, err := ix.repo.ListObjectIDsToReindex(ctx, tenant, ix.embedder.Name(), limit)
 	if err != nil {
 		return 0, err
 	}
 	n := 0
+	var firstFault error
 	for _, id := range ids {
-		if err := ix.IndexObjectByID(ctx, id); err != nil {
+		indexed, err := ix.indexObjectByID(ctx, id, tenant, nil)
+		if err != nil {
 			ix.logger.Warn("reindex stale object", "object_id", id, "err", err)
+			if firstFault == nil {
+				firstFault = err
+			}
 			continue
 		}
-		n++
+		if indexed {
+			n++
+		}
 	}
 	if n > 0 {
 		ix.logger.Info("reindexed stale objects", "count", n, "model", ix.embedder.Name())
+	}
+	if firstFault != nil {
+		return n, fmt.Errorf("reindex stale: %w", firstFault)
 	}
 	return n, nil
 }
 
 // IndexObjectByID extracts text from an object, chunks it, embeds the chunks,
 // and replaces the object's stored chunks. It is idempotent (it deletes old
-// chunks first) so retries are safe. Unsupported or empty content is a no-op
+// chunks first) so retries are safe. Unsupported or empty content is a skip
 // success — only genuine failures (storage, embed, persistence) return errors,
 // which the job queue will retry.
 func (ix *Indexer) IndexObjectByID(ctx context.Context, objectID int64) error {
+	_, err := ix.indexObjectByID(ctx, objectID, "", nil)
+	return err
+}
+
+func (ix *Indexer) indexObjectByID(ctx context.Context, objectID int64, tenant string, expected *access.ChunkRef) (bool, error) {
+	if err := ix.ValidateChunkSinks(); err != nil {
+		return false, err
+	}
 	if ix.embedder == nil {
-		return fmt.Errorf("index: no embedder configured")
+		return false, fmt.Errorf("index: no embedder configured")
+	}
+	if objectID <= 0 {
+		return false, fmt.Errorf("index: object ID must be positive")
 	}
 	obj, err := ix.repo.GetObjectByID(ctx, objectID)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
-			return nil
+			return false, ix.cleanupVanishedObject(ctx, objectID, tenant, expected)
 		}
-		return fmt.Errorf("get object %d: %w", objectID, err)
+		return false, fmt.Errorf("get object %d: %w", objectID, err)
+	}
+	ref, err := refFromObject(obj)
+	if err != nil {
+		return false, err
+	}
+	if tenant != "" && ref.TenantID != tenant {
+		return false, refConflict(ref, "object tenant")
+	}
+	if expected != nil && ref != *expected {
+		return false, refConflict(ref, "expected ref")
 	}
 	current, err := ix.prepareCurrentObject(ctx, obj)
-	if err != nil {
-		return err
+	if err != nil || !current {
+		return false, err
 	}
-	if !current {
-		return nil
-	}
+	return ix.indexLoadedObject(ctx, obj, ref)
+}
+
+func (ix *Indexer) indexLoadedObject(ctx context.Context, obj repository.Object, ref access.ChunkRef) (bool, error) {
 	rc, _, err := ix.store.Get(ctx, obj.StorageKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrSSECustomerKeyRequired) {
 			telemetry.IncIndexerSkip(ctx, "unsupported")
 			ix.logger.Info("indexer: skipping SSE-C object", "key", obj.Key)
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("storage get %q: %w", obj.StorageKey, err)
+		return false, fmt.Errorf("storage get %q: %w", obj.StorageKey, err)
 	}
 	defer rc.Close()
 
 	text, err := ix.extractor.Extract(ctx, obj.ContentType, rc)
 	text, err = ix.applyPII(ctx, obj, text, err)
 	if err != nil {
-		return ix.handleExtractError(obj.Key, err)
+		return false, ix.handleExtractError(obj.Key, err)
 	}
 	pieces := ix.chunker.Chunk(text)
 	if len(pieces) == 0 {
 		telemetry.IncIndexerSkip(ctx, "empty")
-		return nil
+		return false, nil
 	}
 	vectors, err := ix.embedder.Embed(ctx, pieces)
 	if err != nil {
-		return fmt.Errorf("embed %q: %w", obj.Key, err)
+		return false, fmt.Errorf("embed %q: %w", obj.Key, err)
 	}
 	if err := ix.repo.DeleteChunksForObject(ctx, obj.ID); err != nil {
 		ix.logger.Warn("indexer: delete old chunks", "id", obj.ID, "err", err)
 	}
 	chunks := ix.buildChunks(obj, pieces, vectors)
 	if err := ix.repo.InsertChunks(ctx, chunks); err != nil {
-		return fmt.Errorf("insert chunks %d: %w", obj.ID, err)
+		return false, fmt.Errorf("insert chunks %d: %w", obj.ID, err)
 	}
-	if err := ix.pushToSinks(ctx, obj); err != nil {
-		return err
+	if err := ix.pushToSinks(ctx, ref, chunks); err != nil {
+		return false, err
 	}
 	ix.logger.Info("indexed", "tenant", obj.TenantID, "key", obj.Key, "chunks", len(chunks), "model", ix.embedder.Name())
-	return nil
-}
-
-func (ix *Indexer) prepareCurrentObject(ctx context.Context, obj repository.Object) (bool, error) {
-	current, err := ix.repo.GetObject(ctx, obj.TenantID, obj.Bucket, obj.Key)
-	if errors.Is(err, repository.ErrNotFound) {
-		return false, ix.DeleteObjectChunks(ctx, obj.ID)
-	}
-	if err != nil {
-		return false, err
-	}
-	if current.ID != obj.ID {
-		return false, ix.DeleteObjectChunks(ctx, obj.ID)
-	}
-	versions, err := ix.repo.ListObjectVersions(ctx, obj.TenantID, obj.Bucket, obj.Key)
-	if err != nil {
-		return false, err
-	}
-	for _, version := range versions {
-		if version.ID != current.ID {
-			if err := ix.DeleteObjectChunks(ctx, version.ID); err != nil {
-				return false, err
-			}
-		}
-	}
 	return true, nil
 }
 
@@ -401,19 +359,4 @@ func (ix *Indexer) buildChunks(obj repository.Object, pieces []string, vectors [
 		chunks = append(chunks, c)
 	}
 	return chunks
-}
-
-func (ix *Indexer) pushToSinks(ctx context.Context, obj repository.Object) error {
-	if len(ix.sinks) > 0 {
-		rows, err := ix.repo.ListChunksForObject(ctx, obj.ID)
-		if err != nil {
-			return fmt.Errorf("list chunks for sinks %d: %w", obj.ID, err)
-		}
-		for _, s := range ix.sinks {
-			if err := s.UpsertObjectChunks(ctx, obj.ID, rows); err != nil {
-				return fmt.Errorf("sink upsert chunks %d: %w", obj.ID, err)
-			}
-		}
-	}
-	return nil
 }

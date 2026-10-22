@@ -37,8 +37,14 @@ func (s *FileService) CreateDeleteMarker(
 	} else if err := s.authorizePath(ctx, access.ActionDelete, tenant, bucket, key); err != nil {
 		return repository.Object{}, err
 	}
+	return s.insertDeleteMarker(ctx, tenant, bucket, key, current, currentErr == nil)
+}
+
+func (s *FileService) insertDeleteMarker(
+	ctx context.Context, tenant, bucket, key string, current repository.Object, hasCurrent bool,
+) (repository.Object, error) {
 	metadata := map[string]string{deleteMarkerMetadataKey: "true"}
-	if currentErr == nil {
+	if hasCurrent {
 		metadata = metadataWithOwner(metadata, ObjectOwner(current))
 	}
 	marker, err := s.repo.InsertDeleteMarker(ctx, repository.Object{
@@ -50,8 +56,9 @@ func (s *FileService) CreateDeleteMarker(
 	if err != nil {
 		return repository.Object{}, err
 	}
-	if currentErr == nil && s.chunkCleaner != nil {
-		if err := s.chunkCleaner.DeleteObjectChunks(ctx, current.ID); err != nil {
+	if hasCurrent {
+		ref := access.ChunkRef{TenantID: tenant, Bucket: bucket, Key: key, ObjectID: current.ID}
+		if err := s.cleanObjectChunks(ctx, current, ref); err != nil {
 			s.logger.Warn("chunk cleanup on delete marker failed", "object_id", current.ID, "err", err)
 		}
 	}

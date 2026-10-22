@@ -235,3 +235,32 @@
 - 唯一一次本 RUN `local-race.py local` exit 0；完整 repository／spaces／events `-race -count=1 -timeout 300s -json`、无 run／short：145.909／1.007／26.970s，248 顶层 PASS，无 failed／unfinished、无源码漂移；code SHA=`b792dc80e38e1a2969639cb94fe44a7121c56da129d9f08012e7705330352250`。所有 Go 子进程固定 GOMAXPROCS=4 GOFLAGS=-p=1、umask 022。
 - `scope.py verify` exit 0，准确六路径、旧前缀保留。证据在本 RUN `local-implementation/` 与 `local-full-race/attempt-001/`；这不是宏门禁或 accepted，不用 P1A 旧成功抵扣。
 - 返回后仍待新 DeepSeek/max 只读复核、控制器同源复核／原七宏门禁及新 Codex/max 独立验收。真实 PG 未运行（只有静态／rebind／synthetic cause），真实驱动 Close 故障未复现（仅 scanner seam）；外部／生产／业务 E2E 未验。仍只是未装配准备能力，不是 Space 权限或全 P1B 交付，无提交推送部署；截止仍为 2026-10-19T04:50:22Z。
+
+---
+
+## SPACE-P1B Wave-1：scoped chunk cleanup / AI sinks / jobs 合同（2026-10-21 · 文档阶段）
+
+本节仅在末尾追加；上述 Sprint、旧失败／成功及未验边界全部作为历史保留，不抵扣本片证据，不重做 P1A／binding-probe，也不扩大为完整 B 或 P2 许可。
+
+### 本阶段与后续精确范围
+
+- 本阶段只新增 `docs/requirements/personal-team-space-runtime-deny-bound-v1.spec.md` 并追加本文，Go／测试／SQL 均不修改，不运行 Go 测试。完整 B 是该 spec §2 的后续目标，**不是本片实现范围**。
+- 本 RUN 为 `p1b-deny-bound-impl-20261021T122830Z`；精确选择见其 `scheduler/plan-revised.md` 的 `WAVE1_A` 18 条＋`WAVE1_B` 17 条，以及新 spec §3 的逐路径表。FOUNDATION 六条为 A 子集，不另增路径；其余 147 候选全部排除。本 docs writer 只有 `work/allow-docs.json` 的两文档权限。
+- 先通过 runner docs checkpoint，再进入后续 Go 实施；A FOUNDATION 冻结复制后 B 才开始，B API/source checkpoint 后 A 才做 `cmd/server/ai.go` 最小接缝。不改 `main.go`，不宣称全局启动 fatal/preflight 已完成。
+- 追加前历史前缀为 36,493 bytes，SHA256 `aa826fe4031ec033c84f6e9918884ee0b9768e2af60e260a607cfd422cd33258`；checkpoint 必须保留此前缀逐字节不变。此记录仅为文件检查基线，不是工程验收。
+
+### 后续实现固定合同（当前全部待实施）
+
+- `access.ChunkRef` 恰为 TenantID/Bucket/Key string、ObjectID int64；`ValidateChunkRef`、`ScopedChunkCleaner.DeleteScopedObjectChunks` 与 AI `ScopedChunkSink` 的准确 API 见 spec §4。无 VersionID/generation、无授权 grant、不反解析 StorageKey/@v。
+- service/reconcile 各实际对象／版本行只走 scoped cleaner；true nil 仍为 AI-off 清除配置，配置 legacy-only/typed-nil 为 fault、零 ID-only fallback。同步失败仍原 warn-and-continue；保护、Blob→DB、配额、用量、审计／Outbox／事件和既有 delete-provider 语义不变。
+- Indexer 只用权威对象／完整一致 chunks／精确持久事件／已持久 v2 来源；配置 sink fault 先返回，生产只走 scoped。canonical reread 异常空/mixed 不当 clear，无 sink 正常索引零 reread；ReindexStale 只数 indexed，不吞 fault。
+- Qdrant 删除四字段 AND：tenant_id/bucket/object_id/object_key；全部输入先校验再 Delete→PUT。旧缺 scope points 保留，不称已清理。BM25 同锁先验后改，warmup 完整 staging 后替换 tenant；本片不装 Coverage/P0/P1。
+- `delete_chunks` v2 持久 schema_version/object_id/tenant_id/bucket/key/event_id 与版本化无歧义 scope+event dedupe，源对象/chunks/Event 消失后仍可精确重试；v1 无证据 unresolved，经原有限 retry→failed，不伪成功。严格 Event JSON reader 和 AI 私有精确复读为必要前置；不改 queue schema／预算／fencing 或外部事实合同。
+- **不安装 Space BindingReader/CoverageReader/ResourceBoundary gate；not a complete B / not production / no Space runtime deny-bound。** REST/Manager/分享、Search/Chat/Agent、通知/transport/SSE/thumbnail、aggregation/replay、其他 workers/timers 与完整 root 接线均 deferred，不能用 scoped 身份检查冒充交付。
+
+### 待执行门槛与未验证边界
+
+- [ ] runner docs checkpoint：准确两文档、完整历史前缀、其他项目文件不变、新 Go 仍不存在；未通过不得动 Go。
+- [ ] 依 spec §11–12 添加／保留正反例及真实故障注入，gofmt 后普通／race、integration 类型检查、原 cmd/server 包；保留磁盘 SQLite＋完整 Migrate＋local FS、旧断言与原预算。
+- [ ] 合并同源的 make check → python3 cli.py accept → 原完整 make test-race，以及保留的 Web 三步、diff/scope/hash 守卫与独立只读验收，由 controller 后续实测；本 writer 不执行或预填 PASS。
+- **本阶段未实现、未测试；没有任何当前工程门禁通过声明。** 真实 PG/Qdrant、外部身份／存储／KMS、代理/HTTP2、生产、压力/RSS、登录后业务 E2E 均未验证，费用 unknown；无部署、提交或生产暴露许可。

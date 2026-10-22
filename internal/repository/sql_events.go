@@ -87,7 +87,11 @@ func scanEvents(rows *sql.Rows) ([]Event, error) {
 			e.ObjectID = &v
 		}
 		e.CreatedAt = createdT.Time
-		e.Payload, _ = unmarshalKV(payload)
+		decoded, err := unmarshalKV(payload)
+		if err != nil {
+			return nil, err
+		}
+		e.Payload = decoded
 		out = append(out, e)
 	}
 	return out, rows.Err()

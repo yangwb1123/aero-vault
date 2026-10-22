@@ -28,16 +28,7 @@ func (s *FileService) hardDeleteObjectWithVersions(
 	ctx context.Context, obj repository.Object, tenant, bucket, key string,
 	versions []repository.Object, refs *deleteRefs,
 ) error {
-	for _, version := range versions {
-		if IsDeleteMarker(version) {
-			continue
-		}
-		if s.chunkCleaner != nil {
-			if err := s.chunkCleaner.DeleteObjectChunks(ctx, version.ID); err != nil {
-				s.logger.Warn("chunk cleanup on hard delete failed", "key", key, "version", version.VersionID, "err", err)
-			}
-		}
-	}
+	s.cleanHardDeleteChunks(ctx, versions, tenant, bucket, key)
 	deletedKeys := make(map[string]struct{}, len(versions))
 	for _, version := range versions {
 		if IsDeleteMarker(version) {
@@ -96,8 +87,9 @@ func (s *FileService) softDeleteObjectWithRefs(
 	// a safety net when the EventBus subscriber (Indexer) drops the deletion
 	// event due to buffer overflow. See docs/requirements/expansion-v144.md
 	// direction 1, Phase 2.
-	if s.chunkCleaner != nil && !IsDeleteMarker(obj) {
-		if err := s.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
+	if !IsDeleteMarker(obj) {
+		ref := access.ChunkRef{TenantID: tenant, Bucket: bucket, Key: key, ObjectID: obj.ID}
+		if err := s.cleanObjectChunks(ctx, obj, ref); err != nil {
 			s.logger.Warn("chunk cleanup on soft delete failed", "key", key, "err", err)
 		}
 	}
@@ -250,6 +242,7 @@ func (s *FileService) AuthorizeDelete(ctx context.Context, tenant, bucket, key s
 // versions intact. If it was current, the repository promotes the newest
 // remaining version.
 func (s *FileService) DeleteVersion(ctx context.Context, tenant, bucket, key, versionID string) error {
+	tenant, bucket = defaults(tenant, bucket)
 	obj, err := s.objectVersion(ctx, tenant, bucket, key, versionID)
 	if err != nil {
 		return err
@@ -270,19 +263,26 @@ func (s *FileService) DeleteVersion(ctx context.Context, tenant, bucket, key, ve
 		return err
 	}
 	wasCurrent := len(versions) > 0 && versions[0].ID == obj.ID
-	if s.chunkCleaner != nil && !IsDeleteMarker(obj) {
-		if err := s.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
-			s.logger.Warn("chunk cleanup on version delete failed", "key", key, "version", versionID, "err", err)
-		}
+	ref := access.ChunkRef{TenantID: tenant, Bucket: bucket, Key: key, ObjectID: obj.ID}
+	if err := s.deleteVersionData(ctx, obj, ref, versionID); err != nil {
+		return err
 	}
+	return s.finishVersionDelete(ctx, obj, wasCurrent)
+}
+
+func (s *FileService) deleteVersionData(ctx context.Context, obj repository.Object, ref access.ChunkRef, versionID string) error {
 	if !IsDeleteMarker(obj) {
+		if err := s.cleanObjectChunks(ctx, obj, ref); err != nil {
+			s.logger.Warn("chunk cleanup on version delete failed", "key", ref.Key, "version", versionID, "err", err)
+		}
 		if err := s.store.Delete(ctx, obj.StorageKey); err != nil {
 			return fmt.Errorf("storage delete %q: %w", obj.StorageKey, err)
 		}
 	}
-	if err := s.repo.DeleteObjectVersion(ctx, obj.TenantID, obj.Bucket, obj.Key, obj.VersionID); err != nil {
-		return err
-	}
+	return s.repo.DeleteObjectVersion(ctx, obj.TenantID, obj.Bucket, obj.Key, obj.VersionID)
+}
+
+func (s *FileService) finishVersionDelete(ctx context.Context, obj repository.Object, wasCurrent bool) error {
 	bytes, objects := countedObjectUsage([]repository.Object{obj})
 	if _, err := s.addTenantUsage(ctx, obj.TenantID, UsageObjectDelete, -bytes, -objects); err != nil {
 		return fmt.Errorf("record version-delete usage: %w", err)

@@ -21,12 +21,14 @@ type testEnv struct {
 	repo  repository.Repository
 	store storage.Storage
 	svc   *service.FileService
+	dsn   string
 }
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	dir := t.TempDir()
-	repo, err := repository.Open(context.Background(), "sqlite", "file:"+filepath.Join(dir, "test.db"))
+	dsn := "file:" + filepath.Join(dir, "test.db")
+	repo, err := repository.Open(context.Background(), "sqlite", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +41,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 	svc := service.NewFileService(store, repo, nil)
-	return &testEnv{repo: repo, store: store, svc: svc}
+	return &testEnv{repo: repo, store: store, svc: svc, dsn: dsn}
 }
 
 // putObject writes an object through the service (auto-creates the bucket).
@@ -730,10 +732,23 @@ func TestIndexerWithPIIRedactsChunks(t *testing.T) {
 	}
 }
 
-// recordingEnqueuer captures enqueued jobs to verify the event->job bridge.
-type recordingEnqueuer struct{ jobs []repository.Job }
+// recordingEnqueuer captures enqueued jobs and, when a repository is set,
+// forwards them to the durable queue exactly like production.
+type recordingEnqueuer struct {
+	jobs []repository.Job
+	repo repository.Repository
+}
 
-func (r *recordingEnqueuer) Enqueue(_ context.Context, j repository.Job) (int64, bool, error) {
+func (r *recordingEnqueuer) Enqueue(ctx context.Context, j repository.Job) (int64, bool, error) {
+	if r.repo != nil {
+		id, deduped, err := r.repo.EnqueueJob(ctx, j)
+		if err != nil {
+			return 0, false, err
+		}
+		j.ID = id
+		r.jobs = append(r.jobs, j)
+		return id, deduped, nil
+	}
 	r.jobs = append(r.jobs, j)
 	return int64(len(r.jobs)), false, nil
 }
@@ -778,14 +793,23 @@ func TestIndexerRunBridgesEventsToQueue(t *testing.T) {
 	env := newTestEnv(t)
 	obj := env.putObject(t, "evt.txt", "text/plain", "event bridged content")
 
-	enq := &recordingEnqueuer{}
+	enq := &recordingEnqueuer{repo: env.repo}
 	ix := NewIndexer(env.repo, env.store, NewDefaultExtractor(), NewChunker(), NewHashEmbedder(64), nil).
 		WithQueue(enq)
 
-	// Feed a created event through a closed channel after one send so Run exits.
-	sub := make(chan repository.Event, 1)
+	// Feed a persisted created event through a closed channel after one send so Run exits.
 	id := obj.ID
-	sub <- repository.Event{ID: 9999, TenantID: testTenant, Type: repository.EventCreated, ObjectID: &id}
+	event := repository.Event{TenantID: testTenant, Bucket: testBucket, Key: obj.Key, Type: repository.EventCreated, ObjectID: &id}
+	eventID, err := env.repo.InsertEvent(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.ID = eventID
+	if err := env.repo.MarkEventConsumed(context.Background(), eventID); err != nil {
+		t.Fatal(err)
+	}
+	sub := make(chan repository.Event, 1)
+	sub <- event
 	close(sub)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -821,9 +845,18 @@ func TestIndexerRunInlineProcessesEvent(t *testing.T) {
 	ix := NewIndexer(env.repo, env.store, NewDefaultExtractor(), NewChunker(), NewHashEmbedder(64), nil)
 	// No queue -> inline indexing on event.
 
-	sub := make(chan repository.Event, 1)
 	id := obj.ID
-	sub <- repository.Event{ID: 1, TenantID: testTenant, Type: repository.EventCreated, ObjectID: &id}
+	event := repository.Event{TenantID: testTenant, Bucket: testBucket, Key: obj.Key, Type: repository.EventCreated, ObjectID: &id}
+	eventID, err := env.repo.InsertEvent(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.ID = eventID
+	if err := env.repo.MarkEventConsumed(context.Background(), eventID); err != nil {
+		t.Fatal(err)
+	}
+	sub := make(chan repository.Event, 1)
+	sub <- event
 	close(sub)
 	ix.Run(context.Background(), sub)
 

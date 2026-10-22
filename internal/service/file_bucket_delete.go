@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
@@ -67,10 +68,9 @@ func (s *FileService) deleteBucketData(ctx context.Context, tenant, bucket strin
 		if IsDeleteMarker(obj) {
 			continue
 		}
-		if s.chunkCleaner != nil {
-			if err := s.chunkCleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
-				s.logger.Warn("chunk cleanup on bucket delete failed", "key", obj.Key, "err", err)
-			}
+		ref := access.ChunkRef{TenantID: tenant, Bucket: bucket, Key: obj.Key, ObjectID: obj.ID}
+		if err := s.cleanObjectChunks(ctx, obj, ref); err != nil {
+			s.logger.Warn("chunk cleanup on bucket delete failed", "key", obj.Key, "err", err)
 		}
 		if _, deleted := deletedKeys[obj.StorageKey]; deleted {
 			continue

@@ -3,9 +3,9 @@
 // QdrantIndex offloads retrieval to a dedicated Qdrant vector store for very
 // large deployments (ROADMAP #1). It is the second consumer of the two AI seams:
 // it implements the READ seam (VectorIndex.SearchVectors) and the WRITE seam
-// (ChunkSink.UpsertObjectChunks / DeleteObjectChunks), so chunks written by the
-// indexer flow into Qdrant and queries flow back out — with NO change to Search
-// or the indexer. It speaks Qdrant's REST API directly over net/http +
+// (ScopedChunkSink), so chunks written by the indexer flow into Qdrant and
+// queries flow back out. The legacy ChunkSink methods remain for source
+// compatibility but refuse ID-only writes without issuing HTTP. It speaks Qdrant's REST API directly over net/http +
 // encoding/json (stdlib only; no client library), exactly like HTTPEmbedder and
 // HTTPLLM.
 //
@@ -236,51 +236,18 @@ type qdrantDeleteReq struct {
 	Filter qdrantFilter `json:"filter"`
 }
 
-// UpsertObjectChunks replaces everything Qdrant holds for this object with
-// exactly these chunks. Because a re-index can change the chunk-ID set, it first
-// deletes all existing points for object_id (so stale points can't linger), then
-// upserts the new points (id = chunk.ID, vector = chunk.Embedding, payload = the
-// chunk fields). Chunks with empty embeddings are skipped. The upsert uses
-// ?wait=true so the write is durable before returning (the durable indexer job
-// retries on error).
-func (q *QdrantIndex) UpsertObjectChunks(ctx context.Context, objectID int64, chunks []repository.Chunk) error {
-	if err := q.DeleteObjectChunks(ctx, objectID); err != nil {
-		return err
-	}
-	points := make([]qdrantPoint, 0, len(chunks))
-	for _, c := range chunks {
-		if len(c.Embedding) == 0 {
-			continue
-		}
-		points = append(points, qdrantPoint{
-			ID:     c.ID,
-			Vector: c.Embedding,
-			Payload: chunkPayload{
-				TenantID:   c.TenantID,
-				Bucket:     c.Bucket,
-				ObjectID:   c.ObjectID,
-				ObjectKey:  c.ObjectKey,
-				Seq:        c.Seq,
-				Content:    c.Content,
-				Dim:        c.Dim,
-				EmbedModel: c.EmbedModel,
-			},
-		})
-	}
-	if len(points) == 0 {
-		// Nothing to write; the delete above already purged stale points.
-		return nil
-	}
-	return q.do(ctx, http.MethodPut, "/points", "wait=true", qdrantUpsertReq{Points: points}, nil)
+// UpsertObjectChunks is retained only for source compatibility. Production
+// writes must use UpsertScopedObjectChunks with a complete ChunkRef; this
+// legacy entry point never issues HTTP and never falls back to object-id scope.
+func (q *QdrantIndex) UpsertObjectChunks(context.Context, int64, []repository.Chunk) error {
+	return fmt.Errorf("qdrant: explicit scoped chunk reference required for upsert")
 }
 
-// DeleteObjectChunks removes every point for this object via a delete-by-filter
-// on object_id.
-func (q *QdrantIndex) DeleteObjectChunks(ctx context.Context, objectID int64) error {
-	body := qdrantDeleteReq{Filter: qdrantFilter{
-		Must: []qdrantMatch{{Key: "object_id", Match: qdrantMatchVal{Value: objectID}}},
-	}}
-	return q.do(ctx, http.MethodPost, "/points/delete", "wait=true", body, nil)
+// DeleteObjectChunks is retained only for source compatibility. Production
+// deletes must use DeleteScopedObjectChunks with a complete ChunkRef; this
+// legacy entry point never issues HTTP.
+func (q *QdrantIndex) DeleteObjectChunks(context.Context, int64) error {
+	return fmt.Errorf("qdrant: explicit scoped chunk reference required for delete")
 }
 
 // do performs one Qdrant REST call: it encodes reqBody as JSON, sets the

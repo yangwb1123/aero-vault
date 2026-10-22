@@ -3,10 +3,9 @@ package main
 import (
 	"context"
 	"log/slog"
-
-	"github.com/aero-vault/aero-vault/internal/access"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
 	"github.com/aero-vault/aero-vault/internal/config"
 	"github.com/aero-vault/aero-vault/internal/events"
@@ -122,6 +121,10 @@ func buildIndexer(ctx context.Context, cfg *config.Config, logger *slog.Logger, 
 		logger.Info("pii scan enabled", "redact", cfg.AI.PIIRedact)
 	}
 	svc.WithChunkCleaner(indexer)
+	if err := indexer.ValidateChunkSinks(); err != nil {
+		logger.Error("indexer disabled (invalid chunk sink configuration)", "err", err)
+		return
+	}
 	registerIndexerJobs(jobReg, jobQueue, indexer)
 	idxSub, _ := bus.Subscribe()
 	systemCtx := access.SystemContext(ctx, "*")
@@ -136,18 +139,10 @@ func registerIndexerJobs(jobReg *jobs.Registry, jobQueue *jobs.Queue, indexer *a
 		return
 	}
 	jobReg.Register(ai.JobIndexObject, func(ctx context.Context, job repository.Job) error {
-		id, err := ai.DecodeObjectID(job.Payload)
-		if err != nil {
-			return err
-		}
-		return indexer.IndexObjectByID(access.SystemContext(ctx, job.TenantID), id)
+		return indexer.ExecuteChunkJob(access.SystemContext(ctx, job.TenantID), job)
 	})
 	jobReg.Register(ai.JobDeleteChunks, func(ctx context.Context, job repository.Job) error {
-		id, err := ai.DecodeObjectID(job.Payload)
-		if err != nil {
-			return err
-		}
-		return indexer.DeleteObjectChunks(access.SystemContext(ctx, job.TenantID), id)
+		return indexer.ExecuteChunkJob(access.SystemContext(ctx, job.TenantID), job)
 	})
 	indexer.WithQueue(jobQueue)
 }

@@ -32,6 +32,21 @@ func hardDeleteKey(
 	if len(versions) == 0 {
 		versions = []repository.Object{obj}
 	}
+	if err := checkDeleteVersionsProtection(ctx, repo, versions); err != nil {
+		return err
+	}
+	if err := deleteVersionBlobs(ctx, repo, store, cleaner, versions, logger); err != nil {
+		return err
+	}
+	if err := repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err != nil {
+		return err
+	}
+	bytes, objects := deletionUsage(versions)
+	adjustUsage(ctx, repo, obj.TenantID, -bytes, -objects, logger)
+	return nil
+}
+
+func checkDeleteVersionsProtection(ctx context.Context, repo repository.Repository, versions []repository.Object) error {
 	// Gate before any destructive action (FR-1.1): a hold or WORM lock placed
 	// after the caller's pre-check is caught here with zero side effects — no
 	// chunk cleanup, no blob delete, no row delete.
@@ -44,6 +59,13 @@ func hardDeleteKey(
 			return errKeyProtected
 		}
 	}
+	return nil
+}
+
+func deleteVersionBlobs(
+	ctx context.Context, repo repository.Repository, store storage.Storage, cleaner ChunkCleaner,
+	versions []repository.Object, logger *slog.Logger,
+) error {
 	for _, version := range versions {
 		// Per-version re-check (FR-1.2) narrows the residual TOCTOU window to
 		// the width of a single store.Delete call; on hit, abort immediately.
@@ -62,11 +84,6 @@ func hardDeleteKey(
 			return fmt.Errorf("delete storage key %q: %w", version.StorageKey, err)
 		}
 	}
-	if err := repo.HardDeleteObject(ctx, obj.TenantID, obj.Bucket, obj.Key); err != nil {
-		return err
-	}
-	bytes, objects := deletionUsage(versions)
-	adjustUsage(ctx, repo, obj.TenantID, -bytes, -objects, logger)
 	return nil
 }
 
@@ -120,10 +137,10 @@ func hardDeleteVersion(
 func cleanObjectChunks(
 	ctx context.Context, cleaner ChunkCleaner, obj repository.Object, logger *slog.Logger,
 ) {
-	if cleaner == nil || isDeleteMarker(obj) {
+	if isDeleteMarker(obj) {
 		return
 	}
-	if err := cleaner.DeleteObjectChunks(ctx, obj.ID); err != nil {
+	if err := deleteScopedObjectChunks(ctx, cleaner, obj); err != nil {
 		logger.Warn("chunk cleanup during reconcile delete failed", "id", obj.ID, "key", obj.Key, "err", err)
 	}
 }
