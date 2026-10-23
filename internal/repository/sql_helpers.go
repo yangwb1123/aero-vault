@@ -112,8 +112,12 @@ func scanUsages(rows *sql.Rows) ([]Usage, error) {
 		if err := rows.Scan(&u.ID, &u.TenantID, &u.Caller, &u.Query, &cidRaw, &oidRaw, &u.RequestID, &createdT, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.TotalTokens, &u.LatencyMs, &u.CostMicros); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(cidRaw, &u.ChunkIDs)
-		_ = json.Unmarshal(oidRaw, &u.ObjectIDs)
+		if err := json.Unmarshal(cidRaw, &u.ChunkIDs); err != nil {
+			return nil, fmt.Errorf("decode usage chunk_ids: %w", err)
+		}
+		if err := json.Unmarshal(oidRaw, &u.ObjectIDs); err != nil {
+			return nil, fmt.Errorf("decode usage object_ids: %w", err)
+		}
 		u.CreatedAt = createdT.Time
 		out = append(out, u)
 	}

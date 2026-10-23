@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -112,7 +113,9 @@ func (s *sqlStore) getIdempotencyKey(ctx context.Context, tenant, key string) (I
 	}
 	rec.ResponseBody = body
 	if headerJSON.Valid && headerJSON.String != "" {
-		_ = json.Unmarshal([]byte(headerJSON.String), &rec.ResponseHeaders)
+		if err := json.Unmarshal([]byte(headerJSON.String), &rec.ResponseHeaders); err != nil {
+			return IdempotencyRecord{}, fmt.Errorf("decode persisted idempotency response headers: %w", err)
+		}
 	}
 	return rec, nil
 }
