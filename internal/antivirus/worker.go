@@ -11,6 +11,7 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/spaces"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
@@ -88,6 +89,7 @@ type Worker struct {
 	queue      Enqueuer
 	objects    ObjectController
 	quarantine bool
+	boundary   *access.ResourceBoundary
 	logger     *slog.Logger
 }
 
@@ -95,12 +97,22 @@ func NewWorker(repo repository.Repository, store storage.Storage, scanner Scanne
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Worker{repo: repo, store: store, scanner: scanner, queue: queue, quarantine: quarantine, logger: logger}
+	reader, _ := repo.(spaces.BindingReader)
+	return &Worker{repo: repo, store: store, scanner: scanner, queue: queue, quarantine: quarantine,
+		boundary: access.NewResourceBoundary(reader, nil), logger: logger}
 }
 
 // WithObjectController routes worker mutations through FileService.
 func (w *Worker) WithObjectController(objects ObjectController) *Worker {
 	w.objects = objects
+	return w
+}
+
+// WithResourceBoundary injects the raw deny-only binding reader used before
+// every storage, scanner or controller side effect. An explicit missing reader
+// stays a fault; it never falls back to the constructor-discovered port.
+func (w *Worker) WithResourceBoundary(reader spaces.BindingReader) *Worker {
+	w.boundary = access.NewResourceBoundary(reader, nil)
 	return w
 }
 
@@ -118,6 +130,32 @@ func (c *scanCounter) Read(p []byte) (int, error) {
 	n, err := c.ReadCloser.Read(p)
 	c.n.Add(int64(n))
 	return n, err
+}
+
+// admitObject validates the exact loaded row, job tenant provenance and the
+// deny-only resource boundary before any storage, scanner or controller side
+// effect. A missing job tenant/wildcard is a fault: system identity is not a
+// Space exemption. Its successful return is not an authorization grant.
+func (w *Worker) admitObject(ctx context.Context, objectID int64, obj repository.Object) error {
+	if obj.ID != objectID {
+		return fmt.Errorf("antivirus: object row ID %d does not match requested %d", obj.ID, objectID)
+	}
+	ref := access.ChunkRef{TenantID: obj.TenantID, Bucket: obj.Bucket, Key: obj.Key, ObjectID: obj.ID}
+	if err := access.ValidateChunkRef(ref); err != nil {
+		return fmt.Errorf("antivirus: invalid object scope: %w", err)
+	}
+	if principal, ok := access.PrincipalFrom(ctx); ok {
+		// GetObjectByID is unscoped and the handler runs with the system
+		// bypass, so the job tenant must be explicit and exact. A missing or
+		// wildcard tenant is a provenance fault even for a system principal.
+		if principal.TenantID == "" || principal.TenantID == "*" || principal.TenantID != obj.TenantID {
+			return fmt.Errorf("antivirus: job tenant %q does not match object tenant %q", principal.TenantID, obj.TenantID)
+		}
+	}
+	if err := w.boundary.CheckBucket(ctx, obj.TenantID, obj.Bucket); err != nil {
+		return fmt.Errorf("antivirus: resource boundary: %w", err)
+	}
+	return nil
 }
 
 // Run drains created events from sub and enqueues a virus_scan job per object.
@@ -155,18 +193,15 @@ func (w *Worker) ScanObjectByID(ctx context.Context, objectID int64) error {
 	if w.objects == nil {
 		return errors.New("antivirus: object controller is required")
 	}
+	if objectID <= 0 {
+		return fmt.Errorf("antivirus: object ID must be positive")
+	}
 	obj, err := w.repo.GetObjectByID(ctx, objectID)
 	if err != nil {
 		return fmt.Errorf("get object %d: %w", objectID, err)
 	}
-	// Tenant-consistency guard: GetObjectByID is unscoped and the job handler
-	// runs with the system bypass, so a mismatch between the job tenant and
-	// the object's tenant means a job-provenance bug — fail closed instead of
-	// tagging/quarantining a foreign tenant's object. The event bridge always
-	// copies e.TenantID into the job, so today this is defense in depth.
-	if principal, ok := access.PrincipalFrom(ctx); ok &&
-		principal.TenantID != "" && principal.TenantID != "*" && principal.TenantID != obj.TenantID {
-		return fmt.Errorf("antivirus: job tenant %q does not match object tenant %q", principal.TenantID, obj.TenantID)
+	if err := w.admitObject(ctx, objectID, obj); err != nil {
+		return err
 	}
 	rc, _, err := w.store.Get(ctx, obj.StorageKey)
 	if err != nil {

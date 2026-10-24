@@ -202,75 +202,16 @@ func (h *Handler) writeThumbnailGenerateError(w http.ResponseWriter, r *http.Req
 }
 
 func classify(err error) (string, string, int) {
-	if code, msg, status, ok := classifyLock(err); ok {
-		return code, msg, status
+	// Preserve the inherited order after the boundary-first, redacted mapping.
+	for _, check := range []func(error) (string, string, int, bool){
+		classifyBoundary, classifyLock, classifyRequestError,
+		classifyThumbnailContentError, classifyThumbnailBudgetError, classifyArgumentError,
+	} {
+		if code, msg, status, ok := check(err); ok {
+			return code, msg, status
+		}
 	}
 	switch {
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, service.ErrTimeout):
-		// Server-side request deadline: the client may still be connected, so
-		// the abort must be visible (504), never a silent empty response.
-		return "Timeout", "request timed out", http.StatusGatewayTimeout
-	case errors.Is(err, service.ErrTenantDisabled):
-		return "TenantDisabled", service.ErrTenantDisabled.Error(), http.StatusForbidden
-	case errors.Is(err, service.ErrEntitlementUnavailable):
-		return "EntitlementUnavailable", service.ErrEntitlementUnavailable.Error(), http.StatusServiceUnavailable
-	case errors.Is(err, service.ErrQuotaExceeded):
-		return "QuotaExceeded", err.Error(), http.StatusInsufficientStorage
-	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):
-		return "NotFound", "object not found", http.StatusNotFound
-	case errors.Is(err, service.ErrUploadNotFound), errors.Is(err, repository.ErrUploadNotFound):
-		return "NoSuchUpload", "upload not found", http.StatusNotFound
-	case errors.Is(err, thumbnail.ErrImageTooLarge):
-		// Defensive ordering (not load-bearing): the thumbnail handler unwraps
-		// the raw sentinel before classifying (that unwrap is the load-bearing
-		// defense), and errors.Is on the raw sentinel never matches
-		// ErrInvalidArgs — so the 413 outcome holds regardless of this case's
-		// position. Keeping it ahead of ErrInvalidArgs only matters for a
-		// hypothetical wrapped ErrInvalidArgs %w ErrImageTooLarge from a
-		// future call site.
-		return "ImageTooLarge", err.Error(), http.StatusRequestEntityTooLarge
-	case errors.Is(err, thumbnail.ErrUnsupportedContentEncoding):
-		return "UnsupportedMediaType", thumbnailContentEncodingMessage(err), http.StatusUnsupportedMediaType
-	case errors.Is(err, thumbnail.ErrUnsupportedFormat):
-		// Defensive ordering (not load-bearing), mirroring ErrImageTooLarge:
-		// the thumbnail handler wraps only ErrUnsupportedFormat (never
-		// ErrInvalidArgs), so errors.Is on the raw sentinel cannot match the
-		// ErrInvalidArgs case regardless of this case's position.
-		return "UnsupportedMediaType", err.Error(), http.StatusUnsupportedMediaType
-	case errors.Is(err, thumbnail.ErrMetadataTooLarge):
-		// Required, not defensive: the thumbnail handler unwraps the raw
-		// sentinel before classifying (that unwrap is the load-bearing
-		// defense), and errors.Is on the raw sentinel never matches
-		// ErrInvalidArgs — without this case the raw sentinel would fall
-		// through to default → 500 InternalError. The class is 413 per RFC
-		// 9110 §15.5.14 (Content Too Large): the request's declared image
-		// metadata exceeds the server's processing budget (8 MiB),
-		// before any pixel buffer is allocated.
-		return "MetadataTooLarge", err.Error(), http.StatusRequestEntityTooLarge
-	case errors.Is(err, thumbnail.ErrSourceTooLarge):
-		// Required, not defensive: the thumbnail handler unwraps the raw
-		// sentinel before classifying (that unwrap is the load-bearing
-		// defense), and errors.Is on the raw sentinel never matches
-		// ErrInvalidArgs — without this case the raw sentinel would fall
-		// through to default → 500 InternalError. The class is 413 per RFC
-		// 9110 §15.5.14 (Content Too Large): the request's source image
-		// payload exceeds the server's 128 MiB compressed-input processing
-		// budget (MaxSourceBytes) and was cut mid-decode by the read cap.
-		return "SourceTooLarge", err.Error(), http.StatusRequestEntityTooLarge
-	case errors.Is(err, thumbnail.ErrNilSource):
-		return "InternalError", "thumbnail source unavailable", http.StatusInternalServerError
-	case errors.Is(err, service.ErrInvalidArgs):
-		return "InvalidArgument", err.Error(), http.StatusBadRequest
-	case errors.Is(err, service.ErrBadDigest):
-		return "BadDigest", err.Error(), http.StatusBadRequest
-	case errors.Is(err, service.ErrMetadataTooLarge),
-		errors.Is(err, service.ErrMetadataKeyTooLong),
-		errors.Is(err, service.ErrMetadataValueTooLong):
-		return "InvalidArgument", err.Error(), http.StatusBadRequest
-	case errors.Is(err, service.ErrSizeMismatch):
-		return "SizeMismatch", err.Error(), http.StatusBadRequest
-	case errors.Is(err, mw.ErrBodyTooLarge):
-		return "BodyTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrRangeNotSatisfiable):
 		return "InvalidRange", "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable
 	case errors.Is(err, service.ErrPreconditionFailed):
@@ -278,14 +219,84 @@ func classify(err error) (string, string, int) {
 	case errors.Is(err, mw.ErrBodyTooLarge):
 		return "BodyTooLarge", err.Error(), http.StatusRequestEntityTooLarge
 	case errors.Is(err, service.ErrForbidden):
-		// Surface the denial reason (e.g. default_deny) in the message —
-		// the fail-closed delete contract requires operator-visible reasons.
-
+		// Preserve operator-visible reasons for the legacy delete contract.
 		return "AccessDenied", err.Error(), http.StatusForbidden
 	case errors.Is(err, service.ErrObjectCorrupt):
 		return "ObjectCorrupt", "object is marked as corrupt", http.StatusGone
 	default:
 		return "InternalError", err.Error(), http.StatusInternalServerError
+	}
+}
+
+func classifyRequestError(err error) (string, string, int, bool) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, service.ErrTimeout):
+		// A server deadline remains visible even when the client is connected.
+		return "Timeout", "request timed out", http.StatusGatewayTimeout, true
+	case errors.Is(err, service.ErrTenantDisabled):
+		return "TenantDisabled", service.ErrTenantDisabled.Error(), http.StatusForbidden, true
+	case errors.Is(err, service.ErrEntitlementUnavailable):
+		return "EntitlementUnavailable", service.ErrEntitlementUnavailable.Error(), http.StatusServiceUnavailable, true
+	case errors.Is(err, service.ErrQuotaExceeded):
+		return "QuotaExceeded", err.Error(), http.StatusInsufficientStorage, true
+	case errors.Is(err, service.ErrNotFound), errors.Is(err, repository.ErrNotFound):
+		return "NotFound", "object not found", http.StatusNotFound, true
+	case errors.Is(err, service.ErrUploadNotFound), errors.Is(err, repository.ErrUploadNotFound):
+		return "NoSuchUpload", "upload not found", http.StatusNotFound, true
+	default:
+		return "", "", 0, false
+	}
+}
+
+func classifyThumbnailContentError(err error) (string, string, int, bool) {
+	switch {
+	case errors.Is(err, thumbnail.ErrImageTooLarge):
+		// The handler's raw unwrap is load-bearing. This ordering is only
+		// defensive for hypothetical wrappers joining ErrInvalidArgs.
+		return "ImageTooLarge", err.Error(), http.StatusRequestEntityTooLarge, true
+	case errors.Is(err, thumbnail.ErrUnsupportedContentEncoding):
+		return "UnsupportedMediaType", thumbnailContentEncodingMessage(err), http.StatusUnsupportedMediaType, true
+	case errors.Is(err, thumbnail.ErrUnsupportedFormat):
+		// Like ImageTooLarge, the raw sentinel cannot match ErrInvalidArgs.
+		return "UnsupportedMediaType", err.Error(), http.StatusUnsupportedMediaType, true
+	default:
+		return "", "", 0, false
+	}
+}
+
+func classifyThumbnailBudgetError(err error) (string, string, int, bool) {
+	switch {
+	case errors.Is(err, thumbnail.ErrMetadataTooLarge):
+		// Required: raw unwrap preserves this sentinel instead of stringifying
+		// it into InvalidArgument. The 8 MiB metadata budget is RFC 9110 413.
+		return "MetadataTooLarge", err.Error(), http.StatusRequestEntityTooLarge, true
+	case errors.Is(err, thumbnail.ErrSourceTooLarge):
+		// The same raw-sentinel rule applies to the 128 MiB source budget
+		// (MaxSourceBytes), cut mid-decode by the read cap.
+		return "SourceTooLarge", err.Error(), http.StatusRequestEntityTooLarge, true
+	case errors.Is(err, thumbnail.ErrNilSource):
+		return "InternalError", "thumbnail source unavailable", http.StatusInternalServerError, true
+	default:
+		return "", "", 0, false
+	}
+}
+
+func classifyArgumentError(err error) (string, string, int, bool) {
+	switch {
+	case errors.Is(err, service.ErrInvalidArgs):
+		return "InvalidArgument", err.Error(), http.StatusBadRequest, true
+	case errors.Is(err, service.ErrBadDigest):
+		return "BadDigest", err.Error(), http.StatusBadRequest, true
+	case errors.Is(err, service.ErrMetadataTooLarge),
+		errors.Is(err, service.ErrMetadataKeyTooLong),
+		errors.Is(err, service.ErrMetadataValueTooLong):
+		return "InvalidArgument", err.Error(), http.StatusBadRequest, true
+	case errors.Is(err, service.ErrSizeMismatch):
+		return "SizeMismatch", err.Error(), http.StatusBadRequest, true
+	case errors.Is(err, mw.ErrBodyTooLarge):
+		return "BodyTooLarge", err.Error(), http.StatusRequestEntityTooLarge, true
+	default:
+		return "", "", 0, false
 	}
 }
 

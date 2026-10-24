@@ -50,24 +50,27 @@ func nonZeroTime(t time.Time) *time.Time {
 // GET /v1/admin/jobs?status=&type=&limit=
 // Returns recent jobs plus a status histogram for the dashboard.
 func (h *AdminHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
-	if !h.requireOperatorAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) || !h.checkGlobalAggregate(w, r) {
 		return
 	}
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	rows, err := h.repo.ListJobs(r.Context(), q.Get("status"), q.Get("type"), limit)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		h.writeError(w, r, adminBoundaryFault(err))
 		return
 	}
 	stats, err := h.repo.JobStats(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		h.writeError(w, r, adminBoundaryFault(err))
 		return
 	}
 	out := make([]jobDTO, 0, len(rows))
 	for _, j := range rows {
 		out = append(out, toJobDTO(j))
+	}
+	if !h.checkGlobalAggregate(w, r) {
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"stats": stats, "jobs": out})
 }
@@ -78,13 +81,20 @@ func (h *AdminHandler) RetryJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, err := strconv.ParseInt(chiURLParam(r, "id"), 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: "id must be int"}})
 		return
 	}
-	if err := h.repo.RetryJob(r.Context(), id, "manual retry", time.Now()); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+	present, err := h.admitRetryJob(r.Context(), id)
+	if err != nil {
+		h.writeError(w, r, err)
 		return
+	}
+	if present {
+		if err := h.repo.RetryJob(r.Context(), id, "manual retry", time.Now()); err != nil {
+			h.writeError(w, r, adminBoundaryFault(err))
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "status": "pending"})
 }

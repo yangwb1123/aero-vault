@@ -27,19 +27,35 @@ import (
 // these on PUT/POST/DELETE/GET and enforces accordingly.
 // GET /v1/usage — any authenticated tenant sees its own row.
 func (h *AdminHandler) Usage(w http.ResponseWriter, r *http.Request) {
-	q, err := h.svc.Usage(r.Context(), mw.TenantFrom(r.Context()))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+	tenant := mw.TenantFrom(r.Context())
+	if !h.checkTenantAggregate(w, r, tenant) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	if h.svc == nil {
+		h.writeError(w, r, adminBoundaryFault(errors.New("missing usage service")))
+		return
+	}
+	q, err := h.svc.Usage(r.Context(), tenant)
+	if err != nil {
+		h.writeError(w, r, adminBoundaryFault(err))
+		return
+	}
+	if q.TenantID != tenant {
+		h.writeError(w, r, adminBoundaryFault(errors.New("usage tenant scope echo")))
+		return
+	}
+	out := map[string]any{
 		"tenant":       q.TenantID,
 		"used_bytes":   q.UsedBytes,
 		"used_objects": q.UsedObjects,
 		"max_bytes":    q.MaxBytes,
 		"max_objects":  q.MaxObjects,
 		"updated_at":   q.UpdatedAt,
-	})
+	}
+	if !h.checkTenantAggregate(w, r, tenant) {
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // PUT /v1/admin/tenants/{t}/quota
@@ -288,13 +304,16 @@ func (h *AdminHandler) PutBucketQuota(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/admin/webhook-failures
 func (h *AdminHandler) ListWebhookFailures(w http.ResponseWriter, r *http.Request) {
-	if !h.requireOperatorAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) || !h.checkGlobalAggregate(w, r) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	rows, err := h.repo.ListWebhookFailures(r.Context(), limit)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		h.writeError(w, r, adminBoundaryFault(err))
+		return
+	}
+	if !h.checkGlobalAggregate(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"failures": rows})
@@ -458,13 +477,16 @@ func (h *AdminHandler) auditForTenant(
 //
 //	GET /v1/admin/audit?limit=N
 func (h *AdminHandler) ListAudit(w http.ResponseWriter, r *http.Request) {
-	if !h.requireOperatorAdmin(w, r) {
+	if !h.requireOperatorAdmin(w, r) || !h.checkGlobalAggregate(w, r) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	rows, err := h.repo.ListAudit(r.Context(), limit)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		h.writeError(w, r, adminBoundaryFault(err))
+		return
+	}
+	if !h.checkGlobalAggregate(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"audit": rows})

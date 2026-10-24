@@ -1,7 +1,9 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/access"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/spaces"
 )
 
 const (
@@ -49,58 +52,24 @@ type vaultAccountSummaryResponse struct {
 func (h *AdminHandler) AccountSummary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Vary", "Authorization, X-Aero-Tenant")
-	principal, ok := access.PrincipalFrom(r.Context())
-	if !ok || principal.Kind != access.PrincipalService {
-		h.writeAccountSummaryError(w, r, http.StatusForbidden, "Forbidden", "machine credentials required")
-		return
-	}
-	request, ok := parseVaultAccountSummaryRequest(r, principal)
+	request, principal, ok := h.accountSummaryRequest(w, r)
 	if !ok {
-		h.writeAccountSummaryError(w, r, http.StatusBadRequest, "InvalidArgument", "invalid account summary request")
 		return
 	}
-	region := vaultAccountSourceRegion()
-	if request.Region != "" && request.Region != region {
-		h.writeAccountSummaryError(w, r, http.StatusBadRequest, "InvalidArgument", "requested region is not served")
-		return
-	}
-	if h.repo == nil {
+	if adminPortMissing(h.repo) {
 		h.writeAccountSummaryError(w, r, http.StatusServiceUnavailable, "Unavailable", "account summary source unavailable")
 		return
 	}
-
-	buckets, err := h.repo.ListBuckets(r.Context(), request.TenantID)
+	if !h.checkTenantAggregate(w, r, request.TenantID) {
+		return
+	}
+	response, err := h.materializeAccountSummary(r.Context(), request)
 	if err != nil {
-		h.writeAccountSummaryError(w, r, http.StatusServiceUnavailable, "Unavailable", "account summary source unavailable")
+		h.writeError(w, r, err)
 		return
 	}
-	quota, err := h.repo.GetTenantQuota(r.Context(), request.TenantID)
-	if err != nil {
-		h.writeAccountSummaryError(w, r, http.StatusServiceUnavailable, "Unavailable", "account summary source unavailable")
+	if !h.checkTenantAggregate(w, r, request.TenantID) {
 		return
-	}
-	sort.Strings(buckets)
-	now := time.Now().UTC()
-	version := quota.UpdatedAt.UTC().UnixMilli()
-	if version < 1 {
-		version = now.UnixMilli()
-	}
-	datasets := make(map[string]any, len(request.Datasets))
-	for _, dataset := range request.Datasets {
-		switch dataset {
-		case "aero-vault.tenants":
-			datasets[dataset] = map[string]any{"items": []map[string]any{{
-				"id": request.TenantID, "status": "active",
-			}}}
-		case "aero-vault.buckets":
-			datasets[dataset] = map[string]any{"items": buckets}
-		case "aero-vault.usage":
-			datasets[dataset] = map[string]any{
-				"tenant_id": request.TenantID, "used_bytes": quota.UsedBytes,
-				"used_objects": quota.UsedObjects, "max_bytes": quota.MaxBytes,
-				"max_objects": quota.MaxObjects,
-			}
-		}
 	}
 	detail, _ := json.Marshal(map[string]any{
 		"account_id": request.AccountID, "datasets": request.Datasets,
@@ -113,19 +82,103 @@ func (h *AdminHandler) AccountSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, vaultAccountSummaryResponse{
-		SourceRegion: region, Version: version, GeneratedAt: now, Complete: true,
-		Datasets: datasets,
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *AdminHandler) accountSummaryRequest(w http.ResponseWriter, r *http.Request) (vaultAccountSummaryRequest, access.Principal, bool) {
+	principal, ok := access.PrincipalFrom(r.Context())
+	if !ok || principal.Kind != access.PrincipalService {
+		h.writeAccountSummaryError(w, r, http.StatusForbidden, "Forbidden", "machine credentials required")
+		return vaultAccountSummaryRequest{}, principal, false
+	}
+	request, ok := parseVaultAccountSummaryRequest(r, principal)
+	if !ok {
+		h.writeAccountSummaryError(w, r, http.StatusBadRequest, "InvalidArgument", "invalid account summary request")
+		return request, principal, false
+	}
+	if request.Region != "" && request.Region != vaultAccountSourceRegion() {
+		h.writeAccountSummaryError(w, r, http.StatusBadRequest, "InvalidArgument", "requested region is not served")
+		return request, principal, false
+	}
+	return request, principal, true
+}
+
+func (h *AdminHandler) materializeAccountSummary(ctx context.Context, request vaultAccountSummaryRequest) (vaultAccountSummaryResponse, error) {
+	buckets, err := h.repo.ListBuckets(ctx, request.TenantID)
+	if err != nil {
+		return vaultAccountSummaryResponse{}, adminBoundaryFault(err)
+	}
+	quota, err := h.repo.GetTenantQuota(ctx, request.TenantID)
+	if err != nil {
+		return vaultAccountSummaryResponse{}, adminBoundaryFault(err)
+	}
+	if quota.TenantID != request.TenantID {
+		return vaultAccountSummaryResponse{}, adminBoundaryFault(errors.New("quota tenant scope echo"))
+	}
+	status, err := h.accountSummaryTenant(ctx, request.TenantID)
+	if err != nil {
+		return vaultAccountSummaryResponse{}, err
+	}
+	sort.Strings(buckets)
+	now := time.Now().UTC()
+	version := quota.UpdatedAt.UTC().UnixMilli()
+	if version < 1 {
+		version = now.UnixMilli()
+	}
+	return vaultAccountSummaryResponse{
+		SourceRegion: vaultAccountSourceRegion(), Version: version, GeneratedAt: now, Complete: true,
+		Datasets: accountSummaryDatasets(request, buckets, quota, status),
 		Sources: []map[string]any{{
 			"source_account_id": request.CanonicalUID, "scope_type": "tenant",
-			"scope_id": request.TenantID, "status": "active", "data": map[string]any{},
+			"scope_id": request.TenantID, "status": status, "data": map[string]any{},
 		}},
 		Memberships: []map[string]any{{
 			"scope_type": "tenant", "scope_id": request.TenantID,
 			"source_member_id": request.CanonicalUID, "role": "member",
-			"status": "active", "data": map[string]any{},
+			"status": status, "data": map[string]any{},
 		}},
-	})
+	}, nil
+}
+
+func (h *AdminHandler) accountSummaryTenant(ctx context.Context, requested string) (string, error) {
+	tenant, known, err := h.repo.GetTenant(ctx, requested)
+	if err != nil {
+		return "", adminBoundaryFault(err)
+	}
+	if !known {
+		if tenant != (repository.TenantRecord{}) {
+			return "", adminBoundaryFault(errors.New("unknown tenant with row"))
+		}
+		return "unknown", nil
+	}
+	if tenant.TenantID != requested {
+		return "", adminBoundaryFault(errors.New("tenant scope echo"))
+	}
+	if tenant.Status != "active" {
+		return "", errors.Join(access.ErrDenied, spaces.ErrTenantUnavailable)
+	}
+	return tenant.Status, nil
+}
+
+func accountSummaryDatasets(request vaultAccountSummaryRequest, buckets []string, quota repository.TenantQuota, status string) map[string]any {
+	datasets := make(map[string]any, len(request.Datasets))
+	for _, dataset := range request.Datasets {
+		switch dataset {
+		case "aero-vault.tenants":
+			datasets[dataset] = map[string]any{"items": []map[string]any{{
+				"id": request.TenantID, "status": status,
+			}}}
+		case "aero-vault.buckets":
+			datasets[dataset] = map[string]any{"items": buckets}
+		case "aero-vault.usage":
+			datasets[dataset] = map[string]any{
+				"tenant_id": request.TenantID, "used_bytes": quota.UsedBytes,
+				"used_objects": quota.UsedObjects, "max_bytes": quota.MaxBytes,
+				"max_objects": quota.MaxObjects,
+			}
+		}
+	}
+	return datasets
 }
 
 func (h *AdminHandler) writeAccountSummaryError(w http.ResponseWriter, r *http.Request, status int, code, message string) {

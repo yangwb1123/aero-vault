@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
+	"github.com/aero-vault/aero-vault/internal/spaces"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
@@ -57,24 +59,35 @@ func DecodeObjectID(p string) (int64, error) {
 
 // Worker bridges created events to replicate jobs and executes them.
 type Worker struct {
-	repo    repository.Repository
-	primary storage.Storage
-	replica storage.Storage
-	queue   Enqueuer
-	tagger  ObjectTagger
-	logger  *slog.Logger
+	repo     repository.Repository
+	primary  storage.Storage
+	replica  storage.Storage
+	queue    Enqueuer
+	tagger   ObjectTagger
+	boundary *access.ResourceBoundary
+	logger   *slog.Logger
 }
 
 func NewWorker(repo repository.Repository, primary, replica storage.Storage, queue Enqueuer, logger *slog.Logger) *Worker {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Worker{repo: repo, primary: primary, replica: replica, queue: queue, logger: logger}
+	reader, _ := repo.(spaces.BindingReader)
+	return &Worker{repo: repo, primary: primary, replica: replica, queue: queue,
+		boundary: access.NewResourceBoundary(reader, nil), logger: logger}
 }
 
 // WithObjectTagger routes status mutations through FileService.
 func (w *Worker) WithObjectTagger(tagger ObjectTagger) *Worker {
 	w.tagger = tagger
+	return w
+}
+
+// WithResourceBoundary injects the raw deny-only binding reader used before
+// primary reads, replica writes and status tags. An explicit missing reader
+// stays a fault; it never falls back to the constructor-discovered port.
+func (w *Worker) WithResourceBoundary(reader spaces.BindingReader) *Worker {
+	w.boundary = access.NewResourceBoundary(reader, nil)
 	return w
 }
 
@@ -99,13 +112,44 @@ func (w *Worker) Run(ctx context.Context, sub <-chan repository.Event) {
 	}
 }
 
+// admitObject validates the exact loaded row, job tenant provenance and the
+// deny-only resource boundary before any primary read, replica write or status
+// tag. Its successful return is not an authorization grant.
+func (w *Worker) admitObject(ctx context.Context, objectID int64, obj repository.Object) error {
+	if obj.ID != objectID {
+		return fmt.Errorf("replication: object row ID %d does not match requested %d", obj.ID, objectID)
+	}
+	ref := access.ChunkRef{TenantID: obj.TenantID, Bucket: obj.Bucket, Key: obj.Key, ObjectID: obj.ID}
+	if err := access.ValidateChunkRef(ref); err != nil {
+		return fmt.Errorf("replication: invalid object scope: %w", err)
+	}
+	if principal, ok := access.PrincipalFrom(ctx); ok {
+		// GetObjectByID is unscoped and the job handler runs with the system
+		// bypass, so the job tenant must be explicit and exact. A missing or
+		// wildcard tenant is a provenance fault even for a system principal.
+		if principal.TenantID == "" || principal.TenantID == "*" || principal.TenantID != obj.TenantID {
+			return fmt.Errorf("replication: job tenant %q does not match object tenant %q", principal.TenantID, obj.TenantID)
+		}
+	}
+	if err := w.boundary.CheckBucket(ctx, obj.TenantID, obj.Bucket); err != nil {
+		return fmt.Errorf("replication: resource boundary: %w", err)
+	}
+	return nil
+}
+
 // ReplicateObjectByID streams an object from the primary backend into the
 // replica at the same storage key and records repl_status=replicated. Used as
 // the replicate job handler; idempotent (overwrites the replica copy).
 func (w *Worker) ReplicateObjectByID(ctx context.Context, objectID int64) error {
+	if objectID <= 0 {
+		return fmt.Errorf("replication: object ID must be positive")
+	}
 	obj, err := w.repo.GetObjectByID(ctx, objectID)
 	if err != nil {
 		return fmt.Errorf("get object %d: %w", objectID, err)
+	}
+	if err := w.admitObject(ctx, objectID, obj); err != nil {
+		return err
 	}
 	if _, _, ok := service.SSECustomerInfo(obj.Metadata); ok {
 		w.recordStatus(ctx, obj, "skipped")
