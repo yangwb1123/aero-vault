@@ -36,6 +36,7 @@ type EventOutboxRelay struct {
 	logger      *slog.Logger
 	client      *http.Client
 	sink        AuditSink
+	boundary    *outboxBoundary
 	owner       string
 	pollEvery   time.Duration
 	batchSize   int
@@ -110,6 +111,7 @@ func NewEventOutboxRelay(
 		logger:      logger,
 		client:      &http.Client{Timeout: opts.HTTPTimeout},
 		sink:        opts.AuditSink,
+		boundary:    newOutboxBoundaryFromRepository(repo),
 		owner:       fmt.Sprintf("event-outbox:%s", hostname),
 		pollEvery:   opts.PollInterval,
 		batchSize:   opts.BatchSize,
@@ -203,6 +205,10 @@ func (r *EventOutboxRelay) deliverFact(fact repository.EventOutboxRow) {
 //   - other errors (5xx/transport/echo mismatch) → existing backoff+jitter
 //     until maxAttempts → failed (F1).
 func (r *EventOutboxRelay) deliverDeleted(fact repository.EventOutboxRow) {
+	if err := validateOutboxDeletedFact(fact); err != nil {
+		r.retry(fact, err)
+		return
+	}
 	if r.sink == nil {
 		r.complete(fact)
 		return
@@ -244,17 +250,25 @@ func (r *EventOutboxRelay) failImmediately(fact repository.EventOutboxRow) {
 		"fact", fact.ID, "tenant", fact.TenantID, "attempts", fact.Attempts)
 }
 
-// deliverNotify posts the stored payload byte-exact to every matching target
-// (rules resolved at delivery time; the payload is never re-derived — E7
-// fix). Any target failure retries the whole fact; no rules/matches completes
-// it (the fact is still consumed; rules may be configured later).
+// deliverNotify validates the claimed row against its stored payload, admits
+// the exact tenant/bucket before any no-match completion or rule lookup, and
+// re-observes that same scope immediately before every matched POST. A bound
+// resource is a policy-terminal fact; observation faults keep the original
+// bounded retry chain. The payload is never re-derived or re-marshalled.
 func (r *EventOutboxRelay) deliverNotify(fact repository.EventOutboxRow) {
-	meta, err := parseNotifyPayload(fact.Payload)
+	meta, err := validateOutboxNotifyFact(fact)
 	if err != nil {
 		r.retry(fact, err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.httpTimeout)
+	err = r.admitNotify(ctx, meta)
+	cancel()
+	if err != nil {
+		handleNotifyAdmissionFailure(r, fact, err)
+		return
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), r.httpTimeout)
 	rules, err := r.repo.GetBucketNotifications(ctx, meta.Tenant, meta.Bucket)
 	cancel()
 	if err != nil {
@@ -263,21 +277,41 @@ func (r *EventOutboxRelay) deliverNotify(fact repository.EventOutboxRow) {
 	}
 	start := time.Now()
 	deliveryCtx, cancel := context.WithTimeout(context.Background(), r.claimTTL)
-	err = deliverPayload(deliveryCtx, r.client, rules, eventOutboxRemoveEventName, meta.Key, fact.Payload)
+	err = r.deliverNotifyTargets(deliveryCtx, rules, meta, fact.Payload)
 	cancel()
 	if elapsed := time.Since(start); elapsed > r.claimTTL/2 {
 		r.logger.Warn("event outbox delivery approached its lease; raise EVENT_OUTBOX_CLAIM_TTL_SECONDS above targets×timeout",
 			"fact", fact.ID, "elapsed", elapsed, "lease", r.claimTTL)
 	}
 	if err != nil {
-		r.retry(fact, err)
+		handleNotifyAdmissionFailure(r, fact, err)
 		return
 	}
 	r.complete(fact)
 }
 
+func (r *EventOutboxRelay) deliverNotifyTargets(
+	ctx context.Context, rules []repository.NotificationRule, meta notifyPayloadMeta, body []byte,
+) error {
+	for _, rule := range rules {
+		if !ruleMatches(rule, eventOutboxRemoveEventName, meta.Key) {
+			continue
+		}
+		for _, target := range resolveTargets(rule) {
+			if err := r.admitNotify(ctx, meta); err != nil {
+				return err
+			}
+			if err := postEventTo(ctx, r.client, target, body); err != nil {
+				return fmt.Errorf("deliver notification to %s: %w", target, err)
+			}
+		}
+	}
+	return nil
+}
+
 // notifyPayloadMeta is the fixed subset of the notify@1.1 schema the relay
-// needs to re-resolve rules at delivery time.
+// needs to re-resolve rules at delivery time. It is populated only after the
+// claimed row and every embedded record have been validated against it.
 type notifyPayloadMeta struct {
 	Tenant string `json:"tenant"`
 	Bucket string `json:"bucket"`
@@ -293,26 +327,6 @@ func parseNotifyPayload(payload []byte) (notifyPayloadMeta, error) {
 		return meta, errors.New("event outbox payload missing tenant or bucket")
 	}
 	return meta, nil
-}
-
-// deliverPayload POSTs body to every target of every rule matching the event
-// name and key, sequentially (billing deliverBatch shape). Returns the first
-// error so callers can decide retry semantics.
-func deliverPayload(
-	ctx context.Context, client *http.Client, rules []repository.NotificationRule,
-	eventName, key string, body []byte,
-) error {
-	for _, rule := range rules {
-		if !ruleMatches(rule, eventName, key) {
-			continue
-		}
-		for _, target := range resolveTargets(rule) {
-			if err := postEventTo(ctx, client, target, body); err != nil {
-				return fmt.Errorf("deliver notification to %s: %w", target, err)
-			}
-		}
-	}
-	return nil
 }
 
 // complete finalizes a claimed fact. Claim-lost (lease expired mid-flight,

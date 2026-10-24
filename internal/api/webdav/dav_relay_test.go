@@ -1,11 +1,7 @@
-// Relay-driven acceptance for the WebDAV delete surface
-// (docs/requirements/durable-async-delete-outbox-webdav-v1.md, G2/G3):
-// the DELETE response never waits on outbox delivery (AC-2), and the L1
-// (webhook HMAC + notify rule, D2 dedupe live) and L2 (AuditSinkL2
-// bound/unbound tenant) faces all compose from the WebDAV surface (AC-3).
-// Harness timings honor C-6 (ClaimTTL > 2×HTTPTimeout): 60s/10s, both
-// config-valid (60 > 20, ≤600 cap; 10 ≤29 cap); programmatic relay opts
-// bypass config.Validate, so the harness self-honors the bound.
+// WebDAV delete relay acceptance (durable-async-delete-outbox-webdav-v1.md,
+// G2/G3): nonblocking DELETE (AC-2), L1 HMAC/notify D2 and L2 composition (AC-3).
+// Programmatic options honor C-6: ClaimTTL=60s > 2×HTTPTimeout=10s,
+// both config-valid (60≤600, 10≤29); config.Validate is not called here.
 package webdav_test
 
 import (
@@ -44,11 +40,9 @@ type webdavBusWiring struct {
 	webhookSecret string
 }
 
-// newWebdavRelayHarness builds the WebDAV surface with an always-on relay:
-// SQLite + local FS + FileService + mw.Tenant(webdav.Handler) + relay; with
-// busWiring != nil the bus + notifier (+ webhook) are wired. Teardown order
-// (LIFO): relayCancel → bus.Close → whCancel → notifCancel → srv.Close →
-// repo.Close (registered in reverse below).
+// SQLite/local FS/FileService/Tenant/WebDAV/relay; optional bus/notifier/webhook.
+// LIFO teardown: relayCancel → bus.Close → whCancel → notifCancel → srv.Close
+// → repo.Close (registered in reverse below).
 func newWebdavRelayHarness(t *testing.T, relayOpts *events.EventOutboxRelayOptions, busWiring *webdavBusWiring) (*httptest.Server, *service.FileService, string) {
 	t.Helper()
 	ctx := context.Background()
@@ -76,7 +70,16 @@ func newWebdavRelayHarness(t *testing.T, relayOpts *events.EventOutboxRelayOptio
 		go notif.Run(notifCtx, sub)
 		t.Cleanup(notifCancel)
 		if busWiring.webhookURL != "" {
-			wh := events.NewWebhook(busWiring.webhookURL, logger)
+			authority, err := events.NewEventAuthority(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			boundary, err := events.NewResourceBoundaryFromRepository(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wh := events.NewWebhook(busWiring.webhookURL, logger).
+				WithEventAuthority(authority).WithResourceBoundary(boundary)
 			if busWiring.webhookSecret != "" {
 				wh.WithSecret(busWiring.webhookSecret)
 			}
@@ -99,13 +102,9 @@ func newWebdavRelayHarness(t *testing.T, relayOpts *events.EventOutboxRelayOptio
 	return srv, svc, dsn
 }
 
-// G2 (AC-2): the WebDAV DELETE response must not wait on outbox delivery.
-// The L2 target blocks on a release channel while the DELETE is issued
-// synchronously: the returned response is the timing witness — a synchronous
-// implementation could not return while the POST is blocked (it would hang
-// past the 10s relay timeout; the release only lands after the DELETE
-// returns, so the test would hang until go test's package timeout — a slow
-// fail, never a false pass).
+// G2 (AC-2): DELETE must return while L2 waits on release. Release occurs only
+// after DELETE returns, so a synchronous delivery would exceed the 10s timeout
+// or hang until the package timeout; the response is the timing witness.
 func TestWebDAVDelete_ResponseDoesNotBlockOnDelivery(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
@@ -173,9 +172,7 @@ func TestWebDAVDelete_ResponseDoesNotBlockOnDelivery(t *testing.T) {
 		t.Fatalf("deleted@1.1 status = %q, want pending or inflight while target blocked", status)
 	}
 
-	// Recovery: release the target; the in-flight POST completes (200+echo)
-	// and the relay completes the fact (in-flight POST ≤10s + 50ms poll →
-	// ~15s bound).
+	// Release permits 200+echo and completion within 10s HTTP + 50ms poll (<15s).
 	releaseOnce.Do(func() { close(release) })
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -307,9 +304,7 @@ func TestWebDAVDelete_CompositionL1L2(t *testing.T) {
 	}
 	assertAuditRowFor(t, repo, "default", "hard")
 
-	// Both facts reach delivered ≤15s (healthy ~1-2s: next 50ms poll + local
-	// POSTs). A POST completes before its fact completes, so when the status
-	// flips the counters are already settled.
+	// Both facts reach delivered ≤15s; POSTs precede completion, settling counters.
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if outboxStatus(t, dsn, obj.ID, "vault.file.deleted@1.1") == "delivered" &&

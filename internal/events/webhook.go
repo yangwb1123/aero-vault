@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,15 +39,17 @@ func jitter(d time.Duration) time.Duration {
 	return time.Duration(base - base/4 + offset/2)
 }
 
-// Webhook is an outbound fanout: every event seen on the bus is POSTed to the
-// configured URL(s). Failed deliveries are recorded in the repository so the
-// retry worker can re-send with exponential backoff.
+// Webhook fans out persisted events only after fresh deny-only admission for
+// each configured URL. Failed HTTP deliveries are recorded in the optional
+// retry store and re-admitted before re-sending with exponential backoff.
 type Webhook struct {
-	urls   []string
-	secret []byte
-	client *http.Client
-	logger *slog.Logger
-	repo   repository.Repository
+	urls      []string
+	secret    []byte
+	client    *http.Client
+	logger    *slog.Logger
+	repo      repository.Repository
+	authority *EventAuthority
+	boundary  *ResourceBoundary
 }
 
 func NewWebhook(urls string, logger *slog.Logger) *Webhook {
@@ -75,6 +78,20 @@ func (w *Webhook) WithRetryStore(repo repository.Repository) *Webhook {
 	return w
 }
 
+// WithEventAuthority injects the persisted-event reader independently of the
+// optional retry store. Missing or nil authority refuses all delivery.
+func (w *Webhook) WithEventAuthority(authority *EventAuthority) *Webhook {
+	w.authority = authority
+	return w
+}
+
+// WithResourceBoundary injects deny-only admission for every outbound attempt.
+// Missing or nil boundary is a fault, never a legacy allow.
+func (w *Webhook) WithResourceBoundary(boundary *ResourceBoundary) *Webhook {
+	w.boundary = boundary
+	return w
+}
+
 // Run loops on the subscription until ctx is canceled. It is intended to be
 // `go bus.Subscribe(); go webhook.Run(ctx, bus)`.
 func (w *Webhook) Run(ctx context.Context, sub <-chan repository.Event) {
@@ -95,7 +112,14 @@ func (w *Webhook) Run(ctx context.Context, sub <-chan repository.Event) {
 }
 
 func (w *Webhook) deliver(ctx context.Context, e repository.Event) {
-	body, _ := json.Marshal(map[string]any{
+	// Only persisted fields may form the initial envelope. Each target below
+	// gets a fresh authority/boundary observation immediately before its POST.
+	e, err := w.authority.Reread(ctx, e)
+	if err != nil {
+		w.logger.Warn("webhook delivery refused", "error_class", "authority")
+		return
+	}
+	body, err := json.Marshal(map[string]any{
 		"id":         e.ID,
 		"tenant":     e.TenantID,
 		"bucket":     e.Bucket,
@@ -106,15 +130,41 @@ func (w *Webhook) deliver(ctx context.Context, e repository.Event) {
 		"payload":    e.Payload,
 		"created_at": e.CreatedAt.Format(time.RFC3339Nano),
 	})
-	var sig string
-	if len(w.secret) > 0 {
-		mac := hmac.New(sha256.New, w.secret)
-		mac.Write(body)
-		sig = "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	if err != nil {
+		w.logger.Warn("webhook delivery refused", "error_class", "encoding")
+		return
 	}
+	sig := w.signature(body)
 	for _, u := range w.urls {
+		if _, err := w.admitEvent(ctx, e); err != nil {
+			w.logger.Warn("webhook delivery refused", "error_class", "admission")
+			continue
+		}
 		w.postOne(ctx, e.ID, u, body, sig, 1)
 	}
+}
+
+func (w *Webhook) admitEvent(ctx context.Context, e repository.Event) (repository.Event, error) {
+	e, err := w.authority.Reread(ctx, e)
+	if err != nil {
+		return repository.Event{}, err
+	}
+	if err := admitEventBucket(ctx, w.boundary, e.TenantID, e.Bucket); err != nil {
+		return repository.Event{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return repository.Event{}, newResourceBoundaryFault(err)
+	}
+	return e, nil
+}
+
+func (w *Webhook) signature(body []byte) string {
+	if len(w.secret) == 0 {
+		return ""
+	}
+	mac := hmac.New(sha256.New, w.secret)
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 // postOne handles a single delivery attempt + persists a retry row on failure.
@@ -151,7 +201,7 @@ func (w *Webhook) postOne(ctx context.Context, eventID int64, url string, body [
 
 func (w *Webhook) persistFailure(ctx context.Context, eventID int64, url string, body []byte, lastErr string, status, attempt int) {
 	w.logger.Warn("webhook delivery failed", "url", url, "status", status, "err", lastErr)
-	if w.repo == nil {
+	if eventAuthorityMissing(w.repo) {
 		return
 	}
 	// exp backoff: 30s * 2^(attempt-1), cap 1h, +jitter
@@ -172,7 +222,7 @@ func (w *Webhook) persistFailure(ctx context.Context, eventID int64, url string,
 // RetryLoop polls webhook_failures and re-delivers entries whose next_retry_at
 // has elapsed. Intended to run as a goroutine.
 func (w *Webhook) RetryLoop(ctx context.Context) {
-	if w.repo == nil {
+	if eventAuthorityMissing(w.repo) {
 		return
 	}
 	t := time.NewTicker(15 * time.Second)
@@ -195,13 +245,43 @@ func (w *Webhook) RetryLoop(ctx context.Context) {
 }
 
 func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
-	body := []byte(f.Payload)
-	var sig string
-	if len(w.secret) > 0 {
-		mac := hmac.New(sha256.New, w.secret)
-		mac.Write(body)
-		sig = "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	e, err := decodeWebhookRetryEvent(f)
+	if err != nil {
+		w.deadLetterRetry(ctx, f, "invalid webhook event envelope", 0, f.Attempts+1)
+		return
 	}
+	if _, err := w.admitEvent(ctx, e); err != nil {
+		// Faults (even with a nested Denied/NotFound cause) remain temporary
+		// under the existing finite retry policy. Only explicit refusal is terminal.
+		if !IsEventAuthorityFault(err) && IsResourceBoundaryDenied(err) {
+			w.deadLetterRetry(ctx, f, "webhook admission denied", 0, f.Attempts+1)
+		} else {
+			w.handleRetryFailure(ctx, f, "webhook admission fault", 0)
+		}
+		return
+	}
+	// Admission must not repair/re-encode the stored body: signatures and
+	// delivery bytes remain exactly those persisted by the original failure.
+	w.sendRetry(ctx, f)
+}
+
+func decodeWebhookRetryEvent(f repository.WebhookFailure) (repository.Event, error) {
+	e, err := decodeWebhookEventEnvelope([]byte(f.Payload))
+	if err != nil {
+		return repository.Event{}, err
+	}
+	if f.EventID <= 0 || e.ID != f.EventID {
+		return repository.Event{}, errors.New("webhook row and envelope event IDs differ")
+	}
+	if e.TenantID == "" || e.Bucket == "" || e.Key == "" || e.Type == "" {
+		return repository.Event{}, errors.New("incomplete webhook event envelope")
+	}
+	return e, nil
+}
+
+func (w *Webhook) sendRetry(ctx context.Context, f repository.WebhookFailure) {
+	body := []byte(f.Payload)
+	sig := w.signature(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL, bytes.NewReader(body))
 	if err != nil {
 		w.handleRetryFailure(ctx, f, "bad url: "+err.Error(), 0)
@@ -219,7 +299,11 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		if resp.StatusCode < 300 {
-			_ = w.repo.MarkWebhookSucceeded(ctx, f.ID)
+			if !eventAuthorityMissing(w.repo) {
+				if err := w.repo.MarkWebhookSucceeded(ctx, f.ID); err != nil {
+					w.logger.Warn("mark webhook succeeded", "id", f.ID, "err", err)
+				}
+			}
 			return
 		}
 		w.handleRetryFailure(ctx, f, fmt.Sprintf("non-2xx: %d", resp.StatusCode), resp.StatusCode)
@@ -231,18 +315,13 @@ func (w *Webhook) retryOne(ctx context.Context, f repository.WebhookFailure) {
 func (w *Webhook) handleRetryFailure(
 	ctx context.Context, failure repository.WebhookFailure, lastErr string, lastStatus int,
 ) {
-	if w.repo == nil {
+	if eventAuthorityMissing(w.repo) {
 		return
 	}
 	attempts := failure.Attempts + 1
 	if attempts >= 10 {
-		telemetry.IncWebhookDeadLetter(ctx, failure.URL)
 		message := "dead-lettered after " + fmtInt(int64(attempts)) + " attempts: " + lastErr
-		if err := w.repo.MarkWebhookDeadLettered(
-			ctx, failure.ID, message, lastStatus, attempts,
-		); err != nil {
-			w.logger.Warn("mark webhook dead-lettered", "id", failure.ID, "err", err)
-		}
+		w.deadLetterRetry(ctx, failure, message, lastStatus, attempts)
 		return
 	}
 	backoff := time.Duration(30) * time.Second
@@ -255,6 +334,19 @@ func (w *Webhook) handleRetryFailure(
 	); err != nil {
 		w.logger.Warn("update webhook retry", "id", failure.ID, "err", err)
 	}
+}
+
+func (w *Webhook) deadLetterRetry(
+	ctx context.Context, failure repository.WebhookFailure, message string, status, attempts int,
+) {
+	if eventAuthorityMissing(w.repo) {
+		return
+	}
+	if err := w.repo.MarkWebhookDeadLettered(ctx, failure.ID, message, status, attempts); err != nil {
+		w.logger.Warn("mark webhook dead-lettered", "id", failure.ID, "err", err)
+		return
+	}
+	telemetry.IncWebhookDeadLetter(ctx, failure.URL)
 }
 
 func fmtInt(n int64) string {

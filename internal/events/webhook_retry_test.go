@@ -19,7 +19,7 @@ import (
 func TestWebhook_RetryOne_MalformedURLDoesNotPanic(t *testing.T) {
 	w := &Webhook{client: &http.Client{}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	// No repo wired → persistFailure just logs; the assertion is simply: no panic.
-	w.retryOne(context.Background(), repository.WebhookFailure{EventID: 1, URL: "://not a url", Payload: "{}"})
+	w.retryOne(context.Background(), repository.WebhookFailure{EventID: 1, URL: "://not a url", Payload: webhookTestRetryEnvelope(t, w)})
 }
 
 // terminalRepo records calls to the two terminal-transition methods so the test
@@ -78,7 +78,7 @@ func TestWebhook_RetryOne_MaxAttemptsRetiresRow(t *testing.T) {
 	}
 
 	// Attempts=9 → this delivery is attempt 10, which trips the terminal branch.
-	w.retryOne(context.Background(), repository.WebhookFailure{ID: 7, EventID: 1, URL: srv.URL, Payload: "{}", Attempts: 9})
+	w.retryOne(context.Background(), repository.WebhookFailure{ID: 7, EventID: 1, URL: srv.URL, Payload: webhookTestRetryEnvelope(t, w), Attempts: 9})
 
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
@@ -110,7 +110,7 @@ func TestWebhook_RetryOne_BelowMaxReschedules(t *testing.T) {
 	}
 
 	// Attempts=2 → attempt 3, well below the threshold.
-	w.retryOne(context.Background(), repository.WebhookFailure{ID: 3, EventID: 1, URL: srv.URL, Payload: "{}", Attempts: 2})
+	w.retryOne(context.Background(), repository.WebhookFailure{ID: 3, EventID: 1, URL: srv.URL, Payload: webhookTestRetryEnvelope(t, w), Attempts: 2})
 
 	repo.mu.Lock()
 	defer repo.mu.Unlock()

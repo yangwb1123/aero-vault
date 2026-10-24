@@ -18,35 +18,6 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
-// captureHandler records the last request received by the mock server.
-type captureHandler struct {
-	mu     sync.Mutex
-	body   []byte
-	header http.Header
-}
-
-func (h *captureHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.body, _ = io.ReadAll(r.Body)
-	h.header = r.Header.Clone()
-	rw.WriteHeader(http.StatusOK)
-}
-
-// recordFailureRepo records calls to RecordWebhookFailure for assertions.
-type recordFailureRepo struct {
-	repository.Repository // nil embedded interface: any unexpected call panics
-	mu                    sync.Mutex
-	failures              []repository.WebhookFailure
-}
-
-func (r *recordFailureRepo) RecordWebhookFailure(_ context.Context, f repository.WebhookFailure) (int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.failures = append(r.failures, f)
-	return int64(len(r.failures)), nil
-}
-
 func TestNewWebhook(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -118,6 +89,7 @@ func TestWebhookDeliver_SendsToMockServer(t *testing.T) {
 		Type: repository.EventCreated, RequestID: "req-1",
 		CreatedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
+	webhookTestWire(t, w, event)
 	w.deliver(context.Background(), event)
 
 	capt.mu.Lock()
@@ -174,6 +146,7 @@ func TestWebhookDeliverWithHMAC(t *testing.T) {
 		Type: repository.EventDeleted, RequestID: "req-2",
 		CreatedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
 	}
+	webhookTestWire(t, w, event)
 	w.deliver(context.Background(), event)
 
 	mu.Lock()
@@ -221,6 +194,7 @@ func TestWebhookDeliver_SendsEventIDHeaderWithHMAC(t *testing.T) {
 		ID: 123, TenantID: "t1", Bucket: "b", Key: "k",
 		Type: repository.EventCreated, CreatedAt: time.Now(),
 	}
+	webhookTestWire(t, w, event)
 	w.deliver(context.Background(), event)
 
 	mu.Lock()
@@ -259,6 +233,7 @@ func TestWebhookDeliver_MultipleURLs(t *testing.T) {
 		ID: 1, TenantID: "t1", Bucket: "b", Key: "k",
 		Type: repository.EventCreated, CreatedAt: time.Now(),
 	}
+	webhookTestWire(t, w, event)
 	w.deliver(context.Background(), event)
 
 	mu1.Lock()
@@ -290,6 +265,7 @@ func TestWebhookDeliver_Non2xxPersistsFailure(t *testing.T) {
 		ID: 99, TenantID: "t1", Bucket: "b", Key: "k",
 		Type: repository.EventCreated, CreatedAt: time.Now(),
 	}
+	webhookTestWire(t, w, event)
 	w.deliver(context.Background(), event)
 
 	repo.mu.Lock()
@@ -329,6 +305,7 @@ func TestWebhookDeliver_HTTPErrorPersistsFailure(t *testing.T) {
 		ID: 1, TenantID: "t1", Bucket: "b", Key: "k",
 		Type: repository.EventCreated, CreatedAt: time.Now(),
 	}
+	webhookTestWire(t, w, event)
 	w.deliver(context.Background(), event)
 
 	repo.mu.Lock()
@@ -360,6 +337,7 @@ func TestWebhookDeliver_NoRepoDoesNotPanic(t *testing.T) {
 		ID: 1, TenantID: "t1", Bucket: "b", Key: "k",
 		Type: repository.EventCreated, CreatedAt: time.Now(),
 	}
+	webhookTestWire(t, w, event)
 	w.deliver(context.Background(), event)
 }
 
@@ -375,13 +353,14 @@ func TestWebhookRun_DeliversFromSubscription(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sub := make(chan repository.Event, 4)
-	go w.Run(ctx, sub)
-
-	sub <- repository.Event{
+	event := repository.Event{
 		ID: 1, TenantID: "t", Bucket: "b", Key: "k",
 		Type: repository.EventCreated, CreatedAt: time.Now(),
 	}
+	webhookTestWire(t, w, event)
+	sub := make(chan repository.Event, 4)
+	go w.Run(ctx, sub)
+	sub <- event
 
 	time.Sleep(50 * time.Millisecond)
 
