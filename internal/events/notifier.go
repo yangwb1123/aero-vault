@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,9 +20,11 @@ import (
 // event checks the source bucket's notification rules; matching rules trigger
 // an HTTP POST with the standard S3 notification event format.
 type Notifier struct {
-	repo   repository.Repository
-	client *http.Client
-	logger *slog.Logger
+	repo      repository.Repository
+	client    *http.Client
+	logger    *slog.Logger
+	authority *EventAuthority
+	boundary  *ResourceBoundary
 }
 
 // NewNotifier creates a notifier that delivers bucket notification events.
@@ -34,6 +37,24 @@ func NewNotifier(repo repository.Repository, logger *slog.Logger) *Notifier {
 		client: &http.Client{Timeout: 10 * time.Second},
 		logger: logger,
 	}
+}
+
+// WithEventAuthority injects the exact persisted-event reader. An explicit nil
+// is a fault: notification delivery stops rather than becoming a legacy allow.
+func (n *Notifier) WithEventAuthority(authority *EventAuthority) *Notifier {
+	if n != nil {
+		n.authority = authority
+	}
+	return n
+}
+
+// WithResourceBoundary injects the deny-only bucket admission. An explicit nil
+// is a fault; there is no default-allow switch.
+func (n *Notifier) WithResourceBoundary(boundary *ResourceBoundary) *Notifier {
+	if n != nil {
+		n.boundary = boundary
+	}
+	return n
 }
 
 // Run subscribes to events and delivers notifications. Blocks until ctx is done.
@@ -52,40 +73,72 @@ func (n *Notifier) Run(ctx context.Context, sub <-chan repository.Event) {
 }
 
 // deliver matches one event against the bucket's notification rules and posts
-// to every matching target.
+// to every matching target. The bus event is only a wakeup: delivery first
+// rereads the exact persisted row and admits its authoritative tenant/bucket,
+// then uses that row for event-name, D2 ownership, rule matching and POSTing.
+// A forged, bound or faulting event never reaches a rule lookup or target.
 func (n *Notifier) deliver(ctx context.Context, e repository.Event) {
-	rules, err := n.repo.GetBucketNotifications(ctx, e.TenantID, e.Bucket)
-	if err != nil || len(rules) == 0 {
-		return // no rules configured
+	if n == nil || n.repo == nil {
+		return
 	}
-
-	eventName := s3EventName(e.Type)
+	authoritative, err := n.authoritativeEvent(ctx, e)
+	if err != nil {
+		n.logger.Warn("notification event authority rejected", "error_class", "authority")
+		return
+	}
+	if err := n.admitBucket(ctx, authoritative); err != nil {
+		n.logger.Warn("notification event boundary rejected", "error_class", "boundary")
+		return
+	}
+	eventName := s3EventName(authoritative.Type)
 	if eventName == "" {
 		return // not an S3-style event
 	}
-
-	// D2: deletes that committed through the transactional outbox are delivered
-	// by the relay from the self-contained notify@1.1 payload. Skip the bus path
-	// only when the outbox row exists (any status — the WithEvent transaction
-	// commits before s.emit, so the row is visible regardless of relay progress;
-	// no race). E14 paths (DeleteVersion / delete-marker / quarantine) have no
-	// outbox row and keep the bus path — never silently drop them.
-	if e.Type == repository.EventDeleted && e.ObjectID != nil {
-		has, err := n.repo.HasEventOutboxFact(ctx, *e.ObjectID, repository.EventTypeFileNotify11)
-		if err != nil {
-			n.logger.Warn("notification outbox check failed; falling back to bus delivery",
-				"key", e.Key, "err", err)
-		} else if has {
-			return
-		}
+	rules, err := n.repo.GetBucketNotifications(ctx, authoritative.TenantID, authoritative.Bucket)
+	if err != nil || len(rules) == 0 {
+		return // no rules configured
 	}
-
+	if n.outboxOwnsDelete(ctx, authoritative) {
+		return
+	}
 	for _, rule := range rules {
-		if !ruleMatches(rule, eventName, e.Key) {
+		if !ruleMatches(rule, eventName, authoritative.Key) {
 			continue
 		}
-		n.dispatchToTargets(ctx, e, rule, eventName)
+		n.dispatchToTargets(ctx, authoritative, rule, eventName)
 	}
+}
+
+func (n *Notifier) authoritativeEvent(ctx context.Context, e repository.Event) (repository.Event, error) {
+	if n == nil || n.authority == nil {
+		return repository.Event{}, newEventAuthorityFault(errors.New("missing event authority"))
+	}
+	return n.authority.Reread(ctx, e)
+}
+
+func (n *Notifier) admitBucket(ctx context.Context, e repository.Event) error {
+	return admitEventBucket(ctx, n.boundary, e.TenantID, e.Bucket)
+}
+
+// outboxOwnsDelete preserves the D2 split: deletes committed through the
+// transactional outbox are delivered by the relay from the self-contained
+// notify@1.1 payload. Skip the bus path only when the outbox row exists (any
+// status — the WithEvent transaction commits before s.emit, so the row is
+// visible regardless of relay progress; no race). A lookup fault fails closed:
+// without that fact the bus path cannot safely prove the relay owns delivery.
+// E14 paths (DeleteVersion / delete-marker / quarantine) have no outbox row and
+// keep the bus path — never silently drop them.
+func (n *Notifier) outboxOwnsDelete(ctx context.Context, e repository.Event) bool {
+	if e.Type != repository.EventDeleted || e.ObjectID == nil {
+		return false
+	}
+	has, err := n.repo.HasEventOutboxFact(ctx, *e.ObjectID, repository.EventTypeFileNotify11)
+	if err != nil {
+		n.logger.Warn("notification outbox check failed; dropping bus delivery",
+			"key", e.Key, "error_class", "persistence")
+		return true
+	}
+	return has
 }
 
 // dispatchToTargets sends the notification to all configured targets in the rule.

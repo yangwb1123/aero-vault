@@ -17,10 +17,11 @@ func (m *Manager) Authorize(
 	action Action,
 	resource Resource,
 ) (Decision, error) {
-	// System principals are trusted regardless of the enabled gate: a
-	// disabled manager already allowed everyone, so moving the early exit
-	// above the gate is behavior-preserving for system actors (and keeps
-	// the AV quarantine path working even with access control off).
+	if err := m.boundary.CheckBucket(ctx, resource.TenantID, resource.Bucket); err != nil {
+		return denied("resource_boundary"), err
+	}
+	// System trust and disabled-access compatibility apply only after an
+	// authoritative unbound observation; neither exempts Space resources.
 	if principal.Kind == PrincipalSystem {
 		return Decision{Allowed: true, Reason: "trusted_system"}, nil
 	}
@@ -48,47 +49,56 @@ func (m *Manager) Authorize(
 		return denied("directory_store_error"), err
 	}
 	matching := matchingEntries(entries, principal, departments, action)
-	if action == ActionAdminDelete {
-		if hasEffect(matching, EffectDeny) {
-			return denied("explicit_deny"), nil
-		}
-		if capabilityAllows(principal.Capability, resource, action) ||
-			hasExplicitAdminDeleteGrant(principal, matching) || isAdministrator(principal) {
-			return Decision{Allowed: true, Reason: "explicit_delete_grant"}, nil
-		}
-		return denied("delete_permission_required"), nil
-	}
-	if action == ActionDelete {
-		if hasEffect(matching, EffectDeny) {
-			return denied("explicit_deny"), nil
-		}
-		if hasExplicitDeleteGrant(principal, matching) {
-			return Decision{Allowed: true, Reason: "explicit_delete_grant"}, nil
-		}
-		return denied("default_deny"), nil
+	return m.authorizeMatching(principal, action, resource, entries, matching), nil
+}
+
+func (m *Manager) authorizeMatching(principal Principal, action Action, resource Resource, entries, matching []ACLEntry) Decision {
+	if isDeleteAction(action) {
+		return authorizeDelete(principal, action, resource, matching)
 	}
 	if hasEffect(matching, EffectDeny) {
-		return denied("explicit_deny"), nil
+		return denied("explicit_deny")
 	}
 	if hasEffect(matching, EffectAllow) {
-		return Decision{Allowed: true, Reason: "acl_allow"}, nil
+		return Decision{Allowed: true, Reason: "acl_allow"}
 	}
 	if capabilityAllows(principal.Capability, resource, action) {
-		return Decision{Allowed: true, Reason: "capability"}, nil
+		return Decision{Allowed: true, Reason: "capability"}
 	}
 	if principal.SubjectID != "" && principal.SubjectID == resource.OwnerID {
-		return Decision{Allowed: true, Reason: "owner"}, nil
+		return Decision{Allowed: true, Reason: "owner"}
 	}
 	if isAdministrator(principal) {
-		return Decision{Allowed: true, Reason: "administrator"}, nil
+		return Decision{Allowed: true, Reason: "administrator"}
 	}
+	return m.authorizeDefault(principal, action, entries)
+}
+
+func (m *Manager) authorizeDefault(principal Principal, action Action, entries []ACLEntry) Decision {
 	if len(entries) > 0 {
-		return denied("resource_acl_no_match"), nil
+		return denied("resource_acl_no_match")
 	}
 	if m.cfg.DefaultPolicy == DefaultTenant && scopeAllows(principal, action) {
-		return Decision{Allowed: true, Reason: "tenant_default"}, nil
+		return Decision{Allowed: true, Reason: "tenant_default"}
 	}
-	return denied("default_deny"), nil
+	return denied("default_deny")
+}
+
+func authorizeDelete(principal Principal, action Action, resource Resource, matching []ACLEntry) Decision {
+	if hasEffect(matching, EffectDeny) {
+		return denied("explicit_deny")
+	}
+	if action == ActionAdminDelete {
+		if capabilityAllows(principal.Capability, resource, action) ||
+			hasExplicitAdminDeleteGrant(principal, matching) || isAdministrator(principal) {
+			return Decision{Allowed: true, Reason: "explicit_delete_grant"}
+		}
+		return denied("delete_permission_required")
+	}
+	if hasExplicitDeleteGrant(principal, matching) {
+		return Decision{Allowed: true, Reason: "explicit_delete_grant"}
+	}
+	return denied("default_deny")
 }
 
 func hasExplicitDeleteGrant(principal Principal, entries []ACLEntry) bool {
@@ -229,6 +239,9 @@ func authorizeOrDenied(ctx context.Context, authz Authorizer, action Action, res
 	principal, _ := PrincipalFrom(ctx)
 	decision, err := authz.Authorize(ctx, principal, action, resource)
 	if err != nil {
+		if IsResourceBoundaryFault(err) {
+			return err
+		}
 		return errors.Join(ErrDenied, err)
 	}
 	if !decision.Allowed {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/spaces"
 	"github.com/google/uuid"
 )
 
@@ -68,6 +69,9 @@ func (m *Manager) RevokeShare(ctx context.Context, tenant, id string) error {
 	if err != nil {
 		return err
 	}
+	if err := m.boundary.CheckBucket(ctx, share.TenantID, share.Bucket); err != nil {
+		return err
+	}
 	if subjectFromContext(ctx) != share.CreatedBy {
 		resource := Resource{
 			TenantID: tenant, Bucket: share.Bucket, Key: share.Key,
@@ -93,6 +97,9 @@ func (m *Manager) ResolveShare(
 	if err := m.validateShare(share, password, action); err != nil {
 		return Share{}, Principal{}, err
 	}
+	if err := m.checkCapabilityTarget(ctx, share.TenantID, share.Bucket, consume); err != nil {
+		return Share{}, Principal{}, err
+	}
 	if consume {
 		share, err = m.store.ConsumeShare(ctx, share.TokenHash, time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
@@ -104,6 +111,19 @@ func (m *Manager) ResolveShare(
 		Actions: shareActions(share),
 	}
 	return share, CapabilityPrincipal(PrincipalShare, capability), nil
+}
+
+func (m *Manager) checkCapabilityTarget(ctx context.Context, tenant, bucket string, consume bool) error {
+	err := m.boundary.CheckBucket(ctx, tenant, bucket)
+	// Non-consuming resolution is only a lookup, not permission to use the
+	// capability. Keep tenant suspension at FileService's existing read gate
+	// so public HTTP reads retain TenantDisabled, rather than AccessDenied.
+	// Actual consumption and Authorize still reject unavailable tenants;
+	// bound resources and observation faults must never take this path.
+	if !consume && !IsResourceBoundaryFault(err) && errors.Is(err, spaces.ErrTenantUnavailable) {
+		return nil
+	}
+	return err
 }
 
 func (m *Manager) validateShare(share Share, password string, action Action) error {
@@ -154,22 +174,7 @@ func (m *Manager) PublishAsset(ctx context.Context, asset PublicAsset) (PublicAs
 	if asset.Slug == "" || strings.Contains(asset.Slug, "..") || strings.ContainsAny(asset.Slug, "?#") {
 		return PublicAsset{}, fmt.Errorf("%w: invalid asset slug", ErrInvalidArgument)
 	}
-	existing, err := m.store.GetPublicAsset(ctx, asset.Slug)
-	if err == nil {
-		if existing.TenantID != asset.TenantID {
-			return PublicAsset{}, fmt.Errorf("%w: asset slug is already in use", ErrInvalidArgument)
-		}
-		if existing.PublishedBy != subjectFromContext(ctx) {
-			current := Resource{
-				TenantID: existing.TenantID, Bucket: existing.Bucket, Key: existing.Key,
-				Kind: ResourceObject, OwnerID: existing.OwnerID,
-			}
-			if err := m.require(ctx, ActionPublish, current); err != nil {
-				return PublicAsset{}, err
-			}
-		}
-		asset.ID = existing.ID
-	} else if !errors.Is(err, ErrNotFound) {
+	if err := m.reusePublicAssetID(ctx, &asset); err != nil {
 		return PublicAsset{}, err
 	}
 	if asset.ID == "" {
@@ -189,9 +194,39 @@ func (m *Manager) PublishAsset(ctx context.Context, asset PublicAsset) (PublicAs
 	return asset, nil
 }
 
+func (m *Manager) reusePublicAssetID(ctx context.Context, asset *PublicAsset) error {
+	existing, err := m.store.GetPublicAsset(ctx, asset.Slug)
+	if err != nil {
+		if !IsResourceBoundaryFault(err) && errors.Is(err, ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if existing.TenantID != asset.TenantID {
+		return fmt.Errorf("%w: asset slug is already in use", ErrInvalidArgument)
+	}
+	if err := m.boundary.CheckBucket(ctx, existing.TenantID, existing.Bucket); err != nil {
+		return err
+	}
+	if existing.PublishedBy != subjectFromContext(ctx) {
+		current := Resource{
+			TenantID: existing.TenantID, Bucket: existing.Bucket, Key: existing.Key,
+			Kind: ResourceObject, OwnerID: existing.OwnerID,
+		}
+		if err := m.require(ctx, ActionPublish, current); err != nil {
+			return err
+		}
+	}
+	asset.ID = existing.ID
+	return nil
+}
+
 func (m *Manager) ResolvePublicAsset(ctx context.Context, slug string) (PublicAsset, Principal, error) {
 	asset, err := m.store.GetPublicAsset(ctx, strings.Trim(slug, "/"))
 	if err != nil {
+		return PublicAsset{}, Principal{}, err
+	}
+	if err := m.checkCapabilityTarget(ctx, asset.TenantID, asset.Bucket, false); err != nil {
 		return PublicAsset{}, Principal{}, err
 	}
 	capability := Capability{
@@ -206,8 +241,18 @@ func (m *Manager) ListPublicAssets(ctx context.Context, tenant string) ([]Public
 	if !tenantMatches(principal, Resource{TenantID: tenant}) {
 		return nil, ErrDenied
 	}
+	scope := spaces.CoverageScope{Kind: spaces.CoverageTenant, TenantID: tenant}
+	if err := m.boundary.CheckCoverage(ctx, scope); err != nil {
+		return nil, err
+	}
 	assets, err := m.store.ListPublicAssets(ctx, tenant)
 	if err != nil {
+		return nil, err
+	}
+	if err := m.checkPublicAssetRows(ctx, tenant, assets); err != nil {
+		return nil, err
+	}
+	if err := m.boundary.CheckCoverage(ctx, scope); err != nil {
 		return nil, err
 	}
 	if canPublish(principal) || isAdministrator(principal) {
@@ -220,6 +265,18 @@ func (m *Manager) ListPublicAssets(ctx context.Context, tenant string) ([]Public
 		}
 	}
 	return visible, nil
+}
+
+func (m *Manager) checkPublicAssetRows(ctx context.Context, tenant string, assets []PublicAsset) error {
+	for _, asset := range assets {
+		if asset.TenantID != tenant {
+			return boundaryFault("public assets", fmt.Errorf("%w: asset tenant mismatch", ErrInvalidArgument))
+		}
+		if err := m.boundary.CheckBucket(ctx, asset.TenantID, asset.Bucket); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func canPublish(principal Principal) bool {
@@ -237,6 +294,9 @@ func canPublish(principal Principal) bool {
 func (m *Manager) UnpublishAsset(ctx context.Context, tenant, slug string) error {
 	asset, err := m.store.GetPublicAsset(ctx, slug)
 	if err != nil {
+		return err
+	}
+	if err := m.boundary.CheckBucket(ctx, asset.TenantID, asset.Bucket); err != nil {
 		return err
 	}
 	if subjectFromContext(ctx) != asset.PublishedBy {

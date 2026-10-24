@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/spaces"
 )
 
 // fakeRepo is a minimal Repository used only to drive Bus.Publish. It embeds
@@ -247,6 +248,196 @@ func TestPublish_AfterCloseDoesNotPanic(t *testing.T) {
 	b.Publish(context.Background(), repository.Event{Key: "post-close"})
 	if repo.insertCount() != 1 {
 		t.Fatalf("Publish after Close should still persist; inserts=%d", repo.insertCount())
+	}
+}
+
+func TestBus_TransportAdmission(t *testing.T) {
+	cases := []struct {
+		name      string
+		boundary  *ResourceBoundary
+		wantCalls int32
+	}{
+		{"unbound", busTestBoundary(spaces.BindingUnbound, nil), 1},
+		{"bound", busTestBoundary(spaces.BindingBound, nil), 0},
+		{"fault", busTestBoundary(spaces.BindingUnbound, errors.New("probe fault")), 0},
+		{"missing", nil, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeRepo{}
+			bus := New(repo, quietLogger()).WithResourceBoundary(tc.boundary)
+			var calls int32
+			bus.WithTransport(func(context.Context, repository.Event) error {
+				atomic.AddInt32(&calls, 1)
+				return nil
+			})
+			sub, cancel := bus.Subscribe()
+			defer cancel()
+			bus.Publish(context.Background(), repository.Event{
+				TenantID: "t1", Bucket: "b1", Key: "k", Type: repository.EventCreated,
+			})
+			if ev, ok := recv(t, sub, time.Second); !ok || ev.Key != "k" {
+				t.Fatal("persistence and local broadcast must survive transport admission")
+			}
+			if repo.insertCount() != 1 || atomic.LoadInt32(&calls) != tc.wantCalls {
+				t.Fatalf("inserts=%d transport calls=%d, want 1/%d",
+					repo.insertCount(), calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestBus_PublishDoesNotReadAuthorityOrBoundary(t *testing.T) {
+	repo := &busTestWrappedRepo{fakeRepo: &fakeRepo{}}
+	bus := New(repo, quietLogger())
+	sub, cancel := bus.Subscribe()
+	defer cancel()
+	bus.Publish(context.Background(), repository.Event{
+		TenantID: "t1", Bucket: "b1", Key: "local", Type: repository.EventCreated,
+	})
+	if ev, ok := recv(t, sub, time.Second); !ok || ev.Key != "local" {
+		t.Fatal("local publish must still broadcast")
+	}
+	if repo.listCalls != 0 || repo.probeCalls != 0 || repo.insertCount() != 1 {
+		t.Fatalf("list=%d probe=%d inserts=%d; local publish must only insert",
+			repo.listCalls, repo.probeCalls, repo.insertCount())
+	}
+}
+
+func TestBus_WithRepositoryRetainsInjectedCapabilities(t *testing.T) {
+	raw := &fakeRepo{}
+	authorityRepo := &busTestAuthorityRepo{fakeRepo: raw, rows: []repository.Event{busTestDeliverEvent()}}
+	authority, err := NewEventAuthority(authorityRepo)
+	if err != nil {
+		t.Fatalf("new authority: %v", err)
+	}
+	bus := New(authorityRepo, quietLogger()).
+		WithResourceBoundary(busTestBoundary(spaces.BindingUnbound, nil)).
+		WithEventAuthority(authority)
+	wrapper := &busTestWrappedRepo{fakeRepo: raw}
+	bus.WithRepository(wrapper)
+	var transportCalls int32
+	bus.WithTransport(func(context.Context, repository.Event) error {
+		atomic.AddInt32(&transportCalls, 1)
+		return nil
+	})
+	sub, cancel := bus.Subscribe()
+	defer cancel()
+	bus.Publish(context.Background(), repository.Event{
+		TenantID: "t1", Bucket: "b1", Key: "wrapped", Type: repository.EventCreated,
+	})
+	if ev, ok := recv(t, sub, time.Second); !ok || ev.Key != "wrapped" {
+		t.Fatal("expected locally broadcast event")
+	}
+	if raw.insertCount() != 1 || atomic.LoadInt32(&transportCalls) != 1 {
+		t.Fatalf("wrapper insert=%d transport=%d; want 1/1", raw.insertCount(), transportCalls)
+	}
+	bus.DeliverContext(context.Background(), busTestDeliverEvent())
+	if got, ok := recv(t, sub, time.Second); !ok || got.ID != 1 {
+		t.Fatalf("retained authority did not deliver a row: %+v", got)
+	}
+	if wrapper.listCalls != 0 {
+		t.Fatalf("wrapped persistence was reread %d times; raw authority must be retained", wrapper.listCalls)
+	}
+}
+
+func TestBus_DeliverContextUsesAuthoritativeRow(t *testing.T) {
+	want := busTestDeliverEvent()
+	row := busTestDeliverEvent()
+	row.RequestID = "persisted"
+	repo := &busTestAuthorityRepo{fakeRepo: &fakeRepo{}, rows: []repository.Event{row}}
+	authority, err := NewEventAuthority(repo)
+	if err != nil {
+		t.Fatalf("new authority: %v", err)
+	}
+	bus := New(repo, quietLogger()).WithEventAuthority(authority).
+		WithResourceBoundary(busTestBoundary(spaces.BindingUnbound, nil))
+	var transportCalls int32
+	bus.WithTransport(func(context.Context, repository.Event) error {
+		atomic.AddInt32(&transportCalls, 1)
+		return nil
+	})
+	sub, cancel := bus.Subscribe()
+	defer cancel()
+	bus.DeliverContext(context.Background(), want)
+	got, ok := recv(t, sub, time.Second)
+	if !ok || got.RequestID != "persisted" || got.Key != want.Key {
+		t.Fatalf("delivered row = %+v", got)
+	}
+	if repo.insertCount() != 0 || atomic.LoadInt32(&transportCalls) != 0 {
+		t.Fatalf("deliver persisted=%d transport=%d; want 0/0", repo.insertCount(), transportCalls)
+	}
+	if repo.listCalls != 1 || repo.lastTenant != want.TenantID || repo.lastAfter != want.ID-1 {
+		t.Fatalf("reread args calls=%d tenant=%q after=%d", repo.listCalls, repo.lastTenant, repo.lastAfter)
+	}
+}
+
+func TestBus_DeliverContextRefusesUnsafeRows(t *testing.T) {
+	cases := []struct {
+		name      string
+		authority bool
+		boundary  *ResourceBoundary
+		rows      bool
+		mutate    func(*repository.Event)
+	}{
+		{"no_authority", false, busTestBoundary(spaces.BindingUnbound, nil), true, nil},
+		{"bound", true, busTestBoundary(spaces.BindingBound, nil), true, nil},
+		{"missing_boundary", true, nil, true, nil},
+		{"boundary_fault", true, busTestBoundary(spaces.BindingUnbound, errors.New("probe fault")), true, nil},
+		{"not_persisted", true, busTestBoundary(spaces.BindingUnbound, nil), false, nil},
+		{"forged_id", true, busTestBoundary(spaces.BindingUnbound, nil), true, func(e *repository.Event) { e.ID = 2 }},
+		{"forged_scope", true, busTestBoundary(spaces.BindingUnbound, nil), true, func(e *repository.Event) { e.Bucket = "other" }},
+		{"forged_type", true, busTestBoundary(spaces.BindingUnbound, nil), true, func(e *repository.Event) { e.Type = repository.EventDeleted }},
+		{"forged_object", true, busTestBoundary(spaces.BindingUnbound, nil), true, func(e *repository.Event) { v := int64(8); e.ObjectID = &v }},
+		{"forged_payload", true, busTestBoundary(spaces.BindingUnbound, nil), true, func(e *repository.Event) { e.Payload = map[string]string{"v": "2"} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := busTestDeliverEvent()
+			row := busTestDeliverEvent()
+			if tc.mutate != nil {
+				tc.mutate(&row)
+			}
+			repo := &busTestAuthorityRepo{fakeRepo: &fakeRepo{}}
+			if tc.rows {
+				repo.rows = []repository.Event{row}
+			}
+			bus := New(repo, quietLogger())
+			if tc.authority {
+				authority, err := NewEventAuthority(repo)
+				if err != nil {
+					t.Fatalf("new authority: %v", err)
+				}
+				bus.WithEventAuthority(authority)
+			}
+			if tc.boundary != nil {
+				bus.WithResourceBoundary(tc.boundary)
+			}
+			sub, cancel := bus.Subscribe()
+			defer cancel()
+			bus.DeliverContext(context.Background(), want)
+			expectNothing(t, sub, 50*time.Millisecond)
+		})
+	}
+}
+
+func TestBus_LegacyDeliverDelegatesScopedEvent(t *testing.T) {
+	row := busTestDeliverEvent()
+	repo := &busTestAuthorityRepo{fakeRepo: &fakeRepo{}, rows: []repository.Event{row}}
+	authority, err := NewEventAuthority(repo)
+	if err != nil {
+		t.Fatalf("new authority: %v", err)
+	}
+	bus := New(repo, quietLogger()).WithEventAuthority(authority).
+		WithResourceBoundary(busTestBoundary(spaces.BindingUnbound, nil))
+	sub, cancel := bus.Subscribe()
+	defer cancel()
+	bus.Deliver(row)
+	if got, ok := recv(t, sub, time.Second); !ok || got.ID != row.ID {
+		t.Fatalf("delivered row = %+v", got)
+	}
+	if repo.listCalls != 1 {
+		t.Fatalf("legacy Deliver rereads = %d, want 1", repo.listCalls)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aero-vault/aero-vault/internal/spaces"
 	"github.com/google/uuid"
 )
 
@@ -32,8 +33,9 @@ type Config struct {
 }
 
 type Manager struct {
-	store Store
-	cfg   Config
+	store    Store
+	cfg      Config
+	boundary *ResourceBoundary
 }
 
 func NewManager(store Store, cfg Config) (*Manager, error) {
@@ -49,7 +51,11 @@ func NewManager(store Store, cfg Config) (*Manager, error) {
 	if len(cfg.ShareSecret) < 32 {
 		return nil, errors.New("access: share secret must be at least 32 bytes")
 	}
-	return &Manager{store: store, cfg: cfg}, nil
+	// Capture the concrete store's independent read ports once. A missing or
+	// typed-nil capability remains a fault, even with access control disabled.
+	binding, _ := store.(spaces.BindingReader)
+	coverage, _ := store.(spaces.CoverageReader)
+	return &Manager{store: store, cfg: cfg, boundary: NewResourceBoundary(binding, coverage)}, nil
 }
 
 func (m *Manager) Enabled() bool { return m != nil && m.cfg.Enabled }
@@ -217,6 +223,9 @@ func (entry ACLEntry) resource() Resource {
 func (m *Manager) DeleteACL(ctx context.Context, tenant, id string) error {
 	entry, err := m.store.GetACLEntry(ctx, tenant, id)
 	if err != nil {
+		return err
+	}
+	if err := m.boundary.CheckBucket(ctx, entry.TenantID, entry.Bucket); err != nil {
 		return err
 	}
 	if subjectFromContext(ctx) != entry.CreatedBy {

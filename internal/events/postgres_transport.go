@@ -13,7 +13,8 @@
 // Typical wiring (done by the parent, NOT here):
 //
 //	tr := events.NewPostgresTransport(dsn, "")
-//	go tr.Run(ctx, func(e repository.Event) { bus.Publish(ctx, e) }) // or a re-broadcast hook
+//	tr.WithResourceBoundary(boundary)
+//	go tr.Run(ctx, func(e repository.Event) { bus.DeliverContext(ctx, e) })
 //	// and on local publish, also call tr.Publish(ctx, e)
 //
 // Status: OPT-IN. REQUIRES Postgres. This file is NOT exercised by CI tests —
@@ -50,8 +51,9 @@ const DefaultChannel = "aero_vault_events"
 // Postgres LISTEN/NOTIFY channel. It stores configuration only; no connection
 // is opened until Publish or Run is called.
 type PostgresTransport struct {
-	dsn     string
-	channel string
+	dsn      string
+	channel  string
+	boundary *ResourceBoundary
 }
 
 // NewPostgresTransport returns a transport configured for dsn and channel.
@@ -66,10 +68,29 @@ func NewPostgresTransport(dsn, channel string) *PostgresTransport {
 // Channel reports the LISTEN/NOTIFY channel this transport uses.
 func (t *PostgresTransport) Channel() string { return t.channel }
 
-// Publish marshals e to JSON and emits it on the configured channel via
-// pg_notify, using a short-lived connection. The 8000-byte NOTIFY payload
-// limit applies (see package doc).
+// WithResourceBoundary injects the deny-only egress admission used before any
+// event is encoded or connected to Postgres. An explicit nil is a fault and
+// refuses all publishes; it is never a legacy allow.
+func (t *PostgresTransport) WithResourceBoundary(boundary *ResourceBoundary) *PostgresTransport {
+	if t != nil {
+		t.boundary = boundary
+	}
+	return t
+}
+
+// Publish admits the exact event tenant/bucket, then marshals e to JSON and
+// emits it on the configured channel via pg_notify, using a short-lived
+// connection. Admission runs before encoding and connecting, so a bound bucket,
+// a boundary fault or a missing capability never sends the full event JSON.
+// The 8000-byte NOTIFY payload limit applies (see package doc).
 func (t *PostgresTransport) Publish(ctx context.Context, e repository.Event) error {
+	if t == nil {
+		return fmt.Errorf("postgres transport admission: %w",
+			newResourceBoundaryFault(errors.New("missing postgres transport")))
+	}
+	if err := admitEventBucket(ctx, t.boundary, e.TenantID, e.Bucket); err != nil {
+		return fmt.Errorf("postgres transport admission: %w", err)
+	}
 	payload, err := encodeEvent(e)
 	if err != nil {
 		return fmt.Errorf("encode event: %w", err)
