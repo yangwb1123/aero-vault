@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/ai"
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -28,13 +29,18 @@ type AIHandler struct {
 	agent    *ai.Agent
 	logger   *slog.Logger
 	degraded bool // when true, all AI endpoints return 503 immediately
+
+	lineageBoundary    *access.ResourceBoundary
+	lineageResources   LineageResourceReader
+	lineageReaderFault error
 }
 
 func NewAIHandler(repo repository.Repository, search *ai.Search, chat *ai.Chat, agent *ai.Agent, logger *slog.Logger, degraded bool) *AIHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &AIHandler{repo: repo, search: search, chat: chat, agent: agent, logger: logger, degraded: degraded}
+	h := &AIHandler{repo: repo, search: search, chat: chat, agent: agent, logger: logger, degraded: degraded}
+	return h.WithLineageReaders(discoverLineageReaders(repo))
 }
 
 // aiDegraded checks whether AI is in degraded mode and returns early with 503.
@@ -77,10 +83,17 @@ func (h *AIHandler) Search(w http.ResponseWriter, r *http.Request) {
 		ReqID:  mw.RequestIDFrom(r.Context()),
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		writeAIError(w, r, err, false)
 		return
 	}
 	writeJSON(w, http.StatusOK, searchResponse{Query: req.Query, Hits: hits})
+}
+
+type chatStreamRequest struct {
+	Query  string `json:"query"`
+	K      int    `json:"k,omitempty"`
+	Mode   string `json:"mode,omitempty"`
+	Bucket string `json:"bucket,omitempty"`
 }
 
 // POST /v1/chat/stream — SSE response. Token chunks use event:token and the
@@ -98,16 +111,15 @@ func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	var req struct {
-		Query  string `json:"query"`
-		K      int    `json:"k,omitempty"`
-		Mode   string `json:"mode,omitempty"`
-		Bucket string `json:"bucket,omitempty"`
-	}
+	var req chatStreamRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Query == "" {
 		http.Error(w, "query required", http.StatusBadRequest)
 		return
 	}
+	h.answerChatStream(w, r, flusher, req)
+}
+
+func (h *AIHandler) answerChatStream(w http.ResponseWriter, r *http.Request, flusher http.Flusher, req chatStreamRequest) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -138,12 +150,13 @@ func (h *AIHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	if writeFailed.Load() || streamCtx.Err() != nil {
 		return
 	}
+	finishChatStream(w, flusher, resp, err)
+}
+
+func finishChatStream(w http.ResponseWriter, flusher http.Flusher, resp ai.ChatResp, err error) {
 	if err != nil {
-		if errors.Is(err, ai.ErrBudgetExceeded) {
-			writeSSEError(w, flusher, "BudgetExceeded", "tenant AI budget exceeded")
-		} else {
-			writeSSEError(w, flusher, "InternalError", err.Error())
-		}
+		_, payload := aiErrorResponse(err, true)
+		writeSSEError(w, flusher, payload.Code, payload.Message)
 		return
 	}
 	// Final frame: full answer + citations as JSON
@@ -188,7 +201,7 @@ func (h *AIHandler) Agent(w http.ResponseWriter, r *http.Request) {
 		Tenant: mw.TenantFrom(r.Context()), Query: req.Query, ReqID: mw.RequestIDFrom(r.Context()),
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		writeAIError(w, r, err, false)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -225,11 +238,7 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		Caller: "rest:chat", ReqID: mw.RequestIDFrom(r.Context()), Prior: req.Prior,
 	})
 	if err != nil {
-		if errors.Is(err, ai.ErrBudgetExceeded) {
-			writeJSON(w, http.StatusPaymentRequired, errorBody{Error: errorPayload{Code: "BudgetExceeded", Message: "tenant AI budget exceeded", RequestID: mw.RequestIDFrom(r.Context())}})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		writeAIError(w, r, err, true)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -242,14 +251,14 @@ func (h *AIHandler) Lineage(w http.ResponseWriter, r *http.Request) {
 	}
 	idStr := chi.URLParam(r, "id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: "id must be int"}})
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: errorPayload{Code: "InvalidArgument", Message: "id must be a positive int"}})
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	usages, err := h.repo.ListUsageForObject(r.Context(), mw.TenantFrom(r.Context()), id, limit)
+	usages, err := h.readAdmittedLineage(r.Context(), mw.TenantFrom(r.Context()), id, limit)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{Code: "InternalError", Message: err.Error()}})
+		writeAIError(w, r, err, false)
 		return
 	}
 	entries := make([]lineageEntry, 0, len(usages))
@@ -263,6 +272,24 @@ func (h *AIHandler) Lineage(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, lineageResponse{ObjectID: id, Entries: entries})
+}
+
+// Boundary classification must precede budget and legacy error mappings: a
+// nested NotFound/Denied/BudgetExceeded cause is not an admission decision.
+func aiErrorResponse(err error, chatBudget bool) (int, errorPayload) {
+	if code, message, status, ok := classifyBoundary(err); ok {
+		return status, errorPayload{Code: code, Message: message}
+	}
+	if chatBudget && errors.Is(err, ai.ErrBudgetExceeded) {
+		return http.StatusPaymentRequired, errorPayload{Code: "BudgetExceeded", Message: "tenant AI budget exceeded"}
+	}
+	return http.StatusInternalServerError, errorPayload{Code: "InternalError", Message: err.Error()}
+}
+
+func writeAIError(w http.ResponseWriter, r *http.Request, err error, chatBudget bool) {
+	status, payload := aiErrorResponse(err, chatBudget)
+	payload.RequestID = mw.RequestIDFrom(r.Context())
+	writeJSON(w, status, errorBody{Error: payload})
 }
 
 // avoid unused warnings if service is referenced elsewhere in the package

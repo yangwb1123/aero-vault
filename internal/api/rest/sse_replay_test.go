@@ -40,7 +40,10 @@ func TestSSEReplayIncludesConsumedEventsAcrossPages(t *testing.T) {
 	handler := NewSSEHandler(nil, repo, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/v1/events/stream", nil)
-	replayedThrough := handler.replayMissed(rec, rec, req, "tenant-a", firstID)
+	replayedThrough, err := handler.replayMissed(rec, rec, req, "tenant-a", firstID)
+	if err != nil {
+		t.Fatalf("replay missed: %v", err)
+	}
 
 	if replayedThrough != lastID {
 		t.Fatalf("replayed through %d, want %d", replayedThrough, lastID)
