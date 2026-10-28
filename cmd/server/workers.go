@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,275 +21,346 @@ import (
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
-func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, bus *events.Bus, jobReg *jobs.Registry, jobQueue *jobs.Queue, svc *service.FileService) error {
-	if cfg.Antivirus.Enabled && jobReg != nil {
-		scanner := buildScanner(cfg, logger)
-		avw := antivirus.NewWorker(repo, store, scanner, jobQueue, cfg.Antivirus.Quarantine, logger).
-			WithObjectController(svc)
-		jobReg.Register(antivirus.JobScan, func(ctx context.Context, job repository.Job) error {
-			id, err := antivirus.DecodeObjectID(job.Payload)
-			if err != nil {
-				return err
-			}
-			return avw.ScanObjectByID(access.AntivirusContext(ctx, job.TenantID), id)
-		})
-		avSub, _ := bus.Subscribe()
-		go avw.Run(ctx, avSub)
-		logger.Info("antivirus enabled", "scanner", scanner.Name(), "quarantine", cfg.Antivirus.Quarantine)
+type backgroundWorkers struct {
+	cfg         *config.Config
+	logger      *slog.Logger
+	repo        repository.Repository
+	store       storage.Storage
+	bus         *events.Bus
+	registry    *jobs.Registry
+	queue       *jobs.Queue
+	svc         *service.FileService
+	readers     spaceReaders
+	av          *antivirus.Worker
+	replica     *replication.Worker
+	resync      *replication.Resyncer
+	notifier    *events.Notifier
+	webhook     *events.Webhook
+	relay       *events.EventOutboxRelay
+	maintenance *maintenanceWorkers
+	initialized bool
+	started     bool
+}
+
+func prepareBackgroundWorkers(cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, bus *events.Bus, reg *jobs.Registry, queue *jobs.Queue, svc *service.FileService, readers spaceReaders) (*backgroundWorkers, error) {
+	if err := readers.validate(); err != nil {
+		return nil, err
 	}
-	if cfg.Replication.Enabled && jobReg != nil {
-		replica, err := buildStorageFrom(ctx, cfg.Replication.Storage)
+	w := &backgroundWorkers{cfg: cfg, logger: logger, repo: repo, store: store,
+		bus: bus, registry: reg, queue: queue, svc: svc, readers: readers}
+	w.notifier = events.NewNotifier(repo, logger).WithEventAuthority(readers.router.EventAuthority).
+		WithResourceBoundary(events.NewResourceBoundary(readers.router.Binding))
+	if cfg.Events.WebhookURL != "" {
+		w.webhook = events.NewWebhook(cfg.Events.WebhookURL, logger).WithSecret(cfg.Events.WebhookSecret).
+			WithRetryStore(repo).WithEventAuthority(readers.router.EventAuthority).
+			WithResourceBoundary(events.NewResourceBoundary(readers.router.Binding))
+	}
+	if cfg.Antivirus.Enabled && reg != nil {
+		scanner := buildScanner(cfg, logger)
+		w.av = antivirus.NewWorker(repo, store, scanner, queue, cfg.Antivirus.Quarantine, logger).
+			WithObjectController(svc).WithResourceBoundary(readers.router.Binding)
+		registerAntivirusJob(reg, w.av)
+	}
+	var err error
+	w.relay, err = prepareEventOutboxRelay(cfg, logger, repo, readers.router.Binding)
+	if err != nil {
+		return nil, err
+	}
+	w.maintenance, err = prepareMaintenance(cfg, logger, repo, store, svc.ChunkCleaner(), readers)
+	if err != nil {
+		return nil, err
+	}
+	return w, w.validate()
+}
+
+func registerAntivirusJob(reg *jobs.Registry, worker *antivirus.Worker) {
+	reg.Register(antivirus.JobScan, func(ctx context.Context, job repository.Job) error {
+		id, err := antivirus.DecodeObjectID(job.Payload)
+		if err != nil {
+			return err
+		}
+		return worker.ScanObjectByID(access.AntivirusContext(ctx, job.TenantID), id)
+	})
+}
+
+func registerReplicationJob(reg *jobs.Registry, worker *replication.Worker) {
+	reg.Register(replication.JobReplicate, func(ctx context.Context, job repository.Job) error {
+		id, err := replication.DecodeObjectID(job.Payload)
+		if err != nil {
+			return err
+		}
+		return worker.ReplicateObjectByID(access.SystemContext(ctx, job.TenantID), id)
+	})
+}
+
+func (w *backgroundWorkers) validate() error {
+	if w == nil || w.cfg == nil || w.bus == nil || w.svc == nil {
+		return spaceStartupFault(errors.New("missing background worker dependencies"))
+	}
+	if err := w.readers.validate(); err != nil {
+		return err
+	}
+	if err := w.validateQueue(); err != nil {
+		return err
+	}
+	if err := w.validateConsumers(); err != nil {
+		return err
+	}
+	return w.maintenance.validate(w.cfg)
+}
+
+func (w *backgroundWorkers) validateQueue() error {
+	if (w.registry == nil) != (w.queue == nil) || (w.cfg.Jobs.Workers > 0 && w.registry == nil) {
+		return spaceStartupFault(errors.New("incomplete job registry/queue"))
+	}
+	return nil
+}
+
+func (w *backgroundWorkers) validateConsumers() error {
+	if w.notifier == nil || (w.cfg.Events.WebhookURL != "" && w.webhook == nil) || (w.cfg.EventOutbox.Enabled && w.relay == nil) {
+		return spaceStartupFault(errors.New("missing prepared event consumer"))
+	}
+	if w.cfg.Antivirus.Enabled && w.registry != nil && w.av == nil {
+		return spaceStartupFault(errors.New("missing prepared antivirus worker"))
+	}
+	return nil
+}
+
+// Secondary storage construction can perform backend I/O. It is deliberately
+// after every consumer's preflight, and before any subscription, pool or Run.
+// No nil-storage worker or proxy is installed: the real handle is constructed
+// with its raw reader before registration and remains owned by this instance.
+func (w *backgroundWorkers) initialize(ctx context.Context) error {
+	if err := w.validate(); err != nil {
+		return err
+	}
+	if w.initialized {
+		return spaceStartupFault(errors.New("background workers already initialized"))
+	}
+	if w.cfg.Replication.Enabled && w.registry != nil {
+		replica, err := buildStorageFrom(ctx, w.cfg.Replication.Storage)
 		if err != nil {
 			return fmt.Errorf("build replica storage: %w", err)
 		}
-		rw := replication.NewWorker(repo, store, replica, jobQueue, logger).
-			WithObjectTagger(svc)
-		jobReg.Register(replication.JobReplicate, func(ctx context.Context, job repository.Job) error {
-			id, err := replication.DecodeObjectID(job.Payload)
-			if err != nil {
-				return err
-			}
-			return rw.ReplicateObjectByID(access.SystemContext(ctx, job.TenantID), id)
-		})
-		rwSub, _ := bus.Subscribe()
-		go rw.Run(ctx, rwSub)
-		if cfg.Replication.ResyncIntervalMinutes > 0 {
-			go replication.NewResyncer(repo, jobQueue,
-				time.Duration(cfg.Replication.ResyncIntervalMinutes)*time.Minute, logger).Run(ctx)
-			logger.Info("replication resync enabled",
-				"interval_minutes", cfg.Replication.ResyncIntervalMinutes)
+		w.replica = replication.NewWorker(w.repo, w.store, replica, w.queue, w.logger).
+			WithObjectTagger(w.svc).WithResourceBoundary(w.readers.router.Binding)
+		registerReplicationJob(w.registry, w.replica)
+		if w.cfg.Replication.ResyncIntervalMinutes > 0 {
+			w.resync = replication.NewResyncer(w.repo, w.queue,
+				time.Duration(w.cfg.Replication.ResyncIntervalMinutes)*time.Minute, w.logger).
+				WithResourceBoundary(w.readers.router.Binding)
 		}
-		logger.Info("replication enabled", "replica_backend", replica.Backend())
+		w.logger.Info("replication enabled", "replica_backend", replica.Backend())
 	}
-	if jobReg != nil {
-		go jobs.NewPool(repo, jobReg, cfg.Jobs.Workers, logger).Run(ctx)
-		logger.Info("job pool started", "workers", cfg.Jobs.Workers)
-	}
-	startWebhook(ctx, cfg, logger, repo, bus)
-	startNotificationWorker(ctx, logger, repo, bus)
-	if err := startEventOutboxRelay(ctx, cfg, logger, repo); err != nil {
+	w.initialized = true
+	return nil
+}
+
+func (w *backgroundWorkers) validateInitialized() error {
+	if err := w.validate(); err != nil {
 		return err
 	}
-	if cfg.Reconcile.IntervalMinutes > 0 {
-		startReconcile(ctx, cfg, logger, repo, store, svc.ChunkCleaner())
+	if !w.initialized || w.started {
+		return spaceStartupFault(errors.New("workers not initialized or already started"))
+	}
+	return w.validateReplication()
+}
+
+func (w *backgroundWorkers) validateReplication() error {
+	if !w.cfg.Replication.Enabled || w.registry == nil {
+		return nil
+	}
+	if w.replica == nil {
+		return spaceStartupFault(errors.New("replication worker not initialized"))
+	}
+	if w.cfg.Replication.ResyncIntervalMinutes > 0 && w.resync == nil {
+		return spaceStartupFault(errors.New("resync worker not initialized"))
 	}
 	return nil
 }
 
-func startWebhook(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, bus *events.Bus) {
-	if cfg.Events.WebhookURL != "" {
-		wh := events.NewWebhook(cfg.Events.WebhookURL, logger).
-			WithSecret(cfg.Events.WebhookSecret).
-			WithRetryStore(repo)
-		whSub, _ := bus.Subscribe()
-		go wh.Run(ctx, whSub)
-		go wh.RetryLoop(ctx)
-		logger.Info("event webhook enabled", "url", cfg.Events.WebhookURL, "signed", cfg.Events.WebhookSecret != "")
+func (w *backgroundWorkers) start(ctx context.Context) error {
+	if err := w.validateInitialized(); err != nil {
+		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	w.started = true
+	if w.av != nil {
+		sub, _ := w.bus.Subscribe()
+		go w.av.Run(ctx, sub)
+	}
+	if w.replica != nil {
+		sub, _ := w.bus.Subscribe()
+		go w.replica.Run(ctx, sub)
+	}
+	if w.resync != nil {
+		go w.resync.Run(ctx)
+	}
+	if w.webhook != nil {
+		sub, _ := w.bus.Subscribe()
+		go w.webhook.Run(ctx, sub)
+		go w.webhook.RetryLoop(ctx)
+		w.logger.Info("event webhook enabled", "url", w.cfg.Events.WebhookURL, "signed", w.cfg.Events.WebhookSecret != "")
+	}
+	sub, _ := w.bus.Subscribe()
+	go w.notifier.Run(ctx, sub)
+	w.logger.Info("bucket notification worker started")
+	runPreparedEventOutboxRelay(ctx, w.cfg, w.logger, w.repo, w.relay)
+	w.maintenance.start(ctx, w.cfg, w.logger)
+	if w.registry != nil {
+		go jobs.NewPool(w.repo, w.registry, w.cfg.Jobs.Workers, w.logger).Run(ctx)
+		w.logger.Info("job pool started", "workers", w.cfg.Jobs.Workers)
+	}
+	return nil
+}
+
+// Retain the standalone builder for existing tests/callers, but use the same
+// guarded prepare/initialize/start path. Production supplies captured raw ports
+// explicitly and never rediscovers them through a write wrapper.
+func buildBackgroundWorkers(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, bus *events.Bus, reg *jobs.Registry, queue *jobs.Queue, svc *service.FileService) error {
+	readers, err := captureSpaceReaders(repo)
+	if err != nil {
+		return err
+	}
+	w, err := prepareBackgroundWorkers(cfg, logger, repo, store, bus, reg, queue, svc, readers)
+	if err != nil {
+		return err
+	}
+	if err := w.initialize(ctx); err != nil {
+		return err
+	}
+	return w.start(ctx)
+}
+
+type maintenanceWorkers struct {
+	reconcile *reconcile.Job
+	lifecycle *reconcile.LifecycleJob
+	retention *reconcile.RetentionJob
+	uploadGC  *reconcile.UploadGCJob
+}
+
+func prepareMaintenance(cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, cc reconcile.ChunkCleaner, readers spaceReaders) (*maintenanceWorkers, error) {
+	m := &maintenanceWorkers{}
+	if cfg.Reconcile.IntervalMinutes <= 0 {
+		return m, nil
+	}
+	interval := time.Duration(cfg.Reconcile.IntervalMinutes) * time.Minute
+	m.reconcile = reconcile.New(repo, store, interval, cfg.Reconcile.DeleteOrphanBlobs,
+		time.Duration(cfg.Reconcile.OrphanGraceMinutes)*time.Minute, cfg.Reconcile.Tenants, logger).
+		WithScrub(cfg.Reconcile.ScrubEnabled, 100).WithChunkCleaner(cc).
+		WithResourceBoundary(readers.router.Binding).WithOrphanCoverage(readers.router.Coverage)
+	m.lifecycle = reconcile.NewLifecycle(repo, store, interval, logger).
+		WithChunkCleaner(cc).WithResourceBoundary(readers.router.Binding)
+	if cfg.Reconcile.RetentionDays > 0 || cfg.Reconcile.IdempotencyTTLHours > 0 {
+		m.retention = reconcile.NewRetention(repo, store, interval,
+			time.Duration(cfg.Reconcile.RetentionDays)*24*time.Hour, logger).
+			WithChunkCleaner(cc).WithResourceBoundary(readers.router.Binding)
+		if cfg.Reconcile.IdempotencyTTLHours > 0 {
+			m.retention.WithIdempotencyTTL(time.Duration(cfg.Reconcile.IdempotencyTTLHours) * time.Hour)
+		}
+	}
+	if cfg.Reconcile.UploadGCEnable {
+		m.uploadGC = reconcile.NewUploadGC(repo, store, interval,
+			time.Duration(cfg.Reconcile.UploadGCHours)*time.Hour, logger).WithResourceBoundary(readers.router.Binding)
+	}
+	if cfg.Reconcile.ClusterSingleton {
+		m.singleton(uuid.NewString())
+	}
+	return m, m.validate(cfg)
+}
+
+func (m *maintenanceWorkers) singleton(id string) {
+	m.reconcile.WithClusterSingleton(id)
+	m.lifecycle.WithClusterSingleton(id)
+	if m.retention != nil {
+		m.retention.WithClusterSingleton(id)
+	}
+	if m.uploadGC != nil {
+		m.uploadGC.WithClusterSingleton(id)
+	}
+}
+
+func (m *maintenanceWorkers) validate(cfg *config.Config) error {
+	if m == nil {
+		return spaceStartupFault(errors.New("missing maintenance preparation"))
+	}
+	if cfg.Reconcile.IntervalMinutes <= 0 {
+		return nil
+	}
+	if err := errors.Join(m.reconcile.ValidateResourceBoundary(), m.lifecycle.ValidateResourceBoundary()); err != nil {
+		return err
+	}
+	if cfg.Reconcile.RetentionDays > 0 || cfg.Reconcile.IdempotencyTTLHours > 0 {
+		if err := m.retention.ValidateResourceBoundary(); err != nil {
+			return err
+		}
+	}
+	if cfg.Reconcile.UploadGCEnable {
+		return m.uploadGC.ValidateResourceBoundary()
+	}
+	return nil
+}
+
+func (m *maintenanceWorkers) start(ctx context.Context, cfg *config.Config, logger *slog.Logger) {
+	if m.reconcile == nil {
+		return
+	}
+	go m.reconcile.Run(ctx)
+	go m.lifecycle.Run(ctx)
+	if m.retention != nil {
+		go m.retention.Run(ctx)
+	}
+	if m.uploadGC != nil {
+		go m.uploadGC.Run(ctx)
+	}
+	logger.Info("reconcile + lifecycle jobs started", "interval_minutes", cfg.Reconcile.IntervalMinutes,
+		"delete_orphan_blobs", cfg.Reconcile.DeleteOrphanBlobs, "orphan_grace_minutes", cfg.Reconcile.OrphanGraceMinutes,
+		"tenants", cfg.Reconcile.Tenants, "cluster_singleton", cfg.Reconcile.ClusterSingleton,
+		"retention_days", cfg.Reconcile.RetentionDays, "upload_gc_ttl_hours", cfg.Reconcile.UploadGCHours)
 }
 
 func startReconcile(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, store storage.Storage, cc reconcile.ChunkCleaner) {
-	j := reconcile.New(repo, store, time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute,
-		cfg.Reconcile.DeleteOrphanBlobs,
-		time.Duration(cfg.Reconcile.OrphanGraceMinutes)*time.Minute,
-		cfg.Reconcile.Tenants, logger).WithScrub(cfg.Reconcile.ScrubEnabled, 100)
-	if cc != nil {
-		j.WithChunkCleaner(cc)
+	readers, err := captureSpaceReaders(repo)
+	if err != nil {
+		logger.Error("prepare maintenance readers", "err", err)
+		return
 	}
-	lf := reconcile.NewLifecycle(repo, store, time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute, logger)
-	if cc != nil {
-		lf.WithChunkCleaner(cc)
+	m, err := prepareMaintenance(cfg, logger, repo, store, cc, readers)
+	if err != nil {
+		logger.Error("prepare maintenance", "err", err)
+		return
 	}
-	var rg *reconcile.RetentionJob
-	if cfg.Reconcile.RetentionDays > 0 || cfg.Reconcile.IdempotencyTTLHours > 0 {
-		rg = reconcile.NewRetention(repo, store, time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute,
-			time.Duration(cfg.Reconcile.RetentionDays)*24*time.Hour, logger)
-		if cc != nil {
-			rg.WithChunkCleaner(cc)
-		}
-		if cfg.Reconcile.IdempotencyTTLHours > 0 {
-			rg.WithIdempotencyTTL(time.Duration(cfg.Reconcile.IdempotencyTTLHours) * time.Hour)
-		}
-	}
-	var ug *reconcile.UploadGCJob
-	if cfg.Reconcile.UploadGCEnable {
-		ug = reconcile.NewUploadGC(repo, store,
-			time.Duration(cfg.Reconcile.IntervalMinutes)*time.Minute,
-			time.Duration(cfg.Reconcile.UploadGCHours)*time.Hour, logger)
-	}
-	if cfg.Reconcile.ClusterSingleton {
-		instanceID := uuid.NewString()
-		j.WithClusterSingleton(instanceID)
-		lf.WithClusterSingleton(instanceID)
-		if rg != nil {
-			rg.WithClusterSingleton(instanceID)
-		}
-		if ug != nil {
-			ug.WithClusterSingleton(instanceID)
-		}
-	}
-	go j.Run(ctx)
-	go lf.Run(ctx)
-	if rg != nil {
-		go rg.Run(ctx)
-	}
-	if ug != nil {
-		go ug.Run(ctx)
-	}
-	logger.Info("reconcile + lifecycle jobs started",
-		"interval_minutes", cfg.Reconcile.IntervalMinutes,
-		"delete_orphan_blobs", cfg.Reconcile.DeleteOrphanBlobs,
-		"orphan_grace_minutes", cfg.Reconcile.OrphanGraceMinutes,
-		"tenants", cfg.Reconcile.Tenants,
-		"cluster_singleton", cfg.Reconcile.ClusterSingleton,
-		"retention_days", cfg.Reconcile.RetentionDays,
-		"upload_gc_ttl_hours", cfg.Reconcile.UploadGCHours)
+	m.start(ctx, cfg, logger)
 }
 
 func startNotificationWorker(ctx context.Context, logger *slog.Logger, repo repository.Repository, bus *events.Bus) {
-	notif := events.NewNotifier(repo, logger)
+	readers, err := captureSpaceReaders(repo)
+	if err != nil {
+		logger.Error("prepare notification readers", "err", err)
+		return
+	}
+	n := events.NewNotifier(repo, logger).WithEventAuthority(readers.router.EventAuthority).
+		WithResourceBoundary(events.NewResourceBoundary(readers.router.Binding))
 	sub, _ := bus.Subscribe()
-	go notif.Run(ctx, sub)
+	go n.Run(ctx, sub)
 	logger.Info("bucket notification worker started")
 }
 
-// startEventOutboxRelay drains the transactional deletion outbox (claim →
-// deliver → complete). It starts unless EVENT_OUTBOX_ENABLED=false: the
-// kill-switch gates only the relay loop — the transactional enqueue inside
-// *DeleteObject*WithEvent is never gated (deletion atomicity is not
-// negotiable), so rows keep accumulating while disabled and drain (FIFO) on
-// re-enable. With no notification rules the relay is a silent no-op. Notify
-// facts are delivered from their self-contained payload; deleted@1.1 facts
-// are completed without local re-broadcast (D3) unless an L2 AuditSink is
-// configured, in which case they are delivered to the audit sink (FR-2/FR-4).
-// An L2 adapter that fails its own endpoint validation aborts startup
-// (fail-fast, F6 — config.Validate already rejected it; this is the second
-// enforcement point). Numeric knobs are likewise validated unconditionally,
-// so a disabled relay still fails startup on a bad poll interval or
-// malformed L2 endpoint (F3/F7).
-func startEventOutboxRelay(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository) error {
-	// Kill-switch gate first, before any options/L2-sink construction or
-	// goroutine (D1): the backlog count is the one diagnostic that still runs
-	// while disabled (read-only, nil-repo-safe, never blocks startup — D6).
-	if !cfg.EventOutbox.Enabled {
-		logger.Info("event outbox relay disabled",
-			"backlog", eventOutboxBacklog(ctx, repo),
-			"audit_sink_kind", auditSinkKind(cfg))
-
-		return nil
+func startWebhook(ctx context.Context, cfg *config.Config, logger *slog.Logger, repo repository.Repository, bus *events.Bus) {
+	if cfg.Events.WebhookURL == "" {
+		return
 	}
-	opts := events.EventOutboxRelayOptions{
-		PollInterval:    time.Duration(cfg.EventOutbox.PollMilliseconds) * time.Millisecond,
-		BatchSize:       cfg.EventOutbox.BatchSize,
-		ClaimTTL:        time.Duration(cfg.EventOutbox.ClaimTTLSeconds) * time.Second,
-		HTTPTimeout:     time.Duration(cfg.EventOutbox.HTTPTimeoutSeconds) * time.Second,
-		MaxAttempts:     cfg.EventOutbox.MaxAttempts,
-		DeliveredRetain: time.Duration(cfg.EventOutbox.DeliveredRetentionHours) * time.Hour,
-		FailedRetain:    time.Duration(cfg.EventOutbox.FailedRetentionHours) * time.Hour,
-	}
-	kind := auditSinkKind(cfg)
-	sink, err := auditSinkForEventOutbox(cfg, opts.HTTPTimeout, logger)
+	readers, err := captureSpaceReaders(repo)
 	if err != nil {
-		return err
+		logger.Error("prepare webhook readers", "err", err)
+		return
 	}
-	if sink != nil {
-		opts.AuditSink = sink
-		endpoint, bindings := auditSinkBearerConfig(cfg)
-		logger.Info("event outbox relay L2 audit sink enabled", "endpoint", endpoint,
-			"bindings", len(bindings), "kind", kind)
-	}
-	variant := "none"
-	if sink != nil {
-		variant = "bearer"
-	}
-	logger.Info("event outbox relay audit sink", "kind", kind, "variant", variant)
-	relay := events.NewEventOutboxRelay(repo, logger, opts)
-	go relay.Run(ctx)
-	logger.Info("event outbox relay started",
-		"audit_sink_kind", kind,
-		"poll_ms", cfg.EventOutbox.PollMilliseconds,
-		"batch", cfg.EventOutbox.BatchSize,
-		"claim_ttl_s", cfg.EventOutbox.ClaimTTLSeconds,
-		"http_timeout_s", cfg.EventOutbox.HTTPTimeoutSeconds,
-		"max_attempts", cfg.EventOutbox.MaxAttempts,
-		"delivered_retain_h", cfg.EventOutbox.DeliveredRetentionHours,
-		"failed_retain_h", cfg.EventOutbox.FailedRetentionHours,
-		"backlog", eventOutboxBacklog(ctx, repo))
-
-	return nil
-}
-
-func auditSinkKind(cfg *config.Config) string {
-	kind := strings.ToUpper(strings.TrimSpace(cfg.AuditSink.Kind))
-	if kind != "" {
-		return kind
-	}
-	if cfg.AuditSink.Legacy.Enabled || cfg.AuditGovernance.Enabled ||
-		cfg.AuditSink.Endpoint != "" || cfg.AuditSink.BindingsFile != "" || len(cfg.AuditSink.Bindings) > 0 ||
-		cfg.AuditSinkL2.Endpoint != "" || cfg.AuditSinkL2.BindingsFile != "" || len(cfg.AuditSinkL2.Bindings) > 0 {
-		return config.AuditSinkKindL2
-	}
-	return config.AuditSinkKindL0
-}
-
-func auditSinkBearerConfig(cfg *config.Config) (string, []config.AuditSinkL2Binding) {
-	if cfg.AuditSink.Endpoint != "" || cfg.AuditSink.BindingsFile != "" || len(cfg.AuditSink.Bindings) > 0 {
-		return cfg.AuditSink.Endpoint, cfg.AuditSink.Bindings
-	}
-	endpoint := cfg.AuditSinkL2.Endpoint
-	bindings := cfg.AuditSinkL2.Bindings
-	if endpoint == "" {
-		endpoint = cfg.AuditSink.Endpoint
-		bindings = cfg.AuditSink.Bindings
-	}
-	return endpoint, bindings
-}
-
-func auditSinkForEventOutbox(
-	cfg *config.Config, timeout time.Duration, logger *slog.Logger,
-) (events.AuditSink, error) {
-	if auditSinkKind(cfg) != config.AuditSinkKindL2 ||
-		cfg.AuditSink.Legacy.Enabled || cfg.AuditGovernance.Enabled {
-		return nil, nil
-	}
-	endpoint, bindings := auditSinkBearerConfig(cfg)
-	if endpoint == "" {
-		return nil, nil
-	}
-	sink, err := events.NewAuditSinkL2(endpoint, auditSinkL2Bindings(bindings),
-		events.NewAuditSinkL2Client(timeout), logger)
-	if err != nil {
-		return nil, fmt.Errorf("build audit sink L2: %w", err)
-	}
-	return sink, nil
-}
-
-// eventOutboxBacklog returns the event_outbox depth for the startup log
-// (D6). Diagnostic only: a nil repo or query error yields "unknown" and
-// never blocks or fails startup. It is the only outbox signal that exists
-// while the relay is disabled — all outbox counters are relay-side and
-// frozen when off, and PROMETHEUS_ENABLED defaults to false.
-func eventOutboxBacklog(ctx context.Context, repo repository.Repository) any {
-	if repo == nil {
-		return "unknown"
-	}
-	n, err := repo.CountEventOutbox(ctx)
-	if err != nil {
-		return "unknown"
-	}
-	return n
-}
-
-// auditSinkL2Bindings flattens the config bindings into the adapter's
-// tenant → token map. Token values never appear in logs (the caller logs
-// only the count).
-func auditSinkL2Bindings(bindings []config.AuditSinkL2Binding) map[string]string {
-	if len(bindings) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(bindings))
-	for _, binding := range bindings {
-		out[binding.Tenant] = binding.Token
-	}
-	return out
+	w := events.NewWebhook(cfg.Events.WebhookURL, logger).WithSecret(cfg.Events.WebhookSecret).
+		WithRetryStore(repo).WithEventAuthority(readers.router.EventAuthority).
+		WithResourceBoundary(events.NewResourceBoundary(readers.router.Binding))
+	sub, _ := bus.Subscribe()
+	go w.Run(ctx, sub)
+	go w.RetryLoop(ctx)
 }

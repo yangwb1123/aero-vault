@@ -8,11 +8,13 @@ import (
 	"github.com/aero-vault/aero-vault/internal/repository"
 )
 
-func buildAccessManager(cfg *config.Config, repo repository.Repository) (*access.Manager, error) {
+// raw must be the migrated repository, before billing/audit write wrapping:
+// NewManager captures its binding/coverage readers through the existing Store.
+func buildAccessManager(cfg *config.Config, raw repository.Repository) (*access.Manager, error) {
 	if !cfg.Access.Enabled {
 		return nil, nil
 	}
-	store, ok := repo.(access.Store)
+	store, ok := raw.(access.Store)
 	if !ok {
 		return nil, fmt.Errorf("repository does not implement enterprise access store")
 	}

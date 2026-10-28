@@ -30,7 +30,7 @@ func idemTestRepo(t *testing.T) repository.Repository {
 	if err := repo.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return repo
+	return idemBoundaryRepo(t, repo)
 }
 
 func idemSilentLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

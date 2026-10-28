@@ -264,3 +264,13 @@
 - [ ] 依 spec §11–12 添加／保留正反例及真实故障注入，gofmt 后普通／race、integration 类型检查、原 cmd/server 包；保留磁盘 SQLite＋完整 Migrate＋local FS、旧断言与原预算。
 - [ ] 合并同源的 make check → python3 cli.py accept → 原完整 make test-race，以及保留的 Web 三步、diff/scope/hash 守卫与独立只读验收，由 controller 后续实测；本 writer 不执行或预填 PASS。
 - **本阶段未实现、未测试；没有任何当前工程门禁通过声明。** 真实 PG/Qdrant、外部身份／存储／KMS、代理/HTTP2、生产、压力/RSS、登录后业务 E2E 均未验证，费用 unknown；无部署、提交或生产暴露许可。
+
+
+## PRODUCT-USABILITY-24H — bounded delivery (2026-10-28)
+
+- Continue inherited 72-path Wave7 source without treating old make-check/accept as new acceptance.
+- Approved: two isolated Codex/max writers, requirements-first exact slices in `docs/requirements/product-usability-v1.spec.md`; controller-only local commit/fast-forward merge into main AFTER complete gates and read-only review.
+- Window 2026-10-28T08:54:43Z → 2026-10-29T08:54:43Z, including preparation; no automatic extension, push or deployment.
+- Preserve original gates/budgets/oracles/interfaces/migrations/configuration/dependencies and all earlier history. Controlled frontend bundles are generated and verified, not hand-edited.
+- No Space grants/KB/platform expansion. Missing authority faults; UI hints never replace backend authorization.
+- Current implementation/results are pending and tracked in the private run ledger, not prefilled PASS here.

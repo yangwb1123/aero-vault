@@ -117,7 +117,8 @@ func newGovernanceE2EServerWithAuthz(t *testing.T, bindingState string, authz Au
 	wrapped := auditgovernance.WrapRepository(repo, runtime)
 	bus := events.New(wrapped, logger).WithRepository(wrapped)
 	svc := service.NewFileService(store, wrapped, logger).
-		WithEventSink(bus).WithAuthorizer(allowAllProvider{})
+		WithEventSink(bus).WithAuthorizer(allowAllProvider{}).
+		WithSpaceBoundary(service.NewSpaceBoundary(service.DiscoverSpaceBoundaryReaders(repo)))
 	srv := httptest.NewServer(NewRouter(svc, nil, authz))
 	t.Cleanup(srv.Close)
 	return srv, govStore, dsn

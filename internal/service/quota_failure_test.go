@@ -23,7 +23,7 @@ func TestPutFailsClosedWhenQuotaCannotBeRead(t *testing.T) {
 	service, repository := newTestSvc(t)
 	failing := NewFileService(
 		service.Storage(), quotaFailureRepository{Repository: repository}, nil,
-	)
+	).WithSpaceBoundary(NewSpaceBoundary(DiscoverSpaceBoundaryReaders(repository)))
 	_, err := failing.Put(
 		context.Background(), "", "", "not-written.txt",
 		strings.NewReader("payload"), 7, PutOptions{},

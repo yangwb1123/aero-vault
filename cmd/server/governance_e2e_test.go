@@ -1,20 +1,9 @@
 package main
 
-// Activation-gate scope-alignment matrix E2E (test-only; design
-// docs/requirements/activation-gate-scope-alignment-matrix-e2e-v2.design.md).
-// Pins, against real FileService+EventBus+Repository wiring (main.go order):
-//   - REQ-1: bound-tenant first PUT -> exactly one outbox row + exactly one POST
-//   - REQ-2: unbound tenant -> zero outbox rows, zero POSTs, zero token calls
-//   - REQ-3: matrix M1-M6 exact terminal outbox state (delivered / 409 / 422 /
-//     tenant-mismatch / transient-200 / conflict receipt)
-//   - T-3 pins: 202-only acceptance, 200 transient, full 4-member permanent
-//     closed list (relay.go:228-236), deterministic fact-ID recomputation
-//   - REQ-4 behavioral pins: POST path+query, OAuth2 form scope/resource,
-//     response-scope echo (a RequiredScope drift fails M1 loudly)
-//
-// Zero production/schema/dependency footprint. All SQL uses sqlite "?"
-// placeholders (I1); created_at is TEXT RFC3339 (ms) and parsed RFC3339Nano,
-// byte-identical to the write path's flexTime scan.
+// Activation-gate scope-alignment matrix E2E (test-only):
+// docs/requirements/activation-gate-scope-alignment-matrix-e2e-v2.design.md.
+// Pins REQ-1..4/T-3: activation, M1-M6 outcomes, receipts, deterministic IDs,
+// OAuth scope/resource and first-PUT fact capture. SQL uses SQLite "?" (I1).
 
 import (
 	"context"
@@ -73,29 +62,7 @@ func newGovReceiver(mode string) *govReceiver {
 
 func (r *govReceiver) serve(w http.ResponseWriter, req *http.Request) {
 	if req.URL.Path == "/token" {
-		r.tokenCalls.Add(1)
-		if err := req.ParseForm(); err != nil {
-			http.Error(w, "bad form", http.StatusBadRequest)
-			return
-		}
-		// Hard pins (REQ-4): token.go:64 always passes RequiredScope and the
-		// resourceTransport injects RequiredResource, so these are unconditional.
-		if req.Form.Get("grant_type") != "client_credentials" ||
-			req.Form.Get("scope") != auditgovernance.RequiredScope ||
-			req.Form.Get("resource") != auditgovernance.RequiredResource {
-			http.Error(w, "token form mismatch", http.StatusBadRequest)
-			return
-		}
-		user, secret, ok := req.BasicAuth()
-		if !ok || user != e2eClientID || secret != e2eClientSecret {
-			http.Error(w, "bad client credentials", http.StatusUnauthorized)
-			return
-		}
-		// Snake_case OAuth2 wire shape (snaplink wireTokenResponse) + scope echo:
-		// validTokenScopes exact-matches RequiredScope (token.go:152-153).
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"`+e2eToken+`","token_type":"Bearer",`+
-			`"expires_in":3600,"scope":"`+auditgovernance.RequiredScope+`"}`)
+		r.serveToken(w, req)
 		return
 	}
 	if req.URL.Path != "/api/v1/events" {
@@ -121,6 +88,10 @@ func (r *govReceiver) serve(w http.ResponseWriter, req *http.Request) {
 	sequence := len(r.posts) - 1
 	r.mu.Unlock()
 	r.postCount.Add(1)
+	r.serveEventResponse(w, body.EventID, sequence)
+}
+
+func (r *govReceiver) serveEventResponse(w http.ResponseWriter, eventID string, sequence int) {
 	switch r.mode {
 	case "409":
 		http.Error(w, "conflict", http.StatusConflict)
@@ -131,20 +102,41 @@ func (r *govReceiver) serve(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "deferred", http.StatusOK)
 			return
 		}
-		r.writeReceipt(w, body.EventID, e2eTenant, false)
+		r.writeReceipt(w, eventID, e2eTenant, false)
 	case "202-conflict":
-		r.writeReceipt(w, body.EventID, e2eTenant, true)
+		r.writeReceipt(w, eventID, e2eTenant, true)
 	case "202-wrong-tenant":
 		// The wire governanceEvent has no tenant_id; the echo is script-constant.
-		r.writeReceipt(w, body.EventID, "mallory", false)
+		r.writeReceipt(w, eventID, "mallory", false)
 	default: // 202-echo
-		r.writeReceipt(w, body.EventID, e2eTenant, false)
+		r.writeReceipt(w, eventID, e2eTenant, false)
 	}
 }
 
+func (r *govReceiver) serveToken(w http.ResponseWriter, req *http.Request) {
+	r.tokenCalls.Add(1)
+	if err := req.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if req.Form.Get("grant_type") != "client_credentials" ||
+		req.Form.Get("scope") != auditgovernance.RequiredScope ||
+		req.Form.Get("resource") != auditgovernance.RequiredResource {
+		http.Error(w, "token form mismatch", http.StatusBadRequest)
+		return
+	}
+	user, secret, ok := req.BasicAuth()
+	if !ok || user != e2eClientID || secret != e2eClientSecret {
+		http.Error(w, "bad client credentials", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(w, `{"access_token":"`+e2eToken+`","token_type":"Bearer",`+
+		`"expires_in":3600,"scope":"`+auditgovernance.RequiredScope+`"}`)
+}
+
 func (r *govReceiver) writeReceipt(w http.ResponseWriter, eventID, tenant string, conflict bool) {
-	// Explicit application/json: a missing Content-Type on a 202 is itself
-	// ErrInvalidReceipt (http.go:178-185).
+	// A 202 without application/json is itself ErrInvalidReceipt.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = fmt.Fprintf(w, `{"receipt":{"event_id":%q,"tenant_id":%q,"status":"ledgered",`+
@@ -152,11 +144,7 @@ func (r *govReceiver) writeReceipt(w http.ResponseWriter, eventID, tenant string
 		eventID, tenant, time.Now().UTC().Format(time.RFC3339Nano), conflict)
 }
 
-// sourceSystem is the mutex-guarded read of r.source: the field is written
-// in serve under r.mu, and unlocked reads (previously direct field access in
-// the wantFactID call sites) are a formal Go-memory-model violation even when
-// TSan's happens-before chains mask them. cmd/server runs under -race via the
-// extended test-race target, so this accessor is the gate-clean access path.
+// sourceSystem pairs with serve's mutex-protected write.
 func (r *govReceiver) sourceSystem() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -181,11 +169,8 @@ func (r *govReceiver) postDelta() time.Duration {
 	return r.posts[1].at.Sub(r.posts[0].at)
 }
 
-// governanceE2EConfig is the single source of the harness timing envelope
-// (refactor B: the literal previously inlined in newGovernanceE2E). It
-// returns a complete, valid envelope — fixed loopback endpoints keep it
-// usable standalone by boot-gate tests that must not dial a live receiver;
-// live harnesses override BaseURL/TokenURL with their receiver endpoint.
+// governanceE2EConfig retains the harness timing envelope. Boot-gate tests
+// never dial these fixed loopback endpoints; live fixtures substitute their own.
 func governanceE2EConfig() config.AuditGovernanceConfig {
 	return config.AuditGovernanceConfig{
 		Enabled: true, BaseURL: "http://127.0.0.1:1", TokenURL: "http://127.0.0.1:1/token",
@@ -225,6 +210,7 @@ func newGovernanceE2E(t *testing.T, mode string) *govHarness {
 	if err := repo.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	readers := governanceSpaceReaders(t, repo)
 	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
 	if err != nil {
 		t.Fatal(err)
@@ -241,6 +227,8 @@ func newGovernanceE2E(t *testing.T, mode string) *govHarness {
 	bus := events.New(wrepo, logger)
 	bus.WithRepository(wrepo)
 	svc := service.NewFileService(store, wrepo, logger).WithEventSink(bus)
+	readers.wireBus(bus)
+	readers.wireService(svc)
 	// Cleanup runs last-registered first: rt.Close -> repo.Close -> server.Close.
 	t.Cleanup(receiver.server.Close)
 	t.Cleanup(func() { _ = repo.Close() })
@@ -265,8 +253,7 @@ func startRelay(t *testing.T, rt *auditgovernance.Runtime) {
 
 // ── assertion helpers (raw sqlite conns; "?" placeholders per I1) ──────────
 
-// eventRowID resolves the outbox origin_id: the object_events row id (a
-// separate AUTOINCREMENT from objects.id — A4), via the object FK.
+// eventRowID resolves the independently allocated event row ID (A4).
 func eventRowID(t *testing.T, dsn string, objectID int64) int64 {
 	t.Helper()
 	db, err := sql.Open("sqlite", dsn)
@@ -315,9 +302,7 @@ lease_expires_at_ns FROM audit_governance_outbox WHERE origin_kind='file' AND or
 	return row, err
 }
 
-// wantFactID recomputes the deterministic fact ID from observed inputs only:
-// the wire source_system + the object_events row (id, type, created_at).
-// A drift in any formula input breaks the pin loudly (E13/T-4, H2/R2).
+// wantFactID recomputes the ID from source_system and the persisted event.
 func wantFactID(t *testing.T, dsn, source string, objectID int64) string {
 	t.Helper()
 	if !strings.HasPrefix(source, "aero-vault.") || len(source) != 54 {
@@ -357,8 +342,7 @@ func waitForRow(t *testing.T, dsn string, originID int64, pred func(govOutboxRow
 	t.Fatalf("row never reached desired state: last=%+v", last)
 }
 
-// quiesce asserts a negative/stability property for a full window; negative
-// assertions must never use waitFor (true at t=0 is vacuous — A6).
+// quiesce asserts stability for the full window, not a vacuous t=0 success.
 func quiesce(t *testing.T, d time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -387,11 +371,7 @@ func TestGovernanceE2EActivationGateBoundTenant(t *testing.T) {
 	originID := eventRowID(t, h.dsn, obj.ID)
 	// Deterministic pre-start snapshot (B1): relay not started, no claim possible.
 	row := rowFor(t, h, originID)
-	if row.tenantID != e2eTenant || row.originKind != repository.AuditOriginFile ||
-		row.originID != originID || row.attempts != 0 || row.deliveredAtNS != 0 ||
-		row.failedAtNS != 0 || row.availableAtNS == 0 || row.claimOwner != "" {
-		t.Fatalf("pre-start snapshot: %+v", row)
-	}
+	checkGovernancePreStart(t, row, originID)
 	startRelay(t, h.rt)
 	waitForRow(t, h.dsn, originID, func(row govOutboxRow) bool {
 		return row.deliveredAtNS > 0 && row.attempts == 1 &&
@@ -410,6 +390,15 @@ func TestGovernanceE2EActivationGateBoundTenant(t *testing.T) {
 	}
 	if id := rowFor(t, h, originID).id; id != wantFactID(t, h.dsn, h.receiver.sourceSystem(), obj.ID) {
 		t.Fatalf("fact ID %q != deterministic recomputation", id)
+	}
+}
+
+func checkGovernancePreStart(t *testing.T, row govOutboxRow, originID int64) {
+	t.Helper()
+	if row.tenantID != e2eTenant || row.originKind != repository.AuditOriginFile ||
+		row.originID != originID || row.attempts != 0 || row.deliveredAtNS != 0 ||
+		row.failedAtNS != 0 || row.availableAtNS == 0 || row.claimOwner != "" {
+		t.Fatalf("pre-start snapshot: %+v", row)
 	}
 }
 

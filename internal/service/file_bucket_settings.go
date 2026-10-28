@@ -19,18 +19,34 @@ func (s *FileService) HeadBucket(ctx context.Context, tenant, bucket string) (bo
 
 func (s *FileService) ListBuckets(ctx context.Context, tenant string) ([]string, error) {
 	tenant, _ = defaults(tenant, "")
+	if err := s.admitBucketNamesTenant(ctx, tenant); err != nil {
+		return nil, err
+	}
 	if err := s.requireActiveTenant(ctx, tenant); err != nil {
 		return nil, err
 	}
 	buckets, err := s.repo.ListBuckets(ctx, tenant)
-	if err != nil || s.authorizer == nil {
-		return buckets, err
+	if err != nil {
+		return nil, err
+	}
+	if len(buckets) == 0 {
+		if err := s.admitCoverage(ctx, tenantCoverage(tenant)); err != nil {
+			return nil, err
+		}
 	}
 	visible := make([]string, 0, len(buckets))
 	for _, bucket := range buckets {
-		if s.authorizeBucket(ctx, access.ActionList, tenant, bucket) == nil {
-			visible = append(visible, bucket)
+		err := s.authorizeBucket(ctx, access.ActionList, tenant, bucket)
+		if ordinaryAccessDenial(err) {
+			continue
 		}
+		if err != nil {
+			return nil, err
+		}
+		visible = append(visible, bucket)
+	}
+	if err := s.admitBucketNamesTenant(ctx, tenant); err != nil {
+		return nil, err
 	}
 	return visible, nil
 }

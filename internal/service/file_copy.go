@@ -18,6 +18,11 @@ func (s *FileService) CopyObject(
 	replaceMetadata bool,
 	replaceTags bool,
 ) (repository.Object, error) {
+	tenant, srcBucket = defaults(tenant, srcBucket)
+	_, dstBucket = defaults(tenant, dstBucket)
+	if err := s.admitCopy(ctx, tenant, srcBucket, srcKey, dstBucket, dstKey); err != nil {
+		return repository.Object{}, err
+	}
 	var (
 		rc  io.ReadCloser
 		src repository.Object
@@ -44,6 +49,19 @@ func (s *FileService) CopyObject(
 		destination.Tags = cloneMetadata(src.Tags)
 	}
 	return s.Put(ctx, tenant, dstBucket, dstKey, rc, src.Size, destination)
+}
+
+func (s *FileService) admitCopy(ctx context.Context, tenant, srcBucket, srcKey, dstBucket, dstKey string) error {
+	if err := validateKey(srcKey); err != nil {
+		return err
+	}
+	if err := validateKey(dstKey); err != nil {
+		return err
+	}
+	if err := s.admitBucket(ctx, tenant, srcBucket); err != nil {
+		return err
+	}
+	return s.admitBucket(ctx, tenant, dstBucket)
 }
 
 func metadataWithoutEncryption(meta map[string]string) map[string]string {

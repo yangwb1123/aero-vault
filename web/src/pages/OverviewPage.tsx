@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { IrisBadge, IrisCard } from '@iris-ui-kit/react'
-import type { VaultClient } from '../api/vault'
+import type { VaultClient, VaultSession } from '../api/vault'
 import { PageError, PageHeader, PageLoading } from '../components/Page'
 import { useResource } from '../hooks/useResource'
 
@@ -30,7 +30,8 @@ export function OverviewPage({ client }: { client: VaultClient }): React.ReactEl
 
   return (
     <section>
-      <PageHeader title="空间概览" description="身份、租户配额与存储桶均来自 Aero Vault 实时接口。" />
+      <PageHeader title="空间概览" description="当前租户的文件存储、配额与可见存储桶，均来自 Aero Vault 实时接口。" />
+      <p className="muted">文件浏览桶：<strong>default（固定）</strong>。文件与回收站仅浏览当前租户的默认桶；此处可见桶列表不切换文件浏览范围。</p>
       <div className="metric-grid">
         <IrisCard variant="outline" header="已用空间">
           <div className="metric-value">{formatBytes(usage.used_bytes)}</div>
@@ -45,18 +46,24 @@ export function OverviewPage({ client }: { client: VaultClient }): React.ReactEl
           <div className="metric-label">当前租户可见</div>
         </IrisCard>
       </div>
-      <IrisCard variant="outline" header="Snaplink 会话">
-        <div className="status-row">
-          <span>认证状态</span>
-          <IrisBadge tone={session.authenticated ? 'success' : 'warning'}>
-            {session.authenticated ? '已认证' : '匿名开发'}
-          </IrisBadge>
-        </div>
-        <div className="status-row"><span>主体</span><strong>{session.subject_id || 'anonymous'}</strong></div>
-        <div className="status-row"><span>租户</span><strong>{session.tenant_id}</strong></div>
-        <div className="status-row"><span>主体类型</span><strong>{session.principal_kind}</strong></div>
-        <div className="status-row"><span>Scopes</span><strong>{session.scopes.join(', ') || '—'}</strong></div>
-      </IrisCard>
+      <SessionCard session={session} />
     </section>
+  )
+}
+
+function SessionCard({ session }: { session: VaultSession }): React.ReactElement {
+  return (
+    <IrisCard variant="outline" header="服务端会话">
+      <div className="status-row">
+        <span>认证状态</span>
+        <IrisBadge tone={session.authenticated ? 'success' : 'warning'}>
+          {session.authenticated ? '已认证' : '匿名会话'}
+        </IrisBadge>
+      </div>
+      <div className="status-row"><span>主体</span><strong>{session.subject_id || 'anonymous'}</strong></div>
+      <div className="status-row"><span>服务端租户</span><strong>{session.tenant_id}</strong></div>
+      <div className="status-row"><span>主体类型</span><strong>{session.principal_kind}</strong></div>
+      <div className="status-row"><span>Scopes</span><strong>{session.scopes.join(', ') || '—'}</strong></div>
+    </IrisCard>
   )
 }

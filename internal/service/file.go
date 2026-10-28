@@ -107,6 +107,7 @@ type FileService struct {
 	shareLister     ShareLister
 	readVerify      ReadVerificationConfig
 	authorizer      access.Authorizer
+	spaceBoundary   SpaceBoundary
 	deleteFailOpen  bool
 	tenantStatus    bool
 	usageAccountant UsageAccountant
@@ -130,6 +131,14 @@ func (s *FileService) WithAuthorizer(authorizer access.Authorizer) *FileService 
 		}
 	}
 	s.authorizer = authorizer
+	return s
+}
+
+// WithSpaceBoundary replaces the per-instance deny-only capability. A true
+// nil clears the optional legacy capability; a configured typed-nil faults.
+// Production roots must call ValidateSpaceBoundary before protected starts.
+func (s *FileService) WithSpaceBoundary(boundary SpaceBoundary) *FileService {
+	s.spaceBoundary = boundary
 	return s
 }
 

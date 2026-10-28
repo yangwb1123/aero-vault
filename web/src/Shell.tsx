@@ -6,12 +6,14 @@ import {
   IrisButton,
   IrisIcon,
   useSkin,
-  type NavNode,
 } from '@iris-ui-kit/react'
 import { VaultClient } from './api/vault'
 import { useAuth } from './auth/AuthProvider'
 import type { WebConfig } from './config'
+import { PageHeader } from './components/Page'
 import { PageBoundary } from './components/PageBoundary'
+import { useSessionNavigation } from './hooks/useSessionNavigation'
+import { isManagementRoute, navigationMenus, routeKeys } from './navigation'
 import { ActivityPage } from './pages/ActivityPage'
 import { AgentPage } from './pages/AgentPage'
 import { FilesPage } from './pages/FilesPage'
@@ -27,52 +29,78 @@ import { SearchPage } from './pages/SearchPage'
 import { ServicesPage } from './pages/ServicesPage'
 import { objectRoute, parseObjectRoute, useHashRoute } from './router'
 
-const menus: NavNode[] = [
-  { key: 'overview', title: '空间概览', icon: 'home' },
-  { key: 'files', title: '文件', icon: 'folder' },
-  { key: 'activity', title: '对象动态', icon: 'clock' },
-  { key: 'buckets', title: '存储桶', icon: 'archive' },
-  { key: 'access', title: '访问与发布', icon: 'lock' },
-  { key: 'departments', title: '部门与成员', icon: 'users' },
-  { key: 'search', title: '知识检索', icon: 'search' },
-  { key: 'chat', title: '知识 Chat', icon: 'link' },
-  { key: 'agent', title: '知识 Agent', icon: 'grid' },
-  { key: 'lineage', title: '对象血缘', icon: 'clock' },
-  { key: 'operations', title: '运行运维', icon: 'settings' },
-  { key: 'services', title: '平台服务', icon: 'grid' },
-]
-const routeKeys = new Set(menus.map((item) => item.key))
+type SessionNavigation = ReturnType<typeof useSessionNavigation>
+const clientPages: Record<string, React.ComponentType<{ client: VaultClient }>> = {
+  buckets: BucketsPage, access: AccessPage, departments: DepartmentsPage,
+  search: SearchPage, chat: ChatPage, agent: AgentPage, lineage: LineagePage,
+  operations: OperationsPage,
+}
 
-function PageHost({
-  route,
-  client,
-  config,
-  navigate,
-}: {
+function PageHost({ route, client, config, navigate, navigation }: {
   route: string
   client: VaultClient
   config: WebConfig
   navigate(route: string): void
+  navigation: SessionNavigation
 }): React.ReactElement {
+  if (isManagementRoute(route) && !navigation.management[route]) {
+    return <UnavailableManagement route={route} navigation={navigation} navigate={navigate} />
+  }
   const object = parseObjectRoute(route)
   if (object) return <ObjectPage key={`${object.deleted}:${object.key}`} client={client} objectKey={object.key} deleted={object.deleted} onBack={() => navigate('files')} onRestored={() => navigate(objectRoute(object.key))} />
   if (route === 'files') return <FilesPage client={client} onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted))} />
   if (route === 'activity') return <ActivityPage client={client} onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted))} />
-  if (route === 'buckets') return <BucketsPage client={client} />
-  if (route === 'access') return <AccessPage client={client} />
-  if (route === 'departments') return <DepartmentsPage client={client} />
-  if (route === 'search') return <SearchPage client={client} />
-  if (route === 'chat') return <ChatPage client={client} />
-  if (route === 'agent') return <AgentPage client={client} />
-  if (route === 'lineage') return <LineagePage client={client} />
-  if (route === 'operations') return <OperationsPage client={client} />
   if (route === 'services') return <ServicesPage config={config} />
-  return <OverviewPage client={client} />
+  const Page = clientPages[route] ?? OverviewPage
+  return <Page client={client} />
+}
+
+function UnavailableManagement({ route, navigation, navigate }: {
+  route: string
+  navigation: SessionNavigation
+  navigate(route: string): void
+}): React.ReactElement {
+  const pending = navigation.status === 'loading' || (route === 'operations' && navigation.operatorLoading)
+  const description = pending
+    ? '正在通过服务端确认会话与管理入口资格，确认前不会加载管理页面。'
+    : '当前会话尚未确认此管理入口的访问资格；会话读取或入口检查失败时也不会加载。登录、文件归属或写入权限不代表管理权限，具体资源仍由服务端授权。'
+  return (
+    <section>
+      <PageHeader title="管理入口暂不可用" description={description} />
+      {route === 'operations' ? <p className="muted">跨租户运维需要服务端 operator admin 检查通过；租户管理资格不代表跨租户权限。</p> : null}
+      <IrisButton variant="outline" onClick={() => navigate('files')}>返回文件</IrisButton>
+      <IrisButton variant="ghost" onClick={navigation.reload}>重新检查会话</IrisButton>
+    </section>
+  )
+}
+
+function ShellToolbar({ navigation }: { navigation: SessionNavigation }): React.ReactElement {
+  const auth = useAuth()
+  const { skin, setMode, setSkin } = useSkin()
+  const dark = skin.type === 'dark'
+  const authenticated = navigation.session?.authenticated
+  const label = navigation.session ? authenticated ? '已认证' : '匿名会话' : '会话未确认'
+  return (
+    <div className="shell-toolbar">
+      <IrisBadge tone={authenticated ? 'success' : 'warning'}>{label}</IrisBadge>
+      <IrisButton
+        variant="outline" size="sm" aria-label="切换主题"
+        onClick={() => { setMode('fixed'); setSkin(dark ? 'light' : 'dark') }}
+      >
+        <IrisIcon name={dark ? 'sun' : 'moon'} size={16} />
+      </IrisButton>
+      <IrisAvatar name="Aero User" size={32} />
+      {auth.session ? (
+        <IrisButton variant="ghost" size="sm" onClick={auth.logout}>退出</IrisButton>
+      ) : (
+        <IrisButton variant="ghost" size="sm" onClick={auth.login}>Snaplink 登录</IrisButton>
+      )}
+    </div>
+  )
 }
 
 export function Shell({ config }: { config: WebConfig }): React.ReactElement {
   const auth = useAuth()
-  const { skin, setMode, setSkin } = useSkin()
   const [route, navigate] = useHashRoute('overview')
   const object = parseObjectRoute(route)
   const pageRoute = routeKeys.has(route) || object ? route : 'overview'
@@ -82,7 +110,9 @@ export function Shell({ config }: { config: WebConfig }): React.ReactElement {
     () => new VaultClient(config.apiBase, () => token),
     [config.apiBase, token],
   )
-  const dark = skin.type === 'dark'
+  const navigation = useSessionNavigation(client)
+  const { buckets, departments, operations } = navigation.management
+  const menus = React.useMemo(() => navigationMenus({ buckets, departments, operations }), [buckets, departments, operations])
 
   return (
     <IrisAdminLayout
@@ -91,34 +121,12 @@ export function Shell({ config }: { config: WebConfig }): React.ReactElement {
       onActiveKeyChange={navigate}
       showTabs={false}
       appTitle="Aero Vault"
-      toolbar={
-        <div className="shell-toolbar">
-          <IrisBadge tone={auth.session ? 'success' : 'warning'}>
-            {auth.session ? 'Snaplink 已认证' : '匿名开发'}
-          </IrisBadge>
-          <IrisButton
-            variant="outline"
-            size="sm"
-            aria-label="切换主题"
-            onClick={() => {
-              setMode('fixed')
-              setSkin(dark ? 'light' : 'dark')
-            }}
-          >
-            <IrisIcon name={dark ? 'sun' : 'moon'} size={16} />
-          </IrisButton>
-          <IrisAvatar name="Aero User" size={32} />
-          {auth.session ? (
-            <IrisButton variant="ghost" size="sm" onClick={auth.logout}>退出</IrisButton>
-          ) : (
-            <IrisButton variant="ghost" size="sm" onClick={auth.login}>Snaplink 登录</IrisButton>
-          )}
-        </div>
-      }
+      toolbar={<ShellToolbar navigation={navigation} />}
       footer={<div className="shell-footer">文件由 Aero Vault 管理 · 身份由 Snaplink 验证 · UI 由 Iris UI 构建</div>}
     >
+      <p className="muted">服务端租户：{navigation.session?.tenant_id ?? '未确认'} · 文件浏览桶：default（固定）</p>
       <PageBoundary resetKey={pageRoute}>
-        <PageHost route={pageRoute} client={client} config={config} navigate={navigate} />
+        <PageHost route={pageRoute} client={client} config={config} navigate={navigate} navigation={navigation} />
       </PageBoundary>
     </IrisAdminLayout>
   )

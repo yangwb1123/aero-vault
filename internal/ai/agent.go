@@ -3,10 +3,9 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"strings"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
 	"github.com/aero-vault/aero-vault/internal/service"
@@ -63,158 +62,107 @@ const agentSystemPrompt = `You are an agent with access to a knowledge vault. Av
 
 Use tools when you need information; you may call several in a row. When you have enough context, write the final answer. Cite sources you used.`
 
-// Run executes the loop.
+// Run executes the loop. Every model call, forced-final call and final answer
+// is gated by all resource refs accumulated from actual tool results.
 func (a *Agent) Run(ctx context.Context, req AgentReq) (AgentResp, error) {
-	if a.llm == nil {
+	if err := searchContextError(ctx); err != nil {
+		return AgentResp{}, err
+	}
+	if nilLike(a.llm) {
 		return AgentResp{}, fmt.Errorf("agent disabled: no LLM configured")
 	}
 	if req.Query == "" {
 		return AgentResp{}, fmt.Errorf("query required")
 	}
-	tools := []ToolSpec{
-		{Type: "function", Function: map[string]any{
-			"name":        "list_files",
-			"description": "List object keys, optionally filtered by prefix.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"prefix": map[string]any{"type": "string"},
-					"limit":  map[string]any{"type": "integer"},
-				},
-			},
-		}},
-		{Type: "function", Function: map[string]any{
-			"name":        "read_file",
-			"description": "Read an object's text content (truncated to 4KB).",
-			"parameters": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"key": map[string]any{"type": "string"}},
-				"required":   []string{"key"},
-			},
-		}},
-		{Type: "function", Function: map[string]any{
-			"name":        "search",
-			"description": "Semantic search across indexed chunks.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"query": map[string]any{"type": "string"},
-					"k":     map[string]any{"type": "integer"},
-				},
-				"required": []string{"query"},
-			},
-		}},
-	}
+	guard := newAgentResourceGuard(a.svc, a.search, a.repo, req.Tenant)
 	messages := []ChatMessage{
 		{Role: "system", Content: agentSystemPrompt},
 		{Role: "user", Content: req.Query},
 	}
+	tools := agentToolSpecs()
 	var steps []AgentStep
 	var lastModel string
 
 	for step := 0; step < a.MaxSteps; step++ {
-		resp, err := a.llm.Chat(ctx, ChatRequest{
-			Messages: messages, Tools: tools, ToolChoice: "auto",
-		})
+		if err := guard.validate(ctx); err != nil {
+			return AgentResp{}, fmt.Errorf("agent resource guard: %w", err)
+		}
+		resp, err := a.llm.Chat(ctx, ChatRequest{Messages: append([]ChatMessage(nil), messages...), Tools: tools, ToolChoice: "auto"})
 		if err != nil {
-			return AgentResp{}, fmt.Errorf("llm step %d: %w", step, err)
+			return AgentResp{}, fmt.Errorf("llm step %d: %w", step, errors.Join(err, ctx.Err()))
 		}
 		lastModel = resp.Model
 		if len(resp.ToolCalls) == 0 {
+			if err := guard.validate(ctx); err != nil {
+				return AgentResp{}, fmt.Errorf("agent final resource guard: %w", err)
+			}
 			return AgentResp{Answer: resp.Content, Steps: steps, Model: lastModel}, nil
 		}
-		// Append the LLM's tool-call message verbatim into the history.
-		toolMsgs := make([]ChatMessage, 0, len(resp.ToolCalls)+1)
-		// The OpenAI shape expects role="assistant" + tool_calls in the same message.
-		assistantTC, _ := json.Marshal(map[string]any{"tool_calls": resp.ToolCalls})
-		toolMsgs = append(toolMsgs, ChatMessage{Role: "assistant", Content: string(assistantTC)})
-
-		for _, tc := range resp.ToolCalls {
-			name, _ := tc.Function["name"].(string)
-			argsStr, _ := tc.Function["arguments"].(string)
-			var args map[string]any
-			_ = json.Unmarshal([]byte(argsStr), &args)
-			result := a.dispatchTool(ctx, req.Tenant, name, args)
-			steps = append(steps, AgentStep{Tool: name, Args: args, Result: result})
-			toolMsgs = append(toolMsgs, ChatMessage{Role: "tool", Content: result})
+		toolMsgs, newSteps, err := a.executeToolCalls(ctx, guard, req.Tenant, resp.ToolCalls)
+		if err != nil {
+			return AgentResp{}, err
 		}
+		messages = append(messages, assistantToolMessage(resp))
 		messages = append(messages, toolMsgs...)
+		steps = append(steps, newSteps...)
 	}
-	// Force final answer
+	return a.forcedFinal(ctx, guard, messages, steps, lastModel)
+}
+
+func (a *Agent) executeToolCalls(
+	ctx context.Context,
+	guard *agentResourceGuard,
+	tenant string,
+	calls []ToolCall,
+) ([]ChatMessage, []AgentStep, error) {
+	toolMsgs := make([]ChatMessage, 0, len(calls))
+	steps := make([]AgentStep, 0, len(calls))
+	for _, tc := range calls {
+		if err := guard.validate(ctx); err != nil {
+			return nil, nil, fmt.Errorf("agent pre-tool resource guard: %w", err)
+		}
+		name, _ := tc.Function["name"].(string)
+		argsStr, _ := tc.Function["arguments"].(string)
+		args := decodeToolArgs(argsStr)
+		result, err := a.dispatchTool(ctx, guard, tenant, name, args)
+		if err != nil {
+			return nil, nil, fmt.Errorf("agent tool %s: %w", name, err)
+		}
+		if err := guard.validate(ctx); err != nil {
+			return nil, nil, fmt.Errorf("agent post-tool resource guard: %w", err)
+		}
+		steps = append(steps, AgentStep{Tool: name, Args: args, Result: result})
+		toolMsgs = append(toolMsgs, ChatMessage{Role: "tool", Content: result})
+	}
+	return toolMsgs, steps, nil
+}
+
+func (a *Agent) forcedFinal(
+	ctx context.Context,
+	guard *agentResourceGuard,
+	messages []ChatMessage,
+	steps []AgentStep,
+	lastModel string,
+) (AgentResp, error) {
 	messages = append(messages, ChatMessage{Role: "system", Content: "Step budget exhausted. Provide the final answer now."})
-	resp, err := a.llm.Chat(ctx, ChatRequest{Messages: messages})
+	if err := guard.validate(ctx); err != nil {
+		return AgentResp{}, fmt.Errorf("agent forced-final resource guard: %w", err)
+	}
+	resp, err := a.llm.Chat(ctx, ChatRequest{Messages: append([]ChatMessage(nil), messages...)})
 	if err != nil {
-		return AgentResp{}, fmt.Errorf("forced final answer: %w", err)
+		return AgentResp{}, fmt.Errorf("forced final answer: %w", errors.Join(err, ctx.Err()))
+	}
+	if err := guard.validate(ctx); err != nil {
+		return AgentResp{}, fmt.Errorf("agent forced-final output guard: %w", err)
 	}
 	return AgentResp{Answer: resp.Content, Steps: steps, Model: resp.Model}, nil
 }
 
-func (a *Agent) callListFiles(ctx context.Context, tenant string, args map[string]any) string {
-	prefix, _ := args["prefix"].(string)
-	limit := 20
-	if v, ok := args["limit"].(float64); ok {
-		limit = int(v)
+func assistantToolMessage(resp ChatResponse) ChatMessage {
+	assistantTC, _ := json.Marshal(map[string]any{"tool_calls": resp.ToolCalls})
+	content := string(assistantTC)
+	if resp.Content != "" {
+		content = resp.Content + "\n" + content
 	}
-	page, err := a.svc.List(ctx, tenant, service.DefaultBucket, prefix, "", limit)
-	if err != nil {
-		return "error: " + err.Error()
-	}
-	var b strings.Builder
-	for _, o := range page.Objects {
-		fmt.Fprintf(&b, "%s\t%d bytes\n", o.Key, o.Size)
-	}
-	if b.Len() == 0 {
-		return "(no objects)"
-	}
-	return b.String()
-}
-
-func (a *Agent) callReadFile(ctx context.Context, tenant string, args map[string]any) string {
-	key, _ := args["key"].(string)
-	if key == "" {
-		return "error: key required"
-	}
-	rc, _, err := a.svc.Get(ctx, tenant, service.DefaultBucket, key)
-	if err != nil {
-		return "error: " + err.Error()
-	}
-	defer rc.Close()
-	body, _ := io.ReadAll(io.LimitReader(rc, 4<<10))
-	return string(body)
-}
-
-func (a *Agent) callSearch(ctx context.Context, tenant string, args map[string]any) string {
-	if a.search == nil {
-		return "error: search not enabled"
-	}
-	q, _ := args["query"].(string)
-	k := 5
-	if v, ok := args["k"].(float64); ok {
-		k = int(v)
-	}
-	if k <= 0 || k > 100 {
-		k = 5
-	}
-	hits, err := a.search.Query(ctx, Request{Tenant: tenant, Query: q, K: k, Mode: "hybrid", Caller: "agent:search"})
-	if err != nil {
-		return "error: " + err.Error()
-	}
-	var b strings.Builder
-	for i, h := range hits {
-		fmt.Fprintf(&b, "[#%d] %s/%s#%d\n%s\n", i+1, h.Bucket, h.ObjectKey, h.Seq, h.Chunk)
-	}
-	return b.String()
-}
-
-func (a *Agent) dispatchTool(ctx context.Context, tenant, name string, args map[string]any) string {
-	switch name {
-	case "list_files":
-		return a.callListFiles(ctx, tenant, args)
-	case "read_file":
-		return a.callReadFile(ctx, tenant, args)
-	case "search":
-		return a.callSearch(ctx, tenant, args)
-	default:
-		return "error: unknown tool " + name
-	}
+	return ChatMessage{Role: "assistant", Content: content}
 }

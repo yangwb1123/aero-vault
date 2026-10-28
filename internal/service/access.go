@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -37,11 +36,17 @@ func (s *FileService) objectForAction(
 	if err != nil {
 		return repository.Object{}, err
 	}
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return repository.Object{}, err
+	}
 	obj, err := s.repo.GetObject(ctx, tenant, bucket, key)
-	if errors.Is(err, repository.ErrNotFound) {
+	if repositoryObjectMissing(err) {
 		return repository.Object{}, ErrNotFound
 	}
 	if err != nil {
+		return repository.Object{}, err
+	}
+	if err := s.validateBoundaryObjects([]repository.Object{obj}, tenant, bucket, key); err != nil {
 		return repository.Object{}, err
 	}
 	if err := s.authorizeObject(ctx, action, obj); err != nil {
@@ -63,13 +68,10 @@ func (s *FileService) filterAuthorizedVersions(
 	ctx context.Context,
 	versions []repository.Object,
 ) ([]repository.Object, error) {
-	if s.authorizer == nil {
-		return versions, nil
-	}
 	out := make([]repository.Object, 0, len(versions))
 	for _, version := range versions {
 		err := s.authorizeObject(ctx, access.ActionRead, version)
-		if errors.Is(err, ErrForbidden) {
+		if ordinaryAccessDenial(err) {
 			continue
 		}
 		if err != nil {
@@ -85,6 +87,9 @@ func (s *FileService) authorize(
 	action access.Action,
 	resource access.Resource,
 ) error {
+	if err := s.admitBucket(ctx, resource.TenantID, resource.Bucket); err != nil {
+		return err
+	}
 	if err := s.requireActiveTenant(ctx, resource.TenantID); err != nil {
 		return err
 	}
@@ -107,7 +112,7 @@ func (s *FileService) authorize(
 	principal, _ := access.PrincipalFrom(ctx)
 	decision, err := s.authorizer.Authorize(ctx, principal, action, resource)
 	if err != nil {
-		return fmt.Errorf("authorization decision: %w", err)
+		return spaceBoundaryFault(fmt.Errorf("authorization decision: %w", err))
 	}
 	if !decision.Allowed {
 		return fmt.Errorf("%w: %s", ErrForbidden, decision.Reason)
@@ -133,13 +138,12 @@ func (s *FileService) requireActiveTenant(ctx context.Context, tenant string) er
 }
 
 func (s *FileService) authorizeObject(ctx context.Context, action access.Action, obj repository.Object) error {
-	return s.authorize(ctx, action, access.Resource{
-		TenantID: obj.TenantID,
-		Bucket:   obj.Bucket,
-		Key:      obj.Key,
-		Kind:     objectResourceKind(obj.Key),
-		OwnerID:  obj.Metadata[ownerMetadataKey],
-	})
+	resource := replayObjectResource(obj)
+	if err := s.authorize(ctx, action, resource); err != nil {
+		return err
+	}
+	recordReplayAdmission(ctx, action, resource, &obj)
+	return nil
 }
 
 func (s *FileService) authorizePath(
@@ -147,12 +151,12 @@ func (s *FileService) authorizePath(
 	action access.Action,
 	tenant, bucket, key string,
 ) error {
-	return s.authorize(ctx, action, access.Resource{
-		TenantID: tenant,
-		Bucket:   bucket,
-		Key:      key,
-		Kind:     objectResourceKind(key),
-	})
+	resource := access.Resource{TenantID: tenant, Bucket: bucket, Key: key, Kind: objectResourceKind(key)}
+	if err := s.authorize(ctx, action, resource); err != nil {
+		return err
+	}
+	recordReplayAdmission(ctx, action, resource, nil)
+	return nil
 }
 
 func objectResourceKind(key string) access.ResourceKind {
@@ -170,6 +174,9 @@ func (s *FileService) preparePutAccess(
 	tenant, bucket, key string,
 	metadata map[string]string,
 ) (map[string]string, error) {
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return nil, err
+	}
 	existing, err := s.repo.GetObject(ctx, tenant, bucket, key)
 	if err == nil {
 		if err := s.authorizeObject(ctx, access.ActionWrite, existing); err != nil {
@@ -177,7 +184,7 @@ func (s *FileService) preparePutAccess(
 		}
 		return metadataWithOwner(metadata, existing.Metadata[ownerMetadataKey]), nil
 	}
-	if !errors.Is(err, repository.ErrNotFound) {
+	if !repositoryObjectMissing(err) {
 		return nil, err
 	}
 	if err := s.authorizePath(ctx, access.ActionCreate, tenant, bucket, key); err != nil {
@@ -223,11 +230,21 @@ func (s *FileService) listObjectsMatching(
 	fetch objectPageFetcher,
 	matches func(repository.Object) bool,
 ) (repository.ListPage, error) {
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return repository.ListPage{}, err
+	}
 	if err := s.requireActiveTenant(ctx, tenant); err != nil {
 		return repository.ListPage{}, err
 	}
 	if s.authorizer == nil && matches == nil {
-		return fetch(ctx, tenant, bucket, prefix, marker, limit)
+		page, err := fetch(ctx, tenant, bucket, prefix, marker, limit)
+		if err == nil {
+			err = s.validateBoundaryObjects(page.Objects, tenant, bucket, "")
+		}
+		if err != nil {
+			return repository.ListPage{}, err
+		}
+		return page, nil
 	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
@@ -261,6 +278,9 @@ func (s *FileService) collectAuthorizedObjects(
 		if err != nil {
 			return nil, err
 		}
+		if err := s.validateBoundaryObjects(page.Objects, tenant, bucket, ""); err != nil {
+			return nil, err
+		}
 		for _, obj := range page.Objects {
 			if matches != nil && !matches(obj) {
 				continue
@@ -284,7 +304,7 @@ func (s *FileService) appendAuthorizedObject(
 	ctx context.Context, obj repository.Object, objects *[]repository.Object,
 ) error {
 	err := s.authorizeObject(ctx, access.ActionRead, obj)
-	if errors.Is(err, ErrForbidden) {
+	if ordinaryAccessDenial(err) {
 		return nil
 	}
 	if err != nil {

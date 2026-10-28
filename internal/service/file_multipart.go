@@ -2,11 +2,8 @@ package service
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/access"
@@ -52,6 +49,9 @@ func (s *FileService) InitMultipart(ctx context.Context, tenant, bucket, key str
 		return repository.Upload{}, err
 	}
 	if err := s.repo.CreateBucket(ctx, tenant, bucket); err != nil {
+		return repository.Upload{}, err
+	}
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
 		return repository.Upload{}, err
 	}
 	bcfg, err := s.repo.GetBucketConfig(ctx, tenant, bucket)
@@ -176,7 +176,7 @@ func (s *FileService) checkMultipartLock(ctx context.Context, u repository.Uploa
 		return nil
 	}
 	cur, err := s.repo.GetObject(ctx, u.TenantID, u.Bucket, u.Key)
-	if errors.Is(err, repository.ErrNotFound) {
+	if repositoryObjectMissing(err) {
 		return nil
 	}
 	if err != nil {
@@ -263,54 +263,6 @@ func (s *FileService) saveMultipartObject(ctx context.Context, obj repository.Ob
 
 func (s *FileService) AbortMultipart(ctx context.Context, uploadID string) error {
 	return s.AbortMultipartFor(ctx, defaultMultipartScope(), uploadID)
-}
-
-// AbortMultipartFor verifies ownership and persists an idempotent abort result.
-func (s *FileService) AbortMultipartFor(
-	ctx context.Context, scope MultipartScope, uploadID string,
-) error {
-	scope = normalizeMultipartScope(scope)
-	idemKey := multipartAbortKey(uploadID)
-	rec, claimed, err := s.repo.ClaimIdempotencyKey(
-		ctx, scope.TenantID, idemKey, "", "",
-	)
-	if err != nil {
-		return fmt.Errorf("idempotency claim: %w", err)
-	}
-	if !claimed {
-		if rec.Status != repository.IdempotencyCompleted ||
-			rec.ResponseStatus != http.StatusNoContent {
-			return fmt.Errorf("%w: multipart abort is already in progress", ErrPreconditionFailed)
-		}
-		var cached repository.Upload
-		if err := json.Unmarshal(rec.ResponseBody, &cached); err != nil {
-			return fmt.Errorf("decode aborted upload %s: %w", uploadID, err)
-		}
-		if !multipartScopeMatchesUpload(scope, cached) {
-			return multipartScopeError(scope, uploadID)
-		}
-		return nil
-	}
-	u, err := s.loadMultipartUpload(ctx, scope, uploadID)
-	if err != nil {
-		return s.releaseMultipartCompletion(ctx, scope, idemKey, err)
-	}
-	if err := s.store.AbortMultipart(ctx, uploadStorageKey(u), u.BackendUID); err != nil {
-		return s.releaseMultipartCompletion(
-			ctx, scope, idemKey, fmt.Errorf("storage abort multipart: %w", err),
-		)
-	}
-	body, _ := json.Marshal(u)
-	if err := s.repo.CompleteIdempotencyKey(
-		ctx, scope.TenantID, idemKey, http.StatusNoContent, body, "application/json", nil,
-	); err != nil {
-		return s.releaseMultipartCompletion(ctx, scope, idemKey, err)
-	}
-	if err := s.repo.DeleteUpload(ctx, uploadID); err != nil {
-		_ = s.repo.DeleteIdempotencyKey(ctx, scope.TenantID, idemKey)
-		return err
-	}
-	return nil
 }
 
 // multipartCompleteKey returns the idempotency key for CompleteMultipart.

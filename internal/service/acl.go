@@ -94,15 +94,33 @@ func (s *FileService) SetBucketACL(ctx context.Context, tenant, bucket, acl stri
 // ObjectPublicReadable reports whether an object may be read anonymously, taking
 // both the object ACL and its bucket's ACL into account.
 func (s *FileService) ObjectPublicReadable(ctx context.Context, tenant, bucket, key string) bool {
+	readable, err := s.ObjectPublicReadableWithError(ctx, tenant, bucket, key)
+	return err == nil && readable
+}
+
+// ObjectPublicReadableWithError retains observation faults for adapters that
+// can return errors. The historical bool API fails closed on every error.
+func (s *FileService) ObjectPublicReadableWithError(ctx context.Context, tenant, bucket, key string) (bool, error) {
 	tenant, bucket, err := checkedObjectDefaults(tenant, bucket, key)
 	if err != nil {
-		return false
+		return false, err
 	}
-	if acl, err := s.repo.GetObjectACL(ctx, tenant, bucket, key); err == nil && PublicReadable(acl) {
-		return true
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return false, err
 	}
-	if cfg, err := s.repo.GetBucketConfig(ctx, tenant, bucket); err == nil && PublicReadable(cfg.ACL) {
-		return true
+	if err := s.requireActiveTenant(ctx, tenant); err != nil {
+		return false, err
 	}
-	return false
+	acl, err := s.repo.GetObjectACL(ctx, tenant, bucket, key)
+	if err != nil && !repositoryObjectMissing(err) {
+		return false, err
+	}
+	if err == nil && PublicReadable(acl) {
+		return true, nil
+	}
+	cfg, err := s.repo.GetBucketConfig(ctx, tenant, bucket)
+	if err != nil {
+		return false, err
+	}
+	return PublicReadable(cfg.ACL), nil
 }

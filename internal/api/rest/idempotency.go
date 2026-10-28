@@ -11,6 +11,7 @@ import (
 
 	mw "github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
@@ -38,61 +39,74 @@ import (
 // idemSpoolThreshold bytes in memory, beyond that in a temp file — and handed
 // to the downstream handler unchanged; a body that cannot be read fails closed
 // with 500 before any claim is taken.
-func idempotency(repo repository.Repository, logger *slog.Logger, hashBody bool) func(http.Handler) http.Handler {
+func idempotency(repo repository.Repository, logger *slog.Logger, hashBody bool, boundaries ...IdempotencyReplayBoundary) func(http.Handler) http.Handler {
 	h := &IdempotencyHandler{repo: repo, logger: logger, hashBody: hashBody}
+	if len(boundaries) == 0 {
+		h.boundary, _ = repo.(IdempotencyReplayBoundary)
+	} else if len(boundaries) == 1 {
+		h.boundary = boundaries[0]
+	}
 	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key, ok := extractIdempotencyKey(r)
-			if !ok {
-				next.ServeHTTP(w, r)
-				return
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h.serveIdempotent(w, r, next) })
+	}
+}
+
+func (h *IdempotencyHandler) serveIdempotent(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	key, ok := extractIdempotencyKey(r)
+	if !ok {
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	ctx := r.Context()
+	tenant := mw.TenantFrom(ctx)
+	reqID := mw.RequestIDFrom(ctx)
+	fp := fingerprint(r)
+
+	if h.hashBody {
+		sp, bodyHash, err := spoolBody(r)
+		if err != nil {
+			h.logger.Warn("idempotency body spool failed", "err", err, "key", key, "tenant", tenant)
+			writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{
+				Code: "InternalError", Message: "could not buffer request body", RequestID: reqID,
+			}})
+			return
+		}
+		defer sp.Close()
+		fp = bodyFingerprint(r, bodyHash)
+	}
+
+	if h.handleIdempotentRequest(w, r, key, fp, tenant, reqID) {
+		return
+	}
+	h.executeIdempotent(w, r, next, key, tenant)
+}
+
+func (h *IdempotencyHandler) executeIdempotent(w http.ResponseWriter, r *http.Request, next http.Handler, key, tenant string) {
+	ctx := r.Context()
+	observedCtx, observation := service.ObserveReplayAdmission(ctx)
+	r = r.WithContext(observedCtx)
+	cap := &idemCapture{ResponseWriter: w, status: http.StatusOK}
+	done := false
+	defer func() {
+		if !done {
+			if delErr := h.repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
+				h.logger.Warn("idempotency release (panic) failed", "err", delErr, "key", key, "tenant", tenant)
 			}
+		}
+	}()
 
-			ctx := r.Context()
-			tenant := mw.TenantFrom(ctx)
-			reqID := mw.RequestIDFrom(ctx)
-			fp := fingerprint(r)
+	next.ServeHTTP(cap, r)
+	done = true
 
-			if h.hashBody {
-				sp, bodyHash, err := spoolBody(r)
-				if err != nil {
-					h.logger.Warn("idempotency body spool failed", "err", err, "key", key, "tenant", tenant)
-					writeJSON(w, http.StatusInternalServerError, errorBody{Error: errorPayload{
-						Code: "InternalError", Message: "could not buffer request body", RequestID: reqID,
-					}})
-					return
-				}
-				defer sp.Close()
-				fp = bodyFingerprint(r, bodyHash)
-			}
-
-			if h.handleIdempotentRequest(w, r, key, fp, tenant, reqID) {
-				return
-			}
-
-			cap := &idemCapture{ResponseWriter: w, status: http.StatusOK}
-			done := false
-			defer func() {
-				if !done {
-					if delErr := h.repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
-						h.logger.Warn("idempotency release (panic) failed", "err", delErr, "key", key, "tenant", tenant)
-					}
-				}
-			}()
-
-			next.ServeHTTP(cap, r)
-			done = true
-
-			if cap.status >= 500 {
-				if delErr := h.repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
-					h.logger.Warn("idempotency release failed", "err", delErr, "key", key, "tenant", tenant)
-				}
-				return
-			}
-			if cmpErr := h.repo.CompleteIdempotencyKey(ctx, tenant, key, cap.status, cap.body, cap.Header().Get("Content-Type"), replayableHeaders(cap.Header())); cmpErr != nil {
-				h.logger.Warn("idempotency complete failed", "err", cmpErr, "key", key, "tenant", tenant)
-			}
-		})
+	if cap.status >= 500 {
+		if delErr := h.repo.DeleteIdempotencyKey(ctx, tenant, key); delErr != nil {
+			h.logger.Warn("idempotency release failed", "err", delErr, "key", key, "tenant", tenant)
+		}
+		return
+	}
+	if cmpErr := h.repo.CompleteIdempotencyKey(ctx, tenant, key, cap.status, cap.body, cap.Header().Get("Content-Type"), replayAdmissionHeaders(replayableHeaders(cap.Header()), observation)); cmpErr != nil {
+		h.logger.Warn("idempotency complete failed", "err", cmpErr, "key", key, "tenant", tenant)
 	}
 }
 
@@ -130,6 +144,9 @@ func replay(w http.ResponseWriter, rec repository.IdempotencyRecord) {
 	// X-Version-Id, X-Meta-*, …) so a replayed response is byte-for-byte what the
 	// original sent, keeping cache validation and client-side metadata intact.
 	for k, vals := range rec.ResponseHeaders {
+		if http.CanonicalHeaderKey(k) == replayAdmissionHeader {
+			continue
+		}
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}
@@ -294,6 +311,7 @@ type IdempotencyHandler struct {
 	repo     repository.Repository
 	logger   *slog.Logger
 	hashBody bool
+	boundary IdempotencyReplayBoundary
 }
 
 func extractIdempotencyKey(r *http.Request) (string, bool) {
@@ -316,6 +334,11 @@ func (h *IdempotencyHandler) handleIdempotentRequest(w http.ResponseWriter, r *h
 		case rec.Fingerprint != fp:
 			idemConflict(w, reqID, "Idempotency-Key reused for a different request")
 		case rec.Status == "completed":
+			if err := h.admitReplay(r, rec); err != nil {
+				code, message, status := classify(err)
+				writeJSON(w, status, errorBody{Error: errorPayload{Code: code, Message: message, RequestID: reqID}})
+				return true
+			}
 			telemetry.IncIdempotencyReplay(ctx)
 			replay(w, rec)
 		default:

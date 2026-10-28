@@ -49,7 +49,7 @@ func TestIdempotency_QueryVariantConflicts(t *testing.T) {
 		calls++
 		w.WriteHeader(http.StatusNoContent) // 204, same as the Delete handler
 	})
-	mwh := idempotency(repo, idemSilentLogger(), false)(h)
+	mwh := idempotency(repo, idemSilentLogger(), false, idemTransportBoundary(repo))(h)
 
 	do := func(url string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodDelete, url, nil)

@@ -13,16 +13,33 @@ import (
 // Usage returns the tenant's current usage + caps.
 func (s *FileService) Usage(ctx context.Context, tenant string) (repository.TenantQuota, error) {
 	tenant, _ = defaults(tenant, "")
+	scope := tenantCoverage(tenant)
+	if err := s.admitCoverage(ctx, scope); err != nil {
+		return repository.TenantQuota{}, err
+	}
 	if err := s.requireActiveTenant(ctx, tenant); err != nil {
 		return repository.TenantQuota{}, err
 	}
-	return s.repo.GetTenantQuota(ctx, tenant)
+	quota, err := s.repo.GetTenantQuota(ctx, tenant)
+	if err != nil {
+		return repository.TenantQuota{}, err
+	}
+	if s.spaceBoundary != nil && quota.TenantID != tenant {
+		return repository.TenantQuota{}, spaceBoundaryFault(ErrInvalidArgs)
+	}
+	if err := s.admitCoverage(ctx, scope); err != nil {
+		return repository.TenantQuota{}, err
+	}
+	return quota, nil
 }
 
 // SetQuota updates the caps for a tenant.
 func (s *FileService) SetQuota(ctx context.Context, tenant string, maxBytes, maxObjects int64) error {
 	tenant, _ = defaults(tenant, "")
 	if err := validateQuotaLimits(maxBytes, maxObjects); err != nil {
+		return err
+	}
+	if err := s.admitCoverage(ctx, tenantCoverage(tenant)); err != nil {
 		return err
 	}
 	return s.repo.SetTenantQuota(ctx, tenant, maxBytes, maxObjects)
@@ -43,11 +60,17 @@ func (s *FileService) ListVersions(ctx context.Context, tenant, bucket, key stri
 	if err != nil {
 		return nil, err
 	}
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return nil, err
+	}
 	if err := s.requireActiveTenant(ctx, tenant); err != nil {
 		return nil, err
 	}
 	versions, err := s.repo.ListObjectVersions(ctx, tenant, bucket, key)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.validateBoundaryObjects(versions, tenant, bucket, key); err != nil {
 		return nil, err
 	}
 	return s.filterAuthorizedVersions(ctx, versions)
@@ -172,11 +195,11 @@ func (s *FileService) BatchDelete(ctx context.Context, tenant, bucket string, ke
 	for _, key := range keys {
 		err := s.Delete(ctx, tenant, bucket, key, false)
 		r := BatchDeleteResult{Key: key}
-		if err == nil || errors.Is(err, ErrNotFound) {
+		if err == nil || (!access.IsResourceBoundaryFault(err) && errors.Is(err, ErrNotFound)) {
 			r.Deleted = true
 		} else {
 			r.Deleted = false
-			r.Error = err.Error()
+			r.Error = batchActionError(err)
 		}
 		results = append(results, r)
 	}
@@ -197,7 +220,7 @@ func (s *FileService) BatchSetTags(ctx context.Context, tenant, bucket string, k
 		err := s.SetTags(ctx, tenant, bucket, key, tags)
 		r := BatchTagResult{Key: key}
 		if err != nil {
-			r.Error = err.Error()
+			r.Error = batchActionError(err)
 		}
 		results = append(results, r)
 	}

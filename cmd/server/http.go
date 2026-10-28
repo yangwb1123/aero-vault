@@ -22,6 +22,7 @@ import (
 	"github.com/aero-vault/aero-vault/internal/mcp"
 	"github.com/aero-vault/aero-vault/internal/middleware"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/server"
 	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/storage"
 	"github.com/aero-vault/aero-vault/internal/thumbnail"
@@ -153,13 +154,44 @@ func mcpScopeGate(authReg *auth.Registry) func(http.Handler) http.Handler {
 	return authReg.Require(auth.Scope(auditgovernance.RequiredScope))
 }
 
+// Retained legacy construction signature. Production uses buildResourceRouter
+// with readers captured before billing/audit wrappers, not this discovery path.
 func buildRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, thumbCache *thumbnail.Cache, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider, extraReady readinessChecker) http.Handler {
+	return buildResourceRouter(svc, repo, store, search, chat, agent, bus, authReg, accessManager,
+		oidc, promHandler, thumbCache, cfg, aiTimeout, aiRL, adminRL, logger, corsProvider,
+		extraReady, rest.DiscoverRouterResourceReaders(repo))
+}
+
+func buildResourceRouter(svc *service.FileService, repo repository.Repository, store storage.Storage, search *ai.Search, chat *ai.Chat, agent *ai.Agent, bus *events.Bus, authReg *auth.Registry, accessManager *access.Manager, oidc *auth.OIDCHandler, promHandler http.Handler, thumbCache *thumbnail.Cache, cfg *config.Config, aiTimeout time.Duration, aiRL, adminRL *middleware.RateLimiter, logger *slog.Logger, corsProvider middleware.BucketCORSProvider, extraReady readinessChecker, readers rest.RouterResourceReaders) http.Handler {
 	r := chi.NewRouter()
 	adminAuthz := configuredAdminDeleteProvider()
 	thumbnailAdmission := thumbnail.NewDecodeAdmission(cfg.App.ThumbnailPerTenantDecodeSlots)
 	if adminAuthz == nil {
 		logger.Error("admin delete authorization provider is not configured", "name", defaultAdminDeleteProviderName)
 	}
+	mountSystemRoutes(r, repo, store, extraReady, promHandler, oidc)
+	r.Mount("/v1", rest.NewRouterWithAdminAuthorizationProvider(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode, adminAuthz,
+		func(h *rest.Handler) {
+			h.WithResourceReaders(readers)
+			h.WithCORSProvider(corsProvider)
+			h.WithThumbnailCache(thumbCache)
+			h.WithThumbnailDecodeAdmission(thumbnailAdmission)
+			if cfg.App.ThumbnailCacheBytes > 0 && cfg.App.ThumbnailCacheTTL == 0 {
+				logger.Warn("thumbnail cache enabled without a retention bound (THUMBNAIL_CACHE_TTL=0): cached derived bytes of deleted/overwritten objects are retained until LRU pressure evicts them; set THUMBNAIL_CACHE_TTL to bound retention")
+			}
+			if accessManager != nil {
+				h.WithAccessManager(accessManager, cfg.Access.PublicBaseURL)
+			}
+		}))
+	mountProtocolRoutes(r, svc, repo, search, chat, authReg, accessManager, cfg, logger)
+	var davH http.Handler
+	if cfg.WebDAV.Prefix != "" {
+		davH = dav.Handler(cfg.WebDAV.Prefix, svc, logger)
+	}
+	return buildDispatcher(r, davH, cfg)
+}
+
+func mountSystemRoutes(r *chi.Mux, repo repository.Repository, store storage.Storage, extraReady readinessChecker, promHandler http.Handler, oidc *auth.OIDCHandler) {
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -180,32 +212,18 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 		r.Get("/auth/oidc/callback", oidc.Callback)
 		r.Get("/auth/oidc/logout", oidc.Logout)
 	}
-	r.Mount("/v1", rest.NewRouterWithAdminAuthorizationProvider(svc, repo, search, chat, agent, bus, authReg, logger, cfg.Reconcile.IdempotencyHashBody, aiRL, adminRL, aiTimeout, cfg.AI.DegradedMode, adminAuthz,
-		func(h *rest.Handler) {
-			h.WithCORSProvider(corsProvider)
-			h.WithThumbnailCache(thumbCache)
-			h.WithThumbnailDecodeAdmission(thumbnailAdmission)
-			if cfg.App.ThumbnailCacheBytes > 0 && cfg.App.ThumbnailCacheTTL == 0 {
-				// Compliance F2 (privacy-by-default posture): the cache is enabled
-				// without a retention bound — derived bytes of deleted/overwritten
-				// objects stay resident until LRU pressure evicts them. Zero
-				// behavior change (0 = unbounded is the documented default); the
-				// operator is alerted to set THUMBNAIL_CACHE_TTL.
-				logger.Warn("thumbnail cache enabled without a retention bound (THUMBNAIL_CACHE_TTL=0): cached derived bytes are retained until LRU pressure evicts them; set THUMBNAIL_CACHE_TTL to bound retention")
-			}
-			if accessManager != nil {
-				h.WithAccessManager(accessManager, cfg.Access.PublicBaseURL)
-			}
-		}))
-	if accessManager != nil {
-		publicAccess := rest.NewPublicAccessHandler(svc, accessManager, logger)
+}
+
+func mountProtocolRoutes(r *chi.Mux, svc *service.FileService, repo repository.Repository, search *ai.Search, chat *ai.Chat, authReg *auth.Registry, manager *access.Manager, cfg *config.Config, logger *slog.Logger) {
+	if manager != nil {
+		publicAccess := rest.NewPublicAccessHandler(svc, manager, logger)
 		r.Get("/share/{token}", publicAccess.Share)
 		r.Head("/share/{token}", publicAccess.Share)
 		r.Get("/public/assets/*", publicAccess.Asset)
 		r.Head("/public/assets/*", publicAccess.Asset)
 	}
 	if cfg.S3Compat.Prefix != "" {
-		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger, accessManager))
+		r.Mount(cfg.S3Compat.Prefix, s3compat.NewRouter(svc, logger, manager))
 	}
 	mcpServer := mcp.NewServer(svc, repo, search, "default", logger)
 	if chat != nil {
@@ -217,11 +235,42 @@ func buildRouter(svc *service.FileService, repo repository.Repository, store sto
 		r.Get("/favicon.ico", webui.Favicon)
 		r.Mount("/ui", webui.Handler())
 	}
-	var davH http.Handler
-	if cfg.WebDAV.Prefix != "" {
-		davH = dav.Handler(cfg.WebDAV.Prefix, svc, logger)
+}
+
+func servePreparedHTTP(ctx context.Context, p *spaceStartup, oidc *auth.OIDCHandler) error {
+	if err := p.requireStarted(); err != nil {
+		return err
 	}
-	return buildDispatcher(r, davH, cfg)
+	cfg, logger, repo := p.cfg, p.logger, p.assembly.repo
+	cors := middleware.NewBucketCORSProvider(repo, 60*time.Second)
+	defer cors.Close()
+	// Exactly one cache is shared by the REST handler and independent TTL driver.
+	cache := thumbnail.NewCache(cfg.App.ThumbnailCacheBytes, time.Duration(cfg.App.ThumbnailCacheTTL)*time.Second)
+	if interval := thumbnailSweepInterval(cfg); interval > 0 {
+		startThumbnailCacheSweep(ctx, cache, interval, logger)
+	}
+	authReg := buildAuthRegistry(ctx, cfg, logger, repo)
+	rl := middleware.NewRateLimiter(cfg.RateLimit.RPS, cfg.RateLimit.Burst)
+	aiRL := middleware.NewRateLimiter(cfg.RateLimit.AIRPS, cfg.RateLimit.AIBurst)
+	adminRL := middleware.NewRateLimiter(cfg.RateLimit.AdminRPS, cfg.RateLimit.AdminBurst)
+	rl.Start(ctx)
+	aiRL.Start(ctx)
+	adminRL.Start(ctx)
+	prom := buildPrometheus(cfg, logger)
+	registerGauges(repo, p.assembly.audit, p.assembly.billing)
+	dispatcher := buildResourceRouter(p.assembly.svc, repo, p.assembly.svc.Storage(), p.search, p.chat, p.agent,
+		p.infra.bus, authReg, p.assembly.manager, oidc, prom, cache, cfg,
+		time.Duration(cfg.App.RequestTimeoutSec)*time.Second, aiRL, adminRL, logger, cors,
+		runtimeReadiness(p.assembly.billing, p.assembly.audit), p.infra.readers.router)
+	final := server.ApplyMiddleware(dispatcher, repo, authReg, rl, cfg, logger, configuredConcurrency(cfg), cors)
+	return runServer(ctx, final, cfg, logger, p.infra.bus, p.infra.shutdown)
+}
+
+func configuredConcurrency(cfg *config.Config) func(http.Handler) http.Handler {
+	if cfg.App.PerTenantMax > 0 {
+		return middleware.NewPerTenantConcurrencyLimiter(cfg.App.MaxInFlight, cfg.App.PerTenantMax).Middleware()
+	}
+	return middleware.NewConcurrencyLimiter(cfg.App.MaxInFlight).Middleware()
 }
 
 func redirectWebUI(w http.ResponseWriter, r *http.Request) {

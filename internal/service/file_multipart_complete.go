@@ -84,33 +84,11 @@ func (s *FileService) completeMultipart(
 		return repository.Object{}, fmt.Errorf("idempotency claim: %w", err)
 	}
 	if !claimed {
-		return replayMultipartCompletion(rec, scope, uploadID)
+		return s.replayMultipartCompletion(ctx, rec, scope, uploadID, opts)
 	}
 	return s.executeMultipartCompletion(
 		ctx, scope, uploadID, idemKey, clientParts, explicitManifest, opts,
 	)
-}
-
-func replayMultipartCompletion(
-	rec repository.IdempotencyRecord,
-	scope MultipartScope,
-	uploadID string,
-) (repository.Object, error) {
-	if rec.Status != repository.IdempotencyCompleted ||
-		rec.ResponseStatus < 200 || rec.ResponseStatus >= 300 ||
-		len(rec.ResponseBody) == 0 {
-		return repository.Object{}, fmt.Errorf(
-			"%w: multipart completion is already in progress", ErrPreconditionFailed,
-		)
-	}
-	var cached repository.Object
-	if err := json.Unmarshal(rec.ResponseBody, &cached); err != nil {
-		return repository.Object{}, fmt.Errorf("decode completed upload %s: %w", uploadID, err)
-	}
-	if !multipartScopeMatchesObject(scope, cached) {
-		return repository.Object{}, multipartScopeError(scope, uploadID)
-	}
-	return cached, nil
 }
 
 func (s *FileService) executeMultipartCompletion(

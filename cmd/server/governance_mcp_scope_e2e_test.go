@@ -61,8 +61,7 @@ const (
 
 // mcpGovHarness embeds the shared govHarness (rowFor/waitForRow/eventRowID/
 // outboxRow/wantFactID read h.dsn; startRelay reads h.rt; the receiver is
-// h.receiver) so the B3-5 tests reuse the governance_e2e_test.go helpers
-// read-only — that file stays untouched at exactly 500 lines.
+// h.receiver) so the B3-5 tests reuse the governance_e2e_test.go helpers.
 type mcpGovHarness struct {
 	govHarness
 	url string
@@ -87,12 +86,54 @@ func newMCPGovernanceE2E(t *testing.T, mode string) *mcpGovHarness {
 	if err := repo.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	readers := governanceSpaceReaders(t, repo)
 	store, err := storage.NewLocal(storage.LocalConfig{Root: filepath.Join(dir, "objects")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.AuditGovernanceConfig{
+	cfg := mcpGovernanceConfig(receiver)
+	rt, err := auditgovernance.New(cfg, repo.(auditgovernance.Store), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrepo := auditgovernance.WrapRepository(repo, rt)
+	bus := events.New(wrepo, logger)
+	bus.WithRepository(wrepo)
+	svc := service.NewFileService(store, wrepo, logger).WithEventSink(bus)
+	readers.wireBus(bus)
+	readers.wireService(svc)
+	authReg, err := auth.Parse("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Provisioning (E9): knownScope rejects the audit scope from
+	// AUTH_KEYS/SigV4/Snaplink; Registry.AddKey accepts arbitrary scopes.
+	// All three principals are registered up front so T-1 and T-2 share the
+	// harness; mcp-admin pins the admin-implies clause (T-2 step 5).
+	addMCPKey(t, authReg, "mcp-write", e2eTenant, auth.ScopeWrite, auth.Scope(auditgovernance.RequiredScope))
+	addMCPKey(t, authReg, "mcp-readonly", e2eTenant, auth.ScopeWrite)
+	addMCPKey(t, authReg, "mcp-admin", e2eTenant, auth.ScopeAdmin)
+	srv := newMCPGovernanceHTTP(svc, wrepo, authReg, logger)
+	t.Cleanup(srv.Close)
+	// Cleanup runs last-registered first: rt.Close -> repo.Close -> receiver.Close -> srv.Close.
+	t.Cleanup(receiver.server.Close)
+	t.Cleanup(func() { _ = repo.Close() })
+	t.Cleanup(rt.Close)
+	return &mcpGovHarness{govHarness: govHarness{dsn: dsn, receiver: receiver, rt: rt}, url: srv.URL}
+}
+
+func newMCPGovernanceHTTP(svc *service.FileService, wrepo repository.Repository, authReg *auth.Registry, logger *slog.Logger) *httptest.Server {
+	mcpServer := mcp.NewServer(svc, wrepo, nil, "default", logger)
+	router := chi.NewRouter()
+	router.Method(http.MethodPost, "/mcp", mcpScopeGate(authReg)(mcp.HTTPHandler(mcpServer)))
+	handler := server.ApplyMiddleware(router, wrepo, authReg, nil, &config.Config{}, logger,
+		middleware.NewConcurrencyLimiter(0).Middleware(), nil)
+	return httptest.NewServer(handler)
+}
+
+func mcpGovernanceConfig(receiver *govReceiver) config.AuditGovernanceConfig {
+	return config.AuditGovernanceConfig{
 		Enabled: true, BaseURL: receiver.server.URL, TokenURL: receiver.server.URL + "/token",
 		HMACKey:            "0123456789abcdef0123456789abcdef", // 32 B, distinct from secrets
 		HTTPTimeoutSeconds: 5, PollMilliseconds: 5, BatchSize: 16,
@@ -106,37 +147,6 @@ func newMCPGovernanceE2E(t *testing.T, mode string) *mcpGovHarness {
 			ClientSecret:    e2eClientSecret,
 		}},
 	}
-	rt, err := auditgovernance.New(cfg, repo.(auditgovernance.Store), logger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wrepo := auditgovernance.WrapRepository(repo, rt)
-	bus := events.New(wrepo, logger)
-	bus.WithRepository(wrepo)
-	svc := service.NewFileService(store, wrepo, logger).WithEventSink(bus)
-	authReg, err := auth.Parse("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Provisioning (E9): knownScope rejects the audit scope from
-	// AUTH_KEYS/SigV4/Snaplink; Registry.AddKey accepts arbitrary scopes.
-	// All three principals are registered up front so T-1 and T-2 share the
-	// harness; mcp-admin pins the admin-implies clause (T-2 step 5).
-	addMCPKey(t, authReg, "mcp-write", e2eTenant, auth.ScopeWrite, auth.Scope(auditgovernance.RequiredScope))
-	addMCPKey(t, authReg, "mcp-readonly", e2eTenant, auth.ScopeWrite)
-	addMCPKey(t, authReg, "mcp-admin", e2eTenant, auth.ScopeAdmin)
-	mcpServer := mcp.NewServer(svc, wrepo, nil, "default", logger)
-	router := chi.NewRouter()
-	router.Method(http.MethodPost, "/mcp", mcpScopeGate(authReg)(mcp.HTTPHandler(mcpServer)))
-	handler := server.ApplyMiddleware(router, wrepo, authReg, nil, &config.Config{}, logger,
-		middleware.NewConcurrencyLimiter(0).Middleware(), nil)
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
-	// Cleanup runs last-registered first: rt.Close -> repo.Close -> receiver.Close -> srv.Close.
-	t.Cleanup(receiver.server.Close)
-	t.Cleanup(func() { _ = repo.Close() })
-	t.Cleanup(rt.Close)
-	return &mcpGovHarness{govHarness: govHarness{dsn: dsn, receiver: receiver, rt: rt}, url: srv.URL}
 }
 
 func addMCPKey(t *testing.T, reg *auth.Registry, token, tenant string, scopes ...auth.Scope) {
@@ -275,11 +285,7 @@ func TestGovernanceE2EMCPWriteFileProvisionedBearer(t *testing.T) {
 
 	// Deterministic pre-start snapshot (B1): relay not started, no claim.
 	row := rowFor(t, &h.govHarness, originID)
-	if row.tenantID != e2eTenant || row.originKind != repository.AuditOriginFile ||
-		row.attempts != 0 || row.deliveredAtNS != 0 || row.failedAtNS != 0 ||
-		row.availableAtNS == 0 || row.claimOwner != "" {
-		t.Fatalf("pre-start snapshot: %+v", row)
-	}
+	checkMCPGovernancePreStart(t, row)
 
 	// Relay delivers exactly once with the REQ-4 form pins.
 	startRelay(t, h.rt)
@@ -303,17 +309,19 @@ func TestGovernanceE2EMCPWriteFileProvisionedBearer(t *testing.T) {
 	}
 }
 
+func checkMCPGovernancePreStart(t *testing.T, row govOutboxRow) {
+	t.Helper()
+	if row.tenantID != e2eTenant || row.originKind != repository.AuditOriginFile ||
+		row.attempts != 0 || row.deliveredAtNS != 0 || row.failedAtNS != 0 ||
+		row.availableAtNS == 0 || row.claimOwner != "" {
+		t.Fatalf("pre-start snapshot: %+v", row)
+	}
+}
+
 // ── T-2 (REQ-5 / A2): rejection precedes enqueue ──────────────────────────
 
-func TestGovernanceE2EMCPScopeGateDeniesUnprovisioned(t *testing.T) {
-	h := newMCPGovernanceE2E(t, "202-echo")
-
-	// Step 1: write-scoped bearer without audit:event:write -> 403 from the
-	// mount gate, byte-exact body, no WWW-Authenticate. The coarse chain gate
-	// can never emit this body (it would say "missing scope: write" — and
-	// mcp-readonly holds write, so it passes the ring), which makes the
-	// discriminator sound at wire level.
-	resp := postMCP(t, h, "mcp-readonly", mcpWritePayload)
+func checkMCPGovernanceScopeDenial(t *testing.T, resp mcpResp) {
+	t.Helper()
 	if resp.status != http.StatusForbidden {
 		t.Fatalf("status=%d want 403 (body %q)", resp.status, resp.body)
 	}
@@ -326,6 +334,18 @@ func TestGovernanceE2EMCPScopeGateDeniesUnprovisioned(t *testing.T) {
 	if want := "missing scope: " + auditgovernance.RequiredScope + "\n"; resp.body != want {
 		t.Fatalf("403 body=%q want %q", resp.body, want)
 	}
+}
+
+func TestGovernanceE2EMCPScopeGateDeniesUnprovisioned(t *testing.T) {
+	h := newMCPGovernanceE2E(t, "202-echo")
+
+	// Step 1: write-scoped bearer without audit:event:write -> 403 from the
+	// mount gate, byte-exact body, no WWW-Authenticate. The coarse chain gate
+	// can never emit this body (it would say "missing scope: write" — and
+	// mcp-readonly holds write, so it passes the ring), which makes the
+	// discriminator sound at wire level.
+	resp := postMCP(t, h, "mcp-readonly", mcpWritePayload)
+	checkMCPGovernanceScopeDenial(t, resp)
 
 	// Step 2: rejection precedes enqueue — zero rows, zero receiver traffic.
 	assertZeroSideEffects(t, h)

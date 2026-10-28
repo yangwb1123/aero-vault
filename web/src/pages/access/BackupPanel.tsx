@@ -52,10 +52,21 @@ export function BackupPanel({ client, bucket }: { client: VaultClient; bucket: s
     }
   }
 
+  return <ArchiveForm prefix={prefix} setPrefix={setPrefix} busy={busy} error={error} progress={progress} download={download} />
+}
+
+function ArchiveForm({ prefix, setPrefix, busy, error, progress, download }: {
+  prefix: string
+  setPrefix(prefix: string): void
+  busy: boolean
+  error?: string
+  progress?: DownloadProgress
+  download(): Promise<void>
+}): React.ReactElement {
   return (
     <div className="access-stack">
-      <IrisCard variant="outline" header="导出可移植备份">
-        <p className="muted">导出当前用户有权访问的对象，压缩包包含 manifest.json、元数据、标签和对象内容。</p>
+      <IrisCard variant="outline" header="导出授权对象归档">
+        <p className="muted">仅导出当前用户有权访问的对象，压缩包包含 manifest.json、元数据、标签和对象内容。这不是灾难恢复备份，不包含完整治理状态，也不保证数据库与 Blob 的一致恢复点。下载交给浏览器不等于确认文件落盘。</p>
         <form className="backup-form" onSubmit={(event) => { event.preventDefault(); void download() }}>
           <label className="access-field"><span>Key 前缀（空为全部）</span><IrisInput value={prefix} placeholder="team/project/" disabled={busy} onChange={(event) => setPrefix(event.target.value)} /></label>
           <IrisButton type="submit" loading={busy} disabled={busy}>下载 tar.gz</IrisButton>

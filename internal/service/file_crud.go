@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -117,6 +116,9 @@ func (s *FileService) Put(ctx context.Context, tenant, bucket, key string, r io.
 	}
 	if err := s.repo.CreateBucket(ctx, tenant, bucket); err != nil {
 		return repository.Object{}, fmt.Errorf("ensure bucket: %w", err)
+	}
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return repository.Object{}, err
 	}
 	bcfg, err := s.repo.GetBucketConfig(ctx, tenant, bucket)
 	if err != nil {
@@ -268,7 +270,7 @@ func (s *FileService) checkOverwriteProtection(ctx context.Context, tenant, buck
 	}
 	obj, err := s.repo.GetObject(ctx, tenant, bucket, key)
 	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
+		if repositoryObjectMissing(err) {
 			return nil
 		}
 		return err

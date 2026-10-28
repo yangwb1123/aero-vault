@@ -17,11 +17,17 @@ func (s *FileService) ListObjectVersionsWithOpts(
 	if err != nil {
 		return repository.VersionListPage{}, err
 	}
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return repository.VersionListPage{}, err
+	}
 	if err := s.requireActiveTenant(ctx, tenant); err != nil {
 		return repository.VersionListPage{}, err
 	}
 	page, err := s.repo.ListObjectVersionsWithOpts(ctx, tenant, bucket, key, opts)
 	if err != nil {
+		return repository.VersionListPage{}, err
+	}
+	if err := s.validateBoundaryObjects(page.Versions, tenant, bucket, key); err != nil {
 		return repository.VersionListPage{}, err
 	}
 	page.Versions, err = s.filterAuthorizedVersions(ctx, page.Versions)
@@ -35,6 +41,9 @@ func (s *FileService) ListMultipartUploads(
 	limit int,
 ) ([]repository.Upload, error) {
 	tenant, bucket = defaults(tenant, bucket)
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return nil, err
+	}
 	if err := s.requireActiveTenant(ctx, tenant); err != nil {
 		return nil, err
 	}
@@ -46,9 +55,22 @@ func (s *FileService) ListMultipartUploads(
 	}
 	filtered := make([]repository.Upload, 0, len(uploads))
 	for _, upload := range uploads {
-		if err := s.authorize(ctx, access.ActionWrite, uploadAccessResource(upload)); err == nil {
-			filtered = append(filtered, upload)
+		if upload.TenantID != tenant || upload.Bucket != bucket {
+			return nil, spaceBoundaryFault(ErrInvalidArgs)
 		}
+		if s.spaceBoundary != nil {
+			if err := validateReplayUpload(upload, upload.ID); err != nil {
+				return nil, err
+			}
+		}
+		err := s.authorize(ctx, access.ActionWrite, uploadAccessResource(upload))
+		if ordinaryAccessDenial(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		filtered = append(filtered, upload)
 	}
 	return filtered, nil
 }

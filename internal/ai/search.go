@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
@@ -19,15 +20,20 @@ var recordSearchDegraded = telemetry.IncSearchDegraded
 // asks the repository for nearest chunks, optionally merges in BM25 results,
 // optionally reranks with a cross-encoder, and records an AI usage row.
 type Search struct {
-	repo     repository.Repository
-	embedder Embedder
-	bm25     *BM25
-	rerank   Reranker
-	vindex   VectorIndex
-	lexical  LexicalIndex
-	results  *resultCache
-	logger   *slog.Logger
-	hitAuth  HitAuthorizer
+	repo              repository.Repository
+	embedder          Embedder
+	bm25              *BM25
+	rerank            Reranker
+	vindex            VectorIndex
+	lexical           LexicalIndex
+	results           *resultCache
+	logger            *slog.Logger
+	hitAuth           HitAuthorizer
+	hitAuthConfigured bool
+	boundary          *SearchResourceBoundary
+	resources         service.SpaceResourceReader
+	resourcesExplicit bool
+	canonical         bool // false only for the optional, wholly unconfigured legacy path
 }
 
 type HitAuthorizer interface {
@@ -40,7 +46,7 @@ func NewSearch(repo repository.Repository, emb Embedder, logger *slog.Logger) *S
 	}
 	// Default to the brute-force repository index; WithVectorIndex swaps in a
 	// scalable backend (pgvector/Qdrant) without changing this service.
-	return &Search{repo: repo, embedder: emb, vindex: repoVectorIndex{repo: repo}, logger: logger}
+	return &Search{repo: repo, resources: repo, embedder: emb, vindex: repoVectorIndex{repo: repo}, logger: logger}
 }
 
 // WithVectorIndex overrides the default brute-force retrieval backend (e.g. a
@@ -61,12 +67,15 @@ func (s *Search) WithLexicalIndex(li LexicalIndex) *Search {
 }
 
 // WithResultCache enables an opt-in, bounded, TTL'd hot-result cache so that
-// identical repeated queries skip the embed + retrieval + rerank work. A
-// capacity<=0 or ttl<=0 leaves caching disabled (no-op). Results can go stale as
-// the corpus changes; the TTL bounds that staleness, which is why this is
-// opt-in with a short default TTL.
+// identical repeated queries skip embedding and retrieval. Only candidates are
+// cached; canonical proof, authorization and reranking run for every subject.
+// A capacity<=0 or ttl<=0 leaves caching disabled (no-op). Corpus additions may
+// remain absent until expiry; stale or revoked candidates are never delivered.
 func (s *Search) WithResultCache(capacity int, ttl time.Duration) *Search {
 	s.results = newResultCache(capacity, ttl)
+	if s.results != nil {
+		s.canonical = true
+	}
 	return s
 }
 
@@ -79,13 +88,17 @@ func (s *Search) WithBM25(b *BM25) *Search {
 // WithReranker installs a cross-encoder reranker (called after retrieval).
 func (s *Search) WithReranker(r Reranker) *Search {
 	s.rerank = r
+	if r != nil {
+		s.canonical = true
+	}
 	return s
 }
 
 // WithHitAuthorizer filters every candidate before it reaches search, chat, or
-// agent callers. Result caching is bypassed because decisions are subject-specific.
+// agent callers. Cached candidates never retain subject-specific decisions.
 func (s *Search) WithHitAuthorizer(authorizer HitAuthorizer) *Search {
-	s.hitAuth = authorizer
+	s.hitAuth, s.hitAuthConfigured = authorizer, true
+	s.canonical = true
 	return s
 }
 
@@ -123,7 +136,7 @@ func (s *Search) bm25Available() bool {
 }
 
 func (s *Search) embedderAvailable() bool {
-	return s.embedder != nil
+	return !nilLike(s.embedder)
 }
 
 func (r *Request) validateMode(mode string, s *Search) error {
@@ -171,12 +184,18 @@ func (r *Request) validate(s *Search) error {
 }
 
 func (s *Search) searchVector(ctx context.Context, req Request) ([]ranked, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	vecs, err := s.embedder.Embed(ctx, []string{req.Query})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 	if len(vecs) == 0 {
 		return nil, fmt.Errorf("embedder returned no vectors")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	hits, err := s.vindex.SearchVectors(ctx, req.Tenant, req.Bucket, vecs[0], min(req.K*2, 100))
 	if err != nil {
@@ -194,6 +213,9 @@ func (s *Search) searchVector(ctx context.Context, req Request) ([]ranked, error
 }
 
 func (s *Search) searchLexical(ctx context.Context, req Request) ([]ranked, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var bm25Hits []ranked
 	queryModel := ""
 	if s.embedder != nil {
@@ -287,34 +309,32 @@ func hitsFromRanked(merged []ranked) []Hit {
 	return out
 }
 
-func (s *Search) applyRerankOrTrim(ctx context.Context, query string, out []Hit, k int) []Hit {
-	if s.rerank != nil && len(out) > 0 {
-		reranked, err := s.rerank.Rerank(ctx, query, out, k)
-		if err == nil {
-			return reranked
-		}
-		s.logger.Warn("rerank failed; using raw order", "err", err)
-		if len(out) > k {
-			return out[:k]
-		}
-		return out
-	}
-	if len(out) > k {
-		return out[:k]
-	}
-	return out
-}
-
 func (s *Search) searchAndMerge(ctx context.Context, req Request, mode string) ([]ranked, error) {
 	var vecHits []ranked
 	var vecErr error
 	if mode == "vector" || mode == "hybrid" {
 		vecHits, vecErr = s.searchVector(ctx, req)
+		if securityResourceError(vecErr) {
+			return nil, vecErr
+		}
 	}
 	var bm25Hits []ranked
 	var lexErr error
 	if mode == "bm25" || mode == "hybrid" {
 		bm25Hits, lexErr = s.searchLexical(ctx, req)
+	}
+	return s.mergeRetrieved(ctx, req, mode, vecHits, bm25Hits, vecErr, lexErr)
+}
+
+func (s *Search) mergeRetrieved(ctx context.Context, req Request, mode string, vecHits, bm25Hits []ranked, vecErr, lexErr error) ([]ranked, error) {
+	if err := retrievalSecurityError(vecErr, lexErr); err != nil {
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, cancelledRetrieval(ctx, vecErr, lexErr)
+	}
+	if err := s.validateRetrieved(ctx, req, vecHits, bm25Hits); err != nil {
+		return nil, err
 	}
 	var merged []ranked
 	switch mode {
@@ -329,37 +349,30 @@ func (s *Search) searchAndMerge(ctx context.Context, req Request, mode string) (
 		}
 		merged = bm25Hits
 	case "hybrid":
-		switch {
-		case ctx.Err() != nil:
-			// Deadline already fired: the healthy half could not have completed
-			// on the same ctx, so degrading would mask the root cause. Return
-			// the failing half's wrapped error (phase preserved; errors.Is(err,
-			// context.DeadlineExceeded) still holds) — bare ctx.Err() only when
-			// both halves succeeded before the deadline (F11 race window).
-			if vecErr != nil {
-				return nil, vecErr
-			}
-			if lexErr != nil {
-				return nil, lexErr
-			}
-			return nil, ctx.Err()
-		case vecErr != nil && lexErr != nil:
-			return nil, vecErr // both halves failed: no healthy half to degrade to
-		case vecErr != nil:
-			reason := degradeReason(vecErr)
-			s.warnDegrade(reason, vecErr)
-			recordSearchDegraded(ctx, reason)
-			merged = bm25Hits // BM25-only (no fusion)
-		case lexErr != nil:
-			s.warnDegrade("lexical", lexErr)
-			recordSearchDegraded(ctx, "lexical")
-			merged = vecHits // vector-only (no fusion)
-		default:
-			merged = rrfMerge(vecHits, bm25Hits) // only fusion path; identical to today
+		merged, vecErr = s.mergeHybrid(ctx, vecHits, bm25Hits, vecErr, lexErr)
+		if vecErr != nil {
+			return nil, vecErr
 		}
 	}
-	merged = trimToOverK(merged, req.K*3)
-	return merged, nil
+	return trimToOverK(merged, req.K*3), nil
+}
+
+func (s *Search) mergeHybrid(ctx context.Context, vecHits, bm25Hits []ranked, vecErr, lexErr error) ([]ranked, error) {
+	switch {
+	case vecErr != nil && lexErr != nil:
+		return nil, vecErr // both halves failed: no healthy half to degrade to
+	case vecErr != nil:
+		reason := degradeReason(vecErr)
+		s.warnDegrade(reason, vecErr)
+		recordSearchDegraded(ctx, reason)
+		return bm25Hits, nil // BM25-only, preserve backend order
+	case lexErr != nil:
+		s.warnDegrade("lexical", lexErr)
+		recordSearchDegraded(ctx, "lexical")
+		return vecHits, nil // vector-only, preserve backend order
+	default:
+		return rrfMerge(vecHits, bm25Hits), nil
+	}
 }
 
 // warnDegrade logs the hybrid-fallback warn for a failed modality. Message
@@ -391,60 +404,6 @@ func degradeReason(err error) string {
 	default:
 		return "vector" // "search chunks:" or any prefix drift
 	}
-}
-
-func (s *Search) Query(ctx context.Context, req Request) ([]Hit, error) {
-	if err := req.validate(s); err != nil {
-		return nil, err
-	}
-	mode := req.Mode
-
-	// Hot-result cache: identical normalized queries short-circuit the embed +
-	// retrieval + rerank work. Returns a copy so callers can't mutate the entry.
-	var cacheKey string
-	if s.results != nil && s.hitAuth == nil {
-		cacheKey = resultCacheKey(req)
-		if hits, ok := s.results.get(cacheKey); ok {
-			s.recordUsage(ctx, req, hits)
-			return hits, nil
-		}
-	}
-
-	// Collect ranked lists per modality. Time from here (a confirmed cache miss)
-	// so the histogram reflects real retrieval+rerank cost, not cache hits.
-	start := time.Now()
-	merged, err := s.searchAndMerge(ctx, req, mode)
-	if err != nil {
-		return nil, err
-	}
-	out := hitsFromRanked(merged)
-	out, err = s.filterAuthorizedHits(ctx, req, out)
-	if err != nil {
-		return nil, err
-	}
-
-	out = s.applyRerankOrTrim(ctx, req.Query, out, req.K)
-
-	s.recordUsage(ctx, req, out)
-	telemetry.RecordSearchLatency(ctx, mode, float64(time.Since(start).Milliseconds()))
-	if s.results != nil && s.hitAuth == nil {
-		s.results.put(cacheKey, out)
-	}
-	return out, nil
-}
-
-func (s *Search) filterAuthorizedHits(ctx context.Context, req Request, hits []Hit) ([]Hit, error) {
-	if s.hitAuth == nil {
-		return hits, nil
-	}
-	out := make([]Hit, 0, len(hits))
-	for _, hit := range hits {
-		if err := s.hitAuth.CanReadObject(ctx, req.Tenant, hit.Bucket, hit.ObjectKey); err != nil {
-			continue
-		}
-		out = append(out, hit)
-	}
-	return out, nil
 }
 
 func (s *Search) recordUsage(ctx context.Context, req Request, hits []Hit) {

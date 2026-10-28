@@ -39,6 +39,9 @@ func (s *FileService) RecordBucketAccessLog(
 	entry AccessLogEntry,
 ) error {
 	tenant, sourceBucket = defaults(tenant, sourceBucket)
+	if err := s.admitBucket(ctx, tenant, sourceBucket); err != nil {
+		return err
+	}
 	bucketCfg, err := s.repo.GetBucketConfig(ctx, tenant, sourceBucket)
 	if err != nil {
 		return fmt.Errorf("get bucket config: %w", err)
@@ -52,6 +55,9 @@ func (s *FileService) RecordBucketAccessLog(
 		return nil
 	}
 
+	if err := s.admitBucket(ctx, tenant, cfg.Target); err != nil {
+		return err
+	}
 	completedAt := entry.CompletedAt
 	if completedAt.IsZero() {
 		completedAt = time.Now().UTC()

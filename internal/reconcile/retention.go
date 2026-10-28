@@ -8,6 +8,7 @@ import (
 
 	"github.com/aero-vault/aero-vault/internal/cluster"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/spaces"
 	"github.com/aero-vault/aero-vault/internal/storage"
 )
 
@@ -32,6 +33,7 @@ type RetentionJob struct {
 	idemTTL      time.Duration
 	singleton    *cluster.Singleton
 	chunkCleaner ChunkCleaner
+	scope        scopeState
 	logger       *slog.Logger
 }
 
@@ -39,7 +41,7 @@ func NewRetention(repo repository.Repository, store storage.Storage, interval ti
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &RetentionJob{repo: repo, store: store, interval: interval, retention: retention, singleton: cluster.NewSingleton(repo, leaseRetentionGC, logger), logger: logger}
+	return &RetentionJob{repo: repo, store: store, interval: interval, retention: retention, singleton: cluster.NewSingleton(repo, leaseRetentionGC, logger), logger: logger, scope: scopeState{repo: repo}}
 }
 
 // WithIdempotencyTTL enables GC of idempotency_keys older than ttl, so the
@@ -64,8 +66,27 @@ func (r *RetentionJob) WithChunkCleaner(cc ChunkCleaner) *RetentionJob {
 	return r
 }
 
+// WithResourceBoundary installs deny-only row admission before protection or
+// purge effects. Explicit nil remains configured and faults.
+func (r *RetentionJob) WithResourceBoundary(reader spaces.BindingReader) *RetentionJob {
+	r.scope = newScopeState(reader)
+	r.scope.repo = r.repo
+	return r
+}
+
+// ValidateResourceBoundary is side-effect-free production preflight.
+func (r *RetentionJob) ValidateResourceBoundary() error {
+	if r == nil {
+		return scopeRowFault(errors.New("missing retention job"))
+	}
+	if scopePortMissing(r.store) {
+		return scopeRowFault(errors.New("missing retention storage"))
+	}
+	return r.scope.validate()
+}
+
 func (r *RetentionJob) Run(ctx context.Context) {
-	if r.interval <= 0 || (r.retention <= 0 && r.idemTTL <= 0) {
+	if r.interval <= 0 || (r.retention <= 0 && r.idemTTL <= 0) || r.scope.ready(ctx) != nil {
 		return
 	}
 	t := time.NewTicker(r.interval)
@@ -84,10 +105,19 @@ func (r *RetentionJob) Run(ctx context.Context) {
 // maybeSweep runs the sweep, gated by the cluster singleton when enabled (lease
 // TTL 2× interval; the holder renews each round).
 func (r *RetentionJob) maybeSweep(ctx context.Context) {
+	if err := r.scope.ready(ctx); err != nil {
+		r.logger.Warn("retention boundary unavailable", "err", err)
+		return
+	}
 	r.singleton.Guard(ctx, 2*r.interval, r.sweep)
 }
 
 func (r *RetentionJob) sweep(ctx context.Context) {
+	r.scope.resetCounts()
+	if err := r.scope.ready(ctx); err != nil {
+		r.logger.Warn("retention boundary unavailable", "err", err)
+		return
+	}
 	if r.retention > 0 {
 		r.purgeSoftDeleted(ctx)
 	}
@@ -99,9 +129,13 @@ func (r *RetentionJob) sweep(ctx context.Context) {
 // purgeIdempotency deletes idempotency keys older than the configured TTL so
 // the dedupe table stays bounded.
 func (r *RetentionJob) purgeIdempotency(ctx context.Context) {
+	if err := r.scope.ready(ctx); err != nil {
+		return
+	}
 	before := time.Now().Add(-r.idemTTL).UTC().Format(time.RFC3339Nano)
 	n, err := r.repo.DeleteIdempotencyKeysBefore(ctx, before)
-	if err != nil {
+	if err = errors.Join(err, scopeContext(ctx)); err != nil {
+		r.scope.faults++
 		r.logger.Warn("retention idempotency gc", "err", err)
 		return
 	}
@@ -111,9 +145,13 @@ func (r *RetentionJob) purgeIdempotency(ctx context.Context) {
 }
 
 func (r *RetentionJob) purgeSoftDeleted(ctx context.Context) {
+	if err := r.scope.ready(ctx); err != nil {
+		return
+	}
 	before := time.Now().Add(-r.retention).UTC().Format(time.RFC3339Nano)
 	objs, err := r.repo.ListSoftDeletedBefore(ctx, before, 200)
-	if err != nil {
+	if err = errors.Join(err, scopeContext(ctx)); err != nil {
+		r.scope.faults++
 		r.logger.Warn("retention list soft-deleted", "err", err)
 		return
 	}
@@ -127,23 +165,33 @@ func (r *RetentionJob) purgeSoftDeleted(ctx context.Context) {
 		}
 	}
 	if purged > 0 {
-		r.logger.Info("retention sweep", "chunk_cleanup_enabled", r.chunkCleaner != nil, "purged", purged)
+		r.logger.Info("retention sweep", "chunk_cleanup_enabled", r.chunkCleaner != nil, "purged", purged,
+			"scope_refused", r.scope.refused, "scope_faults", r.scope.faults)
 	}
 }
 
 // purgeOneSoftDeleted attempts to permanently remove one soft-deleted object.
-// Returns true when the object was purged. Does NOT fail on chunk cleanup or
-// storage delete errors (best-effort).
+// Returns true only after a successful purge. Chunk cleanup remains warn-and-
+// continue; storage failures keep the database rows for a later sweep.
 func (r *RetentionJob) purgeOneSoftDeleted(ctx context.Context, obj repository.Object) bool {
-	protected, err := objectKeyDeletionProtected(ctx, r.repo, obj)
+	actual, outcome, err := r.scope.object(ctx, obj, "", "")
+	if outcome != scopeAdmitted {
+		r.logger.Warn("retention row scope refused", "key", obj.Key, "err", err)
+		return false
+	}
+	obj = actual
+	repo := r.scope.deletionRepo(obj)
+	protected, err := objectKeyDeletionProtected(ctx, repo, obj)
 	if err != nil {
+		r.scope.failed(err)
 		r.logger.Warn("retention protection check", "key", obj.Key, "err", err)
 		return false
 	}
 	if protected {
 		return false
 	}
-	if err := hardDeleteKey(ctx, r.repo, r.store, r.chunkCleaner, obj, r.logger); err != nil {
+	if err := hardDeleteKey(ctx, repo, r.store, r.chunkCleaner, obj, r.logger); err != nil {
+		r.scope.failed(err)
 		if errors.Is(err, errKeyProtected) {
 			r.logger.Warn("retention hard delete skipped: protected", "key", obj.Key)
 		} else {
@@ -151,5 +199,5 @@ func (r *RetentionJob) purgeOneSoftDeleted(ctx context.Context, obj repository.O
 		}
 		return false
 	}
-	return true
+	return r.scope.ready(ctx) == nil
 }

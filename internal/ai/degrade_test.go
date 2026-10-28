@@ -37,11 +37,15 @@ var errSentinelLex = errors.New("sentinel: lexical backend down")
 // lexical half can complete), while Dimensions/Name delegate to inner so the
 // Name() equals the seed chunks' EmbedModel (matchesEmbedModel filter).
 type failingEmbedder struct {
-	inner Embedder
-	err   error
+	inner      Embedder
+	err        error
+	afterEmbed func()
 }
 
 func (f *failingEmbedder) Embed(_ context.Context, _ []string) ([][]float32, error) {
+	if f.afterEmbed != nil {
+		f.afterEmbed()
+	}
 	return nil, f.err
 }
 func (f *failingEmbedder) Dimensions() int { return f.inner.Dimensions() }
@@ -144,6 +148,11 @@ func TestSearchHybrid_DegradesToBM25OnEmbedderFailure(t *testing.T) {
 		t.Fatalf("recordSearchDegraded reasons = %v, want [embed]", *reasons)
 	}
 
+	assertDegradedBM25Matches(t, s, hits)
+}
+
+func assertDegradedBM25Matches(t *testing.T, s *Search, hits []Hit) {
+	t.Helper()
 	// Control: pure bm25 mode on the same fixture must yield the same hit set
 	// (degraded BM25-only == real BM25-only, ordering and content).
 	ctrl, err := s.Query(context.Background(), Request{
@@ -288,10 +297,11 @@ func TestSearchHybrid_DeadlineCtx_NoDegrade(t *testing.T) {
 	env, emb, b := hybridEnv(t)
 	reasons := swapSeam(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 
-	s := NewSearch(env.repo, &failingEmbedder{inner: emb, err: context.DeadlineExceeded}, nil).WithBM25(b)
-	_, err := s.Query(ctx, Request{Tenant: testTenant, Query: "raft consensus", K: 5, Mode: "hybrid"})
+	s := NewSearch(env.repo, &failingEmbedder{inner: emb, err: context.DeadlineExceeded, afterEmbed: cancel}, nil).WithBM25(b)
+	request := Request{Tenant: testTenant, Query: "raft consensus", K: 5, Mode: "hybrid"}
+	_, err := s.Query(ctx, request)
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("cancelled ctx + failing embedder: want DeadlineExceeded, got %v", err)
 	}
@@ -307,19 +317,40 @@ func TestSearchHybrid_DeadlineCtx_NoDegrade(t *testing.T) {
 	// then the deadline fires in the decision window → bare ctx.Err().
 	reasons2 := swapSeam(t)
 	ctx2, cancel2 := context.WithCancel(context.Background())
-	cancel2()
+	defer cancel2()
 	fake := &fakeVectorIndex{hits: []repository.SearchHit{{
 		Score: 0.9,
-		Chunk: repository.Chunk{ID: 1, ObjectID: 1, Bucket: testBucket, ObjectKey: "h.txt", Seq: 0, Content: "raft", EmbedModel: emb.Name()},
+		Chunk: repository.Chunk{ID: 1, ObjectID: 1, TenantID: testTenant, Bucket: testBucket,
+			ObjectKey: "h.txt", Seq: 0, Content: "raft", EmbedModel: emb.Name()},
 	}}}
-	s2 := NewSearch(env.repo, emb, nil).WithBM25(b).WithVectorIndex(fake)
-	_, err = s2.Query(ctx2, Request{Tenant: testTenant, Query: "raft consensus", K: 5, Mode: "hybrid"})
+	s2 := NewSearch(env.repo, emb, nil).WithBM25(b).WithVectorIndex(fake).
+		WithLexicalIndex(&cancelAfterLexical{search: NewSearch(env.repo, emb, nil).WithBM25(b), cancel: cancel2})
+	request2 := Request{Tenant: testTenant, Query: "raft consensus", K: 5, Mode: "hybrid"}
+	_, err = s2.Query(ctx2, request2)
 	if err == nil || err != ctx2.Err() {
 		t.Fatalf("F11 race window: want bare ctx.Err() (%v), got %v", ctx2.Err(), err)
 	}
 	if len(*reasons2) != 0 {
 		t.Fatalf("F11 must not count degrade, got reasons %v", *reasons2)
 	}
+}
+
+// cancelAfterLexical decorates the original in-memory BM25 retrieval without
+// changing any candidate. Cancellation fires only after both healthy halves
+// have materialized, immediately before the hybrid decision.
+type cancelAfterLexical struct {
+	search *Search
+	cancel context.CancelFunc
+}
+
+func (f *cancelAfterLexical) SearchLexical(ctx context.Context, tenant, bucket, query string, limit int) ([]repository.SearchHit, error) {
+	rows, err := f.search.searchLexical(ctx, Request{Tenant: tenant, Bucket: bucket, Query: query, K: limit / 2})
+	hits := make([]repository.SearchHit, 0, len(rows))
+	for _, row := range rows {
+		hits = append(hits, repository.SearchHit{Score: row.score, Chunk: row.chunk})
+	}
+	f.cancel()
+	return hits, err
 }
 
 // D-AC-9 (R11): module-level end-to-end pin for the vector-half failure path

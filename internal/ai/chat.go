@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/aero-vault/aero-vault/internal/repository"
-	"github.com/aero-vault/aero-vault/internal/telemetry"
 )
 
 // ErrBudgetExceeded is returned by chat operations when the tenant has reached
@@ -117,25 +116,35 @@ type ChatResp struct {
 
 const defaultSystemPrompt = `You are aero-vault, an assistant that answers questions using the provided knowledge base context. Cite sources inline as [#n] referring to the numbered chunks. If the context doesn't contain the answer, say so explicitly.`
 
-func (c *Chat) buildChatPrompt(ctx context.Context, req ChatReq) ([]ChatMessage, []Hit, error) {
+func (c *Chat) prepareChatHits(ctx context.Context, req ChatReq) (ChatReq, []Hit, error) {
+	if err := searchContextError(ctx); err != nil {
+		return req, nil, err
+	}
 	if req.Query == "" {
-		return nil, nil, fmt.Errorf("query required")
+		return req, nil, fmt.Errorf("query required")
 	}
 	if req.K <= 0 || req.K > 20 {
 		req.K = 5
 	}
 	if over, err := c.overBudget(ctx, req.Tenant); err != nil {
-		return nil, nil, fmt.Errorf("budget check: %w", err)
+		return req, nil, fmt.Errorf("budget check: %w", err)
 	} else if over {
-		return nil, nil, ErrBudgetExceeded
+		return req, nil, ErrBudgetExceeded
+	}
+	if c.search == nil {
+		return req, nil, fmt.Errorf("retrieval: search unavailable")
 	}
 	hits, err := c.search.Query(ctx, Request{
 		Tenant: req.Tenant, Bucket: req.Bucket, Query: req.Query,
 		K: req.K, Mode: req.Mode, Caller: req.Caller, ReqID: req.ReqID,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("retrieval: %w", err)
+		return req, nil, fmt.Errorf("retrieval: %w", err)
 	}
+	return req, hits, nil
+}
+
+func buildChatMessages(req ChatReq, hits []Hit) []ChatMessage {
 	var ctxBlock strings.Builder
 	ctxBlock.WriteString("Knowledge base context:\n\n")
 	for i, h := range hits {
@@ -147,99 +156,82 @@ func (c *Chat) buildChatPrompt(ctx context.Context, req ChatReq) ([]ChatMessage,
 	}
 	messages = append(messages, req.Prior...)
 	messages = append(messages, ChatMessage{Role: "user", Content: req.Query})
-	return messages, hits, nil
+	return messages
 }
 
 // AnswerStream is the streaming variant. It invokes the LLM with the same
 // retrieval prelude as Answer, but pipes each token chunk to onChunk as the
 // model emits it. The final consolidated ChatResp is returned at the end.
 func (c *Chat) AnswerStream(ctx context.Context, req ChatReq, onChunk func(string)) (ChatResp, error) {
-	if c.llm == nil {
+	if err := searchContextError(ctx); err != nil {
+		return ChatResp{}, err
+	}
+	if nilLike(c.llm) {
 		return ChatResp{}, fmt.Errorf("chat disabled: no LLM configured")
 	}
 	if req.Caller == "" {
 		req.Caller = "rest:chat-stream"
 	}
-	messages, hits, err := c.buildChatPrompt(ctx, req)
+	prepared, hits, err := c.prepareChatHits(ctx, req)
 	if err != nil {
 		return ChatResp{}, err
 	}
+	guard := newChatResourceGuard(c.search, prepared, hits)
+	messages := buildChatMessages(prepared, hits)
+	streamCtx, cancel := guard.modelContext(ctx)
+	defer cancel()
+	if _, err := guard.refresh(streamCtx); err != nil {
+		return ChatResp{}, err
+	}
 	start := time.Now()
-	resp, err := c.llm.ChatStream(ctx, ChatRequest{Messages: messages, Temperature: req.Temperature}, onChunk)
-	if err != nil {
-		return ChatResp{}, fmt.Errorf("llm stream: %w", err)
-	}
+	resp, err := c.llm.ChatStream(streamCtx, ChatRequest{Messages: messages, Temperature: req.Temperature},
+		guard.wrap(streamCtx, onChunk))
 	latency := time.Since(start)
-
-	chunkIDs := make([]int64, 0, len(hits))
-	objIDs := make([]int64, 0, len(hits))
-	seen := map[int64]struct{}{}
-	for _, h := range hits {
-		chunkIDs = append(chunkIDs, h.ChunkID)
-		if _, ok := seen[h.ObjectID]; !ok {
-			seen[h.ObjectID] = struct{}{}
-			objIDs = append(objIDs, h.ObjectID)
-		}
+	if err != nil {
+		err = fmt.Errorf("llm stream: %w", err)
 	}
-	pt, ct, tt := tokensFromUsage(resp.Usage)
-	cost := costMicros(pt, ct, c.promptMicrosPer1K, c.completionMicrosPer1K)
-	if err := c.repo.RecordUsage(ctx, repository.Usage{
-		TenantID: req.Tenant, Caller: req.Caller, Query: req.Query,
-		ChunkIDs: chunkIDs, ObjectIDs: objIDs, RequestID: req.ReqID,
-		Model: resp.Model, PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt,
-		LatencyMs:  latency.Milliseconds(),
-		CostMicros: cost,
-	}); err != nil {
-		c.logger.Warn("audit chat-stream usage", "err", err)
+	hits, err = guard.finish(ctx, err)
+	if err != nil {
+		return ChatResp{}, err
 	}
-	telemetry.RecordAIUsage(ctx, req.Tenant, resp.Model, pt, ct, cost)
+	c.recordChatUsage(ctx, prepared, resp, hits, latency, true)
 	return ChatResp{Answer: resp.Content, Model: resp.Model, Citations: hits}, nil
 }
 
 func (c *Chat) Answer(ctx context.Context, req ChatReq) (ChatResp, error) {
-	if c.llm == nil {
+	if err := searchContextError(ctx); err != nil {
+		return ChatResp{}, err
+	}
+	if nilLike(c.llm) {
 		return ChatResp{}, fmt.Errorf("chat disabled: no LLM configured")
 	}
 	if req.Caller == "" {
 		req.Caller = "rest:chat"
 	}
-	messages, hits, err := c.buildChatPrompt(ctx, req)
+	prepared, hits, err := c.prepareChatHits(ctx, req)
 	if err != nil {
 		return ChatResp{}, err
 	}
+	guard := newChatResourceGuard(c.search, prepared, hits)
+	messages := buildChatMessages(prepared, hits)
+	modelCtx, cancel := guard.modelContext(ctx)
+	defer cancel()
+	if _, err := guard.refresh(modelCtx); err != nil {
+		return ChatResp{}, err
+	}
 	start := time.Now()
-	resp, err := c.llm.Chat(ctx, ChatRequest{
+	resp, err := c.llm.Chat(modelCtx, ChatRequest{
 		Messages: messages, Temperature: req.Temperature,
 	})
-	if err != nil {
-		return ChatResp{}, fmt.Errorf("llm: %w", err)
-	}
 	latency := time.Since(start)
-
-	// Audit the chat call too — distinct caller value lets us slice usage.
-	chunkIDs := make([]int64, 0, len(hits))
-	objSeen := map[int64]struct{}{}
-	objIDs := make([]int64, 0, len(hits))
-	for _, h := range hits {
-		chunkIDs = append(chunkIDs, h.ChunkID)
-		if _, ok := objSeen[h.ObjectID]; !ok {
-			objSeen[h.ObjectID] = struct{}{}
-			objIDs = append(objIDs, h.ObjectID)
-		}
+	if err != nil {
+		err = fmt.Errorf("llm: %w", err)
 	}
-	pt, ct, tt := tokensFromUsage(resp.Usage)
-	cost := costMicros(pt, ct, c.promptMicrosPer1K, c.completionMicrosPer1K)
-	if err := c.repo.RecordUsage(ctx, repository.Usage{
-		TenantID: req.Tenant, Caller: req.Caller, Query: req.Query,
-		ChunkIDs: chunkIDs, ObjectIDs: objIDs, RequestID: req.ReqID,
-		Model: resp.Model, PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt,
-		LatencyMs:  latency.Milliseconds(),
-		CostMicros: cost,
-	}); err != nil {
-		c.logger.Warn("audit chat usage", "err", err)
+	hits, err = guard.finish(ctx, err)
+	if err != nil {
+		return ChatResp{}, err
 	}
-	telemetry.RecordAIUsage(ctx, req.Tenant, resp.Model, pt, ct, cost)
-
+	c.recordChatUsage(ctx, prepared, resp, hits, latency, false)
 	return ChatResp{
 		Answer:    resp.Content,
 		Model:     resp.Model,

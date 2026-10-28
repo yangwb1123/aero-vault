@@ -2,10 +2,13 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
+	"github.com/aero-vault/aero-vault/internal/service"
 )
 
 // An unrecognized search mode is rejected with an error rather than silently
@@ -81,19 +84,42 @@ func (r *recordingVectorIndex) SearchVectors(_ context.Context, _, _ string, _ [
 // every retrieval backend clamps to (silently truncating to 10 before embed-
 // model filtering). The requested limit must stay in [K,100] and the query
 // must still deliver exactly K hits.
-func TestSearchVectorLimit(t *testing.T) {
+func seedSearchVectorLimit(t *testing.T) (*testEnv, *HashEmbedder) {
+	t.Helper()
 	ctx := context.Background()
 	env := newTestEnv(t)
 	emb := NewHashEmbedder(64)
+	obj := env.putObject(t, "k.txt", "text/plain", "sixty")
+	contents := make([]string, 60)
+	for i := range contents {
+		contents[i] = "c"
+	}
+	seedCanonicalQueryRows(t, env, obj, emb, contents...)
+	rows, err := env.repo.ListChunksForObject(ctx, obj.ID)
+	if err != nil {
+		t.Fatalf("list canonical chunks: %v", err)
+	}
+	if len(rows) != 60 {
+		t.Fatalf("seeded %d canonical chunks, want 60", len(rows))
+	}
+	if obj.ID != 1 {
+		t.Fatalf("fixture object ID=%d, want original 1", obj.ID)
+	}
+	return env, emb
+}
+
+func TestSearchVectorLimit(t *testing.T) {
+	ctx := context.Background()
+	env, emb := seedSearchVectorLimit(t)
 	stub := &recordingVectorIndex{}
 	for i := 0; i < 60; i++ {
 		stub.hits = append(stub.hits, repository.SearchHit{
 			Score: 0.99 - float32(i)*0.001,
-			Chunk: repository.Chunk{ID: int64(i + 1), ObjectID: 1, Bucket: testBucket,
+			Chunk: repository.Chunk{ID: int64(i + 1), ObjectID: 1, TenantID: testTenant, Bucket: testBucket,
 				ObjectKey: "k.txt", Seq: 0, Content: "c", EmbedModel: emb.Name()},
 		})
 	}
-	s := NewSearch(env.repo, emb, nil).WithVectorIndex(stub)
+	s := NewSearch(env.repo, emb, nil).WithVectorIndex(stub).WithCanonicalResources(env.repo)
 
 	for _, mode := range []string{"vector", "hybrid"} {
 		s2 := s
@@ -114,5 +140,100 @@ func TestSearchVectorLimit(t *testing.T) {
 		if len(hits) != 60 {
 			t.Errorf("%s: got %d hits, want exactly 60 (pre-fix truncation made this <=10 on every backend)", mode, len(hits))
 		}
+	}
+}
+
+type typedNilHitAuthorizer struct{}
+
+func (*typedNilHitAuthorizer) CanReadObject(context.Context, string, string, string) error {
+	panic("typed-nil hit authorizer must not be called")
+}
+
+func TestSearchProductionValidationRequiresExplicitReadersAndAuthorizer(t *testing.T) {
+	env, emb, _, _ := seedBoundarySearchEnv(t)
+	reader := newSearchBoundaryReader(testTenant, testBucket)
+	configured := func() *Search {
+		return NewSearch(env.repo, emb, nil).WithResourceBoundary(reader, reader).
+			WithCanonicalResources(env.repo).WithHitAuthorizer(env.svc)
+	}
+	var typedNil *canonicalFaultRepo
+	var typedNilAuth *typedNilHitAuthorizer
+	for name, search := range map[string]*Search{
+		"legacy":               NewSearch(env.repo, emb, nil),
+		"implicit canonical":   NewSearch(env.repo, emb, nil).WithResourceBoundary(reader, reader).WithHitAuthorizer(env.svc),
+		"opaque core":          configured().WithResourceBoundaryCore(access.NewResourceBoundary(reader, reader)),
+		"missing binding":      configured().WithResourceBoundary(nil, reader),
+		"missing coverage":     configured().WithResourceBoundary(reader, nil),
+		"missing resources":    configured().WithCanonicalResources(nil),
+		"typed nil resources":  configured().WithCanonicalResources(typedNil),
+		"missing authorizer":   configured().WithHitAuthorizer(nil),
+		"typed nil authorizer": configured().WithHitAuthorizer(typedNilAuth),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := search.ValidateResourceBoundary(); !IsSearchResourceBoundaryFault(err) {
+				t.Fatalf("invalid production configuration admitted: %v", err)
+			}
+		})
+	}
+	if err := configured().ValidateResourceBoundary(); err != nil {
+		t.Fatalf("explicit configuration: %v", err)
+	}
+	if reader.bindingCalls != 0 || reader.coverageCalls != 0 {
+		t.Fatal("startup validator performed resource observations")
+	}
+}
+
+func TestSearchUsesRawCanonicalReaderInsteadOfWrappedRepository(t *testing.T) {
+	env, emb, _, _ := seedBoundarySearchEnv(t)
+	wrapped := &canonicalFaultRepo{Repository: env.repo,
+		objectErr: errors.New("wrapped object reader is not authoritative"),
+		chunksErr: errors.New("wrapped chunk reader is not authoritative")}
+	s := boundarySearch(t, wrapped, emb).WithCanonicalResources(env.repo).WithHitAuthorizer(env.svc)
+	if err := s.ValidateResourceBoundary(); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.Query(context.Background(), Request{Tenant: testTenant, Bucket: testBucket, Query: "raft", K: 2})
+	if err != nil || len(hits) != 2 {
+		t.Fatalf("raw reader lost behind wrapper: hits=%+v err=%v", hits, err)
+	}
+}
+
+func TestSearchConfiguredMissingPortsFaultBeforeWork(t *testing.T) {
+	env, seeded, _, _ := seedBoundarySearchEnv(t)
+	reader := newSearchBoundaryReader(testTenant, testBucket)
+	var typedNil *canonicalFaultRepo
+	for _, configure := range []func(*Search) *Search{
+		func(s *Search) *Search { return s.WithCanonicalResources(nil) },
+		func(s *Search) *Search { return s.WithCanonicalResources(typedNil) },
+		func(s *Search) *Search { return s.WithHitAuthorizer((*typedNilHitAuthorizer)(nil)) },
+		func(s *Search) *Search { return s.WithResourceBoundary(reader, nil) },
+		func(s *Search) *Search { return s.WithVectorIndex((*fakeVectorIndex)(nil)) },
+		func(s *Search) *Search { return s.WithLexicalIndex((*fakeLexical)(nil)) },
+		func(s *Search) *Search { return s.WithReranker((*observingReranker)(nil)) },
+	} {
+		emb := &countingHashEmbedder{inner: seeded}
+		repo := &countingSearchRepo{Repository: env.repo}
+		s := configure(NewSearch(repo, emb, nil))
+		_, err := s.Query(context.Background(), Request{Tenant: testTenant, Bucket: testBucket, Query: "raft", K: 2})
+		if !IsSearchResourceBoundaryFault(err) || emb.embedded != 0 || repo.searches != 0 || repo.usages != 0 {
+			t.Fatalf("configured missing port: err=%v embed=%d search=%d usage=%d", err, emb.embedded, repo.searches, repo.usages)
+		}
+	}
+}
+
+func TestSearchOnlyOrdinaryDenialsMayFilter(t *testing.T) {
+	for _, err := range []error{
+		errors.Join(service.ErrNotFound, access.ErrResourceBoundaryFault),
+		errors.Join(service.ErrForbidden, ErrCanonicalHit),
+		errors.Join(service.ErrForbidden, access.ErrSpaceBound),
+		errors.Join(service.ErrForbidden, service.ErrTenantDisabled),
+		errors.Join(service.ErrNotFound, context.Canceled),
+	} {
+		if ordinaryHitDenial(err) {
+			t.Errorf("fault classified as ordinary denial: %v", err)
+		}
+	}
+	if !ordinaryHitDenial(service.ErrForbidden) || !ordinaryHitDenial(repository.ErrNotFound) {
+		t.Fatal("ordinary denial compatibility lost")
 	}
 }

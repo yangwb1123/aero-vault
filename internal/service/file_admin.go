@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 
 	"github.com/aero-vault/aero-vault/internal/access"
 	"github.com/aero-vault/aero-vault/internal/repository"
@@ -24,11 +23,17 @@ func (s *FileService) AdminDelete(ctx context.Context, tenant, bucket, key strin
 	if err != nil {
 		return err
 	}
+	if err := s.admitBucket(ctx, tenant, bucket); err != nil {
+		return err
+	}
 	obj, err := s.repo.GetObject(ctx, tenant, bucket, key)
-	if errors.Is(err, repository.ErrNotFound) {
+	if repositoryObjectMissing(err) {
 		return ErrNotFound
 	}
 	if err != nil {
+		return err
+	}
+	if err := s.validateBoundaryObjects([]repository.Object{obj}, tenant, bucket, key); err != nil {
 		return err
 	}
 	action := access.ActionAdminDelete

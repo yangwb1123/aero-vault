@@ -2,10 +2,10 @@ package rest
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"mime"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -33,6 +33,7 @@ type Handler struct {
 	thumbnailAdmission *thumbnail.DecodeAdmission
 	adminAuthz         AuthorizationProvider
 	adminAuthzSet      bool
+	resourceReaders    *RouterResourceReaders
 }
 
 func (h *Handler) WithAccessManager(manager *access.Manager, publicBaseURL string) *Handler {
@@ -96,27 +97,9 @@ func keyFromPath(r *http.Request) string {
 // means a bucket-level action (resource = bucket ARN). Returns true when the
 // request may proceed.
 func (h *Handler) checkBucketPolicy(w http.ResponseWriter, r *http.Request, key, action string) bool {
-	cfg, err := h.svc.GetBucketConfig(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket)
-	if err != nil {
-		h.logger.Warn("bucket policy lookup failed; denying request", "bucket", service.DefaultBucket, "err", err)
-		h.writeError(w, r, service.ErrForbidden)
-		return false
-	}
-	if cfg.Policy == "" {
-		return true
-	}
-	p, perr := auth.ParsePolicy(cfg.Policy)
-	if perr != nil || p == nil {
-		h.logger.Warn("bucket policy parse failed; denying request", "bucket", service.DefaultBucket, "err", perr)
-		h.writeError(w, r, service.ErrForbidden)
-		return false
-	}
-	host, _, splitErr := net.SplitHostPort(r.RemoteAddr)
-	if splitErr != nil {
-		host = r.RemoteAddr
-	}
-	if !auth.AllowedResource(p, action, bucketPolicyResourceARN(key), host) {
-		h.writeError(w, r, service.ErrForbidden)
+	if err := h.bucketPolicyAdmission(r, key, action); err != nil {
+		h.logger.Warn("bucket policy admission failed", "bucket", service.DefaultBucket, "err", err)
+		h.writeError(w, r, err)
 		return false
 	}
 	return true
@@ -143,6 +126,10 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != "" {
 		cur, err := h.svc.Stat(r.Context(), mw.TenantFrom(r.Context()), service.DefaultBucket, key)
+		if err != nil && (access.IsResourceBoundaryFault(err) || !errors.Is(err, service.ErrNotFound)) {
+			h.writeError(w, r, err)
+			return
+		}
 		if !h.checkWritePreconditions(w, r, cur, err == nil) {
 			return
 		}
@@ -162,6 +149,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
+	service.RecordReplayObject(r.Context(), obj)
 	writeJSON(w, http.StatusCreated, toObjectDTO(obj))
 }
 
@@ -208,6 +196,7 @@ func (h *Handler) PostForm(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
+	service.RecordReplayObject(r.Context(), obj)
 	writeJSON(w, http.StatusCreated, toObjectDTO(obj))
 }
 

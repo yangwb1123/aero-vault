@@ -37,7 +37,7 @@ func init() {
 		// Files CRUD
 		fileReadRoute(),
 		fileHeadRoute(),
-		{Method: "PUT", Path: "/v1/files/{key}", Summary: "Upload object", Tag: "files", Body: `"file content"`, Status: 201, Response: `{"key":"file.txt","etag":"abc123"}`},
+		{Method: "PUT", Path: "/v1/files/{key}", Summary: "Upload object; cached retries recheck current admission without re-execution", Tag: "files", Body: `"file content"`, Status: 201, Response: `{"key":"file.txt","etag":"abc123"}`},
 		{Method: "POST", Path: "/v1/files/{key}", Summary: "Upload via form or presign/lock/restore", Tag: "files", Status: 200},
 		{Method: "PATCH", Path: "/v1/files/{key}", Summary: "Partial update (metadata)", Tag: "files", Status: 200},
 		{Method: "DELETE", Path: "/v1/files/{key}", Summary: "Delete object", Tag: "files", Status: 204},
@@ -257,6 +257,7 @@ func newRouter(svc *service.FileService, repo repository.Repository, search *ai.
 	} else {
 		adm = NewAdminHandler(svc, repo, reg)
 	}
+	h.directReadConsumers(repo, aih, sse, adm)
 	r := chi.NewRouter()
 	if reg != nil {
 		r.Use(requireRESTScope(reg))
@@ -269,9 +270,10 @@ func newRouter(svc *service.FileService, repo repository.Repository, search *ai.
 	r.Head("/files/*", h.Head)
 
 	// Object mutations are Idempotency-Key aware (opt-in via the header): a
-	// retried write replays the original response instead of duplicating it.
+	// retried write replays original bytes only after current action admission
+	// against original persisted identities, without re-execution or re-signing.
 	r.Group(func(r chi.Router) {
-		r.Use(idempotency(repo, logger, idemHashBody))
+		r.Use(idempotency(repo, logger, idemHashBody, h))
 		r.Post("/files", h.PostForm)
 		r.Post("/files/*", h.postKey)
 		r.Put("/files/*", h.putKey)
