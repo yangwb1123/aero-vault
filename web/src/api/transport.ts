@@ -1,9 +1,5 @@
 import { requestHeaders } from './headers'
 
-interface ErrorEnvelope {
-  error?: { code?: string; message?: string; request_id?: string } | string
-}
-
 export class VaultApiError extends Error {
   constructor(
     readonly status: number,
@@ -36,18 +32,38 @@ export class VaultTransport {
       credentials: 'same-origin',
     })
     if (response.ok) return response
-    let envelope: ErrorEnvelope = {}
-    try {
-      envelope = (await response.json()) as ErrorEnvelope
-    } catch {
-      // Non-JSON reverse proxies still become a bounded status error.
-    }
-    const error = typeof envelope.error === 'object' ? envelope.error : undefined
-    throw new VaultApiError(
-      response.status,
-      error?.code ?? 'HTTPError',
-      error?.message ?? `Aero Vault 请求失败（HTTP ${response.status}）`,
-      error?.request_id,
-    )
+    throw await responseError(response)
   }
+}
+
+async function responseError(response: Response): Promise<VaultApiError> {
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch (reason) {
+    if (isAbortError(reason)) throw reason
+    // Non-JSON reverse proxies still become a bounded status error.
+  }
+  const error = errorFields(body)
+  const requestId = typeof error.request_id === 'string' && error.request_id.trim()
+    ? error.request_id
+    : response.headers.get('X-Request-ID') ?? ''
+  return new VaultApiError(
+    response.status,
+    typeof error.code === 'string' ? error.code : 'HTTPError',
+    typeof error.message === 'string' ? error.message : `Aero Vault 请求失败（HTTP ${response.status}）`,
+    requestId,
+  )
+}
+
+function errorFields(body: unknown): Record<string, unknown> {
+  if (!body || typeof body !== 'object' || !('error' in body)) return {}
+  const error = body.error
+  return error && typeof error === 'object' && !Array.isArray(error)
+    ? error as Record<string, unknown>
+    : {}
+}
+
+function isAbortError(reason: unknown): boolean {
+  return typeof reason === 'object' && reason !== null && 'name' in reason && reason.name === 'AbortError'
 }

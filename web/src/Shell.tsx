@@ -17,6 +17,7 @@ import { isManagementRoute, navigationMenus, routeKeys } from './navigation'
 import { ActivityPage } from './pages/ActivityPage'
 import { AgentPage } from './pages/AgentPage'
 import { FilesPage } from './pages/FilesPage'
+import { fileLocationRoute, parseFileLocationRoute } from './pages/files/fileLocation'
 import { AccessPage } from './pages/access/AccessPage'
 import { ChatPage } from './pages/ChatPage'
 import { BucketsPage } from './pages/buckets/BucketsPage'
@@ -27,9 +28,10 @@ import { ObjectPage } from './pages/object/ObjectPage'
 import { OperationsPage } from './pages/operations/OperationsPage'
 import { SearchPage } from './pages/SearchPage'
 import { ServicesPage } from './pages/ServicesPage'
-import { objectRoute, parseObjectRoute, useHashRoute } from './router'
+import { objectRoute, parseObjectRoute, routeFromHash, useHashRoute, type ObjectRoute } from './router'
 
 type SessionNavigation = ReturnType<typeof useSessionNavigation>
+type NavigateRoute = ReturnType<typeof useHashRoute>[1]
 const clientPages: Record<string, React.ComponentType<{ client: VaultClient }>> = {
   buckets: BucketsPage, access: AccessPage, departments: DepartmentsPage,
   search: SearchPage, chat: ChatPage, agent: AgentPage, lineage: LineagePage,
@@ -40,19 +42,39 @@ function PageHost({ route, client, config, navigate, navigation }: {
   route: string
   client: VaultClient
   config: WebConfig
-  navigate(route: string): void
+  navigate: NavigateRoute
   navigation: SessionNavigation
 }): React.ReactElement {
   if (isManagementRoute(route) && !navigation.management[route]) {
     return <UnavailableManagement route={route} navigation={navigation} navigate={navigate} />
   }
   const object = parseObjectRoute(route)
-  if (object) return <ObjectPage key={`${object.deleted}:${object.key}`} client={client} objectKey={object.key} deleted={object.deleted} onBack={() => navigate('files')} onRestored={() => navigate(objectRoute(object.key))} />
-  if (route === 'files') return <FilesPage client={client} onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted))} />
+  if (object) return <RoutedObjectPage key={route} route={route} object={object} client={client} navigate={navigate} />
+  const location = parseFileLocationRoute(route)
+  if (location) return <FilesPage client={client} location={location}
+    onLocationChange={(next) => navigate(fileLocationRoute(next))}
+    onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted, location))} />
   if (route === 'activity') return <ActivityPage client={client} onOpenObject={(key, deleted) => navigate(objectRoute(key, deleted))} />
   if (route === 'services') return <ServicesPage config={config} />
   const Page = clientPages[route] ?? OverviewPage
   return <Page client={client} />
+}
+
+function RoutedObjectPage({ route, object, client, navigate }: {
+  route: string; object: ObjectRoute; client: VaultClient; navigate: NavigateRoute
+}): React.ReactElement {
+  const fence = React.useMemo(() => ({ active: true }), [client, route])
+  React.useLayoutEffect(() => {
+    fence.active = true
+    return () => { fence.active = false }
+  }, [fence])
+  return <ObjectPage client={client} objectKey={object.key} deleted={object.deleted}
+    onBack={() => navigate(object.returnTo ? fileLocationRoute(object.returnTo) : 'files')}
+    onRestored={() => {
+      if (fence.active && routeFromHash('') === route) {
+        navigate(objectRoute(object.key, false, object.returnTo), { replace: true })
+      }
+    }} />
 }
 
 function UnavailableManagement({ route, navigation, navigate }: {
@@ -103,8 +125,9 @@ export function Shell({ config }: { config: WebConfig }): React.ReactElement {
   const auth = useAuth()
   const [route, navigate] = useHashRoute('overview')
   const object = parseObjectRoute(route)
-  const pageRoute = routeKeys.has(route) || object ? route : 'overview'
-  const activeRoute = object ? 'files' : pageRoute
+  const files = parseFileLocationRoute(route)
+  const pageRoute = routeKeys.has(route) || object || files ? route : 'overview'
+  const activeRoute = object || files ? 'files' : pageRoute
   const token = auth.session?.accessToken ?? ''
   const client = React.useMemo(
     () => new VaultClient(config.apiBase, () => token),

@@ -1,7 +1,8 @@
 import * as React from 'react'
 import { IrisAlert, IrisButton, IrisCard, IrisEmptyState, IrisInput } from '@iris-ui-kit/react'
 import type { FolderItem, FolderListing } from '../../api/files'
-import { childFolderPath, folderCrumbs } from './folderPath'
+import { normalizeFolderPath } from './folderPath'
+import { literalChildFolderPath, literalFolderCrumbs } from './literalFolderPath'
 
 interface FolderPaging {
   loading: boolean
@@ -26,7 +27,7 @@ export function FolderBrowser(props: FolderBrowserProps): React.ReactElement {
   const [name, setName] = React.useState('')
   const folders = listing.items.filter((item) => item.type === 'folder')
   const submit = async () => {
-    const next = childFolderPath(path, name)
+    const next = `${path}${normalizeFolderPath(name)}`
     if (!next || next === path) return
     await create(next)
     setName('')
@@ -35,7 +36,7 @@ export function FolderBrowser(props: FolderBrowserProps): React.ReactElement {
     <IrisCard variant="outline" header="目录">
       <nav className="folder-crumbs" aria-label="目录路径">
         <button type="button" onClick={() => navigate('')}>根目录</button>
-        {folderCrumbs(path).map((crumb) => <React.Fragment key={crumb.path}><span>/</span><button type="button" onClick={() => navigate(crumb.path)}>{crumb.label}</button></React.Fragment>)}
+        {literalFolderCrumbs(path).map((crumb) => <React.Fragment key={crumb.path}><span>/</span><button type="button" onClick={() => navigate(crumb.path)}>{crumb.label}</button></React.Fragment>)}
       </nav>
       <form className="folder-create" onSubmit={(event) => { event.preventDefault(); void submit() }}>
         <IrisInput required value={name} placeholder="新目录名称" disabled={busy} onChange={(event) => setName(event.target.value)} />
@@ -53,7 +54,7 @@ export function FolderBrowser(props: FolderBrowserProps): React.ReactElement {
 
 function FolderEntries({ folders, path, busy, navigate, remove, allowRecursiveDelete = true }: FolderBrowserProps & { folders: FolderItem[] }): React.ReactElement {
   return <div className="folder-grid">{folders.map((folder) => {
-    const fullPath = childFolderPath(path, folder.name)
+    const fullPath = literalChildFolderPath(path, folder.name)
     return (
       <div className="folder-item" key={fullPath}>
         <button type="button" className="folder-open" onClick={() => navigate(fullPath)}><strong>{folder.name}</strong><span>打开目录</span></button>
